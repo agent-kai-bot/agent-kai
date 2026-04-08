@@ -1,0 +1,100 @@
+Screen {
+    layout: grid;
+    grid-size: 3 3;
+    grid-columns: 1fr 3fr 1fr;
+    grid-rows: auto 3fr 2fr;
+}
+
+#header {
+    column-span: 3;
+    background: $primary-darken-3;
+    color: $text;
+    text-style: bold;
+    padding: 0 1;
+    height: 1;
+}
+
+/* Left column */
+#watchlist-panel {
+    border: solid $secondary;
+    padding: 0;
+}
+
+#positions-panel {
+    border: solid $success;
+    padding: 0;
+}
+
+/* Center column */
+#chart-panel {
+    border: solid $primary;
+}
+
+#chat-panel {
+    border: solid $primary;
+    padding: 0 1;
+}
+
+/* Right column */
+#alerts-panel {
+    border: solid $warning;
+    padding: 0 1;
+}
+
+#nats-panel {
+    border: solid $secondary;
+    padding: 0 1;
+}
+
+/* Bottom bar */
+#status-bar {
+    dock: bottom;
+    height: 1;
+    background: $surface;
+    color: $text-muted;
+    padding: 0 1;
+    width: 100%;
+}
+
+#input-area {
+    dock: bottom;
+    height: 3;
+    width: 100%;
+    border: solid $accent;
+    background: $surface;
+    color: $text;
+}
+
+Input:focus {
+    border: solid $accent;
+}
+
+Input > .input--cursor {
+    color: $text;
+    background: $accent;
+}
+
+Input > .input--placeholder {
+    color: $text-muted;
+}
+
+.user-msg {
+    color: $success;
+    margin: 0;
+}
+
+.agent-msg {
+    color: $text;
+    margin: 0;
+}
+
+.tool-msg {
+    color: $warning;
+    margin: 0;
+    text-style: italic;
+}
+
+.error-msg {
+    color: $error;
+    margin: 0;
+}

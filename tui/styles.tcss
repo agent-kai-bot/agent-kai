@@ -1,0 +1,103 @@
+Screen {
+    layout: grid;
+    grid-size: 2 2;
+    grid-columns: 3fr 1fr;
+    grid-rows: 1fr auto;
+}
+
+#header {
+    dock: top;
+    background: $primary-darken-2;
+    color: $text;
+    text-style: bold;
+    padding: 0 1;
+    height: 1;
+}
+
+#chat-scroll {
+    border: solid $primary;
+    padding: 0 1;
+}
+
+#right-panel {
+    layout: vertical;
+}
+
+#nats-panel {
+    border: solid $secondary;
+    padding: 0 1;
+    height: 1fr;
+}
+
+#tool-panel {
+    border: solid $warning;
+    padding: 0 1;
+    height: 1fr;
+}
+
+#nats-title {
+    dock: top;
+    text-style: bold;
+    color: $secondary;
+    height: 1;
+    padding: 0 0;
+}
+
+#tool-title {
+    dock: top;
+    text-style: bold;
+    color: $warning;
+    height: 1;
+    padding: 0 0;
+}
+
+#status-bar {
+    height: 1;
+    background: $surface;
+    color: $text-muted;
+    padding: 0 1;
+    column-span: 2;
+}
+
+#input-area {
+    dock: bottom;
+    width: 100%;
+    height: 3;
+    border: solid $accent;
+    background: $surface;
+    color: $text;
+}
+
+Input:focus {
+    border: solid $accent;
+}
+
+Input > .input--cursor {
+    color: $text;
+    background: $accent;
+}
+
+Input > .input--placeholder {
+    color: $text-muted;
+}
+
+.user-msg {
+    color: $success;
+    margin: 0;
+}
+
+.agent-msg {
+    color: $text;
+    margin: 0;
+}
+
+.tool-msg {
+    color: $warning;
+    margin: 0;
+    text-style: italic;
+}
+
+.error-msg {
+    color: $error;
+    margin: 0;
+}

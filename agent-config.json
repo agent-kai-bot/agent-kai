@@ -1,0 +1,141 @@
+{
+  "nats_url": "nats://localhost:4222",
+  "default_agent": "nano",
+  "workspaces_dir": "workspaces",
+  "log_level": "DEBUG",
+  "log_dir": "logs",
+
+  "endpoints": {
+    "kai-fast": {
+      "base_url": "https://agent-k.ai/v1",
+      "model": "kai-fast",
+      "api_key_env": "AGENT_KAI_API_KEY",
+      "api_key": "missing-kai-api-key",
+      "max_tokens": 2048,
+      "temperature": 0.3,
+      "top_p": 0.95
+    },
+    "kai-smart": {
+      "base_url": "https://agent-k.ai/v1",
+      "model": "kai-smart",
+      "api_key_env": "AGENT_KAI_API_KEY",
+      "api_key": "missing-kai-api-key",
+      "max_tokens": 4096,
+      "temperature": 0.6,
+      "top_p": 0.95
+    }
+  },
+
+  "agents": {
+    "nano": {
+      "description": "Primary trading assistant — the user's main interface",
+      "endpoint": "kai-smart",
+      "fallback_endpoint": null,
+      "max_iterations": 2000
+    },
+    "ceo": {
+      "description": "Strategic leader — sets vision, makes priority decisions, aligns all agents",
+      "endpoint": "kai-smart",
+      "fallback_endpoint": null,
+      "workspace": "ceo",
+      "max_iterations": 2000
+    },
+    "cto": {
+      "description": "Technical leader — architecture decisions, engineering standards, tech strategy",
+      "endpoint": "kai-smart",
+      "fallback_endpoint": null,
+      "workspace": "cto",
+      "max_iterations": 2000
+    },
+    "architect": {
+      "description": "System designer — blueprints, API contracts, data models, design docs",
+      "endpoint": "kai-smart",
+      "fallback_endpoint": null,
+      "workspace": "architect",
+      "max_iterations": 2000
+    },
+    "developer": {
+      "description": "Builder — writes, edits, debugs, and ships code",
+      "endpoint": "kai-smart",
+      "fallback_endpoint": null,
+      "workspace": "developer",
+      "max_iterations": 200
+    },
+    "qa": {
+      "description": "Quality gatekeeper — tests, bug reports, code review, coverage",
+      "endpoint": "kai-smart",
+      "fallback_endpoint": null,
+      "workspace": "qa",
+      "max_iterations": 2000
+    },
+    "ux-manager": {
+      "description": "UX champion — user flows, usability, accessibility, design system",
+      "endpoint": "kai-smart",
+      "fallback_endpoint": null,
+      "workspace": "ux-manager",
+      "max_iterations": 2000
+    },
+    "project-manager": {
+      "description": "Coordinator — task tracking, priorities, schedules, cross-agent communication",
+      "endpoint": "kai-smart",
+      "fallback_endpoint": null,
+      "workspace": "project-manager",
+      "max_iterations": 2000
+    },
+    "seo": {
+      "description": "Search optimizer — keywords, meta tags, technical SEO, content strategy",
+      "endpoint": "kai-smart",
+      "fallback_endpoint": null,
+      "workspace": "seo",
+      "max_iterations": 2000
+    },
+    "sales-marketing": {
+      "description": "Growth driver — messaging, copy, go-to-market, campaigns, lead gen",
+      "endpoint": "kai-smart",
+      "fallback_endpoint": null,
+      "workspace": "sales-marketing",
+      "max_iterations": 2000
+    },
+    "trader": {
+      "description": "Execution specialist — places trades, manages positions, order lifecycle",
+      "endpoint": "kai-smart",
+      "fallback_endpoint": null,
+      "workspace": "trader",
+      "max_iterations": 200
+    },
+    "analyst": {
+      "description": "Technical analysis — indicators, patterns, chart reading, trading signals",
+      "endpoint": "kai-smart",
+      "fallback_endpoint": null,
+      "workspace": "analyst",
+      "max_iterations": 200
+    },
+    "risk-manager": {
+      "description": "Capital guardian — position sizing, stop losses, exposure limits, drawdown monitoring",
+      "endpoint": "kai-smart",
+      "fallback_endpoint": null,
+      "workspace": "risk-manager",
+      "max_iterations": 200
+    },
+    "scanner": {
+      "description": "Market radar — pump.fun monitoring, new token alerts, breakout detection",
+      "endpoint": "kai-fast",
+      "fallback_endpoint": null,
+      "workspace": "scanner",
+      "max_iterations": 200
+    },
+    "onchain": {
+      "description": "Blockchain investigator — wallet tracking, contract analysis, liquidity checks",
+      "endpoint": "kai-smart",
+      "fallback_endpoint": null,
+      "workspace": "onchain",
+      "max_iterations": 200
+    }
+  },
+
+  "tool_safety": {
+    "shell_timeout_seconds": 30,
+    "max_file_read_chars": 10000,
+    "max_output_chars": 5000
+  }
+}
