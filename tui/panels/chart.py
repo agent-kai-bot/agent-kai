@@ -36,20 +36,27 @@ class ChartColorScheme:
 
 
 SCHEMES: dict[str, ChartColorScheme] = {
-    "default": ChartColorScheme(
-        name="default",
-        bar_up="green",
-        bar_down="red",
-        wick="dim",
-        doji="dim yellow",
-        header_up="bold green",
-        header_down="bold red",
-        header_symbol="bold",
-        header_dim="dim",
-        axis="dim",
-    ),
+    # TradingView-style chart colors. The teal-green and soft-red
+    # below are the exact RGB triplets TradingView uses for its
+    # default candle palette and what most professional charts ship
+    # with — readable on dark terminals, not eye-stabbing, doesn't
+    # look like an ANSI demo from 1992. This is the default scheme.
     "classic": ChartColorScheme(
         name="classic",
+        bar_up="rgb(38,166,154)",
+        bar_down="rgb(239,83,80)",
+        wick="grey62",
+        doji="grey78",
+        header_up="bold rgb(38,166,154)",
+        header_down="bold rgb(239,83,80)",
+        header_symbol="bold white",
+        header_dim="grey58",
+        axis="grey46",
+    ),
+    # Loud bright-ANSI green/red. Kept for users who want the
+    # high-contrast vintage terminal look.
+    "neon": ChartColorScheme(
+        name="neon",
         bar_up="bold bright_green",
         bar_down="bold bright_red",
         wick="grey70",
@@ -59,6 +66,21 @@ SCHEMES: dict[str, ChartColorScheme] = {
         header_symbol="bold white",
         header_dim="grey62",
         axis="grey50",
+    ),
+    # Plain ANSI 8-color green/red. Works on the cheapest terminal,
+    # falls back gracefully when the user has SSH'd in over a dumb
+    # tty that doesn't speak truecolor.
+    "ansi": ChartColorScheme(
+        name="ansi",
+        bar_up="green",
+        bar_down="red",
+        wick="dim",
+        doji="dim yellow",
+        header_up="bold green",
+        header_down="bold red",
+        header_symbol="bold",
+        header_dim="dim",
+        axis="dim",
     ),
     "mono": ChartColorScheme(
         name="mono",
@@ -98,7 +120,9 @@ SCHEMES: dict[str, ChartColorScheme] = {
     ),
 }
 
-DEFAULT_SCHEME = "default"
+# `classic` is the default — it's the TradingView-style red/green
+# every trader is already calibrated to read.
+DEFAULT_SCHEME = "classic"
 
 
 class ChartPanel(Widget):
