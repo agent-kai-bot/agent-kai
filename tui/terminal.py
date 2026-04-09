@@ -16,16 +16,13 @@ from agent.learning import (
 )
 from agent.signal_consumer import SignalConsumer
 from agent.skills_store import SkillStore
+from agent_logger import get_logger
 from config import get_skills_dir
 from tui.panels.alerts import AlertsPanel
 from tui.panels.agent_chat import ChatPanel
 from tui.panels.chart import ChartPanel
 from tui.panels.positions import PositionsPanel
 from tui.panels.watchlist import WatchlistPanel
-
-from data_api.config import API_PORT
-
-API_BASE = f"http://localhost:{API_PORT}/api/v1"
 
 # Cloud market data endpoint (agent-k.ai). Bearer-authenticated via the
 # user's AGENT_KAI_API_KEY (env var, .env file, or AGENT-KAI-API-KEY.txt
@@ -117,6 +114,10 @@ class TradingTerminal(App):
         self.agent_runner = agent_runner
         self.bus = bus
         self._agent_working = False
+        # File logger so chart / signal / feed errors land in
+        # logs/tui_YYYY-MM-DD.log instead of disappearing when the
+        # TUI closes. Mirrors the per-agent logger pattern.
+        self.log = get_logger("tui")
         # Track the most recently-dispatched sub-agent so `/learn`
         # with no args knows which session to reflect on.
         self._last_sub_agent: str | None = None
@@ -232,98 +233,89 @@ class TradingTerminal(App):
             # Load positions
             await self._refresh_positions()
         except Exception as e:
-            self._nats_log(f"[red]Init error: {e}[/]")
+            self._log_error("init error", e)
 
     def _seed_watchlist_prices(self, watchlist, symbols: list[str]) -> None:
         """Synchronously fetch latest prices for the watchlist via the
         currently-selected chart source. Runs off the event loop via
         ``asyncio.to_thread`` so the TUI doesn't block.
         """
-        if self._chart_source == "kai-api":
-            headers = _kai_api_headers()
-            if not headers:
-                return
-            for sym in symbols:
-                try:
-                    r = requests.get(
-                        f"{KAI_API_BASE}/market/ohlcv/{sym}",
-                        params={"interval": "1m", "limit": 1},
-                        headers=headers,
-                        timeout=5,
-                    )
-                    if r.status_code != 200:
-                        continue
-                    bars = r.json().get("data") or []
-                    if not bars:
-                        continue
-                    last = _normalize_kai_bar(bars[-1])
-                    watchlist.update_price(sym, last["close"], last["volume"])
-                except Exception:
-                    pass
-            return
-
         if self._chart_source == "coinbase":
             try:
                 from agent.data_sources.coinbase import fetch_latest_price
-            except Exception:
+            except Exception as exc:
+                self.log.warning("watchlist coinbase import failed: %s", exc)
                 return
             for sym in symbols:
                 try:
                     info = fetch_latest_price(sym)
                     watchlist.update_price(sym, info["price"], info.get("volume_24h"))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self.log.warning("watchlist coinbase price %s failed: %s", sym, exc)
             return
 
-        # local data_api
+        # Default: kai-api. Derive the latest close from the most
+        # recent 1m bar — the cloud doesn't expose a separate /price
+        # endpoint and a 1-bar OHLCV call is cheap.
+        headers = _kai_api_headers()
+        if not headers:
+            self.log.warning(
+                "watchlist seed skipped: AGENT_KAI_API_KEY not configured"
+            )
+            return
         for sym in symbols:
             try:
-                resp = requests.get(f"{API_BASE}/price/{sym}", timeout=5)
-                data = resp.json()
-                watchlist.update_price(data["symbol"], data["price"], data.get("volume"))
-            except Exception:
-                pass
+                r = requests.get(
+                    f"{KAI_API_BASE}/market/ohlcv/{sym}",
+                    params={"interval": "1m", "limit": 1},
+                    headers=headers,
+                    timeout=5,
+                )
+                if r.status_code != 200:
+                    self.log.warning(
+                        "watchlist kai-api %s failed: HTTP %s", sym, r.status_code
+                    )
+                    continue
+                bars = r.json().get("data") or []
+                if not bars:
+                    continue
+                last = _normalize_kai_bar(bars[-1])
+                watchlist.update_price(sym, last["close"], last["volume"])
+            except Exception as exc:
+                self.log.warning("watchlist kai-api %s exception: %s", sym, exc)
 
     async def _load_chart(self, symbol: str, interval: str):
         """Load chart data using the current source.
 
-        Three sources are supported:
-        - ``kai-api`` (default): cloud agent-k.ai /v1/market/ohlcv,
-          authenticated with AGENT_KAI_API_KEY. The cloud-first default
-          so the open-source agent works out of the box.
-        - ``local``: localhost data_api (for self-hosted setups).
-        - ``coinbase``: direct Coinbase REST + WebSocket feed.
+        Two sources are supported:
+        - ``kai-api`` (default): cloud agent-k.ai REST bootstrap +
+          live WebSocket stream. Bearer-authenticated via
+          AGENT_KAI_API_KEY. This is the cloud-first default that
+          works out of the box for any user with a key.
+        - ``coinbase``: direct Coinbase REST + WebSocket feed (no
+          auth required, BTC-USD focused).
+
+        Anything else falls back to kai-api so stale state from an
+        earlier dev iteration can never leave the chart in a broken
+        "Chart load error: localhost" state.
 
         All call sites (slash commands, watchlist clicks, timeframe
-        cycling) funnel through here so the selected source is always
-        honored.
+        cycling) funnel through here so the selected source is
+        always honored.
         """
         if self._chart_source == "coinbase":
             await self._start_coinbase_feed(symbol, interval)
             return
 
-        if self._chart_source == "kai-api":
-            await self._load_chart_from_kai_api(symbol, interval)
-            return
-
-        # Local source: one-shot fetch from the project data_api.
-        try:
-            resp = requests.get(
-                f"{API_BASE}/ohlcv/{symbol}",
-                params={"interval": interval, "limit": 120},
-                timeout=10,
+        # Default + safety net: anything other than coinbase routes
+        # through the cloud kai-api feed.
+        if self._chart_source != "kai-api":
+            self.log.info(
+                "chart source '%s' is no longer supported, falling back to kai-api",
+                self._chart_source,
             )
-            bars = resp.json()
-            chart = self.query_one("#chart-panel", ChartPanel)
-            chart.set_data(symbol, interval, bars)
-            self._chart_symbol = symbol
-            try:
-                self._current_tf_idx = self.TIMEFRAMES.index(interval)
-            except ValueError:
-                pass
-            self._save_chart_state(interval)
-        except Exception as e:
-            self._nats_log(f"[red]Chart load error: {e}[/]")
+            self._chart_source = "kai-api"
+        await self._load_chart_from_kai_api(symbol, interval)
 
     async def _load_chart_from_kai_api(self, symbol: str, interval: str) -> None:
         """Hand off to the kai-api WebSocket feed lifecycle.
@@ -354,7 +346,7 @@ class TradingTerminal(App):
                 fetch_candles,
             )
         except Exception as e:
-            self._nats_log(f"[red]kai-api module import failed: {e}[/]")
+            self._log_error("kai-api module import failed", e)
             return
 
         sym_upper = symbol.upper()
@@ -369,7 +361,7 @@ class TradingTerminal(App):
             )
             return
         except Exception as e:
-            self._nats_log(f"[red]kai-api REST fetch failed: {e}[/]")
+            self._log_error("kai-api REST fetch failed", e)
             return
 
         # Populate the chart with the historical window
@@ -377,7 +369,7 @@ class TradingTerminal(App):
             chart = self.query_one("#chart-panel", ChartPanel)
             chart.set_data(sym_upper, interval, hist)
         except Exception as e:
-            self._nats_log(f"[red]chart set_data failed: {e}[/]")
+            self._log_error("chart set_data failed (kai-api path)", e)
             return
 
         self._chart_symbol = sym_upper
@@ -445,7 +437,7 @@ class TradingTerminal(App):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            self._nats_log(f"[red]kai-api WS consumer error: {e}[/]")
+            self._log_error("kai-api WS consumer error", e)
 
     def _save_chart_state(self, interval: str) -> None:
         """Persist chart symbol/timeframe/source/scheme to state.json."""
@@ -481,7 +473,7 @@ class TradingTerminal(App):
                 normalize_product_id,
             )
         except Exception as e:
-            self._nats_log(f"[red]Coinbase module import failed: {e}[/]")
+            self._log_error("Coinbase module import failed", e)
             return
 
         product_id = normalize_product_id(symbol)
@@ -492,7 +484,7 @@ class TradingTerminal(App):
                 fetch_candles, product_id, interval, 120
             )
         except Exception as e:
-            self._nats_log(f"[red]Coinbase historical fetch failed ({product_id} {interval}): {e}[/]")
+            self._log_error(f"Coinbase historical fetch failed ({product_id} {interval})", e)
             return
 
         # Populate the chart with the historical window
@@ -500,7 +492,7 @@ class TradingTerminal(App):
             chart = self.query_one("#chart-panel", ChartPanel)
             chart.set_data(product_id, interval, hist)
         except Exception as e:
-            self._nats_log(f"[red]Chart set_data failed: {e}[/]")
+            self._log_error("chart set_data failed (coinbase path)", e)
             return
 
         # Persist new state
@@ -567,7 +559,7 @@ class TradingTerminal(App):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            self._nats_log(f"[red]Coinbase WS consumer error: {e}[/]")
+            self._log_error("Coinbase WS consumer error", e)
 
     async def _run_coinbase_rest_poller(self, product_id: str, interval: str) -> None:
         """Poll Coinbase REST every 15s and refresh the chart."""
@@ -584,7 +576,7 @@ class TradingTerminal(App):
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    self._nats_log(f"[red]Coinbase poll error: {e}[/]")
+                    self._log_error("Coinbase poll error", e)
         except asyncio.CancelledError:
             raise
 
@@ -740,13 +732,13 @@ class TradingTerminal(App):
                 if len(parts) < 3:
                     self._chat_msg(
                         f"[dim]Current source: {self._chart_source}[/] "
-                        "[dim](available: kai-api, local, coinbase)[/]"
+                        "[dim](available: kai-api, coinbase)[/]"
                     )
                     return True
                 source_name = parts[2].lower()
-                if source_name not in ("kai-api", "local", "coinbase"):
+                if source_name not in ("kai-api", "coinbase"):
                     self._chat_msg(
-                        f"[red]Unknown source '{source_name}'. Use: kai-api, local, coinbase[/]"
+                        f"[red]Unknown source '{source_name}'. Use: kai-api, coinbase[/]"
                     )
                     return True
                 if source_name == self._chart_source:
@@ -1270,6 +1262,22 @@ class TradingTerminal(App):
     def _nats_log(self, markup: str):
         try:
             self.query_one("#nats-panel", RichLog).write(markup)
+        except Exception:
+            pass
+
+    def _log_error(self, msg: str, exc: Exception | None = None) -> None:
+        """Log an error to BOTH the on-screen panel and the file log.
+
+        Use this everywhere a chart / signal / feed / network error
+        happens. Without the file log half, errors disappear when the
+        TUI closes and there's no way to post-mortem the next morning.
+        """
+        if exc is not None:
+            self.log.error("%s: %s", msg, exc)
+        else:
+            self.log.error(msg)
+        try:
+            self._nats_log(f"[red]{msg}[/]")
         except Exception:
             pass
 

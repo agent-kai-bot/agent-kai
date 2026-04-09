@@ -52,11 +52,7 @@ import pandas as pd
 import requests
 from langchain_core.tools import StructuredTool
 
-from data_api.config import API_PORT
-
 logger = logging.getLogger(__name__)
-
-API_BASE = f"http://localhost:{API_PORT}/api/v1"
 
 # ── Indicator computation ───────────────────────────────────
 #
@@ -290,28 +286,28 @@ def _build_strategy_class(
 
 # ── Data fetching ───────────────────────────────────────────
 
-def _fetch_ohlcv(symbol: str, interval: str, limit: int, source: str = "local") -> pd.DataFrame:
+def _fetch_ohlcv(symbol: str, interval: str, limit: int, source: str = "kai-api") -> pd.DataFrame:
     """Fetch OHLCV and return a backtesting-ready DataFrame.
 
     Args:
         symbol: Trading symbol.
         interval: Candle interval.
         limit: Number of bars.
-        source: "local" (default — hits the project data_api) or
-            "coinbase" (direct Coinbase REST — useful for pairs not
-            covered by the local source).
+        source: "kai-api" (default — cloud agent-k.ai market endpoint
+            with bearer auth via AGENT_KAI_API_KEY) or "coinbase"
+            (direct Coinbase REST — useful for pairs the cloud doesn't
+            carry).
     """
     if source == "coinbase":
         from agent.data_sources.coinbase import fetch_candles
         bars = fetch_candles(symbol, interval=interval, limit=limit)
     else:
-        resp = requests.get(
-            f"{API_BASE}/ohlcv/{symbol}",
-            params={"interval": interval, "limit": limit},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        bars = resp.json()
+        # Default + safety net: cloud kai-api. The legacy "local" source
+        # used to hit a localhost data_api that no longer ships with
+        # the open-source agent — anything that wasn't "coinbase" now
+        # routes through the cloud market endpoint.
+        from agent.data_sources.kai_api import fetch_candles as kai_fetch
+        bars = kai_fetch(symbol, interval=interval, limit=limit)
 
     if not bars:
         raise ValueError(f"No OHLCV data for {symbol} {interval} (source={source})")
@@ -336,7 +332,7 @@ def run_declarative_backtest(spec: dict) -> dict[str, Any]:
     limit = spec.get("bars", 500)
     cash = spec.get("cash", 100000)
     commission = spec.get("commission_pct", 0.1) / 100  # backtesting.py uses fraction
-    source = spec.get("source", "local")
+    source = spec.get("source", "kai-api")
 
     buy_conds = spec.get("buy_when", [])
     sell_conds = spec.get("sell_when", [])
@@ -412,7 +408,7 @@ def _run_backtest_tool(
     sell_when: str = "",
     stop_loss_pct: float = 0,
     take_profit_pct: float = 0,
-    source: str = "local",
+    source: str = "kai-api",
 ) -> str:
     """Run a backtest with a declarative strategy spec.
 
