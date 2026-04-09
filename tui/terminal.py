@@ -26,7 +26,42 @@ from tui.panels.watchlist import WatchlistPanel
 from data_api.config import API_PORT
 
 API_BASE = f"http://localhost:{API_PORT}/api/v1"
+
+# Cloud market data endpoint (agent-k.ai). Bearer-authenticated via the
+# user's AGENT_KAI_API_KEY (env var, .env file, or AGENT-KAI-API-KEY.txt
+# in the project root — auto-loaded by config.py at import time).
+KAI_API_BASE = "https://agent-k.ai/v1"
+
 TRACKED_SYMBOLS = ["BTC", "ETH", "SOL"]
+
+
+def _kai_api_headers() -> dict:
+    """Bearer-auth headers for cloud agent-k.ai market data calls."""
+    import os
+    key = os.environ.get("AGENT_KAI_API_KEY", "")
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
+def _normalize_kai_bar(arr: list) -> dict:
+    """Convert a positional cloud bar to the dict shape the chart panel expects.
+
+    Cloud `/v1/market/ohlcv` returns each bar as
+    ``[ts_ms, open, high, low, close, volume]``. Local data_api returns
+    each bar as ``{"ts": "...", "open": ..., ...}``. The chart panel
+    expects the dict shape, so we adapt here.
+    """
+    if not isinstance(arr, list) or len(arr) < 6:
+        return {}
+    from datetime import datetime, timezone
+    ts_ms = int(arr[0])
+    return {
+        "ts": datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+        "open": float(arr[1]),
+        "high": float(arr[2]),
+        "low": float(arr[3]),
+        "close": float(arr[4]),
+        "volume": float(arr[5]),
+    }
 
 # Persisted UI state — chart symbol / timeframe / watchlist survive a
 # restart. Lives under workspaces/terminal/ to match the pattern the
@@ -93,7 +128,10 @@ class TradingTerminal(App):
         # (direct WebSocket + REST fallback). The Coinbase feed
         # owns an async task for streaming; the local feed is
         # one-shot per /chart call.
-        self._chart_source: str = "local"
+        # Default to the cloud agent-k.ai market data API. Self-hosted
+        # users can /chart source local to switch to a local data_api,
+        # or /chart source coinbase for a direct Coinbase feed.
+        self._chart_source: str = "kai-api"
         self._coinbase_stream = None  # CoinbaseCandleStream instance
         self._coinbase_task = None    # asyncio.Task running the feed loop
 
@@ -103,7 +141,7 @@ class TradingTerminal(App):
         self._chart_symbol = state.get("chart_symbol", "BTC")
         saved_tf = state.get("chart_timeframe", "1m")
         self._saved_color_scheme = state.get("chart_color_scheme", "default")
-        self._chart_source = state.get("chart_source", "local")
+        self._chart_source = state.get("chart_source", "kai-api")
         try:
             self._current_tf_idx = self.TIMEFRAMES.index(saved_tf)
         except ValueError:
@@ -176,17 +214,15 @@ class TradingTerminal(App):
         self.query_one("#input-area", Input).focus()
 
     async def _load_initial_data(self):
-        """Load initial prices and chart data from the API."""
+        """Load initial prices and chart data from the active source."""
         try:
-            # Load watchlist prices
+            # Seed watchlist prices. Source matches the chart source —
+            # kai-api derives the latest close from the most recent
+            # OHLCV bar (the cloud doesn't expose a separate /price
+            # endpoint), local hits the local data_api, coinbase uses
+            # the existing fetch_latest_price client.
             watchlist = self.query_one("#watchlist-panel", WatchlistPanel)
-            for sym in TRACKED_SYMBOLS:
-                try:
-                    resp = requests.get(f"{API_BASE}/price/{sym}", timeout=5)
-                    data = resp.json()
-                    watchlist.update_price(data["symbol"], data["price"], data.get("volume"))
-                except Exception:
-                    pass
+            await asyncio.to_thread(self._seed_watchlist_prices, watchlist, TRACKED_SYMBOLS)
 
             # Load chart
             await self._load_chart(self._chart_symbol, self.TIMEFRAMES[self._current_tf_idx])
@@ -196,15 +232,76 @@ class TradingTerminal(App):
         except Exception as e:
             self._nats_log(f"[red]Init error: {e}[/]")
 
-    async def _load_chart(self, symbol: str, interval: str):
-        """Load chart data using the current source (local or coinbase).
+    def _seed_watchlist_prices(self, watchlist, symbols: list[str]) -> None:
+        """Synchronously fetch latest prices for the watchlist via the
+        currently-selected chart source. Runs off the event loop via
+        ``asyncio.to_thread`` so the TUI doesn't block.
+        """
+        if self._chart_source == "kai-api":
+            headers = _kai_api_headers()
+            if not headers:
+                return
+            for sym in symbols:
+                try:
+                    r = requests.get(
+                        f"{KAI_API_BASE}/market/ohlcv/{sym}",
+                        params={"interval": "1m", "limit": 1},
+                        headers=headers,
+                        timeout=5,
+                    )
+                    if r.status_code != 200:
+                        continue
+                    bars = r.json().get("data") or []
+                    if not bars:
+                        continue
+                    last = _normalize_kai_bar(bars[-1])
+                    watchlist.update_price(sym, last["close"], last["volume"])
+                except Exception:
+                    pass
+            return
 
-        This is the source-aware entry point — all call sites (slash
-        commands, watchlist clicks, timeframe cycling) go through
-        here so the selected source is always honored.
+        if self._chart_source == "coinbase":
+            try:
+                from agent.data_sources.coinbase import fetch_latest_price
+            except Exception:
+                return
+            for sym in symbols:
+                try:
+                    info = fetch_latest_price(sym)
+                    watchlist.update_price(sym, info["price"], info.get("volume_24h"))
+                except Exception:
+                    pass
+            return
+
+        # local data_api
+        for sym in symbols:
+            try:
+                resp = requests.get(f"{API_BASE}/price/{sym}", timeout=5)
+                data = resp.json()
+                watchlist.update_price(data["symbol"], data["price"], data.get("volume"))
+            except Exception:
+                pass
+
+    async def _load_chart(self, symbol: str, interval: str):
+        """Load chart data using the current source.
+
+        Three sources are supported:
+        - ``kai-api`` (default): cloud agent-k.ai /v1/market/ohlcv,
+          authenticated with AGENT_KAI_API_KEY. The cloud-first default
+          so the open-source agent works out of the box.
+        - ``local``: localhost data_api (for self-hosted setups).
+        - ``coinbase``: direct Coinbase REST + WebSocket feed.
+
+        All call sites (slash commands, watchlist clicks, timeframe
+        cycling) funnel through here so the selected source is always
+        honored.
         """
         if self._chart_source == "coinbase":
             await self._start_coinbase_feed(symbol, interval)
+            return
+
+        if self._chart_source == "kai-api":
+            await self._load_chart_from_kai_api(symbol, interval)
             return
 
         # Local source: one-shot fetch from the project data_api.
@@ -225,6 +322,55 @@ class TradingTerminal(App):
             self._save_chart_state(interval)
         except Exception as e:
             self._nats_log(f"[red]Chart load error: {e}[/]")
+
+    async def _load_chart_from_kai_api(self, symbol: str, interval: str) -> None:
+        """Fetch a chart window from the cloud agent-k.ai market endpoint.
+
+        Runs the synchronous ``requests`` call off the event loop via
+        ``asyncio.to_thread`` so the TUI doesn't block on network I/O.
+        Cloud bars come back as positional ``[ts_ms, o, h, l, c, v]``
+        arrays which we adapt to the dict shape the chart panel
+        expects via ``_normalize_kai_bar``.
+        """
+        try:
+            headers = _kai_api_headers()
+            if not headers:
+                self._nats_log(
+                    "[red]kai-api chart source requires AGENT_KAI_API_KEY "
+                    "(env var, .env, or AGENT-KAI-API-KEY.txt). "
+                    "Try /chart source local or /chart source coinbase instead.[/]"
+                )
+                return
+
+            def _fetch():
+                r = requests.get(
+                    f"{KAI_API_BASE}/market/ohlcv/{symbol}",
+                    params={"interval": interval, "limit": 120},
+                    headers=headers,
+                    timeout=15,
+                )
+                r.raise_for_status()
+                return r.json()
+
+            payload = await asyncio.to_thread(_fetch)
+            raw = payload.get("data") or payload.get("bars") or []
+            bars = [b for b in (_normalize_kai_bar(arr) for arr in raw) if b]
+
+            if not bars:
+                self._nats_log(f"[red]kai-api: no bars for {symbol} {interval}[/]")
+                return
+
+            chart = self.query_one("#chart-panel", ChartPanel)
+            chart.set_data(symbol, interval, bars)
+            self._chart_symbol = symbol
+            try:
+                self._current_tf_idx = self.TIMEFRAMES.index(interval)
+            except ValueError:
+                pass
+            self._save_chart_state(interval)
+            self._nats_log(f"[dim]chart: kai-api {symbol} {interval} ({len(bars)} bars)[/]")
+        except Exception as e:
+            self._nats_log(f"[red]kai-api chart load error: {e}[/]")
 
     def _save_chart_state(self, interval: str) -> None:
         """Persist chart symbol/timeframe/source/scheme to state.json."""
@@ -519,13 +665,13 @@ class TradingTerminal(App):
                 if len(parts) < 3:
                     self._chat_msg(
                         f"[dim]Current source: {self._chart_source}[/] "
-                        "[dim](available: local, coinbase)[/]"
+                        "[dim](available: kai-api, local, coinbase)[/]"
                     )
                     return True
                 source_name = parts[2].lower()
-                if source_name not in ("local", "coinbase"):
+                if source_name not in ("kai-api", "local", "coinbase"):
                     self._chat_msg(
-                        f"[red]Unknown source '{source_name}'. Use: local, coinbase[/]"
+                        f"[red]Unknown source '{source_name}'. Use: kai-api, local, coinbase[/]"
                     )
                     return True
                 if source_name == self._chart_source:
