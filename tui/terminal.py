@@ -176,6 +176,22 @@ class TradingTerminal(App):
         # drop its matching string. Same length, same order, same
         # mutations — never one without the other.
         self._queue_widgets: list[QueuedInputRow] = []
+        # Auto-trade gate. When True, signal_handlers configured
+        # to dispatch to the trader sub-agent (or any agent in
+        # AUTOTRADE_GATED_AGENTS) are allowed to fire. When False,
+        # those handlers are skipped with a "gated — autotrade off"
+        # log line in chat. Toggled at runtime via /autotrade on|off.
+        # Persisted to workspaces/terminal/state.json so the setting
+        # survives restarts. Default is OFF — accidentally leaving
+        # autotrade enabled across a restart shouldn't be possible
+        # without explicit user opt-in.
+        self._autotrade_enabled: bool = False
+        # SignalHandlerRunner is constructed in on_mount once the
+        # NATS bus is connected and the chat panel is mounted (the
+        # dispatchers need both). Initialized to None here so the
+        # _on_live_signal callback can no-op gracefully if it fires
+        # before construction.
+        self._signal_handler_runner = None
 
         # Restore persisted chart state from workspaces/terminal/state.json.
         # Falls back to the BTC + 1m defaults on first run or corrupt file.
@@ -184,6 +200,7 @@ class TradingTerminal(App):
         saved_tf = state.get("chart_timeframe", "1m")
         self._saved_color_scheme = state.get("chart_color_scheme", "classic")
         self._chart_source = state.get("chart_source", "kai-api")
+        self._autotrade_enabled = bool(state.get("autotrade_enabled", False))
         try:
             self._current_tf_idx = self.TIMEFRAMES.index(saved_tf)
         except ValueError:
@@ -244,9 +261,20 @@ class TradingTerminal(App):
 
             # Subscribe the signal consumer to live signal scanner events.
             # Signals arriving on ``signals.>`` are buffered in the
-            # consumer and also routed to the AlertsPanel via a callback.
+            # consumer and also routed to the AlertsPanel + the
+            # SignalHandlerRunner via the on_signal callback.
             await self.signal_consumer.subscribe(self.bus)
             self.signal_consumer.on_signal = self._on_live_signal
+
+            # Build the SignalHandlerRunner now that the bus + chat
+            # panel are wired up. Loads the signal_handlers block
+            # from agent-config.json, parses each entry, and binds
+            # the action dispatchers (dispatch_agent, dispatch_kai,
+            # chat_message, publish, webhook) to the live bus +
+            # chat + agent_runner. From this point forward every
+            # signal that lands in _on_live_signal also walks the
+            # handler list.
+            self._build_signal_handler_runner()
 
         # Restore saved chart color scheme. If the saved name no
         # longer exists (e.g. the legacy "default" scheme that we
@@ -271,7 +299,7 @@ class TradingTerminal(App):
         chat.append_message("[bold dim]Welcome to KAI. Type a message or use slash commands.[/]")
         chat.append_message(
             "[dim]/buy /sell /analyze /scan /risk /chart /watch /learn /remember "
-            "/model /think /queue /login codex /exit /reset[/]"
+            "/react /autotrade /model /think /queue /login codex /exit /reset[/]"
         )
         chat.append_message("[dim]Mouse-drag any panel to copy. Ctrl+Y = last reply. Ctrl+Shift+C = current selection.[/]")
 
@@ -1124,6 +1152,20 @@ class TradingTerminal(App):
             #                           (or memory entry) in its library
             return await self._handle_remember_command(parts)
 
+        elif cmd == "/react":
+            # /react [hint]           — manual trigger: ask kai to scan
+            #                           the recent signal feed and react
+            #                           (the in-the-loop manual companion
+            #                           to the configured signal_handlers)
+            return await self._handle_react_command(parts)
+
+        elif cmd == "/autotrade":
+            # /autotrade              — show current state
+            # /autotrade on|off       — toggle the autotrade gate that
+            #                           gates trader sub-agent dispatches
+            #                           from signal_handlers
+            return self._handle_autotrade_command(parts)
+
         elif cmd in ("/exit", "/quit"):
             # /exit or /quit          — save chat history, then quit
             self._save_chat_history()
@@ -1207,6 +1249,146 @@ class TradingTerminal(App):
             f"memory), the name (for skills) or content (for memory entries), "
             f"and a one-line summary of what's now persisted."
         )
+
+    async def _handle_react_command(self, parts: list[str]) -> bool:
+        """Manual signal-reaction trigger.
+
+        The configured ``signal_handlers`` block runs automatically on
+        every incoming signal. ``/react`` is the in-the-loop manual
+        companion: it tells kai to walk the recent ring buffer via
+        ``get_signals``, decide which (if any) signals are actionable
+        right now, and react — dispatch to the analyst for validation,
+        ask the risk-manager for sizing, escalate to the trader if
+        ``/autotrade`` is on, or do nothing.
+
+        Forms:
+            /react              react to whatever is in the buffer
+            /react BTC          filter to BTC signals
+            /react clucmay02    filter to a specific strategy
+
+        The hint is just appended to the prompt — kai parses it.
+        """
+        hint = " ".join(parts[1:]).strip()
+        prompt = self._build_react_prompt(hint)
+        chat = self.query_one("#chat-panel", ChatPanel)
+        chat.append_message(
+            f"[dim]Reacting to recent signals{f' ({hint})' if hint else ''}...[/]"
+        )
+        self._agent_working = True
+        self._set_status("reacting to signals...")
+        self.run_worker(self._process_agent(prompt), thread=False)
+        return True
+
+    def _build_react_prompt(self, hint: str) -> str:
+        """Compose the prompt template kai receives from /react."""
+        autotrade_state = "ON" if self._autotrade_enabled else "OFF"
+        if hint:
+            filter_clause = (
+                f"\n\nThe user passed this hint: {hint!r}. Use it to filter the "
+                f"signals you scan (interpret as a symbol, strategy, or signal_type "
+                f"depending on what makes sense)."
+            )
+        else:
+            filter_clause = ""
+        return (
+            "The user just ran /react. Walk through the recent signal feed and "
+            "decide which signals (if any) are actionable RIGHT NOW. Process:\n"
+            "\n"
+            "1. Call get_signals() with no filters first, limit=10. Read what's "
+            "in the buffer.\n"
+            "2. For each signal that looks interesting, decide which sub-agent "
+            "should validate or act on it:\n"
+            "   - Use nats_request('analyst', task) to get an independent "
+            "multi-timeframe technical read on the symbol\n"
+            "   - Use nats_request('risk-manager', task) to size a position "
+            "assuming the signal is real, given current portfolio exposure\n"
+            "   - Use nats_request('trader', task) to actually place an order — "
+            f"but ONLY if autotrade is enabled (currently autotrade is {autotrade_state})\n"
+            "3. Synthesize the sub-agent replies into a single recommendation per "
+            "actionable signal. Be honest if the signals are noise — saying "
+            "'nothing actionable right now' is a perfectly valid output.\n"
+            "4. If autotrade is OFF and you found a high-confidence signal that "
+            "would warrant a trade, tell the user explicitly: 'autotrade is off — "
+            "if you turn it on with /autotrade on, I would dispatch the trader'.\n"
+            f"{filter_clause}\n"
+            "\n"
+            "Format your final reply as:\n"
+            "  - Signals scanned: N\n"
+            "  - Actionable: M (with the symbol + strategy + your verdict for each)\n"
+            "  - Actions taken: which sub-agents you dispatched and what they "
+            "returned\n"
+            "  - Recommendations: any signals that would be tradeable if "
+            "autotrade were on\n"
+        )
+
+    def _handle_autotrade_command(self, parts: list[str]) -> bool:
+        """Toggle the autotrade gate that gates trader sub-agent dispatches.
+
+        Forms:
+            /autotrade           show current state + the safety story
+            /autotrade on        enable (with confirmation message)
+            /autotrade off       disable
+            /autotrade status    same as /autotrade
+
+        State is persisted to workspaces/terminal/state.json so it
+        survives restarts. Default is OFF — accidentally leaving
+        autotrade enabled across a restart shouldn't be possible
+        without explicit user opt-in.
+        """
+        sub = parts[1].lower() if len(parts) > 1 else "status"
+
+        if sub in ("", "status"):
+            state = "[bold green]ON[/]" if self._autotrade_enabled else "[bold red]OFF[/]"
+            self._chat_msg(f"[dim]autotrade: {state}[/]")
+            self._chat_msg(
+                "[dim]When ON, signal_handlers configured to dispatch to the "
+                "trader sub-agent (or any agent in AUTOTRADE_GATED_AGENTS) "
+                "are allowed to fire automatically. When OFF, those handlers "
+                "log a 'gated' message in chat and skip.[/]"
+            )
+            self._chat_msg("[dim]/autotrade on  |  /autotrade off[/]")
+            return True
+
+        if sub in ("on", "enable", "true", "yes"):
+            if self._autotrade_enabled:
+                self._chat_msg("[dim]autotrade already ON[/]")
+                return True
+            self._autotrade_enabled = True
+            self._persist_autotrade_state()
+            self._chat_msg(
+                "[bold yellow]⚠ AUTOTRADE ENABLED[/] [dim]— signal_handlers that "
+                "dispatch to the trader sub-agent will now fire automatically on "
+                "matching signals. Run /autotrade off to disable.[/]"
+            )
+            return True
+
+        if sub in ("off", "disable", "false", "no"):
+            if not self._autotrade_enabled:
+                self._chat_msg("[dim]autotrade already OFF[/]")
+                return True
+            self._autotrade_enabled = False
+            self._persist_autotrade_state()
+            self._chat_msg("[bold green]autotrade disabled[/] [dim]— trader handlers will be gated[/]")
+            return True
+
+        self._chat_msg(
+            "[red]Usage:[/] [dim]/autotrade  |  /autotrade on  |  /autotrade off[/]"
+        )
+        return True
+
+    def _persist_autotrade_state(self) -> None:
+        """Save the current autotrade flag to workspaces/terminal/state.json.
+
+        Reads the existing state, updates the autotrade_enabled key,
+        writes back atomically. Failures are swallowed — autotrade
+        state is a UX convenience, not load-bearing.
+        """
+        try:
+            state = _load_terminal_state()
+            state["autotrade_enabled"] = bool(self._autotrade_enabled)
+            _save_terminal_state(state)
+        except Exception as exc:
+            self.logger.warning("persist autotrade state failed: %s", exc)
 
     def _handle_queue_command(self, parts: list[str]) -> bool:
         """Inspect or modify the type-ahead input queue.
@@ -1904,12 +2086,22 @@ class TradingTerminal(App):
         alerts.add_alert(alert_type, msg)
 
     def _on_live_signal(self, sig) -> None:
-        """Route a live signal from the SignalConsumer to the AlertsPanel.
+        """Route a live signal from the SignalConsumer to the AlertsPanel
+        AND fan it out to the SignalHandlerRunner for declarative reactions.
 
         Called synchronously from the consumer's ``_ingest`` method.
         Uses ``call_from_thread`` to be safe if the NATS callback
         fires from a background thread.
+
+        Two responsibilities:
+          1. Display — always fires, posts to alerts panel + nats log
+          2. React — runs the configured signal_handlers (analyst
+             dispatch, risk-manager check, autotrade pipeline, etc).
+             Each handler runs through cooldown + autotrade gating
+             before firing. The display side never blocks on the
+             reaction side.
         """
+        # Display side
         try:
             alerts = self.query_one("#alerts-panel", AlertsPanel)
             alerts.add_signal(
@@ -1921,6 +2113,183 @@ class TradingTerminal(App):
             self._nats_log(f"[bold yellow]SIGNAL[/] {sig.summary()}")
         except Exception:
             pass
+
+        # Reaction side
+        runner = getattr(self, "_signal_handler_runner", None)
+        if runner is not None:
+            try:
+                runner.run(sig)
+            except Exception as exc:
+                self.logger.warning("signal handler runner failed: %s", exc)
+
+    # ── Signal handler runner construction + dispatchers ──────
+
+    def _build_signal_handler_runner(self) -> None:
+        """Construct the SignalHandlerRunner with action dispatchers
+        bound to the live bus / chat / agent_runner instances.
+
+        Called from ``on_mount`` after the bus is connected and the
+        chat panel is mounted. Idempotent — safe to call again on
+        config reload (the new runner replaces the old one).
+        """
+        from agent.signal_handlers import (
+            ACTION_CHAT_MESSAGE,
+            ACTION_DISPATCH_AGENT,
+            ACTION_DISPATCH_KAI,
+            ACTION_PUBLISH,
+            ACTION_WEBHOOK,
+            SignalHandlerRunner,
+            load_handlers_from_config,
+            render_template,
+        )
+        from config import _config as raw_config
+
+        handlers = load_handlers_from_config(raw_config)
+        if not handlers:
+            self._signal_handler_runner = None
+            self.logger.info("no signal_handlers configured — passive mode")
+            return
+
+        # ── Dispatchers ──────────────────────────────────────
+        # Each dispatcher is an async callable that takes
+        # (handler, flat_signal_dict) and performs the side effect.
+        # They close over `self` so they can use the bus / chat /
+        # agent_runner / sub_agent_manager.
+
+        async def dispatch_agent(handler, flat):
+            """Spawn the named sub-agent if needed and nats_request the task."""
+            agent_name = handler.agent or ""
+            if not agent_name:
+                self._chat_msg(
+                    f"[red][handler:{handler.name}] dispatch_agent missing 'agent' field[/]"
+                )
+                return
+            mgr = getattr(self, "_sub_agent_manager", None)
+            if not mgr or not self.bus:
+                self._chat_msg(
+                    f"[red][handler:{handler.name}] no sub-agent manager available[/]"
+                )
+                return
+            try:
+                if agent_name not in mgr.agents:
+                    self._chat_msg(
+                        f"[dim][handler:{handler.name}] spawning {agent_name}...[/]"
+                    )
+                    await mgr.spawn(agent_name)
+                task = render_template(handler.task_template, flat)
+                if not task:
+                    task = (
+                        f"A {flat.get('strategy','signal')} {flat.get('signal_type','?')} "
+                        f"signal arrived for {flat.get('symbol','?')} at "
+                        f"${flat.get('price', 0)}. React appropriately."
+                    )
+                reply = await self.bus.request(
+                    f"agent.{agent_name}.request",
+                    {"task": task, "from": self.bus.agent_name},
+                    timeout=28800,
+                )
+                response = reply.get("response", str(reply))
+                self._chat_msg(
+                    f"[bold cyan][{agent_name} ← handler:{handler.name}][/] {response}"
+                )
+            except Exception as exc:
+                self._chat_msg(
+                    f"[red][handler:{handler.name}] dispatch_agent failed: {exc}[/]"
+                )
+
+        async def dispatch_kai(handler, flat):
+            """Send the rendered task to the main agent as a queued chat turn.
+
+            Uses the existing input queue path so a busy main agent
+            queues the dispatch instead of running concurrently with
+            whatever it's already doing.
+            """
+            task = render_template(handler.task_template, flat)
+            if not task:
+                task = (
+                    f"A {flat.get('strategy','signal')} {flat.get('signal_type','?')} "
+                    f"signal arrived for {flat.get('symbol','?')} at "
+                    f"${flat.get('price', 0)}. Decide what to do — read the live "
+                    "signal feed via get_signals if you need more context, then react."
+                )
+            if self._agent_working:
+                self._queue_item(task)
+            else:
+                await self._dispatch_input(task)
+
+        async def chat_message(handler, flat):
+            """Just post a styled message in chat — no LLM call, no cost."""
+            text = render_template(handler.template, flat)
+            if not text:
+                text = (
+                    f"[handler:{handler.name}] {flat.get('strategy','?')} "
+                    f"{flat.get('signal_type','?')} {flat.get('symbol','?')} "
+                    f"@ ${flat.get('price', 0)}"
+                )
+            self._chat_msg(text)
+
+        async def publish_action(handler, flat):
+            """Republish the (rendered) signal to a different NATS topic."""
+            if not self.bus:
+                return
+            subject = render_template(handler.subject, flat) or "signals.handled"
+            try:
+                await self.bus.publish(subject, dict(flat))
+            except Exception as exc:
+                self._chat_msg(
+                    f"[red][handler:{handler.name}] publish failed: {exc}[/]"
+                )
+
+        async def webhook_action(handler, flat):
+            """POST the signal payload to an external URL."""
+            if not handler.url:
+                return
+            try:
+                import json as _json
+                import urllib.request
+                data = _json.dumps(flat, default=str).encode("utf-8")
+                req = urllib.request.Request(
+                    handler.url,
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                # Run in a worker thread so the dispatcher doesn't
+                # block the event loop on a slow webhook target.
+                await asyncio.to_thread(
+                    lambda: urllib.request.urlopen(req, timeout=10).read()
+                )
+            except Exception as exc:
+                self._chat_msg(
+                    f"[red][handler:{handler.name}] webhook failed: {exc}[/]"
+                )
+
+        action_dispatchers = {
+            ACTION_DISPATCH_AGENT: dispatch_agent,
+            ACTION_DISPATCH_KAI: dispatch_kai,
+            ACTION_CHAT_MESSAGE: chat_message,
+            ACTION_PUBLISH: publish_action,
+            ACTION_WEBHOOK: webhook_action,
+        }
+
+        # Schedule async dispatchers as Textual workers so the
+        # SignalConsumer's _ingest callback (which is sync) can
+        # fire-and-forget without awaiting them.
+        def schedule(coro):
+            self.run_worker(coro, thread=False)
+
+        self._signal_handler_runner = SignalHandlerRunner(
+            handlers=handlers,
+            action_dispatchers=action_dispatchers,
+            autotrade_enabled=lambda: self._autotrade_enabled,
+            chat_log=self._chat_msg,
+            run_async=schedule,
+        )
+        self.logger.info(
+            "signal_handler_runner built with %d handler(s), autotrade=%s",
+            len(handlers),
+            "ON" if self._autotrade_enabled else "OFF",
+        )
 
     async def _handle_nats_request(self, subject: str, payload: dict):
         task = payload.get("task") or payload.get("message", "")
