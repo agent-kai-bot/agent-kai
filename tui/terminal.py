@@ -143,7 +143,7 @@ class TradingTerminal(App):
         state = _load_terminal_state()
         self._chart_symbol = state.get("chart_symbol", "BTC")
         saved_tf = state.get("chart_timeframe", "1m")
-        self._saved_color_scheme = state.get("chart_color_scheme", "default")
+        self._saved_color_scheme = state.get("chart_color_scheme", "classic")
         self._chart_source = state.get("chart_source", "kai-api")
         try:
             self._current_tf_idx = self.TIMEFRAMES.index(saved_tf)
@@ -201,12 +201,21 @@ class TradingTerminal(App):
             await self.signal_consumer.subscribe(self.bus)
             self.signal_consumer.on_signal = self._on_live_signal
 
-        # Restore saved chart color scheme
+        # Restore saved chart color scheme. If the saved name no
+        # longer exists (e.g. the legacy "default" scheme that we
+        # renamed), log it and fall through — the panel constructor
+        # already picked the new default and the next state save
+        # will persist that.
         try:
             chart = self.query_one("#chart-panel", ChartPanel)
-            chart.set_color_scheme(self._saved_color_scheme)
-        except Exception:
-            pass
+            if not chart.set_color_scheme(self._saved_color_scheme):
+                self.logger.info(
+                    "saved chart color scheme %r is unknown, using current default %r",
+                    self._saved_color_scheme,
+                    chart.color_scheme,
+                )
+        except Exception as exc:
+            self.logger.warning("chart color scheme restore failed: %s", exc)
 
         # Load initial data
         self.run_worker(self._load_initial_data(), thread=False)
