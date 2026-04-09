@@ -117,7 +117,7 @@ class TradingTerminal(App):
         # File logger so chart / signal / feed errors land in
         # logs/tui_YYYY-MM-DD.log instead of disappearing when the
         # TUI closes. Mirrors the per-agent logger pattern.
-        self.log = get_logger("tui")
+        self.logger = get_logger("tui")
         # Track the most recently-dispatched sub-agent so `/learn`
         # with no args knows which session to reflect on.
         self._last_sub_agent: str | None = None
@@ -244,14 +244,14 @@ class TradingTerminal(App):
             try:
                 from agent.data_sources.coinbase import fetch_latest_price
             except Exception as exc:
-                self.log.warning("watchlist coinbase import failed: %s", exc)
+                self.logger.warning("watchlist coinbase import failed: %s", exc)
                 return
             for sym in symbols:
                 try:
                     info = fetch_latest_price(sym)
                     watchlist.update_price(sym, info["price"], info.get("volume_24h"))
                 except Exception as exc:
-                    self.log.warning("watchlist coinbase price %s failed: %s", sym, exc)
+                    self.logger.warning("watchlist coinbase price %s failed: %s", sym, exc)
             return
 
         # Default: kai-api. Derive the latest close from the most
@@ -259,7 +259,7 @@ class TradingTerminal(App):
         # endpoint and a 1-bar OHLCV call is cheap.
         headers = _kai_api_headers()
         if not headers:
-            self.log.warning(
+            self.logger.warning(
                 "watchlist seed skipped: AGENT_KAI_API_KEY not configured"
             )
             return
@@ -272,7 +272,7 @@ class TradingTerminal(App):
                     timeout=5,
                 )
                 if r.status_code != 200:
-                    self.log.warning(
+                    self.logger.warning(
                         "watchlist kai-api %s failed: HTTP %s", sym, r.status_code
                     )
                     continue
@@ -282,7 +282,7 @@ class TradingTerminal(App):
                 last = _normalize_kai_bar(bars[-1])
                 watchlist.update_price(sym, last["close"], last["volume"])
             except Exception as exc:
-                self.log.warning("watchlist kai-api %s exception: %s", sym, exc)
+                self.logger.warning("watchlist kai-api %s exception: %s", sym, exc)
 
     async def _load_chart(self, symbol: str, interval: str):
         """Load chart data using the current source.
@@ -310,7 +310,7 @@ class TradingTerminal(App):
         # Default + safety net: anything other than coinbase routes
         # through the cloud kai-api feed.
         if self._chart_source != "kai-api":
-            self.log.info(
+            self.logger.info(
                 "chart source '%s' is no longer supported, falling back to kai-api",
                 self._chart_source,
             )
@@ -1273,9 +1273,9 @@ class TradingTerminal(App):
         TUI closes and there's no way to post-mortem the next morning.
         """
         if exc is not None:
-            self.log.error("%s: %s", msg, exc)
+            self.logger.error("%s: %s", msg, exc)
         else:
-            self.log.error(msg)
+            self.logger.error(msg)
         try:
             self._nats_log(f"[red]{msg}[/]")
         except Exception:
