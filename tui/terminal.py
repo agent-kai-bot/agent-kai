@@ -1490,10 +1490,19 @@ class TradingTerminal(App):
                         chat.append_message(f"[dim]Spawning {agent_name}...[/]")
                         await mgr.spawn(agent_name)
 
+                    # Wall-clock cap for sub-agent dispatches from the
+                    # TUI. The 300s default matches NATS_REQUEST_DEFAULT_TIMEOUT
+                    # in agent/tools.py — both paths (TUI direct + LLM
+                    # via nats_request tool) use the same generous
+                    # default so substantive analyst / trader / risk-
+                    # manager work doesn't time out before the sub-agent
+                    # finishes. Was 120s; the previous default was
+                    # too tight and produced false "timed out" errors
+                    # on real review tasks.
                     reply = await self.bus.request(
                         f"agent.{agent_name}.request",
                         {"task": task, "from": self.bus.agent_name},
-                        timeout=120,
+                        timeout=300,
                     )
                     response = reply.get("response", str(reply))
                     chat.append_message(f"[bold cyan][{agent_name}][/] {response}")
