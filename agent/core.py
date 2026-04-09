@@ -12,6 +12,8 @@ from agent.memory_store import MemoryStore
 from agent.memory_tool import create_memory_tool
 from agent.prompts import SYSTEM_PROMPT, build_main_system_prompt
 from agent.runtime_utils import EMPTY_RESPONSE_ERROR, ensure_non_empty_response
+from agent.skills_store import SkillStore
+from agent.skills_tool import create_skills_tools
 from agent_logger import (
     get_logger,
     log_agent_event,
@@ -23,11 +25,13 @@ from config import (
     ENDPOINTS,
     MEMORY_CHAR_LIMIT,
     MEMORY_ENABLED,
+    SKILLS_ENABLED,
     USER_CHAR_LIMIT,
     USER_PROFILE_ENABLED,
     get_agent_config,
     get_endpoint,
     get_memory_path,
+    get_skills_dir,
     get_user_profile_path,
 )
 
@@ -109,6 +113,49 @@ def render_memory_block(store: MemoryStore | None) -> str:
     return "\n\n".join(parts)
 
 
+def build_agent_skill_store(agent_name: str) -> SkillStore | None:
+    """Construct a SkillStore pointing at the agent's own skills dir.
+
+    Returns None if skills are globally disabled. The store itself is
+    lazy — directories are created on first write, not here.
+    """
+    if not SKILLS_ENABLED:
+        return None
+    return SkillStore(skills_dir=Path(get_skills_dir(agent_name)))
+
+
+def render_skill_catalog(store: SkillStore | None) -> str:
+    """Render a short skill catalog for injection into the system prompt.
+
+    Intentionally minimal — just name + one-line description. The
+    agent uses ``skill_view`` to load the body of any skill it wants
+    to follow, so we don't dump full content here. Returns empty
+    string if there are no skills yet, to avoid noise in the prompt.
+    """
+    if store is None:
+        return ""
+    try:
+        items = store.list_skills()
+    except Exception:  # noqa: BLE001
+        return ""
+    if not items:
+        return ""
+    lines = [
+        "══════════════════════════════════════════════",
+        f"SKILLS (your reusable recipes) [{len(items)} available]",
+        "══════════════════════════════════════════════",
+        "Call skill_view(name) to read the full body of any skill below.",
+        "",
+    ]
+    for item in items:
+        name = item.get("name", "?")
+        desc = item.get("description", "")
+        category = item.get("category", "")
+        suffix = f" ({category})" if category else ""
+        lines.append(f"- {name}{suffix}: {desc}")
+    return "\n".join(lines)
+
+
 class AgentRunner:
     """Manages the LangChain agent with primary/fallback LLM endpoints."""
 
@@ -138,8 +185,23 @@ class AgentRunner:
         memory_block = render_memory_block(self.memory_store)
         self.tools.append(create_memory_tool(self.memory_store))
 
+        # Load skills and register the three skill tools. Skills are
+        # procedural memory — on-demand recipes the agent authored in
+        # previous sessions. A minimal catalog is injected into the
+        # system prompt so the LLM knows what's on the shelf without
+        # paying the token cost of full content; bodies are loaded
+        # via the skill_view tool only when needed.
+        self.skill_store = build_agent_skill_store(self.agent_name)
+        skill_catalog = render_skill_catalog(self.skill_store)
+        self.tools.extend(create_skills_tools(self.skill_store))
+
+        # Compose both memory + skill catalog into the shared prompt
+        # "identity" section. Join with a blank line so the headers
+        # stay visually distinct.
+        identity_block = "\n\n".join(b for b in (memory_block, skill_catalog) if b)
+
         prompt = create_prompt(
-            build_main_system_prompt(system_prompt, memory_block=memory_block)
+            build_main_system_prompt(system_prompt, memory_block=identity_block)
         )
         agent = create_tool_calling_agent(self.llm, self.tools, prompt)
         self.executor = AgentExecutor(
