@@ -172,7 +172,7 @@ class TradingTerminal(App):
 
         chat = self.query_one("#chat-panel", ChatPanel)
         chat.append_message("[bold dim]Welcome to KAI. Type a message or use slash commands.[/]")
-        chat.append_message("[dim]/buy /sell /analyze /scan /risk /chart /watch /learn[/]")
+        chat.append_message("[dim]/buy /sell /analyze /scan /risk /chart /watch /learn /model /login codex[/]")
         self.query_one("#input-area", Input).focus()
 
     async def _load_initial_data(self):
@@ -593,7 +593,109 @@ class TradingTerminal(App):
             self.run_worker(self._run_learn_flow(target), thread=False)
             return True
 
+        elif cmd == "/login":
+            # /login codex — open browser, run OAuth flow, save tokens
+            provider = parts[1].lower() if len(parts) > 1 else ""
+            if provider != "codex":
+                self._chat_msg(
+                    "[red]Usage: /login codex[/]  "
+                    "[dim](authenticates against your ChatGPT subscription)[/]"
+                )
+                return True
+            self._chat_msg("[dim]Starting Codex OAuth flow — a browser window will open...[/]")
+            self.run_worker(self._run_codex_login(), thread=False)
+            return True
+
+        elif cmd == "/model":
+            # /model                  — show current model for every agent
+            # /model AGENT            — show that agent's current model
+            # /model AGENT EP/MODEL   — switch the agent to a new (endpoint, model) pair
+            return await self._handle_model_command(parts)
+
         return False
+
+    async def _run_codex_login(self) -> None:
+        """Run the Codex OAuth login flow off the UI thread."""
+        from agent.codex_auth import login as codex_login
+        try:
+            creds = await asyncio.to_thread(codex_login)
+            self._chat_msg(
+                f"[bold green]Logged in to ChatGPT[/] "
+                f"[dim](account_id={creds.account_id[:8]}…, expires in "
+                f"{(creds.expires_at - int(__import__('time').time())) // 3600}h)[/]"
+            )
+            self._chat_msg("[dim]Codex endpoint is now usable. "
+                           "Restart agents that should pick it up.[/]")
+        except Exception as e:
+            self._chat_msg(f"[red]Codex login failed: {e}[/]")
+
+    async def _handle_model_command(self, parts: list[str]) -> bool:
+        """Inspect or change the model an agent uses (runtime override).
+
+        At runtime we can't rebuild a sub-agent's executor without
+        respawning it, so /model with an override calls
+        ``mgr.stop()`` then ``mgr.spawn()`` for the target agent
+        after temporarily mutating its in-memory config.
+        """
+        from config import AGENTS, list_endpoint_models, ENDPOINTS
+
+        if len(parts) == 1:
+            # List every agent's currently-configured endpoint+model
+            lines = ["[dim]Current models per agent:[/]"]
+            for name, cfg in AGENTS.items():
+                ep = cfg.get("endpoint", "(default)")
+                model = cfg.get("model", "(default)")
+                lines.append(f"  [bold]{name}[/]: {ep}/{model}")
+            for line in lines:
+                self._chat_msg(line)
+            return True
+
+        agent_name = parts[1]
+        if agent_name not in AGENTS:
+            self._chat_msg(f"[red]Unknown agent '{agent_name}'[/]")
+            return True
+
+        if len(parts) == 2:
+            cfg = AGENTS[agent_name]
+            self._chat_msg(
+                f"[dim]{agent_name}: endpoint={cfg.get('endpoint')} "
+                f"model={cfg.get('model', '(default)')}[/]"
+            )
+            available = []
+            for ep_name in ENDPOINTS:
+                for m in list_endpoint_models(ep_name):
+                    available.append(f"{ep_name}/{m}")
+            self._chat_msg(f"[dim]Available: {', '.join(available)}[/]")
+            return True
+
+        # /model AGENT EP/MODEL — apply override
+        spec = parts[2]
+        if "/" not in spec:
+            self._chat_msg("[red]Spec must be ENDPOINT/MODEL (e.g. codex-cli/gpt-5.4)[/]")
+            return True
+        ep_name, model_name = spec.split("/", 1)
+        if ep_name not in ENDPOINTS:
+            self._chat_msg(f"[red]Unknown endpoint '{ep_name}'[/]")
+            return True
+        if model_name not in list_endpoint_models(ep_name):
+            self._chat_msg(
+                f"[red]Model '{model_name}' not on endpoint '{ep_name}'. "
+                f"Available: {list_endpoint_models(ep_name)}[/]"
+            )
+            return True
+
+        # Mutate the config + respawn the sub-agent if it's running
+        AGENTS[agent_name]["endpoint"] = ep_name
+        AGENTS[agent_name]["model"] = model_name
+        self._chat_msg(f"[dim]{agent_name} → {spec}[/]")
+
+        mgr = getattr(self, "_sub_agent_manager", None)
+        if mgr and agent_name in mgr.agents:
+            self._chat_msg(f"[dim]Respawning {agent_name} with new model...[/]")
+            await mgr.stop(agent_name)
+            await mgr.spawn(agent_name)
+            self._chat_msg(f"[bold green]{agent_name} restarted on {spec}[/]")
+        return True
 
     async def _run_agent_task(self, agent_name: str, task: str):
         """Spawn an agent (if needed) and send it a task, display results in chat."""

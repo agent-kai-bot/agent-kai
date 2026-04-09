@@ -38,7 +38,7 @@ class SubAgent:
         # Load config for this agent name (falls back to defaults if not in config)
         cfg = get_agent_config(name)
         endpoint_cfg = cfg.get("endpoint")
-        fallback_cfg = cfg.get("fallback_endpoint")
+        fallback_chain = cfg.get("fallback_endpoints") or []
         max_iterations = cfg.get("max_iterations", 10)
         self.workspace = cfg.get("workspace", "")
 
@@ -98,18 +98,32 @@ class SubAgent:
             handle_parsing_errors=True,
         )
 
-        # Build fallback executor if configured
-        self.fallback_executor = None
-        if fallback_cfg:
-            fallback_llm = create_llm(fallback_cfg)
-            fallback_agent = create_tool_calling_agent(fallback_llm, tools, prompt)
-            self.fallback_executor = AgentExecutor(
-                agent=fallback_agent,
-                tools=tools,
-                verbose=False,
-                max_iterations=max_iterations,
-                handle_parsing_errors=True,
-            )
+        # Build the fallback chain — each entry becomes its own
+        # AgentExecutor so we can swap them on the fly. The chain
+        # walks in order: first failure → second executor, etc.
+        # Falls back from the primary in ``_invoke_with_fallback``.
+        self.fallback_executors: list[AgentExecutor] = []
+        for fb_cfg in fallback_chain:
+            try:
+                fb_llm = create_llm(fb_cfg)
+                fb_agent = create_tool_calling_agent(fb_llm, tools, prompt)
+                self.fallback_executors.append(AgentExecutor(
+                    agent=fb_agent,
+                    tools=tools,
+                    verbose=False,
+                    max_iterations=max_iterations,
+                    handle_parsing_errors=True,
+                ))
+            except Exception as exc:
+                # A broken fallback shouldn't kill agent init — log and skip.
+                import logging
+                logging.getLogger(__name__).warning(
+                    "fallback executor build failed for %s endpoint=%s: %s",
+                    name, fb_cfg.get("base_url"), exc,
+                )
+        # Backwards-compat alias used by older code paths that read
+        # ``self.fallback_executor`` (singular).
+        self.fallback_executor = self.fallback_executors[0] if self.fallback_executors else None
 
         self.chat_history = []
         self._running = False
@@ -212,27 +226,41 @@ class SubAgent:
             return f"Error: {e}"
 
     async def _invoke_with_fallback(self, task: str, publish_status: bool = False) -> str:
-        """Run the primary executor and fall back on error-like output.
+        """Run the primary executor, walking the fallback chain on failure.
+
+        Tries the primary first, then each entry in
+        ``self.fallback_executors`` in order. Stops at the first
+        executor that returns a non-error result. If everything
+        fails, returns the last error string.
 
         Args:
             task: Task text to execute.
-            publish_status: Whether to emit a NATS status update before fallback.
+            publish_status: Emit a NATS status update before each fallback.
 
         Returns:
-            The primary or fallback output.
+            The first non-error output, or the last error if everything failed.
         """
         active_executor = self.executor
         output = await self._invoke(active_executor, task)
-        if output.startswith("Error:") and self.fallback_executor:
-            self.log.warning("PRIMARY_FAILED agent=%s, trying fallback", self.name)
-            log_agent_event(self.name, "fallback")
+
+        chain = list(self.fallback_executors)
+        attempt = 0
+        while output.startswith("Error:") and chain:
+            attempt += 1
+            next_executor = chain.pop(0)
+            self.log.warning(
+                "PRIMARY_FAILED agent=%s attempt=%d/%d trying fallback",
+                self.name, attempt, len(self.fallback_executors),
+            )
+            log_agent_event(self.name, f"fallback_{attempt}")
             if publish_status and self.bus:
                 await self.bus.publish(
                     f"agent.{self.name}.status",
-                    {"state": "fallback", "task": task[:100]},
+                    {"state": "fallback", "attempt": attempt, "task": task[:100]},
                 )
-            active_executor = self.fallback_executor
+            active_executor = next_executor
             output = await self._invoke(active_executor, task)
+
         if output == EMPTY_RESPONSE_ERROR:
             retry_output = await self._invoke(active_executor, f"{task}{FINAL_RESPONSE_RETRY_PROMPT}")
             if retry_output != EMPTY_RESPONSE_ERROR:

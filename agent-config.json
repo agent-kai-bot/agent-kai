@@ -7,30 +7,90 @@
 
   "endpoints": {
     "kai-fast": {
+      "provider": "openai",
       "base_url": "https://agent-k.ai/v1",
-      "model": "kai-fast",
       "api_key_env": "AGENT_KAI_API_KEY",
       "api_key": "missing-kai-api-key",
-      "max_tokens": 2048,
-      "temperature": 0.3,
-      "top_p": 0.95
+      "models": {
+        "kai-fast": {
+          "context_window": 32000,
+          "max_tokens": 2048,
+          "temperature": 0.3,
+          "top_p": 0.95
+        }
+      }
     },
     "kai-smart": {
+      "provider": "openai",
       "base_url": "https://agent-k.ai/v1",
-      "model": "kai-smart",
       "api_key_env": "AGENT_KAI_API_KEY",
       "api_key": "missing-kai-api-key",
-      "max_tokens": 4096,
-      "temperature": 0.6,
-      "top_p": 0.95
+      "models": {
+        "kai-smart": {
+          "context_window": 200000,
+          "max_tokens": 4096,
+          "temperature": 0.6,
+          "top_p": 0.95
+        }
+      }
     },
     "kai-local": {
+      "provider": "openai",
       "base_url": "http://192.168.222.45:8000/v1",
-      "model": "qwen35-gptq",
       "api_key": "not-needed",
-      "max_tokens": 4096,
-      "temperature": 0.6,
-      "top_p": 0.95
+      "models": {
+        "qwen35-gptq": {
+          "context_window": 32000,
+          "max_tokens": 4096,
+          "temperature": 0.6,
+          "top_p": 0.95
+        }
+      }
+    },
+    "codex-cli": {
+      "provider": "codex-cli",
+      "base_url": "https://chatgpt.com/backend-api/codex",
+      "default_model": "gpt-5.4",
+      "models": {
+        "gpt-5.4": {
+          "context_window": 200000,
+          "max_tokens": 16384,
+          "reasoning_effort": "medium",
+          "text_verbosity": "medium"
+        },
+        "gpt-5.3": {
+          "context_window": 200000,
+          "max_tokens": 16384,
+          "reasoning_effort": "high",
+          "text_verbosity": "medium"
+        },
+        "gpt-5.1-codex-mini": {
+          "context_window": 128000,
+          "max_tokens": 8192,
+          "reasoning_effort": "medium",
+          "text_verbosity": "low"
+        }
+      }
+    },
+    "openai-direct": {
+      "provider": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "default_model": "gpt-5.4",
+      "models": {
+        "gpt-5.4": {
+          "context_window": 200000,
+          "max_tokens": 16384
+        },
+        "gpt-4o": {
+          "context_window": 128000,
+          "max_tokens": 4096
+        },
+        "spark": {
+          "context_window": 128000,
+          "max_tokens": 4096
+        }
+      }
     }
   },
 
@@ -114,7 +174,10 @@
     "analyst": {
       "description": "Technical analysis — indicators, patterns, chart reading, trading signals",
       "endpoint": "kai-local",
-      "fallback_endpoint": null,
+      "model": "qwen35-gptq",
+      "fallback_endpoints": [
+        {"endpoint": "codex-cli", "model": "gpt-5.4"}
+      ],
       "workspace": "analyst",
       "max_iterations": 200
     },
@@ -141,8 +204,11 @@
     },
     "mentor": {
       "description": "Reflection coach — reads other agents' sessions and authors reusable skills for them",
-      "endpoint": "kai-local",
-      "fallback_endpoint": null,
+      "endpoint": "codex-cli",
+      "model": "gpt-5.4",
+      "fallback_endpoints": [
+        {"endpoint": "kai-local", "model": "qwen35-gptq"}
+      ],
       "workspace": "mentor",
       "max_iterations": 200
     }
