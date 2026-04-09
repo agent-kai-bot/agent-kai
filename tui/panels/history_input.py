@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from textual import events
 from textual.binding import Binding
 from textual.widgets import Input
 
@@ -72,10 +73,112 @@ class HistoryInput(Input):
         self._history_path: Path | None = history_path
         if history_path is not None:
             self._load_from_disk()
+        # Multi-line paste buffer.  Textual's default Input._on_paste
+        # truncates pasted text at the first newline (it's a single
+        # -line widget), so a paste like a stack trace or a code
+        # snippet loses everything after line 1.  We override the
+        # paste handler to capture the FULL multi-line text into
+        # this buffer and show a summary indicator in the visible
+        # value.  On submit the parent app calls take_pasted_buffer()
+        # to retrieve the original text instead of the summary.
+        self._pasted_buffer: str | None = None
 
     # ------------------------------------------------------------------
     # public API
     # ------------------------------------------------------------------
+
+    def take_pasted_buffer(self) -> str | None:
+        """Return and clear any buffered multi-line paste.
+
+        Called by ``TradingTerminal.on_input_submitted`` to retrieve
+        the original full text of a multi-line paste — the visible
+        ``self.value`` only holds a summary indicator like
+        "[paste: 5 lines, 280 chars] first line preview…" because
+        the underlying Textual ``Input`` is a single-line widget.
+
+        Returns ``None`` if there's no buffered paste, in which case
+        the caller should use ``self.value`` directly.
+        """
+        buf = self._pasted_buffer
+        self._pasted_buffer = None
+        return buf
+
+    async def _on_paste(self, event: events.Paste) -> None:
+        """Capture multi-line pastes into a buffer instead of truncating.
+
+        Textual's default ``Input._on_paste`` does
+        ``event.text.splitlines()[0]`` and inserts only that — fine
+        for a single-line widget, awful when the user is trying to
+        paste a stack trace, a code block, or any wrapped chunk into
+        the chat. We intercept here:
+
+        - **Single-line paste**: defer to the parent so the normal
+          insert-at-cursor / replace-selection behavior runs unchanged.
+        - **Multi-line paste**: stash the normalized full text on
+          ``self._pasted_buffer``, replace the visible value with a
+          summary indicator the user can recognize, park the cursor
+          at end-of-line, and stop the event so the parent never
+          runs (which would otherwise truncate to the first line).
+
+        Line endings are normalized to ``\\n`` so the agent sees
+        consistent text regardless of the source platform's CR/LF
+        conventions.
+        """
+        text = event.text
+        if not text:
+            event.stop()
+            return
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        if "\n" in normalized:
+            self._pasted_buffer = normalized
+            n_lines = normalized.count("\n") + 1
+            n_chars = len(normalized)
+            first_line = normalized.split("\n", 1)[0]
+            preview = first_line[:40]
+            suffix = "…" if len(first_line) > 40 else ""
+            self.value = f"[paste: {n_lines} lines, {n_chars} chars] {preview}{suffix}"
+            self.cursor_position = len(self.value)
+            event.stop()
+            return
+        # Single-line paste — let the parent handle it normally.
+        # Note: Input._on_paste is sync (returns None), so we call
+        # without await — making this method async only so we can
+        # match the rest of the override surface that IS async.
+        super()._on_paste(event)
+
+    async def _on_key(self, event: events.Key) -> None:
+        """Abandon a buffered paste on the first edit keystroke.
+
+        UX rule: a buffered multi-line paste is "all or nothing".
+        Either the user hits Enter to send it as-is, or they touch
+        any other key to abandon it and start fresh. Half-edited
+        paste summaries would be confusing because the visible
+        value is just a placeholder, not the real content.
+
+        Enter, history navigation (Up/Down), and the no-op modifier
+        keys all leave the buffer alone. Anything else clears both
+        the buffer and the visible value so the user gets a clean
+        input on the very next keystroke.
+        """
+        if self._pasted_buffer is not None:
+            preserve_keys = {
+                "enter",
+                "up",
+                "down",
+                "ctrl+c",
+                "ctrl+l",
+                "ctrl+y",
+                "ctrl+t",
+                "ctrl+shift+c",
+                "shift",
+                "ctrl",
+                "alt",
+            }
+            if event.key not in preserve_keys:
+                self._pasted_buffer = None
+                self.value = ""
+                self.cursor_position = 0
+        await super()._on_key(event)
 
     def remember(self, text: str) -> None:
         """Record a submitted line and reset the cursor.
