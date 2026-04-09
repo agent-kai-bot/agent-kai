@@ -5,6 +5,20 @@ Screen {
     grid-rows: auto 3fr 2fr;
 }
 
+/* Chart-vs-chat row sizing modes. Toggled at runtime by
+ * /chart half | /chart full via Screen.add_class / remove_class.
+ * The default (Screen { grid-rows: auto 3fr 2fr }) is "full" — chart
+ * gets the larger middle row. The .chart-half rule below flips the
+ * ratio so the chat panel dominates and the chart shrinks. */
+
+Screen.chart-half {
+    grid-rows: auto 1fr 4fr;
+}
+
+Screen.chart-full {
+    grid-rows: auto 3fr 2fr;
+}
+
 #header {
     column-span: 3;
     background: $primary-darken-3;

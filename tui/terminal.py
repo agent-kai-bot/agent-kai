@@ -204,6 +204,12 @@ class TradingTerminal(App):
         self._saved_color_scheme = state.get("chart_color_scheme", "classic")
         self._chart_source = state.get("chart_source", "kai-api")
         self._autotrade_enabled = bool(state.get("autotrade_enabled", False))
+        # Chart-vs-chat row sizing mode. "full" is the default 3fr/2fr
+        # layout (chart 60% / chat 40%); "half" flips the ratio to
+        # 1fr/4fr so the chart shrinks and the chat dominates. Toggled
+        # at runtime via /chart half | /chart full and re-applied in
+        # on_mount via _apply_chart_size_mode.
+        self._chart_size_mode: str = state.get("chart_size_mode", "full")
         try:
             self._current_tf_idx = self.TIMEFRAMES.index(saved_tf)
         except ValueError:
@@ -294,6 +300,17 @@ class TradingTerminal(App):
                 )
         except Exception as exc:
             self.logger.warning("chart color scheme restore failed: %s", exc)
+
+        # Restore the persisted chart-vs-chat row sizing. Has to run
+        # after the screen is fully mounted (the styles object only
+        # exists once Textual has built the layout) but before the
+        # user starts typing — on_mount is the right window. If the
+        # restore fails for any reason, the default 3fr/2fr layout
+        # from terminal_styles.tcss is what gets shown.
+        try:
+            self._apply_chart_size_mode(self._chart_size_mode)
+        except Exception as exc:
+            self.logger.warning("chart size restore failed: %s", exc)
 
         # Load initial data
         self.run_worker(self._load_initial_data(), thread=False)
@@ -735,17 +752,79 @@ class TradingTerminal(App):
                 raise
 
     def _save_chart_state(self, interval: str) -> None:
-        """Persist chart symbol/timeframe/source/scheme to state.json."""
+        """Persist chart symbol/timeframe/source/scheme to state.json.
+
+        Loads the existing state first and merges the chart fields on
+        top, so other state keys (autotrade_enabled, chart_size_mode,
+        anything added later) survive every chart save. Previously
+        this built a fresh dict from scratch and silently clobbered
+        autotrade_enabled every time the user changed the chart
+        symbol or color.
+        """
         try:
             current_scheme = self.query_one("#chart-panel", ChartPanel).color_scheme
         except Exception:
             current_scheme = "default"
-        _save_terminal_state({
-            "chart_symbol": self._chart_symbol,
-            "chart_timeframe": interval,
-            "chart_color_scheme": current_scheme,
-            "chart_source": self._chart_source,
-        })
+        state = _load_terminal_state()
+        state["chart_symbol"] = self._chart_symbol
+        state["chart_timeframe"] = interval
+        state["chart_color_scheme"] = current_scheme
+        state["chart_source"] = self._chart_source
+        _save_terminal_state(state)
+
+    def _set_chart_size_mode(self, mode: str) -> None:
+        """Toggle the chart-vs-chat row sizing mode + persist.
+
+        ``mode`` is one of "full" / "half". Applies the corresponding
+        CSS class to the Screen so Textual recomputes the grid_rows
+        in place, then persists to state.json (load-then-merge so
+        other state fields survive).
+
+        Idempotent — calling with the current mode is a no-op visual
+        but still re-saves state, which is fine.
+        """
+        if mode not in ("full", "half"):
+            mode = "full"
+        self._chart_size_mode = mode
+        self._apply_chart_size_mode(mode)
+        # Persist via load-then-merge to avoid clobbering other state.
+        try:
+            state = _load_terminal_state()
+            state["chart_size_mode"] = mode
+            _save_terminal_state(state)
+        except Exception as exc:
+            self.logger.warning("persist chart_size_mode failed: %s", exc)
+
+    def _apply_chart_size_mode(self, mode: str) -> None:
+        """Apply the chart row sizing mode by toggling Screen CSS classes.
+
+        The CSS rules for ``Screen.chart-full`` and ``Screen.chart-half``
+        are defined in tui/terminal_styles.tcss. Toggling the class
+        triggers Textual to recompute the grid_rows in place, with
+        no need to mutate ``self.screen.styles.grid_rows`` directly
+        (which has reactive-property quirks across Textual versions).
+
+        Both classes are removed first so a switch from one to the
+        other doesn't leave both classes attached.
+        """
+        try:
+            screen = self.screen
+        except Exception:
+            # Pre-mount or post-unmount — there's no screen yet/anymore
+            # to mutate. Will be re-applied in on_mount.
+            return
+        for cls in ("chart-half", "chart-full"):
+            try:
+                screen.remove_class(cls)
+            except Exception:
+                pass
+        target_class = "chart-half" if mode == "half" else "chart-full"
+        try:
+            screen.add_class(target_class)
+        except Exception as exc:
+            self.logger.warning(
+                "chart size mode %r class apply failed: %s", mode, exc
+            )
 
     # ── Coinbase feed lifecycle ───────────────────────────────
 
@@ -1220,6 +1299,31 @@ class TradingTerminal(App):
                 chart = self.query_one("#chart-panel", ChartPanel)
                 chart.toggle_visible(True)
                 self._chat_msg("[dim]Chart visible[/]")
+                return True
+
+            # Chart-vs-chat row sizing. Mutates the screen's grid_rows
+            # at runtime — Textual recomputes the layout in place. The
+            # choice is persisted to workspaces/terminal/state.json so
+            # it survives restart, and re-applied in on_mount.
+            if sub in ("half", "halfsize", "small"):
+                self._set_chart_size_mode("half")
+                self._chat_msg(
+                    "[dim]Chart shrunk — chat is now the dominant panel. "
+                    "Restore with /chart full[/]"
+                )
+                return True
+
+            if sub in ("full", "fullsize", "default"):
+                self._set_chart_size_mode("full")
+                self._chat_msg("[dim]Chart restored to full size[/]")
+                return True
+
+            if sub == "size":
+                # /chart size — show the current size mode
+                mode = getattr(self, "_chart_size_mode", "full")
+                self._chat_msg(
+                    f"[dim]Chart size: {mode} (available: full, half)[/]"
+                )
                 return True
 
             if sub == "source":
