@@ -568,15 +568,18 @@ def create_nats_publish_tool(bus):
 
 # ── NATS Request (send task to agent, wait for reply) ────────
 
-# Default wall-clock timeout for nats_request. The previous default of
-# 120s was too short for substantive analyst / mentor / risk-manager
-# work — especially when the target agent is queued behind another
-# task. 300s gives proper headroom for real review tasks while still
-# capping runaway loops.
-NATS_REQUEST_DEFAULT_TIMEOUT = 300.0
-# Hard upper bound — even if the LLM passes a larger value we cap here
-# so a stuck sub-agent can't lock the calling agent for an hour.
-NATS_REQUEST_MAX_TIMEOUT = 1800.0
+# Default wall-clock timeout for nats_request. 8 hours matches the
+# codex_exec / claude_exec frontier-escalation tools (CODEX_TIMEOUT,
+# CLAUDE_TIMEOUT) — sub-agents doing real review work can legitimately
+# run for hours when chained through fallback endpoints, multi-step
+# reasoning at xhigh effort, or large backtest sweeps. The previous
+# 120s default was producing false "timed out" errors on routine
+# analyst reviews. The hard cap and the default are now identical
+# because there's no compelling reason to pick a smaller default
+# than the max — if you really want a faster bail-out, pass an
+# explicit timeout_seconds.
+NATS_REQUEST_DEFAULT_TIMEOUT = 28800.0  # 8 hours
+NATS_REQUEST_MAX_TIMEOUT = 28800.0      # 8 hours
 
 
 def _clamp_request_timeout(value: float | int | None) -> float:
@@ -644,10 +647,11 @@ def create_nats_request_tool(bus):
             "  agent_name (string) — e.g. 'analyst', 'trader', 'risk-manager'\n"
             "  task (string) — the work the sub-agent should do\n"
             f"  timeout_seconds (int, optional) — wall-clock timeout. "
-            f"Default {int(NATS_REQUEST_DEFAULT_TIMEOUT)}s, max "
-            f"{int(NATS_REQUEST_MAX_TIMEOUT)}s. Bump this for deep "
-            "reviews or any task you expect to take more than a few "
-            "minutes (e.g. timeout_seconds=900 for a 15-minute analysis)."
+            f"Default {int(NATS_REQUEST_DEFAULT_TIMEOUT)}s (8 hours — same as the "
+            f"codex/claude escalation tools), max {int(NATS_REQUEST_MAX_TIMEOUT)}s. "
+            "Pass a smaller value if you want a faster bail-out (e.g. "
+            "timeout_seconds=600 for a 10-minute cap on a routine query). "
+            "Most callers should leave this unset and trust the default."
         ),
     )
 
