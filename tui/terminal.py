@@ -657,18 +657,38 @@ class TradingTerminal(App):
         self._chat_msg(f"[dim]Chart: {symbol} {tf}[/]")
 
     async def on_input_submitted(self, event: Input.Submitted):
-        text = event.value.strip()
+        # Multi-line paste handling: if the input has a buffered
+        # paste, the visible value is just a "[paste: N lines]"
+        # summary — the full text lives in HistoryInput's
+        # _pasted_buffer. take_pasted_buffer() returns and clears
+        # it. Falls through to event.value for plain typed input
+        # and single-line pastes.
+        pasted = None
+        take = getattr(event.input, "take_pasted_buffer", None)
+        if callable(take):
+            pasted = take()
+        if pasted is not None:
+            # Strip only leading/trailing whitespace; preserve
+            # internal newlines so the agent sees the original
+            # structure (stack traces, code blocks, etc).
+            text = pasted.strip()
+        else:
+            text = event.value.strip()
         if not text:
             return
         # Record in shell-style history before clearing the input
         # so the user can recall it with Up arrow on the next prompt.
+        # Multi-line pastes are NOT added to history — they're
+        # content the user copied from somewhere else, not a typed
+        # command worth replaying via Up arrow.
         # Cast guard: every Input we mount in compose() is a
         # HistoryInput, but a stray plain Input would still hit this
         # handler, so we feature-detect rather than isinstance-check
         # to avoid an extra import in this hot path.
-        remember = getattr(event.input, "remember", None)
-        if callable(remember):
-            remember(text)
+        if pasted is None:
+            remember = getattr(event.input, "remember", None)
+            if callable(remember):
+                remember(text)
         event.input.value = ""
 
         # Busy → queue instead of dropping. The queue is drained
