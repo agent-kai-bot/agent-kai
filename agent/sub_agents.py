@@ -5,10 +5,17 @@ import asyncio
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-from agent.core import build_agent_memory_store, create_llm, render_memory_block
+from agent.core import (
+    build_agent_memory_store,
+    build_agent_skill_store,
+    create_llm,
+    render_memory_block,
+    render_skill_catalog,
+)
 from agent.memory_tool import create_memory_tool
 from agent.prompts import build_sub_agent_system_prompt
 from agent.runtime_utils import EMPTY_RESPONSE_ERROR, ensure_non_empty_response
+from agent.skills_tool import create_skills_tools
 from agent.tools import create_sub_agent_tools
 from agent_logger import get_logger, log_agent_event, log_llm_request, log_llm_response
 from config import get_agent_config
@@ -45,16 +52,32 @@ class SubAgent:
         # snapshot is captured before the system prompt is assembled.
         self.memory_store = build_agent_memory_store(name)
         memory_block = render_memory_block(self.memory_store)
-        tools = list(tools) + [create_memory_tool(self.memory_store)]
+
+        # Per-agent procedural memory — skills live in the agent's
+        # own workspace skills/ dir and are loaded on demand via the
+        # skill_view tool. Only the catalog (names + one-liners) is
+        # injected into the system prompt.
+        self.skill_store = build_agent_skill_store(name)
+        skill_catalog = render_skill_catalog(self.skill_store)
+
+        tools = (
+            list(tools)
+            + [create_memory_tool(self.memory_store)]
+            + create_skills_tools(self.skill_store)
+        )
 
         llm = create_llm(endpoint_cfg)
+
+        # Stack memory + skill catalog into one identity block. Either
+        # can be empty; the join drops empty strings.
+        identity_block = "\n\n".join(b for b in (memory_block, skill_catalog) if b)
 
         role_prompt = system_prompt or cfg.get("system_prompt")
         prompt_text = build_sub_agent_system_prompt(
             agent_name=name,
             role_prompt=role_prompt,
             workspace=self.workspace,
-            memory_block=memory_block,
+            memory_block=identity_block,
         )
         # Escape curly braces so LangChain doesn't treat them as template vars
         prompt_text = prompt_text.replace("{", "{{").replace("}", "}}")

@@ -39,6 +39,13 @@ USER_PROFILE_ENABLED = bool(_memory_cfg.get("user_profile_enabled", True))
 MEMORY_CHAR_LIMIT = int(_memory_cfg.get("memory_char_limit", 11_000))
 USER_CHAR_LIMIT = int(_memory_cfg.get("user_char_limit", 6_875))
 
+# Skills — on-demand procedural memory. Per-agent library of
+# reusable recipes the agent authored itself after hard-won
+# trial-and-error sessions. Each agent has its own skills dir at
+# workspaces/<role>/skills/. Disable globally by flipping the flag.
+_skills_cfg = _config.get("skills", {})
+SKILLS_ENABLED = bool(_skills_cfg.get("enabled", True))
+
 # Tool safety
 _tool_safety = _config.get("tool_safety", {})
 SHELL_TIMEOUT_SECONDS = _tool_safety.get("shell_timeout_seconds", 30)
@@ -100,6 +107,11 @@ def get_workspace_path(agent_name):
 def get_memory_path(agent_name):
     """Get the path to the agent's MEMORY.md (per-agent notes)."""
     return os.path.join(get_workspace_path(agent_name), "memories", "MEMORY.md")
+
+
+def get_skills_dir(agent_name):
+    """Get the path to the agent's skills directory."""
+    return os.path.join(get_workspace_path(agent_name), "skills")
 
 
 def get_user_profile_path():

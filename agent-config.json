@@ -140,6 +140,10 @@
     "user_char_limit": 6875
   },
 
+  "skills": {
+    "enabled": true
+  },
+
   "tool_safety": {
     "shell_timeout_seconds": 30,
     "max_file_read_chars": 10000,
