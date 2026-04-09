@@ -568,31 +568,62 @@ def create_nats_publish_tool(bus):
 
 # ── NATS Request (send task to agent, wait for reply) ────────
 
+# Default wall-clock timeout for nats_request. The previous default of
+# 120s was too short for substantive analyst / mentor / risk-manager
+# work — especially when the target agent is queued behind another
+# task. 300s gives proper headroom for real review tasks while still
+# capping runaway loops.
+NATS_REQUEST_DEFAULT_TIMEOUT = 300.0
+# Hard upper bound — even if the LLM passes a larger value we cap here
+# so a stuck sub-agent can't lock the calling agent for an hour.
+NATS_REQUEST_MAX_TIMEOUT = 1800.0
+
+
+def _clamp_request_timeout(value: float | int | None) -> float:
+    """Clamp the user-supplied timeout into the allowed range."""
+    if value is None or value <= 0:
+        return NATS_REQUEST_DEFAULT_TIMEOUT
+    return float(min(NATS_REQUEST_MAX_TIMEOUT, max(1.0, value)))
+
+
 def create_nats_request_tool(bus):
     """Create the nats_request tool bound to a NatsBus instance."""
 
-    def _nats_request_sync(agent_name: str, task: str) -> str:
+    def _nats_request_sync(
+        agent_name: str,
+        task: str,
+        timeout_seconds: int = 0,
+    ) -> str:
+        timeout = _clamp_request_timeout(timeout_seconds)
         try:
             loop = asyncio.get_running_loop()
             future = asyncio.run_coroutine_threadsafe(
                 bus.request(
                     f"agent.{agent_name}.request",
                     {"task": task, "from": bus.agent_name},
-                    timeout=120.0,
+                    timeout=timeout,
                 ),
                 loop,
             )
-            result = future.result(timeout=125)
+            # The outer future timeout adds a small buffer over the
+            # inner bus.request timeout so the inner one wins on a
+            # natural timeout (clearer error message).
+            result = future.result(timeout=timeout + 5)
             return result.get("response", str(result))
         except Exception as e:
             return f"Error requesting from agent '{agent_name}': {e}"
 
-    async def _nats_request_async(agent_name: str, task: str) -> str:
+    async def _nats_request_async(
+        agent_name: str,
+        task: str,
+        timeout_seconds: int = 0,
+    ) -> str:
+        timeout = _clamp_request_timeout(timeout_seconds)
         try:
             result = await bus.request(
                 f"agent.{agent_name}.request",
                 {"task": task, "from": bus.agent_name},
-                timeout=120.0,
+                timeout=timeout,
             )
             return result.get("response", str(result))
         except Exception as e:
@@ -604,8 +635,19 @@ def create_nats_request_tool(bus):
         name="nats_request",
         description=(
             "Send a task to a named sub-agent and wait for its reply. "
-            "The agent must already be running (use spawn_agent first). "
-            "Inputs: agent_name (string, e.g. 'researcher'), task (string, the task description)."
+            "The agent must already be running — call spawn_agent first "
+            "if it isn't. The reply is delivered synchronously over NATS "
+            "request/reply, so this is the ONLY way to receive a sub-agent's "
+            "output (do NOT pass tasks via spawn_agent — that path is "
+            "fire-and-forget and the reply is lost).\n\n"
+            "Inputs:\n"
+            "  agent_name (string) — e.g. 'analyst', 'trader', 'risk-manager'\n"
+            "  task (string) — the work the sub-agent should do\n"
+            f"  timeout_seconds (int, optional) — wall-clock timeout. "
+            f"Default {int(NATS_REQUEST_DEFAULT_TIMEOUT)}s, max "
+            f"{int(NATS_REQUEST_MAX_TIMEOUT)}s. Bump this for deep "
+            "reviews or any task you expect to take more than a few "
+            "minutes (e.g. timeout_seconds=900 for a 15-minute analysis)."
         ),
     )
 
@@ -613,30 +655,39 @@ def create_nats_request_tool(bus):
 # ── Spawn Agent ──────────────────────────────────────────────
 
 def create_spawn_agent_tool(sub_agent_manager):
-    """Create the spawn_agent tool bound to a SubAgentManager."""
+    """Create the spawn_agent tool bound to a SubAgentManager.
 
-    def _spawn_sync(name: str, task: str = "", system_prompt: str = "") -> str:
+    The spawn tool DELIBERATELY does not accept an initial task. The
+    earlier signature took a ``task`` argument that was dispatched via
+    ``bus.publish`` (fire-and-forget) — the LLM expected a reply,
+    didn't get one, then sent a follow-up via ``nats_request`` while
+    the sub-agent was still busy with the published task. The
+    follow-up wall-clocked past the request timeout because the
+    sub-agent was queued. Net effect: the LLM saw "request timed
+    out" even though the work succeeded — except the response went
+    to a topic nobody was listening on.
+
+    The fix is to remove the initial-task parameter entirely so the
+    LLM is forced into the only correct pattern:
+
+        spawn_agent(name)            # spawn returns when ready
+        nats_request(name, task)     # explicit request/reply, gets the response back
+    """
+
+    def _spawn_sync(name: str) -> str:
         try:
             loop = asyncio.get_running_loop()
             future = asyncio.run_coroutine_threadsafe(
-                sub_agent_manager.spawn(
-                    name,
-                    system_prompt=system_prompt or None,
-                    initial_task=task or None,
-                ),
+                sub_agent_manager.spawn(name),
                 loop,
             )
             return future.result(timeout=10)
         except Exception as e:
             return f"Error spawning agent: {e}"
 
-    async def _spawn_async(name: str, task: str = "", system_prompt: str = "") -> str:
+    async def _spawn_async(name: str) -> str:
         try:
-            return await sub_agent_manager.spawn(
-                name,
-                system_prompt=system_prompt or None,
-                initial_task=task or None,
-            )
+            return await sub_agent_manager.spawn(name)
         except Exception as e:
             return f"Error spawning agent: {e}"
 
@@ -646,9 +697,15 @@ def create_spawn_agent_tool(sub_agent_manager):
         name="spawn_agent",
         description=(
             "Spawn a background sub-agent that listens on NATS for tasks. "
-            "Inputs: name (string, unique name like 'researcher' or 'coder'), "
-            "task (string, optional initial task to send it), "
-            "system_prompt (string, optional custom system prompt)."
+            "Returns when the sub-agent is ready to receive requests.\n\n"
+            "IMPORTANT: this does NOT send a task to the new agent. To "
+            "actually run work on the sub-agent, call nats_request(name, "
+            "task) immediately after spawn_agent returns. spawn_agent only "
+            "sets up the sub-agent process and its NATS subscription — "
+            "task delivery and reply handling are nats_request's job.\n\n"
+            "Idempotent: spawning an already-running agent is a no-op.\n\n"
+            "Inputs:\n"
+            "  name (string) — unique sub-agent name like 'analyst', 'trader'"
         ),
     )
 
