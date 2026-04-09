@@ -5,7 +5,8 @@ import asyncio
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-from agent.core import create_llm
+from agent.core import build_agent_memory_store, create_llm, render_memory_block
+from agent.memory_tool import create_memory_tool
 from agent.prompts import build_sub_agent_system_prompt
 from agent.runtime_utils import EMPTY_RESPONSE_ERROR, ensure_non_empty_response
 from agent.tools import create_sub_agent_tools
@@ -37,6 +38,15 @@ class SubAgent:
         # docker_sandbox tool can bind-mount it as /work. Without this
         # the sub-agent couldn't share files with its sandboxed runs.
         tools = create_sub_agent_tools(bus, workspace_host_path=self.workspace or None)
+
+        # Per-agent persistent memory — each sub-agent curates its own
+        # MEMORY.md under its workspace but shares USER.md with every
+        # other agent in the process. Loaded here so the frozen
+        # snapshot is captured before the system prompt is assembled.
+        self.memory_store = build_agent_memory_store(name)
+        memory_block = render_memory_block(self.memory_store)
+        tools = list(tools) + [create_memory_tool(self.memory_store)]
+
         llm = create_llm(endpoint_cfg)
 
         role_prompt = system_prompt or cfg.get("system_prompt")
@@ -44,6 +54,7 @@ class SubAgent:
             agent_name=name,
             role_prompt=role_prompt,
             workspace=self.workspace,
+            memory_block=memory_block,
         )
         # Escape curly braces so LangChain doesn't treat them as template vars
         prompt_text = prompt_text.replace("{", "{{").replace("}", "}}")

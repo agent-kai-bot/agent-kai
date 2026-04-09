@@ -1,5 +1,6 @@
 """LangChain agent core — AgentRunner wrapping AgentExecutor with fallback."""
 
+from pathlib import Path
 from typing import AsyncIterator
 
 from langchain.agents import AgentExecutor, create_tool_calling_agent
@@ -7,6 +8,8 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI
 
+from agent.memory_store import MemoryStore
+from agent.memory_tool import create_memory_tool
 from agent.prompts import SYSTEM_PROMPT, build_main_system_prompt
 from agent.runtime_utils import EMPTY_RESPONSE_ERROR, ensure_non_empty_response
 from agent_logger import (
@@ -16,7 +19,17 @@ from agent_logger import (
     log_llm_response,
     log_tool_call,
 )
-from config import ENDPOINTS, get_agent_config, get_endpoint
+from config import (
+    ENDPOINTS,
+    MEMORY_CHAR_LIMIT,
+    MEMORY_ENABLED,
+    USER_CHAR_LIMIT,
+    USER_PROFILE_ENABLED,
+    get_agent_config,
+    get_endpoint,
+    get_memory_path,
+    get_user_profile_path,
+)
 
 
 def create_llm(endpoint_cfg=None):
@@ -47,12 +60,61 @@ def create_prompt(system_prompt=None):
     ])
 
 
+def build_agent_memory_store(agent_name: str) -> MemoryStore | None:
+    """Construct and load a MemoryStore for the given agent.
+
+    Returns None if memory is globally disabled in config. The store
+    is always loaded from disk here (not lazily) so the frozen
+    system-prompt snapshot is captured before the system prompt is
+    built — load order matters.
+    """
+    if not MEMORY_ENABLED and not USER_PROFILE_ENABLED:
+        return None
+    store = MemoryStore(
+        memory_path=Path(get_memory_path(agent_name)),
+        user_path=Path(get_user_profile_path()),
+        memory_char_limit=MEMORY_CHAR_LIMIT,
+        user_char_limit=USER_CHAR_LIMIT,
+    )
+    try:
+        store.load_from_disk()
+    except Exception as exc:  # noqa: BLE001
+        # A corrupt MEMORY.md should never crash agent startup.
+        # Log and continue with an empty store.
+        import logging
+        logging.getLogger(__name__).warning(
+            "memory: load_from_disk failed for %s: %s", agent_name, exc
+        )
+    return store
+
+
+def render_memory_block(store: MemoryStore | None) -> str:
+    """Render the combined MEMORY.md + USER.md block for a system prompt.
+
+    Respects the individual ``MEMORY_ENABLED`` / ``USER_PROFILE_ENABLED``
+    flags so either store can be disabled independently. Returns an
+    empty string if there's nothing to inject.
+    """
+    if store is None:
+        return ""
+    parts: list[str] = []
+    if MEMORY_ENABLED:
+        mem_block = store.format_for_system_prompt("memory")
+        if mem_block:
+            parts.append(mem_block)
+    if USER_PROFILE_ENABLED:
+        user_block = store.format_for_system_prompt("user")
+        if user_block:
+            parts.append(user_block)
+    return "\n\n".join(parts)
+
+
 class AgentRunner:
     """Manages the LangChain agent with primary/fallback LLM endpoints."""
 
     def __init__(self, tools, bus=None, agent_name=None):
         self.bus = bus
-        self.tools = tools
+        self.tools = list(tools)  # copy so we can append the memory tool
         self.chat_history = []
         self.agent_name = agent_name or "nano"
         self.log = get_logger(self.agent_name)
@@ -66,7 +128,19 @@ class AgentRunner:
         self.llm = create_llm(ep)
         self.fallback_llm = create_llm(self.fallback_endpoint) if self.fallback_endpoint else None
 
-        prompt = create_prompt(build_main_system_prompt(system_prompt))
+        # Load persistent memory and register the tool that mutates it.
+        # The frozen snapshot is injected into the system prompt here;
+        # mid-session writes through the tool update disk + the tool's
+        # live state view but never the system prompt (preserves prefix
+        # cache and keeps the LLM's notion of "what's in memory" stable
+        # for the rest of the turn).
+        self.memory_store = build_agent_memory_store(self.agent_name)
+        memory_block = render_memory_block(self.memory_store)
+        self.tools.append(create_memory_tool(self.memory_store))
+
+        prompt = create_prompt(
+            build_main_system_prompt(system_prompt, memory_block=memory_block)
+        )
         agent = create_tool_calling_agent(self.llm, self.tools, prompt)
         self.executor = AgentExecutor(
             agent=agent,

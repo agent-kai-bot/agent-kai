@@ -133,6 +133,13 @@
     }
   },
 
+  "memory": {
+    "enabled": true,
+    "user_profile_enabled": true,
+    "memory_char_limit": 11000,
+    "user_char_limit": 6875
+  },
+
   "tool_safety": {
     "shell_timeout_seconds": 30,
     "max_file_read_chars": 10000,
