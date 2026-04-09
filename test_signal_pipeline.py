@@ -150,7 +150,26 @@ def test_offline() -> None:
 
 
 async def test_nats_live() -> None:
-    """Publish through real NATS and verify the consumer picks it up."""
+    """Publish through real NATS and verify the consumer picks it up.
+
+    CRITICAL: this test must NEVER publish to the production
+    ``signals.>`` or ``ai.analysis.completed`` subjects on the
+    shared NATS broker. Doing so floods every other consumer on
+    the same broker with fake signals — most importantly, the
+    running TUI's ``SignalConsumer`` will treat the test prices
+    as real scanner output and surface them as alerts. We learned
+    this the hard way: the user saw "BUY BTC $70,950" and "SELL
+    SOL $145" in their alerts panel during a session — those are
+    the EXACT prices hardcoded below, leaked from this test
+    every time it ran.
+
+    Fix: publish to a unique throwaway prefix
+    (``test_pipeline_signals.>`` and ``test_pipeline_ai.analysis.completed``)
+    that the production consumer does NOT subscribe to. The test's
+    own local subscription matches the same prefix so the round-
+    trip still works for verification — but no other subscriber
+    on the broker (the TUI included) sees the test traffic.
+    """
     _h("13. NATS live publish → subscribe")
 
     try:
@@ -185,9 +204,14 @@ async def test_nats_live() -> None:
         payload = json.loads(msg.data.decode())
         await consumer._handle_signal(subject, payload)
 
-    sub = await nc.subscribe("signals.>", cb=nats_handler)
+    # Subscribe to the THROWAWAY test prefix so we don't pollute
+    # any other subscribers on this broker (notably a running TUI).
+    sub = await nc.subscribe("test_pipeline_signals.>", cb=nats_handler)
 
-    # Publish a test signal
+    # Publish a test signal — to the throwaway prefix. The
+    # consumer's _handle_signal parses parts[1]/parts[2] for
+    # strategy/symbol so any subject prefix works as long as the
+    # remaining segments are still {strategy}.{symbol}.
     test_payload = {
         "source": "signal-scanner",
         "strategy": "clucmay02",
@@ -197,7 +221,7 @@ async def test_nats_live() -> None:
         "timestamp": "2026-04-09T01:00:00Z",
         "bb_price_percent": 0.028,
     }
-    await nc.publish("signals.clucmay02.BTC", json.dumps(test_payload).encode())
+    await nc.publish("test_pipeline_signals.clucmay02.BTC", json.dumps(test_payload).encode())
     await nc.flush()
 
     # Wait for delivery
@@ -228,7 +252,9 @@ async def test_nats_live() -> None:
             "price": {"ETH": 2450.0, "SOL": 145.0, "LINK": 14.5}[sym],
             "timestamp": "2026-04-09T01:05:00Z",
         }
-        await nc.publish(f"signals.double_top.{sym}", json.dumps(payload).encode())
+        # Throwaway test prefix — see the comment in test_nats_live
+        # for why this isn't `signals.double_top.{sym}`.
+        await nc.publish(f"test_pipeline_signals.double_top.{sym}", json.dumps(payload).encode())
     await nc.flush()
     await asyncio.sleep(0.5)
 
@@ -247,7 +273,11 @@ async def test_nats_live() -> None:
         payload = json.loads(msg.data.decode())
         await consumer._handle_ai_analysis(subject, payload)
 
-    sub2 = await nc.subscribe("ai.analysis.completed", cb=ai_handler)
+    # Throwaway test subject — same isolation reason as the
+    # signals.> publishes above. The production consumer subscribes
+    # to ai.analysis.completed, NOT test_pipeline_ai.analysis.completed,
+    # so the running TUI won't see this test ANALYSIS event.
+    sub2 = await nc.subscribe("test_pipeline_ai.analysis.completed", cb=ai_handler)
     ai_payload = {
         "event": "analysis_completed",
         "result_id": "abc123",
@@ -255,7 +285,7 @@ async def test_nats_live() -> None:
         "use_case": "daily_analysis",
         "timestamp": "2026-04-09T02:00:00Z",
     }
-    await nc.publish("ai.analysis.completed", json.dumps(ai_payload).encode())
+    await nc.publish("test_pipeline_ai.analysis.completed", json.dumps(ai_payload).encode())
     await nc.flush()
     await asyncio.sleep(0.5)
 
