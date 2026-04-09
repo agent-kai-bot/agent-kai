@@ -76,7 +76,7 @@ for env_var, filename in _TOKEN_FILE_MAPPINGS.items():
 
 # Top-level settings
 NATS_URL = _config.get("nats_url", "nats://localhost:4222")
-DEFAULT_AGENT = _config.get("default_agent", "nano")
+DEFAULT_AGENT = _config.get("default_agent", "kai")
 WORKSPACES_DIR = os.path.join(PROJECT_ROOT, _config.get("workspaces_dir", "workspaces"))
 
 # Endpoints registry: name -> {base_url, model, api_key, max_tokens, temperature, top_p}
@@ -263,7 +263,7 @@ def get_user_profile_path():
 
     User preferences are intentionally shared across every agent so
     something the user tells the trader agent ("I prefer USD sizing")
-    is also visible to the analyst, risk-manager, and nano agents on
+    is also visible to the analyst, risk-manager, and kai agents on
     their next session without duplicating state.
     """
     os.makedirs(WORKSPACES_DIR, exist_ok=True)

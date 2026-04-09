@@ -49,7 +49,7 @@ class AgentTUI(App):
             self._nats_log("[bold green]NATS connected[/]")
             from config import AGENTS
             for name, cfg in AGENTS.items():
-                if name == "nano":
+                if name == "kai":
                     continue
                 desc = cfg.get("description", "")
                 self._nats_log(f"  [dim]{name}[/] [dim italic]{desc[:30]}[/]")

@@ -664,7 +664,7 @@ def create_list_agents_tool(sub_agent_manager):
             # Show available predefined agents from config
             from config import AGENTS
             predefined = [f"  {name}: {cfg.get('description', '')}"
-                          for name, cfg in AGENTS.items() if name != "nano"]
+                          for name, cfg in AGENTS.items() if name != "kai"]
             lines = ["No sub-agents running.", "", "Available predefined agents (use spawn_agent):"]
             lines.extend(predefined)
             return "\n".join(lines)
@@ -710,7 +710,7 @@ def _get_crypto_tools(signal_consumer=None):
 def create_tools(bus=None, sub_agent_manager=None, signal_consumer=None):
     """Create and return all agent tools."""
     tools = [file_read, file_write, file_edit, shell_exec, python_exec, web_fetch, codex_exec, claude_exec]
-    # Main agent ("nano") has no workspace, so the sandbox is fully isolated.
+    # Main agent ("kai") has no workspace, so the sandbox is fully isolated.
     tools.append(create_docker_sandbox_tool(workspace_host_path=None))
     tools.extend(_get_crypto_tools(signal_consumer=signal_consumer))
     if bus:
