@@ -6,3 +6,16 @@ logs/
 eval_results.json
 eval_results/
 .claude/
+
+# Secrets / credentials — never commit
+AGENT-KAI-API-KEY.txt
+OPENAI-API-KEY.txt
+ANTHROPIC-API-KEY.txt
+*.key
+*.pem
+.env
+.env.*
+!.env.example
+
+# Per-user runtime state
+workspaces/terminal/state.json
