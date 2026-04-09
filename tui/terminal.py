@@ -23,6 +23,7 @@ from tui.panels.agent_chat import ChatPanel
 from tui.panels.chart import ChartPanel
 from tui.panels.history_input import HistoryInput
 from tui.panels.positions import PositionsPanel
+from tui.panels.queue_row import QueuedInputRow
 from tui.panels.watchlist import WatchlistPanel
 
 # Cloud market data endpoint (agent-k.ai). Bearer-authenticated via the
@@ -155,6 +156,11 @@ class TradingTerminal(App):
         # commands when you keep typing while the previous one
         # hasn't returned. Empty list = nothing pending.
         self._input_queue: list[str] = []
+        # Widget references for the queued items, kept in lockstep
+        # with _input_queue so each row's [X] click can locate and
+        # drop its matching string. Same length, same order, same
+        # mutations — never one without the other.
+        self._queue_widgets: list[QueuedInputRow] = []
 
         # Restore persisted chart state from workspaces/terminal/state.json.
         # Falls back to the BTC + 1m defaults on first run or corrupt file.
@@ -248,7 +254,7 @@ class TradingTerminal(App):
 
         chat = self.query_one("#chat-panel", ChatPanel)
         chat.append_message("[bold dim]Welcome to KAI. Type a message or use slash commands.[/]")
-        chat.append_message("[dim]/buy /sell /analyze /scan /risk /chart /watch /learn /model /think /login codex[/]")
+        chat.append_message("[dim]/buy /sell /analyze /scan /risk /chart /watch /learn /model /think /queue /login codex[/]")
         chat.append_message("[dim]Mouse-drag any panel to copy. Ctrl+Y = last reply. Ctrl+Shift+C = current selection.[/]")
         self.query_one("#input-area", Input).focus()
 
@@ -671,17 +677,33 @@ class TradingTerminal(App):
         # while the agent is mid-task and they'll execute one after
         # another in submission order — same UX as typing ahead in
         # bash while a long-running command is in flight.
+        #
+        # Each queued item also gets a clickable row in chat with an
+        # [X] button so the user can drop individual items without
+        # waiting for them to come up (or use /queue clear to nuke
+        # the whole queue at once).
         if self._agent_working:
-            self._input_queue.append(text)
-            chat = self.query_one("#chat-panel", ChatPanel)
-            n = len(self._input_queue)
-            preview = text[:60].replace("\n", " ")
-            chat.append_message(
-                f"[dim italic]queued (#{n}): {preview}[/]"
-            )
+            self._queue_item(text)
             return
 
         await self._dispatch_input(text)
+
+    def _queue_item(self, text: str) -> None:
+        """Append text to _input_queue AND mount its [X]-clickable row.
+
+        Keeps ``_input_queue`` and ``_queue_widgets`` in lockstep —
+        same length, same order. Both lists must be mutated together
+        from this method (and ``_drain_input_queue`` /
+        ``_drop_queue_item`` for removal) so the row index always
+        maps to the matching string.
+        """
+        self._input_queue.append(text)
+        position = len(self._input_queue)
+        row = QueuedInputRow(text, position)
+        self._queue_widgets.append(row)
+        chat = self.query_one("#chat-panel", ChatPanel)
+        chat.mount(row)
+        chat.scroll_end(animate=False)
 
     async def _dispatch_input(self, text: str) -> None:
         """Run a single user input through the chat → slash → agent path.
@@ -752,6 +774,17 @@ class TradingTerminal(App):
         if not self._input_queue:
             return
         next_text = self._input_queue.pop(0)
+        # Pop the matching widget and remove it from chat — the
+        # "running" message below replaces it visually.
+        next_row = self._queue_widgets.pop(0) if self._queue_widgets else None
+        if next_row is not None:
+            try:
+                next_row.remove()
+            except Exception:
+                pass
+        # Renumber the rest of the queue so (#N) labels stay accurate.
+        self._renumber_queue_widgets()
+
         remaining = len(self._input_queue)
         chat = self.query_one("#chat-panel", ChatPanel)
         suffix = f" ({remaining} more queued)" if remaining else ""
@@ -761,6 +794,55 @@ class TradingTerminal(App):
         # Schedule on a fresh worker so the calling finally block
         # can complete cleanly without nesting agent loops.
         self.run_worker(self._dispatch_input(next_text), thread=False)
+
+    def _renumber_queue_widgets(self) -> None:
+        """Sync the (#N) labels on every queued row with their FIFO index.
+
+        Call after any queue mutation (drain, X click, /queue clear)
+        so a queue of [a, b, c] always renders as #1 #2 #3 even
+        after #2 was removed.
+        """
+        for i, row in enumerate(self._queue_widgets):
+            row.set_position(i + 1)
+
+    def _drop_queue_item(self, row: "QueuedInputRow") -> None:
+        """Remove a single queued item by its widget reference.
+
+        Triggered by an [X] click on the row (via the
+        ``QueuedInputRow.Removed`` message routed through
+        ``on_queued_input_row_removed``) and also reused by
+        ``/queue clear`` to flush the whole list one item at a time.
+        Synchronous and safe to call from anywhere — no await,
+        no race with the queue mutators.
+        """
+        try:
+            idx = self._queue_widgets.index(row)
+        except ValueError:
+            # Already gone — perhaps a drain raced with the click.
+            # Make sure the widget is removed from the DOM either way.
+            try:
+                row.remove()
+            except Exception:
+                pass
+            return
+        self._queue_widgets.pop(idx)
+        if 0 <= idx < len(self._input_queue):
+            self._input_queue.pop(idx)
+        try:
+            row.remove()
+        except Exception:
+            pass
+        self._renumber_queue_widgets()
+
+    def on_queued_input_row_removed(self, message: "QueuedInputRow.Removed") -> None:
+        """Handle the user clicking [X] on a queued row.
+
+        Textual auto-dispatches ``QueuedInputRow.Removed`` to this
+        snake_case-named method on any ancestor that defines it.
+        We delegate to ``_drop_queue_item`` so the same code path
+        is shared with ``/queue clear``.
+        """
+        self._drop_queue_item(message.row)
 
     async def _handle_slash_command(self, text: str) -> bool:
         """Parse and route slash commands. Returns True if handled."""
@@ -960,7 +1042,59 @@ class TradingTerminal(App):
             # /think AGENT LEVEL      — set AGENT's thinking level
             return await self._handle_think_command(parts)
 
+        elif cmd == "/queue":
+            # /queue                  — show how many items are pending
+            # /queue clear            — drop everything in the queue
+            return self._handle_queue_command(parts)
+
         return False
+
+    def _handle_queue_command(self, parts: list[str]) -> bool:
+        """Inspect or clear the type-ahead input queue.
+
+        Forms:
+            /queue          show pending count + a hint about [X]
+            /queue clear    drop all queued items at once
+
+        Individual items can also be removed by clicking the [X]
+        button on each queued row in chat — that path goes through
+        ``on_queued_input_row_removed`` -> ``_drop_queue_item``.
+        ``/queue clear`` is the bulk equivalent for the case where
+        the user has 30 things stacked up and doesn't want to click
+        each one.
+        """
+        sub = parts[1].lower() if len(parts) > 1 else ""
+
+        if sub in ("", "list", "show"):
+            n = len(self._input_queue)
+            if n == 0:
+                self._chat_msg("[dim]queue empty[/]")
+                return True
+            self._chat_msg(
+                f"[dim]{n} item{'s' if n != 1 else ''} queued — "
+                f"click [X] on any row to drop it, or /queue clear to flush[/]"
+            )
+            return True
+
+        if sub in ("clear", "drop", "flush", "wipe"):
+            n = len(self._input_queue)
+            if n == 0:
+                self._chat_msg("[dim]queue already empty[/]")
+                return True
+            # Drop in reverse so the renumber pass after each
+            # removal stays cheap (we always pop the tail). Each
+            # _drop_queue_item already handles renumbering.
+            for row in list(reversed(self._queue_widgets)):
+                self._drop_queue_item(row)
+            self._chat_msg(
+                f"[dim]queue cleared ({n} item{'s' if n != 1 else ''} dropped)[/]"
+            )
+            return True
+
+        self._chat_msg(
+            "[red]Usage:[/] [dim]/queue  |  /queue clear[/]"
+        )
+        return True
 
     async def _run_codex_login(self) -> None:
         """Run the Codex OAuth login flow off the UI thread."""
