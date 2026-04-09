@@ -18,6 +18,62 @@ _config = load_config()
 # Project root (where agent-config.json lives)
 PROJECT_ROOT = os.path.dirname(os.path.abspath(CONFIG_PATH))
 
+
+# ── Secret loading ──────────────────────────────────────────
+#
+# Three places we accept secrets, in priority order:
+#
+# 1. The current process environment (preferred for production /
+#    docker / systemd / CI).
+# 2. A local ``.env`` file in the project root (loaded via
+#    python-dotenv if present). Convenient for dev — never commit.
+# 3. Bare token files at the project root, like
+#    ``AGENT-KAI-API-KEY.txt``. Lowest friction for a one-off
+#    test ("download key, drop into project, restart agent").
+#
+# Each of these is loaded ONCE here, not on every get_endpoint call,
+# so the resolved env state is stable for the rest of the process.
+
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv(os.path.join(PROJECT_ROOT, ".env"), override=False)
+except ImportError:
+    pass
+
+
+def _load_secret_from_file(filename: str) -> str | None:
+    """Read a single-line secret from a token file in PROJECT_ROOT.
+
+    Returns the stripped contents if the file exists, else None.
+    Used as a last-resort source for API keys so users can drop a
+    downloaded credential file into the project and have things
+    just work — without ever committing it (see .gitignore).
+    """
+    path = os.path.join(PROJECT_ROOT, filename)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+# Drop-in token files we know about. The mapping is
+# {env_var_name: filename}. If the env var is not already set
+# AND the file exists, we promote the file's contents into the env.
+_TOKEN_FILE_MAPPINGS = {
+    "AGENT_KAI_API_KEY": "AGENT-KAI-API-KEY.txt",
+    "OPENAI_API_KEY": "OPENAI-API-KEY.txt",
+    "ANTHROPIC_API_KEY": "ANTHROPIC-API-KEY.txt",
+}
+
+for env_var, filename in _TOKEN_FILE_MAPPINGS.items():
+    if not os.environ.get(env_var):
+        secret = _load_secret_from_file(filename)
+        if secret:
+            os.environ[env_var] = secret
+
 # Top-level settings
 NATS_URL = _config.get("nats_url", "nats://localhost:4222")
 DEFAULT_AGENT = _config.get("default_agent", "nano")
