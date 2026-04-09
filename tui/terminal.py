@@ -163,6 +163,14 @@ class TradingTerminal(App):
         # commands when you keep typing while the previous one
         # hasn't returned. Empty list = nothing pending.
         self._input_queue: list[str] = []
+        # Path where chat_history is persisted across TUI restarts.
+        # Saved after every successful turn (in _process_agent's
+        # finally block) AND on app teardown via on_unmount, so
+        # closing the TUI / killing it / Ctrl+C all preserve the
+        # most recent conversation. Loaded in on_mount before the
+        # welcome banner so the user sees their old session
+        # immediately on relaunch.
+        self._chat_history_path = Path("workspaces/terminal/chat_history.json")
         # Widget references for the queued items, kept in lockstep
         # with _input_queue so each row's [X] click can locate and
         # drop its matching string. Same length, same order, same
@@ -261,8 +269,29 @@ class TradingTerminal(App):
 
         chat = self.query_one("#chat-panel", ChatPanel)
         chat.append_message("[bold dim]Welcome to KAI. Type a message or use slash commands.[/]")
-        chat.append_message("[dim]/buy /sell /analyze /scan /risk /chart /watch /learn /model /think /queue /login codex[/]")
+        chat.append_message(
+            "[dim]/buy /sell /analyze /scan /risk /chart /watch /learn /remember "
+            "/model /think /queue /login codex /exit /reset[/]"
+        )
         chat.append_message("[dim]Mouse-drag any panel to copy. Ctrl+Y = last reply. Ctrl+Shift+C = current selection.[/]")
+
+        # Restore the previous session's chat history if any. We do
+        # this AFTER the welcome banner so the visual order is
+        # "welcome → restored history → fresh prompts." If no saved
+        # history exists this is a no-op and the user gets a clean
+        # start. The restore mounts both the agent's chat_history
+        # list (so the LLM has context for the next turn) and the
+        # chat panel widgets (so the user sees what was there).
+        try:
+            n = self._load_chat_history()
+            if n > 0:
+                chat.append_message(
+                    f"[dim italic]restored {n} message{'s' if n != 1 else ''} from "
+                    f"the previous session — /reset to start fresh[/]"
+                )
+        except Exception as exc:
+            self.logger.warning("chat history restore failed: %s", exc)
+
         self.query_one("#input-area", Input).focus()
 
     async def _load_initial_data(self):
@@ -1089,7 +1118,95 @@ class TradingTerminal(App):
             # /queue clear            — drop everything in the queue
             return self._handle_queue_command(parts)
 
+        elif cmd == "/remember":
+            # /remember [hint]        — ask kai to summarize the recent
+            #                           discussion and save it as a skill
+            #                           (or memory entry) in its library
+            return await self._handle_remember_command(parts)
+
+        elif cmd in ("/exit", "/quit"):
+            # /exit or /quit          — save chat history, then quit
+            self._save_chat_history()
+            self._chat_msg("[dim]Chat saved. Goodbye.[/]")
+            self.exit()
+            return True
+
+        elif cmd == "/reset":
+            # /reset                  — wipe chat history (visible AND
+            #                           the agent's chat_history list AND
+            #                           the persisted save file)
+            self.action_clear_chat()
+            try:
+                if self._chat_history_path.exists():
+                    self._chat_history_path.unlink()
+            except Exception as exc:
+                self.logger.warning("delete chat_history.json failed: %s", exc)
+            self._chat_msg("[dim]Chat history reset — fresh session.[/]")
+            return True
+
         return False
+
+    async def _handle_remember_command(self, parts: list[str]) -> bool:
+        """Ask kai to summarize the recent discussion and save it.
+
+        Builds a prompt template from the user's hint (if any) and
+        dispatches it to the main kai agent as a regular chat turn.
+        Kai's LLM uses its existing ``memory`` and ``skill_manage``
+        tools to perform the actual save — no new tools are required.
+
+        The hint is optional. With no hint, kai picks the most
+        recent meaningful discussion thread and summarizes that.
+        With a hint, kai uses the hint as a topic anchor for
+        scanning recent context.
+        """
+        hint = " ".join(parts[1:]).strip()
+        prompt = self._build_remember_prompt(hint)
+        chat = self.query_one("#chat-panel", ChatPanel)
+        chat.append_message(
+            f"[dim]Saving discovery{f' about {hint!r}' if hint else ''}...[/]"
+        )
+        self._agent_working = True
+        self._set_status("saving discovery...")
+        self.run_worker(self._process_agent(prompt), thread=False)
+        return True
+
+    @staticmethod
+    def _build_remember_prompt(hint: str) -> str:
+        """Compose the /remember prompt template that gets sent to kai."""
+        if hint:
+            topic_clause = f' about "{hint}"'
+        else:
+            topic_clause = ""
+        return (
+            f"The user just ran /remember. Look back at the most recent "
+            f"meaningful discussion in our chat history{topic_clause}. "
+            f"Summarize what we discovered, then save it for future sessions:\n"
+            f"\n"
+            f"- If it is a REUSABLE PROCEDURE (a trading strategy with entry "
+            f"conditions, exit conditions, indicator parameters, pitfalls, and "
+            f"a verification checklist), use the skill_manage tool to create "
+            f"a new skill in your library. Use kebab-case for the name "
+            f"(e.g. 'ema-cross-with-volume-confirm'). Follow the standard "
+            f"skill template with these sections: 'When to use', 'Steps', "
+            f"'Pitfalls', 'Verification'. Required frontmatter keys: name, "
+            f"description, category (one of analysis / execution / risk), tags.\n"
+            f"\n"
+            f"- If it is a FACT or PREFERENCE (e.g. 'user prefers 1h analyses', "
+            f"'the local 6h endpoint sometimes errors and Coinbase 6h is the "
+            f"reliable fallback'), use the memory tool with action='add' to "
+            f"add it to your memory store. Use target='memory' for personal "
+            f"notes or target='user' for cross-agent user preferences.\n"
+            f"\n"
+            f"Capture EVERYTHING needed to recreate this discovery from "
+            f"scratch. Do not assume future-you remembers anything from "
+            f"this session. Be specific about numbers, timeframes, indicator "
+            f"settings, market regimes, and any caveats or failure modes "
+            f"we found.\n"
+            f"\n"
+            f"After saving, confirm in your reply: what you saved (skill or "
+            f"memory), the name (for skills) or content (for memory entries), "
+            f"and a one-line summary of what's now persisted."
+        )
 
     def _handle_queue_command(self, parts: list[str]) -> bool:
         """Inspect or modify the type-ahead input queue.
@@ -1739,6 +1856,11 @@ class TradingTerminal(App):
             self._agent_working = False
             self._set_status("idle")
             await self._refresh_positions()
+            # Persist the updated chat_history to disk so the next
+            # session can resume where we left off, even if the TUI
+            # crashes before on_unmount runs. The save is cheap and
+            # idempotent — overwrite-and-rename of one small JSON file.
+            self._save_chat_history()
             self._drain_input_queue()
 
     # ── NATS handlers ─────────────────────────────────────────
@@ -1861,6 +1983,155 @@ class TradingTerminal(App):
             self._nats_log(f"[red]{msg}[/]")
         except Exception:
             pass
+
+    # ── Chat history persistence ──────────────────────────────
+
+    def _save_chat_history(self) -> None:
+        """Persist the agent's chat_history to disk.
+
+        Format: a JSON array of ``{"role": "human"|"ai", "content": "..."}``
+        dicts, one per LangChain message in ``agent_runner.chat_history``.
+        Tool-call IDs and other run-scoped metadata are intentionally
+        dropped — they reference per-session run_ids that won't be
+        valid after a restart anyway. The conversational thread (which
+        is what the LLM uses for context on the next turn) is preserved
+        verbatim.
+
+        Saved after every successful turn (in ``_process_agent``'s
+        finally block) AND on app teardown (``on_unmount``), so a
+        crash, kill -9, terminal close, or clean exit all preserve
+        the most recent conversation.
+
+        Failures are logged but never raised — chat persistence is a
+        convenience, not load-bearing, and a corrupt save file should
+        never block the agent from running.
+        """
+        try:
+            history = list(getattr(self.agent_runner, "chat_history", []) or [])
+            if not history:
+                # Don't write an empty file — just remove any stale one
+                # so a fresh session doesn't surface yesterday's empty
+                # restore message.
+                if self._chat_history_path.exists():
+                    self._chat_history_path.unlink()
+                return
+
+            entries: list[dict] = []
+            for msg in history:
+                role = self._role_for_message(msg)
+                content = getattr(msg, "content", "")
+                if isinstance(content, list):
+                    # Some LLMs return content as a list of structured
+                    # blocks. Flatten to plain text for the on-disk
+                    # format — the LLM only needs the text on reload.
+                    parts: list[str] = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            t = block.get("text") or block.get("content") or ""
+                            if isinstance(t, str):
+                                parts.append(t)
+                        elif isinstance(block, str):
+                            parts.append(block)
+                    content = "".join(parts)
+                if not isinstance(content, str):
+                    content = str(content)
+                entries.append({"role": role, "content": content})
+
+            self._chat_history_path.parent.mkdir(parents=True, exist_ok=True)
+            self._chat_history_path.write_text(
+                json.dumps(entries, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self.logger.warning("save chat history failed: %s", exc)
+
+    def _load_chat_history(self) -> int:
+        """Restore chat_history from disk on TUI start. Returns count restored.
+
+        Reconstructs LangChain ``HumanMessage`` / ``AIMessage`` objects
+        from the saved JSON and assigns them to
+        ``agent_runner.chat_history``. Also re-mounts each message in
+        the chat panel so the user sees the previous conversation
+        immediately on relaunch.
+
+        No-op (returns 0) if the save file doesn't exist or is empty.
+        Logs and returns 0 on read errors — chat restore is a
+        convenience.
+        """
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        path = self._chat_history_path
+        if not path.exists():
+            return 0
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            self.logger.warning("read chat history failed: %s", exc)
+            return 0
+        if not raw.strip():
+            return 0
+        try:
+            entries = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            self.logger.warning("parse chat history failed: %s", exc)
+            return 0
+        if not isinstance(entries, list):
+            return 0
+
+        restored: list = []
+        chat = self.query_one("#chat-panel", ChatPanel)
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            role = entry.get("role", "")
+            content = entry.get("content", "")
+            if not isinstance(content, str) or not content:
+                continue
+            if role == "human":
+                restored.append(HumanMessage(content=content))
+                chat.append_message(f"[bold green]> {content}[/]", "user-msg")
+            elif role == "ai":
+                restored.append(AIMessage(content=content))
+                # Drop the rich-markup styling — we don't have the
+                # original tool_start / tool_end events to recreate
+                # the inline tool log lines. Just show the answer.
+                chat.append_message(content, "agent-msg")
+
+        self.agent_runner.chat_history = restored
+        return len(restored)
+
+    @staticmethod
+    def _role_for_message(msg) -> str:
+        """Return ``human`` / ``ai`` / ``system`` for a LangChain message.
+
+        Looks at the message type name. Conservative on unknown types
+        — defaults to ``"ai"`` so anything that's not clearly a user
+        prompt is treated as agent output (the LLM rarely needs to
+        re-see system messages on reload, and the chat panel
+        doesn't render them anyway).
+        """
+        cls = type(msg).__name__.lower()
+        if "human" in cls:
+            return "human"
+        if "system" in cls:
+            return "system"
+        return "ai"
+
+    async def on_unmount(self) -> None:
+        """Save chat history one more time on app teardown.
+
+        Covers the path where Ctrl+C / app crash bypasses the
+        per-turn save in ``_process_agent``. Idempotent with the
+        per-turn save — same content gets written twice in the
+        common case, no harm done.
+        """
+        try:
+            self._save_chat_history()
+        except Exception as exc:
+            try:
+                self.logger.warning("on_unmount save failed: %s", exc)
+            except Exception:
+                pass
 
     # ── Actions ───────────────────────────────────────────────
 
