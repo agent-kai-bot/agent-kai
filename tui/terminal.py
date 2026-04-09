@@ -1491,18 +1491,19 @@ class TradingTerminal(App):
                         await mgr.spawn(agent_name)
 
                     # Wall-clock cap for sub-agent dispatches from the
-                    # TUI. The 300s default matches NATS_REQUEST_DEFAULT_TIMEOUT
-                    # in agent/tools.py — both paths (TUI direct + LLM
-                    # via nats_request tool) use the same generous
-                    # default so substantive analyst / trader / risk-
-                    # manager work doesn't time out before the sub-agent
-                    # finishes. Was 120s; the previous default was
-                    # too tight and produced false "timed out" errors
-                    # on real review tasks.
+                    # TUI. 8 hours (28800s) matches
+                    # NATS_REQUEST_DEFAULT_TIMEOUT in agent/tools.py —
+                    # both paths (TUI direct + LLM via nats_request
+                    # tool) use the same generous default so
+                    # substantive analyst / trader / risk-manager
+                    # work doesn't time out before the sub-agent
+                    # finishes. Routine queries return in seconds;
+                    # the cap is for deep multi-step reasoning chains
+                    # that legitimately take hours.
                     reply = await self.bus.request(
                         f"agent.{agent_name}.request",
                         {"task": task, "from": self.bus.agent_name},
-                        timeout=300,
+                        timeout=28800,
                     )
                     response = reply.get("response", str(reply))
                     chat.append_message(f"[bold cyan][{agent_name}][/] {response}")
@@ -1610,10 +1611,16 @@ class TradingTerminal(App):
 
             chat.append_message(f"[dim]Reflecting on {target_agent} (tool_count={session.tool_count})...[/]")
 
+            # Same 8-hour wall-clock cap as the regular sub-agent
+            # dispatch path. Mentor reflections on dense sessions
+            # (long tool-call lists, large response bodies, multiple
+            # candidate skills) can take many minutes — the previous
+            # 180s default would cut off the mentor mid-draft and
+            # corrupt the structured reply parser.
             reply = await self.bus.request(
                 "agent.mentor.request",
                 {"task": reflection_prompt, "from": self.bus.agent_name},
-                timeout=180,
+                timeout=28800,
             )
             mentor_reply = reply.get("response", str(reply))
             chat.append_message(f"[bold magenta][mentor][/] {mentor_reply}")
