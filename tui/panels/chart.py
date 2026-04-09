@@ -165,12 +165,23 @@ class ChartPanel(Widget):
     # ── Visibility toggle ───────────────────────────────────
 
     def toggle_visible(self, visible: bool | None = None) -> bool:
-        """Toggle or explicitly set chart visibility. Returns new state."""
+        """Toggle or explicitly set chart visibility. Returns new state.
+
+        Uses ``self.visible`` (CSS ``visibility: hidden``) — NOT
+        ``self.display`` (CSS ``display: none``). The grid layout
+        in ``terminal_styles.tcss`` is a fixed 3×3 with chart-panel
+        in row 2 col 2 and chat-panel in row 3 col 2; setting
+        ``display`` collapses the chart's grid cell entirely and
+        Textual auto-flows the row-3 children left by one column to
+        fill the gap, scrambling the whole layout. Setting ``visible``
+        keeps the slot reserved (the chart cell stays an empty box)
+        so every other panel stays exactly where it was.
+        """
         if visible is None:
             self._visible = not self._visible
         else:
             self._visible = visible
-        self.display = self._visible
+        self.visible = self._visible
         return self._visible
 
     def set_data(self, symbol: str, interval: str, bars: list[dict]):
