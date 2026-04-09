@@ -242,7 +242,7 @@ class TradingTerminal(App):
 
         chat = self.query_one("#chat-panel", ChatPanel)
         chat.append_message("[bold dim]Welcome to KAI. Type a message or use slash commands.[/]")
-        chat.append_message("[dim]/buy /sell /analyze /scan /risk /chart /watch /learn /model /login codex[/]")
+        chat.append_message("[dim]/buy /sell /analyze /scan /risk /chart /watch /learn /model /think /login codex[/]")
         chat.append_message("[dim]Mouse-drag any panel to copy. Ctrl+Y = last reply. Ctrl+Shift+C = current selection.[/]")
         self.query_one("#input-area", Input).focus()
 
@@ -868,6 +868,13 @@ class TradingTerminal(App):
             # /model AGENT EP/MODEL   — switch the agent to a new (endpoint, model) pair
             return await self._handle_model_command(parts)
 
+        elif cmd == "/think":
+            # /think                  — show kai's current thinking level
+            # /think LEVEL            — set kai's thinking level
+            # /think AGENT            — show AGENT's current thinking level
+            # /think AGENT LEVEL      — set AGENT's thinking level
+            return await self._handle_think_command(parts)
+
         return False
 
     async def _run_codex_login(self) -> None:
@@ -977,6 +984,185 @@ class TradingTerminal(App):
             # effect next time it spawns.
             self._chat_msg(
                 f"[dim]{agent_name} not running — new model will take effect on next spawn[/]"
+            )
+        return True
+
+    async def _handle_think_command(self, parts: list[str]) -> bool:
+        """Inspect or change an agent's reasoning effort (thinking level).
+
+        Reasoning effort is the ``reasoning.effort`` parameter on
+        the OpenAI Responses API for gpt-5.x / o-series models. It
+        controls how much hidden chain-of-thought the model burns
+        before answering — higher = better answers on hard problems
+        but slower and more expensive (the hidden tokens are billed).
+
+        Forms:
+            /think                — show kai's current thinking level
+            /think LEVEL          — set kai's thinking level
+            /think AGENT          — show AGENT's current level
+            /think AGENT LEVEL    — set AGENT's thinking level
+
+        Valid levels (case-insensitive, with aliases):
+            none       (off)
+            minimal    (min)
+            low
+            medium     (default)
+            high
+            xhigh      (x-high, extreme, max, extra)
+
+        Per-agent overrides are runtime-only — mirroring /model,
+        we mutate the in-memory AGENTS dict and rebuild the executor
+        in place via ``reload_llm()`` (main agent) or stop+spawn
+        (sub-agent). Restart the TUI to revert to the on-disk
+        defaults from agent-config.json.
+
+        Endpoint compatibility: not every endpoint honors the
+        reasoning_effort parameter. Codex CLI / Responses API
+        (codex-cli/gpt-5.x) DOES. The cloud kai-smart endpoint
+        passes through to vLLM running qwen3, which does not.
+        We set the override regardless and warn the user when the
+        currently-active endpoint won't act on it — the override
+        becomes load-bearing as soon as they /model swap to a
+        thinking-capable endpoint.
+        """
+        from config import (
+            AGENTS,
+            VALID_REASONING_EFFORTS,
+            normalize_reasoning_effort,
+            set_agent_reasoning_effort,
+        )
+
+        # Endpoints whose model family honors reasoning_effort. Used
+        # to warn the user when /think is set on an agent whose
+        # current endpoint will silently ignore the new level.
+        thinking_endpoints = {"codex-cli", "openai-direct"}
+
+        # Form 1: no args — show kai's current effort + the menu of valid levels
+        if len(parts) == 1:
+            kai_cfg = AGENTS.get(self.agent_runner.agent_name, {})
+            current = kai_cfg.get("reasoning_effort") or "(default: medium)"
+            self._chat_msg(
+                f"[dim]{self.agent_runner.agent_name} thinking level: "
+                f"[bold]{current}[/][/]"
+            )
+            self._chat_msg(
+                f"[dim]Valid: {', '.join(VALID_REASONING_EFFORTS)} "
+                f"(aliases: x-high, extreme, max, min, off)[/]"
+            )
+            self._chat_msg(
+                "[dim]Usage: /think LEVEL  |  /think AGENT LEVEL[/]"
+            )
+            return True
+
+        arg1 = parts[1]
+
+        # Form 2: /think LEVEL — set kai's level (the most common case)
+        if len(parts) == 2 and normalize_reasoning_effort(arg1) is not None:
+            return await self._apply_thinking_level(
+                self.agent_runner.agent_name, arg1, thinking_endpoints
+            )
+
+        # Form 3: /think AGENT — inspect a specific agent
+        if len(parts) == 2:
+            agent_name = arg1
+            if agent_name not in AGENTS:
+                self._chat_msg(
+                    f"[red]Unknown agent or invalid level '{arg1}'[/]  "
+                    f"[dim]Valid levels: {', '.join(VALID_REASONING_EFFORTS)}[/]"
+                )
+                return True
+            cfg = AGENTS[agent_name]
+            current = cfg.get("reasoning_effort") or "(default: medium)"
+            ep = cfg.get("endpoint", "(unset)")
+            ep_name = ep if isinstance(ep, str) else (ep.get("endpoint") or "(unset)")
+            warn = ""
+            if ep_name not in thinking_endpoints:
+                warn = (
+                    f" [yellow](note: endpoint '{ep_name}' may not honor "
+                    "reasoning_effort)[/]"
+                )
+            self._chat_msg(
+                f"[dim]{agent_name} thinking level: [bold]{current}[/]"
+                f" on endpoint {ep_name}{warn}[/]"
+            )
+            return True
+
+        # Form 4: /think AGENT LEVEL — set a specific agent's level
+        agent_name = arg1
+        level = parts[2]
+        if agent_name not in AGENTS:
+            self._chat_msg(f"[red]Unknown agent '{agent_name}'[/]")
+            return True
+        return await self._apply_thinking_level(agent_name, level, thinking_endpoints)
+
+    async def _apply_thinking_level(
+        self,
+        agent_name: str,
+        level: str,
+        thinking_endpoints: set[str],
+    ) -> bool:
+        """Validate, apply, and rebuild for a thinking-level change.
+
+        Shared between the /think LEVEL form (kai) and the
+        /think AGENT LEVEL form (any agent). Mirrors the rebuild
+        logic in _handle_model_command — main agent uses
+        ``reload_llm()``, sub-agents use stop+spawn.
+        """
+        from config import AGENTS, set_agent_reasoning_effort
+
+        try:
+            canonical = set_agent_reasoning_effort(agent_name, level)
+        except ValueError as exc:
+            self._chat_msg(f"[red]{exc}[/]")
+            return True
+
+        # Warn when the currently-active endpoint doesn't honor the
+        # parameter — the override is set in memory but the user
+        # won't see any behavior change until they /model swap to a
+        # thinking-capable endpoint.
+        cfg = AGENTS[agent_name]
+        ep = cfg.get("endpoint")
+        ep_name = ep if isinstance(ep, str) else (
+            ep.get("endpoint") if isinstance(ep, dict) else None
+        )
+        suppressed = ep_name not in thinking_endpoints
+        if suppressed:
+            self._chat_msg(
+                f"[yellow]warning: {agent_name} is on '{ep_name}' which may not "
+                f"honor reasoning_effort. Override stored — will take effect "
+                f"after /model swap to a thinking-capable endpoint.[/]"
+            )
+
+        self._chat_msg(f"[dim]{agent_name} thinking → [bold]{canonical}[/][/]")
+
+        # Rebuild the executor so the new effort hits the next request.
+        if agent_name == self.agent_runner.agent_name:
+            try:
+                summary = self.agent_runner.reload_llm()
+            except Exception as exc:
+                self._chat_msg(f"[red]reload_llm failed: {exc}[/]")
+                self.logger.warning(
+                    "reload_llm failed for %s after /think: %s", agent_name, exc
+                )
+                return True
+            self._chat_msg(
+                f"[bold green]{agent_name} now thinking at {canonical}[/] "
+                f"[dim](on {summary['provider']}/{summary['model']})[/]"
+            )
+            return True
+
+        mgr = getattr(self, "_sub_agent_manager", None)
+        if mgr and agent_name in mgr.agents:
+            self._chat_msg(f"[dim]Respawning {agent_name} with thinking={canonical}...[/]")
+            await mgr.stop(agent_name)
+            await mgr.spawn(agent_name)
+            self._chat_msg(
+                f"[bold green]{agent_name} restarted thinking at {canonical}[/]"
+            )
+        else:
+            self._chat_msg(
+                f"[dim]{agent_name} not running — thinking={canonical} will "
+                "take effect on next spawn[/]"
             )
         return True
 
