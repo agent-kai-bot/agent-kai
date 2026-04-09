@@ -85,6 +85,13 @@ ENDPOINTS = _config.get("endpoints", {})
 # Agents registry: name -> {endpoint, fallback_endpoint, system_prompt, max_iterations, description}
 AGENTS = _config.get("agents", {})
 
+# Signal handlers — declarative rules for what to do when a signal
+# arrives via NATS (signals.{strategy}.{symbol}). Loaded as raw list
+# of dicts here; agent.signal_handlers.load_handlers_from_config
+# parses each entry into a SignalHandler dataclass with validation.
+# See agent/signal_handlers.py for the full schema.
+SIGNAL_HANDLERS = _config.get("signal_handlers", []) or []
+
 # Persistent memory — bounded curated memory (MEMORY.md per agent,
 # USER.md shared across all agents). Ported from the Hermes design
 # with larger char limits tuned for our LLM context budget. Disable

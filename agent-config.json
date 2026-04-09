@@ -234,6 +234,66 @@
     "enabled": true
   },
 
+  "signal_handlers": [
+    {
+      "name": "any-buy-to-analyst",
+      "enabled": false,
+      "match": {
+        "signal_type": "BUY"
+      },
+      "action": "dispatch_agent",
+      "agent": "analyst",
+      "task_template": "A {strategy} BUY signal just fired for {symbol} at ${price}. Run a multi-timeframe TA (1h + 4h + 1d) and tell me whether you'd validate this — what's your independent technical read? Be honest if it looks like noise.",
+      "cooldown_seconds": 600
+    },
+    {
+      "name": "any-sell-to-analyst",
+      "enabled": false,
+      "match": {
+        "signal_type": "SELL"
+      },
+      "action": "dispatch_agent",
+      "agent": "analyst",
+      "task_template": "A {strategy} SELL signal just fired for {symbol} at ${price}. Run a multi-timeframe TA and tell me whether the trend break is real or this is a fakeout.",
+      "cooldown_seconds": 600
+    },
+    {
+      "name": "high-confidence-buy-to-risk-manager",
+      "enabled": false,
+      "match": {
+        "signal_type": "BUY",
+        "confidence": "high"
+      },
+      "action": "dispatch_agent",
+      "agent": "risk-manager",
+      "task_template": "A high-confidence BUY signal arrived for {symbol} at ${price} from {strategy}. Check current portfolio exposure via get_positions and size a position assuming 1.5% risk per trade and ATR-based stops. Tell me the recommended quantity, stop, and target.",
+      "cooldown_seconds": 600
+    },
+    {
+      "name": "auto-execute-clucmay-buy",
+      "enabled": false,
+      "match": {
+        "strategy": "clucmay02",
+        "signal_type": "BUY",
+        "symbol": ["BTC", "ETH", "SOL"]
+      },
+      "action": "dispatch_agent",
+      "agent": "trader",
+      "task_template": "AUTOTRADE: a clucmay02 BUY signal fired for {symbol} at ${price}. Place a paper-trade BUY order using the place_order tool with a conservative size (start with 0.1 of the position the risk-manager would normally recommend). Use ATR-based stop and 2x take-profit. Confirm in your reply with the order details.",
+      "cooldown_seconds": 1800,
+      "requires_autotrade": true
+    },
+    {
+      "name": "ai-token-analyzer-to-chat",
+      "enabled": false,
+      "match": {
+        "source": "ai-token-analyzer"
+      },
+      "action": "chat_message",
+      "template": "[bold magenta][ai-analyzer][/] {symbol} — see eval_results for the full report"
+    }
+  ],
+
   "tool_safety": {
     "shell_timeout_seconds": 30,
     "max_file_read_chars": 10000,
