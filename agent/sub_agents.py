@@ -33,7 +33,10 @@ class SubAgent:
         max_iterations = cfg.get("max_iterations", 10)
         self.workspace = cfg.get("workspace", "")
 
-        tools = create_sub_agent_tools(bus)
+        # Pass the workspace path into the tool factory so the
+        # docker_sandbox tool can bind-mount it as /work. Without this
+        # the sub-agent couldn't share files with its sandboxed runs.
+        tools = create_sub_agent_tools(bus, workspace_host_path=self.workspace or None)
         llm = create_llm(endpoint_cfg)
 
         role_prompt = system_prompt or cfg.get("system_prompt")

@@ -35,6 +35,27 @@ SHELL_TIMEOUT_SECONDS = _tool_safety.get("shell_timeout_seconds", 30)
 MAX_FILE_READ_CHARS = _tool_safety.get("max_file_read_chars", 10_000)
 MAX_OUTPUT_CHARS = _tool_safety.get("max_output_chars", 5_000)
 
+# Docker sandbox tool settings — defaults that apply to every sandboxed
+# container run. These are deliberately strict so the LLM can opt into
+# just the bits it needs (network, specific image) without having to
+# remember every security flag each call.
+_sandbox_cfg = _tool_safety.get("docker_sandbox", {})
+DOCKER_SANDBOX_IMAGE = _sandbox_cfg.get("default_image", "python:3.12-slim")
+DOCKER_SANDBOX_DEFAULT_TIMEOUT = int(_sandbox_cfg.get("default_timeout_seconds", 60))
+DOCKER_SANDBOX_MAX_TIMEOUT = int(_sandbox_cfg.get("max_timeout_seconds", 600))
+DOCKER_SANDBOX_DEFAULT_NETWORK = _sandbox_cfg.get("default_network", "none")
+DOCKER_SANDBOX_ALLOWED_NETWORKS = tuple(
+    _sandbox_cfg.get("allowed_networks", ["none", "bridge"])
+)
+DOCKER_SANDBOX_MEMORY = _sandbox_cfg.get("memory_limit", "512m")
+DOCKER_SANDBOX_CPUS = str(_sandbox_cfg.get("cpu_limit", "1.0"))
+DOCKER_SANDBOX_PIDS = int(_sandbox_cfg.get("pids_limit", 512))
+DOCKER_SANDBOX_TMPFS_SIZE = _sandbox_cfg.get("tmpfs_size", "64m")
+DOCKER_SANDBOX_USER = _sandbox_cfg.get("run_as_user", "65534:65534")
+DOCKER_SANDBOX_MOUNT_WORKSPACE_DEFAULT = bool(
+    _sandbox_cfg.get("mount_workspace_by_default", True)
+)
+
 
 def get_endpoint(name):
     """Get endpoint config by name. Returns dict with base_url, model, etc."""
