@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -148,6 +149,8 @@ class TradingTerminal(App):
         self._coinbase_task = None    # asyncio.Task running the feed loop
         self._kai_api_stream = None   # KaiApiCandleStream instance
         self._kai_api_task = None     # asyncio.Task running the WS consumer
+        self._kai_api_refresh_task = None  # asyncio.Task running the periodic REST refresh
+        self._kai_api_last_refresh: float = 0.0  # epoch timestamp of last successful REST refetch
         # Last text the auto-copy-on-mouseup handler pushed to the
         # OS clipboard. Used to suppress duplicate OSC 52 emissions
         # when TextSelected fires repeatedly during a single drag.
@@ -485,18 +488,38 @@ class TradingTerminal(App):
             pass
         self._save_chart_state(interval)
 
+        self._kai_api_last_refresh = time.time()
+
         # 2) Live WebSocket consumer
         self._kai_api_stream = KaiApiCandleStream(sym_upper, interval)
         self._kai_api_task = asyncio.create_task(
             self._run_kai_api_consumer(sym_upper, interval)
         )
+
+        # 3) Periodic REST refresh — safety net for the WS path.
+        # The WebSocket gives sub-second updates when it's working,
+        # but it can stall for several reasons: connection drops
+        # silently mid-session, the cloud only emits on bar-close,
+        # network blips that make reconnect-with-backoff slow,
+        # auth-token expiry mid-connection. The periodic refetch
+        # guarantees the chart never drifts more than ~20s from
+        # the backend's truth regardless of WS health. Re-bases
+        # via chart.set_data(), which clears + replaces all bars
+        # — any in-progress current candle the WS painted gets
+        # rewritten on the next WS tick so nothing is permanently
+        # lost. Cheap: ~16KB per refetch, every 20s, against the
+        # already-bearer-authed REST endpoint.
+        self._kai_api_refresh_task = asyncio.create_task(
+            self._run_kai_api_periodic_refresh(sym_upper, interval)
+        )
+
         self._nats_log(
             f"[bold cyan]kai-api WS[/] {sym_upper} {interval} live "
-            f"({len(hist)} bars seeded)"
+            f"({len(hist)} bars seeded, REST refresh every 20s)"
         )
 
     async def _stop_kai_api_feed(self) -> None:
-        """Cleanly stop any running kai-api feed task + WS stream."""
+        """Cleanly stop any running kai-api feed task + WS stream + refresh."""
         if self._kai_api_stream is not None:
             try:
                 self._kai_api_stream.stop()
@@ -509,8 +532,17 @@ class TradingTerminal(App):
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+        # Tear down the periodic REST refresh task too
+        refresh = self._kai_api_refresh_task
+        if refresh is not None and not refresh.done():
+            refresh.cancel()
+            try:
+                await refresh
+            except (asyncio.CancelledError, Exception):
+                pass
         self._kai_api_stream = None
         self._kai_api_task = None
+        self._kai_api_refresh_task = None
 
     async def _run_kai_api_consumer(self, symbol: str, interval: str) -> None:
         """Consume the kai-api WebSocket stream, updating the chart live.
@@ -521,6 +553,9 @@ class TradingTerminal(App):
         the chart panel merges by ts: live updates overwrite the
         in-progress bar, and the next ts boundary creates a new one
         automatically.
+
+        Updates ``self._kai_api_last_refresh`` on every received bar
+        so the periodic-refresh task can tell the WS is healthy.
         """
         try:
             chart = self.query_one("#chart-panel", ChartPanel)
@@ -540,10 +575,82 @@ class TradingTerminal(App):
                     "volume": bar["volume"],
                 }
                 chart.update_last_bar(clean)
+                self._kai_api_last_refresh = time.time()
         except asyncio.CancelledError:
             raise
         except Exception as e:
             self._log_error("kai-api WS consumer error", e)
+
+    # Periodic REST refresh interval. Re-fetches historical bars from
+    # the cloud kai-api endpoint and rebases the chart even when the
+    # WebSocket is broken / throttled / silent. The interval is short
+    # enough that the chart never drifts more than ~20 seconds from
+    # backend truth, but long enough that we're not hammering the
+    # endpoint or burning bandwidth.
+    KAI_API_REFRESH_INTERVAL_S = 20.0
+
+    async def _run_kai_api_periodic_refresh(
+        self, symbol: str, interval: str
+    ) -> None:
+        """Periodically re-fetch historical bars and rebase the chart.
+
+        Runs alongside the WebSocket consumer as a safety net. The
+        WS gives sub-second updates when it's healthy, but it can
+        stall for several reasons (silent disconnect, backend only
+        emits on bar-close, slow reconnect backoff, expired auth).
+        This task guarantees the chart stays close to fresh
+        regardless of WS state.
+
+        Cancels cleanly via ``asyncio.CancelledError`` when the
+        feed is stopped (chart source switched, symbol/interval
+        changed, TUI quitting).
+        """
+        from agent.data_sources.kai_api import fetch_candles
+
+        # Initial sleep so we don't immediately re-fetch on top of
+        # the bootstrap that just ran in _start_kai_api_feed.
+        try:
+            await asyncio.sleep(self.KAI_API_REFRESH_INTERVAL_S)
+        except asyncio.CancelledError:
+            raise
+
+        consecutive_failures = 0
+        while True:
+            try:
+                hist = await asyncio.to_thread(
+                    fetch_candles, symbol, interval, 200
+                )
+                if hist:
+                    try:
+                        chart = self.query_one("#chart-panel", ChartPanel)
+                        chart.set_data(symbol, interval, hist)
+                        self._kai_api_last_refresh = time.time()
+                        consecutive_failures = 0
+                    except Exception as exc:
+                        self.logger.warning(
+                            "kai-api periodic refresh: chart update failed: %s", exc
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                consecutive_failures += 1
+                # Log the first few failures, then go quiet so a
+                # persistent backend outage doesn't spam the log.
+                if consecutive_failures <= 3:
+                    self.logger.warning(
+                        "kai-api periodic refresh failed (#%d): %s",
+                        consecutive_failures, exc,
+                    )
+                elif consecutive_failures == 4:
+                    self.logger.warning(
+                        "kai-api periodic refresh: silencing further failures "
+                        "until recovery"
+                    )
+
+            try:
+                await asyncio.sleep(self.KAI_API_REFRESH_INTERVAL_S)
+            except asyncio.CancelledError:
+                raise
 
     def _save_chart_state(self, interval: str) -> None:
         """Persist chart symbol/timeframe/source/scheme to state.json."""
