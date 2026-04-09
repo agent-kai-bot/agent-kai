@@ -21,6 +21,7 @@ from config import get_skills_dir
 from tui.panels.alerts import AlertsPanel
 from tui.panels.agent_chat import ChatPanel
 from tui.panels.chart import ChartPanel
+from tui.panels.history_input import HistoryInput
 from tui.panels.positions import PositionsPanel
 from tui.panels.watchlist import WatchlistPanel
 
@@ -180,7 +181,15 @@ class TradingTerminal(App):
         yield RichLog(id="nats-panel", markup=True, wrap=True)
         # Bottom
         yield Static("Status: idle | Portfolio: $100,000.00", id="status-bar")
-        yield Input(placeholder="/buy BTC 0.1 | /analyze SOL | /scan trending | /learn | or just chat...", id="input-area")
+        # HistoryInput gives us bash-style up/down arrow recall of
+        # previously submitted lines. The history file lives next
+        # to the rest of the terminal state and persists across
+        # restarts (one entry per line, like .bash_history).
+        yield HistoryInput(
+            placeholder="/buy BTC 0.1 | /analyze SOL | /scan trending | /learn | or just chat...",
+            id="input-area",
+            history_path=Path("workspaces/terminal/input_history.txt"),
+        )
 
     async def on_mount(self):
         # Wire NATS
@@ -639,6 +648,15 @@ class TradingTerminal(App):
         text = event.value.strip()
         if not text:
             return
+        # Record in shell-style history before clearing the input
+        # so the user can recall it with Up arrow on the next prompt.
+        # Cast guard: every Input we mount in compose() is a
+        # HistoryInput, but a stray plain Input would still hit this
+        # handler, so we feature-detect rather than isinstance-check
+        # to avoid an extra import in this hot path.
+        remember = getattr(event.input, "remember", None)
+        if callable(remember):
+            remember(text)
         event.input.value = ""
 
         if self._agent_working:
