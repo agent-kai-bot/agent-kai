@@ -7,7 +7,7 @@ from pathlib import Path
 
 import requests
 from textual.app import App, ComposeResult
-from textual.widgets import Input, RichLog, Static
+from textual.widgets import DataTable, Input, RichLog, Static
 
 from tui.panels.alerts import AlertsPanel
 from tui.panels.agent_chat import ChatPanel
@@ -20,6 +20,38 @@ from data_api.config import API_PORT
 API_BASE = f"http://localhost:{API_PORT}/api/v1"
 TRACKED_SYMBOLS = ["BTC", "ETH", "SOL"]
 
+# Persisted UI state — chart symbol / timeframe / watchlist survive a
+# restart. Lives under workspaces/terminal/ to match the pattern the
+# paper trading engine uses (workspaces/trader/portfolio.json).
+TERMINAL_STATE_PATH = Path(__file__).resolve().parent.parent / "workspaces" / "terminal" / "state.json"
+
+
+def _load_terminal_state() -> dict:
+    """Load persisted terminal state, or an empty dict if it doesn't exist."""
+    try:
+        with open(TERMINAL_STATE_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError):
+        # Corrupt state file — start fresh rather than crash the TUI.
+        return {}
+
+
+def _save_terminal_state(state: dict) -> None:
+    """Persist the terminal state atomically. Swallows errors — a write
+    failure should never crash the TUI, since the state is only a UX
+    convenience (chart symbol, timeframe, etc.)."""
+    try:
+        TERMINAL_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TERMINAL_STATE_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+        tmp.replace(TERMINAL_STATE_PATH)
+    except OSError:
+        pass
+
 
 class TradingTerminal(App):
     """KAI Crypto Trading Terminal."""
@@ -31,6 +63,7 @@ class TradingTerminal(App):
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+l", "clear_chat", "Clear chat"),
         ("ctrl+t", "cycle_timeframe", "Timeframe"),
+        ("ctrl+s", "cycle_symbol", "Symbol"),
         ("ctrl+w", "toggle_watchlist_add", "Add symbol"),
     ]
 
@@ -41,12 +74,22 @@ class TradingTerminal(App):
         self.agent_runner = agent_runner
         self.bus = bus
         self._agent_working = False
-        self._current_tf_idx = 0
-        self._chart_symbol = "BTC"
+
+        # Restore persisted chart state from workspaces/terminal/state.json.
+        # Falls back to the BTC + 1m defaults on first run or corrupt file.
+        state = _load_terminal_state()
+        self._chart_symbol = state.get("chart_symbol", "BTC")
+        saved_tf = state.get("chart_timeframe", "1m")
+        try:
+            self._current_tf_idx = self.TIMEFRAMES.index(saved_tf)
+        except ValueError:
+            self._current_tf_idx = 0
 
     def compose(self) -> ComposeResult:
         yield Static(
-            "KAI Trading Terminal (agent-k.ai)  [ctrl+t: timeframe] [ctrl+w: add symbol]",
+            "KAI Trading Terminal (agent-k.ai)  "
+            "[ctrl+s: symbol] [ctrl+t: timeframe] [ctrl+w: add symbol] "
+            "[click a watchlist row to chart it]",
             id="header",
         )
         # Left column
@@ -117,7 +160,7 @@ class TradingTerminal(App):
             self._nats_log(f"[red]Init error: {e}[/]")
 
     async def _load_chart(self, symbol: str, interval: str):
-        """Load chart data from API."""
+        """Load chart data from API and persist the new (symbol, interval)."""
         try:
             resp = requests.get(
                 f"{API_BASE}/ohlcv/{symbol}",
@@ -128,6 +171,15 @@ class TradingTerminal(App):
             chart = self.query_one("#chart-panel", ChartPanel)
             chart.set_data(symbol, interval, bars)
             self._chart_symbol = symbol
+            # Sync the timeframe index so Ctrl+T cycling starts from here.
+            try:
+                self._current_tf_idx = self.TIMEFRAMES.index(interval)
+            except ValueError:
+                pass
+            _save_terminal_state({
+                "chart_symbol": self._chart_symbol,
+                "chart_timeframe": interval,
+            })
         except Exception as e:
             self._nats_log(f"[red]Chart load error: {e}[/]")
 
@@ -147,6 +199,23 @@ class TradingTerminal(App):
             pass
 
     # ── Input handling ────────────────────────────────────────
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Click / Enter on a watchlist row -> load that symbol in the chart.
+
+        Fires for any DataTable in the app so we filter by id. The row
+        key was set to the symbol string when the watchlist was built,
+        so ``event.row_key.value`` gives us the symbol directly.
+        """
+        table = event.data_table
+        if getattr(table, "id", None) != "watchlist-panel":
+            return
+        symbol = event.row_key.value if event.row_key else None
+        if not symbol:
+            return
+        tf = self.TIMEFRAMES[self._current_tf_idx]
+        self.run_worker(self._load_chart(symbol, tf), thread=False)
+        self._chat_msg(f"[dim]Chart: {symbol} {tf}[/]")
 
     async def on_input_submitted(self, event: Input.Submitted):
         text = event.value.strip()
@@ -419,6 +488,30 @@ class TradingTerminal(App):
         tf = self.TIMEFRAMES[self._current_tf_idx]
         self.run_worker(self._load_chart(self._chart_symbol, tf), thread=False)
         self._chat_msg(f"[dim]Chart: {self._chart_symbol} {tf}[/]")
+
+    def action_cycle_symbol(self):
+        """Cycle the chart through the current watchlist.
+
+        Uses the live watchlist (not the TRACKED_SYMBOLS constant) so
+        symbols the user added via ``/watch`` are included in the
+        rotation. Wraps around at the end.
+        """
+        try:
+            watchlist = self.query_one("#watchlist-panel", WatchlistPanel)
+        except Exception:
+            return
+        symbols = list(watchlist.tracked_symbols)
+        if not symbols:
+            self._chat_msg("[dim]Watchlist is empty. Use /watch SYMBOL to add one.[/]")
+            return
+        try:
+            idx = symbols.index(self._chart_symbol)
+        except ValueError:
+            idx = -1
+        next_symbol = symbols[(idx + 1) % len(symbols)]
+        tf = self.TIMEFRAMES[self._current_tf_idx]
+        self.run_worker(self._load_chart(next_symbol, tf), thread=False)
+        self._chat_msg(f"[dim]Chart: {next_symbol} {tf}[/]")
 
     def action_toggle_watchlist_add(self):
         """Focus input with /watch prefix."""
