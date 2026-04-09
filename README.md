@@ -20,6 +20,9 @@ The repo ships a small local adapter process for the TUI and tools, but market d
 - Python 3.13+
 - Docker with Compose
 - An API key from `https://agent-k.ai/`
+- Linux only: a system clipboard helper for the TUI's copy shortcuts (see [Copy & paste](#copy--paste))
+  - Wayland: `sudo apt install wl-clipboard`
+  - X11: `sudo apt install xclip`
 
 ## Get an API key
 
@@ -92,6 +95,42 @@ export KAI_TRACKED_SYMBOLS="BTC,ETH,SOL"
 - `/risk`
 - `/chart BTC 1h`
 - `/watch DOGE`
+
+## Copy & paste
+
+The TUI supports three ways to get text out of the chat into your system clipboard:
+
+- **Click and drag** any panel — releases the mouse button to auto-copy the selection
+- **Ctrl+Shift+C** — copy the current mouse selection (with a chat confirmation showing the backend used)
+- **Ctrl+Y** — copy the most recent agent response in one keystroke, no selection needed
+
+All three routes write to the system clipboard via a runtime-detected backend, in this order: `wl-copy` (Wayland) → `xclip` → `xsel` → OSC 52 (terminal escape sequence). The detected backend is shown in the chat confirmation message — for example:
+
+```
+Copied 312 chars to clipboard via wl-copy — The market is currently…
+```
+
+### Linux setup
+
+VTE-based terminals on Linux (gnome-terminal, Tilix, Terminator, Konsole, MATE Terminal, XFCE Terminal) **disable OSC 52 clipboard writes by default for security reasons**, so the OSC 52 fallback is unreliable on most default Linux terminals — the bytes leave the program but the terminal silently drops them and your system clipboard never changes. Install one of the native clipboard CLIs and the TUI will pick it up automatically:
+
+```bash
+# Wayland sessions (the default on modern Ubuntu / Fedora / Pop!_OS)
+sudo apt install wl-clipboard
+
+# X11 sessions
+sudo apt install xclip
+# or
+sudo apt install xsel
+```
+
+If the chat confirmation says `via osc52`, your system clipboard probably did **not** receive the text — install one of the packages above and try again. The TUI also logs a warning at startup if no clipboard CLI is found.
+
+### macOS / Windows / SSH
+
+- macOS: OSC 52 works on **iTerm2** (enable in Preferences → General → Selection → "Applications in terminal may access clipboard"), **Kitty**, **Alacritty**, **WezTerm**. Apple's stock Terminal.app does not honor OSC 52 — use one of the alternatives.
+- Windows Terminal: OSC 52 works out of the box.
+- Over SSH: OSC 52 is the right path because there is no local CLI on the remote box — it tunnels through the SSH session and your local terminal handles the actual write. Same terminal-support caveats apply.
 
 ## Sub-agent system
 
