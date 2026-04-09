@@ -112,13 +112,22 @@ class HistoryInput(Input):
         paste a stack trace, a code block, or any wrapped chunk into
         the chat. We intercept here:
 
-        - **Single-line paste**: defer to the parent so the normal
-          insert-at-cursor / replace-selection behavior runs unchanged.
+        - **Single-line paste**: clear the buffer and defer to the
+          parent so the normal insert-at-cursor / replace-selection
+          behavior runs unchanged.
         - **Multi-line paste**: stash the normalized full text on
           ``self._pasted_buffer``, replace the visible value with a
           summary indicator the user can recognize, park the cursor
-          at end-of-line, and stop the event so the parent never
-          runs (which would otherwise truncate to the first line).
+          at end-of-line, and call ``event.prevent_default()`` so
+          ``Input._on_paste`` (the base class handler) does NOT run
+          afterwards. Without ``prevent_default()`` Textual's message
+          pump walks the MRO and calls every ``_on_paste`` in the
+          chain — the parent would then ``insert_text_at_cursor``
+          the first line of the paste, appending it to our summary
+          marker and producing a Frankenstein value like
+          ``"[paste: 18 lines, ...] Analyze BTC...Analyze BTC...".``
+          ``event.stop()`` only blocks BUBBLING to ancestor widgets,
+          NOT the within-widget MRO walk — the difference matters.
 
         Line endings are normalized to ``\\n`` so the agent sees
         consistent text regardless of the source platform's CR/LF
@@ -126,6 +135,7 @@ class HistoryInput(Input):
         """
         text = event.text
         if not text:
+            event.prevent_default()
             event.stop()
             return
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -138,13 +148,15 @@ class HistoryInput(Input):
             suffix = "…" if len(first_line) > 40 else ""
             self.value = f"[paste: {n_lines} lines, {n_chars} chars] {preview}{suffix}"
             self.cursor_position = len(self.value)
+            event.prevent_default()
             event.stop()
             return
-        # Single-line paste — let the parent handle it normally.
-        # Note: Input._on_paste is sync (returns None), so we call
-        # without await — making this method async only so we can
-        # match the rest of the override surface that IS async.
-        super()._on_paste(event)
+        # Single-line paste — clear any stale buffer (the user just
+        # replaced their multi-line paste with a single-line one)
+        # and let the parent handle the insertion normally. We do
+        # NOT call prevent_default here because we WANT the parent
+        # to run the insert.
+        self._pasted_buffer = None
 
     async def _on_key(self, event: events.Key) -> None:
         """Abandon a buffered paste on the first edit keystroke.
