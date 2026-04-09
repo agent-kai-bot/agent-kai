@@ -29,6 +29,16 @@ ENDPOINTS = _config.get("endpoints", {})
 # Agents registry: name -> {endpoint, fallback_endpoint, system_prompt, max_iterations, description}
 AGENTS = _config.get("agents", {})
 
+# Persistent memory — bounded curated memory (MEMORY.md per agent,
+# USER.md shared across all agents). Ported from the Hermes design
+# with larger char limits tuned for our LLM context budget. Disable
+# either store by flipping its enabled flag in agent-config.json.
+_memory_cfg = _config.get("memory", {})
+MEMORY_ENABLED = bool(_memory_cfg.get("enabled", True))
+USER_PROFILE_ENABLED = bool(_memory_cfg.get("user_profile_enabled", True))
+MEMORY_CHAR_LIMIT = int(_memory_cfg.get("memory_char_limit", 11_000))
+USER_CHAR_LIMIT = int(_memory_cfg.get("user_char_limit", 6_875))
+
 # Tool safety
 _tool_safety = _config.get("tool_safety", {})
 SHELL_TIMEOUT_SECONDS = _tool_safety.get("shell_timeout_seconds", 30)
@@ -85,6 +95,23 @@ def get_workspace_path(agent_name):
     workspace_path = os.path.join(WORKSPACES_DIR, workspace_name)
     os.makedirs(workspace_path, exist_ok=True)
     return workspace_path
+
+
+def get_memory_path(agent_name):
+    """Get the path to the agent's MEMORY.md (per-agent notes)."""
+    return os.path.join(get_workspace_path(agent_name), "memories", "MEMORY.md")
+
+
+def get_user_profile_path():
+    """Get the path to the shared USER.md (global user profile).
+
+    User preferences are intentionally shared across every agent so
+    something the user tells the trader agent ("I prefer USD sizing")
+    is also visible to the analyst, risk-manager, and nano agents on
+    their next session without duplicating state.
+    """
+    os.makedirs(WORKSPACES_DIR, exist_ok=True)
+    return os.path.join(WORKSPACES_DIR, "user.md")
 
 
 def load_soul(agent_name):
