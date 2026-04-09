@@ -106,6 +106,7 @@ class TradingTerminal(App):
         ("ctrl+s", "cycle_symbol", "Symbol"),
         ("ctrl+w", "toggle_watchlist_add", "Add symbol"),
         ("ctrl+y", "copy_last_response", "Copy last reply"),
+        ("ctrl+shift+c", "copy_selection", "Copy selection"),
     ]
 
     TIMEFRAMES = ["1m", "5m", "15m", "1h"]
@@ -138,6 +139,10 @@ class TradingTerminal(App):
         self._coinbase_task = None    # asyncio.Task running the feed loop
         self._kai_api_stream = None   # KaiApiCandleStream instance
         self._kai_api_task = None     # asyncio.Task running the WS consumer
+        # Last text the auto-copy-on-mouseup handler pushed to the
+        # OS clipboard. Used to suppress duplicate OSC 52 emissions
+        # when TextSelected fires repeatedly during a single drag.
+        self._last_auto_copied: str = ""
 
         # Restore persisted chart state from workspaces/terminal/state.json.
         # Falls back to the BTC + 1m defaults on first run or corrupt file.
@@ -224,6 +229,7 @@ class TradingTerminal(App):
         chat = self.query_one("#chat-panel", ChatPanel)
         chat.append_message("[bold dim]Welcome to KAI. Type a message or use slash commands.[/]")
         chat.append_message("[dim]/buy /sell /analyze /scan /risk /chart /watch /learn /model /login codex[/]")
+        chat.append_message("[dim]Mouse-drag any panel to copy. Ctrl+Y = last reply. Ctrl+Shift+C = current selection.[/]")
         self.query_one("#input-area", Input).focus()
 
     async def _load_initial_data(self):
@@ -1332,6 +1338,82 @@ class TradingTerminal(App):
         inp = self.query_one("#input-area", Input)
         inp.value = "/watch "
         inp.focus()
+
+    def action_copy_selection(self):
+        """Copy the currently mouse-selected text to the system clipboard.
+
+        Bound to ``Ctrl+Shift+C``. Reads ``Screen.get_selected_text()``
+        which Textual maintains automatically as the user click-drags
+        within any widget that has ``ALLOW_SELECT = True`` (the default
+        for ``Static``, ``RichLog``, etc — i.e. everything in our TUI).
+
+        This is the keyboard shortcut version of the auto-copy-on-mouse
+        -up handler below: same underlying call, same OSC 52 path,
+        different trigger. Use the keyboard one when you want explicit
+        confirmation in chat or when your terminal swallowed the
+        mouse-up auto-copy for some reason.
+        """
+        try:
+            text = self.screen.get_selected_text()
+        except Exception as exc:
+            self.logger.warning("get_selected_text failed: %s", exc)
+            self._chat_msg(f"[red]Copy failed: {exc}[/]")
+            return
+
+        if not text:
+            self._chat_msg(
+                "[dim]No selection. Click and drag inside any panel first, "
+                "then hit Ctrl+Shift+C.[/]"
+            )
+            return
+
+        try:
+            self.copy_to_clipboard(text)
+        except Exception as exc:
+            self.logger.warning("copy_to_clipboard (selection) failed: %s", exc)
+            self._chat_msg(f"[red]Copy failed: {exc}[/]")
+            return
+
+        n = len(text)
+        preview = text[:50].replace("\n", " ")
+        if len(text) > 50:
+            preview += "…"
+        self._chat_msg(f"[dim]Copied {n} chars from selection — {preview}[/]")
+        self.logger.info("copied %d chars from mouse selection via Ctrl+Shift+C", n)
+        self._last_auto_copied = text  # so the next auto-copy handler doesn't echo
+
+    def on_text_selected(self, event) -> None:
+        """Auto-copy the current text selection on mouse-up.
+
+        Textual's ``TextSelected`` event bubbles up from the screen
+        whenever a text selection is updated. The event itself carries
+        no payload — we have to call ``screen.get_selected_text()`` to
+        actually grab the highlighted text. We then push it through
+        ``copy_to_clipboard`` (OSC 52 → host terminal → system clipboard).
+
+        Guarded against duplicate emissions: if the selection text
+        hasn't changed since the last copy, we skip. That's the
+        per-tick spam guard for the case where TextSelected fires
+        multiple times during a single drag.
+
+        Deliberately does NOT post a chat message — auto-copy should
+        be invisible. The user knows they highlighted something; the
+        proof is the paste working in the destination app. We do log
+        an INFO line so a post-mortem can verify the fire happened.
+        """
+        try:
+            text = self.screen.get_selected_text()
+        except Exception as exc:
+            self.logger.debug("on_text_selected get_selected_text failed: %s", exc)
+            return
+        if not text or text == self._last_auto_copied:
+            return
+        try:
+            self.copy_to_clipboard(text)
+            self._last_auto_copied = text
+            self.logger.info("auto-copied %d chars from text selection", len(text))
+        except Exception as exc:
+            self.logger.warning("auto-copy_to_clipboard failed: %s", exc)
 
     def action_copy_last_response(self):
         """Copy the most recent agent response to the system clipboard.
