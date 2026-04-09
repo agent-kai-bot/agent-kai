@@ -149,6 +149,12 @@ class TradingTerminal(App):
         # _detect_clipboard_backend for the picking logic and
         # _set_system_clipboard for the actual write path.
         self._clipboard_backend: str | None = None
+        # Inputs that arrived while the agent was busy. Queued
+        # FIFO and drained from every busy-task finally block via
+        # _drain_input_queue, mirroring how a shell stacks up
+        # commands when you keep typing while the previous one
+        # hasn't returned. Empty list = nothing pending.
+        self._input_queue: list[str] = []
 
         # Restore persisted chart state from workspaces/terminal/state.json.
         # Falls back to the BTC + 1m defaults on first run or corrupt file.
@@ -659,23 +665,102 @@ class TradingTerminal(App):
             remember(text)
         event.input.value = ""
 
+        # Busy → queue instead of dropping. The queue is drained
+        # FIFO from every busy-task finally block by
+        # _drain_input_queue, so the user can stack up commands
+        # while the agent is mid-task and they'll execute one after
+        # another in submission order — same UX as typing ahead in
+        # bash while a long-running command is in flight.
         if self._agent_working:
+            self._input_queue.append(text)
             chat = self.query_one("#chat-panel", ChatPanel)
-            chat.append_message("[dim]Agent busy, please wait...[/]")
+            n = len(self._input_queue)
+            preview = text[:60].replace("\n", " ")
+            chat.append_message(
+                f"[dim italic]queued (#{n}): {preview}[/]"
+            )
             return
 
+        await self._dispatch_input(text)
+
+    async def _dispatch_input(self, text: str) -> None:
+        """Run a single user input through the chat → slash → agent path.
+
+        Shared between fresh submissions from ``on_input_submitted``
+        and queue drains from ``_drain_input_queue`` so both code
+        paths produce identical UX (user-msg widget appears, slash
+        commands route, the main agent gets the prompt if nothing
+        claimed it).
+
+        Caller's responsibility: only call this when ``_agent_working``
+        is False. The fresh-submission path checks busy before
+        calling; the drain path enforces the same invariant.
+
+        End-of-turn drain: if the dispatched command was a non-busy
+        slash command (like ``/chart`` or ``/think``) that returned
+        without setting ``_agent_working``, no worker finally block
+        will fire to pull the next queued item. We drain inline at
+        the end to keep back-to-back synchronous commands flushing
+        immediately. Busy-setting commands rely on the worker's
+        finally block to drain when their work completes.
+        """
         chat = self.query_one("#chat-panel", ChatPanel)
         chat.append_message(f"[bold green]> {text}[/]", "user-msg")
 
         # Parse slash commands
         routed = await self._handle_slash_command(text)
         if routed:
+            # Synchronous slash commands (everything that does NOT
+            # set _agent_working before returning) need an explicit
+            # drain here — there's no worker finally to do it for
+            # them. Busy-setting commands (/buy, /sell, /analyze,
+            # /scan, /risk, /learn, the default agent path) all
+            # spawn workers whose finally calls drain.
+            if not self._agent_working:
+                self._drain_input_queue()
             return
 
-        # Default: send to agent
+        # Default: send to main agent
         self._agent_working = True
         self._set_status("thinking...")
         self.run_worker(self._process_agent(text), thread=False)
+
+    def _drain_input_queue(self) -> None:
+        """Pop one queued input and dispatch it on a fresh worker.
+
+        Called from every code path that resets ``_agent_working``
+        to False — the finally blocks of ``_process_agent``,
+        ``_run_agent_task``, and ``_run_learn_command``, plus the
+        synchronous-slash-command tail in ``_dispatch_input``.
+
+        Race-safety: this method is intentionally synchronous (no
+        ``await``) so it cannot be interleaved with another
+        coroutine. Between the caller's ``self._agent_working = False``
+        and this pop+dispatch, no other coroutine can run, which
+        means a user input arriving in the same tick lands in the
+        queue (because we'll have set busy=True via the new worker
+        before the user's submission is processed) instead of
+        racing to grab the slot.
+
+        If for any reason ``_agent_working`` is already True when
+        this is called (e.g. someone else grabbed the slot first),
+        we leave the queue alone and return — the next finally
+        block to fire will pick up where we left off.
+        """
+        if self._agent_working:
+            return
+        if not self._input_queue:
+            return
+        next_text = self._input_queue.pop(0)
+        remaining = len(self._input_queue)
+        chat = self.query_one("#chat-panel", ChatPanel)
+        suffix = f" ({remaining} more queued)" if remaining else ""
+        chat.append_message(
+            f"[dim italic]→ running queued: {next_text[:60]}{suffix}[/]"
+        )
+        # Schedule on a fresh worker so the calling finally block
+        # can complete cleanly without nesting agent loops.
+        self.run_worker(self._dispatch_input(next_text), thread=False)
 
     async def _handle_slash_command(self, text: str) -> bool:
         """Parse and route slash commands. Returns True if handled."""
@@ -1207,6 +1292,7 @@ class TradingTerminal(App):
             self._agent_working = False
             self._set_status("idle")
             await self._refresh_positions()
+            self._drain_input_queue()
 
     def _maybe_nudge_learn(self, agent_name: str) -> None:
         """Emit a one-line hint if the agent's last session is worth reflecting on.
@@ -1314,6 +1400,7 @@ class TradingTerminal(App):
         finally:
             self._agent_working = False
             self._set_status("idle")
+            self._drain_input_queue()
 
     async def _apply_mentor_decision(self, parsed: dict, target_agent: str) -> dict:
         """Persist the mentor's drafted skill into the target agent's library.
@@ -1411,6 +1498,7 @@ class TradingTerminal(App):
             self._agent_working = False
             self._set_status("idle")
             await self._refresh_positions()
+            self._drain_input_queue()
 
     # ── NATS handlers ─────────────────────────────────────────
 
