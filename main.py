@@ -98,24 +98,17 @@ async def main():
 
     try:
         if args.terminal:
-            # Start data API server as subprocess
-            import subprocess as _sp
-            api_proc = _sp.Popen(
-                [sys.executable, "-m", "data_api.server"],
-                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            # Open-source agent talks to the cloud agent-k.ai API for
+            # both LLM and market data. There is no local data_api to
+            # spawn here — the chart panel and the crypto tools all
+            # hit cloud endpoints with the user's AGENT_KAI_API_KEY.
+            from tui.terminal import TradingTerminal
+            terminal = TradingTerminal(
+                agent_runner=agent_runner, bus=bus,
+                signal_consumer=signal_consumer,
             )
-            await asyncio.sleep(2)  # Let API start
-            try:
-                from tui.terminal import TradingTerminal
-                terminal = TradingTerminal(
-                    agent_runner=agent_runner, bus=bus,
-                    signal_consumer=signal_consumer,
-                )
-                terminal._sub_agent_manager = sub_agent_manager
-                await terminal.run_async()
-            finally:
-                api_proc.terminate()
-                api_proc.wait(timeout=5)
+            terminal._sub_agent_manager = sub_agent_manager
+            await terminal.run_async()
         elif args.no_tui:
             if not bus:
                 print("Error: headless mode requires NATS connection.")

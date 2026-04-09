@@ -1,16 +1,33 @@
-"""Crypto-specific tools for KAI agents."""
+"""Crypto-specific tools for KAI agents.
+
+OHLCV / price / indicator data comes from the cloud agent-k.ai
+``/v1/market/ohlcv`` endpoint via ``agent.data_sources.kai_api``.
+The bar fetch helper handles auth (AGENT_KAI_API_KEY auto-loaded
+by config.py at import time) and normalizes the cloud's positional
+bar arrays into the dict shape these tools work with.
+"""
 
 import json
 import requests
 import pandas as pd
 from langchain_core.tools import StructuredTool
 
-from data_api.config import API_PORT
+from agent.data_sources.kai_api import fetch_candles as _kai_fetch_candles
 
-API_BASE = f"http://localhost:{API_PORT}/api/v1"
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
+
+
+def _fetch_bars(symbol: str, interval: str, limit: int) -> list[dict]:
+    """Fetch OHLCV bars from the cloud kai-api endpoint.
+
+    Returns the same dict shape every tool in this module expects:
+    ``[{"ts": iso, "open": ..., "high": ..., ...}, ...]``, oldest
+    first. Raises on auth / network / no-data errors so callers can
+    surface a clear message instead of returning empty silently.
+    """
+    return _kai_fetch_candles(symbol.upper(), interval=interval, limit=limit)
 
 
 def _last_valid_value(series: pd.Series) -> float:
@@ -87,16 +104,9 @@ def _classify_bbands_position(price: float, lower: float, mid: float, upper: flo
 
 def _query_ohlcv(symbol: str, interval: str = "1m", limit: int = 100,
                  start: str = "", end: str = "") -> str:
-    """Query historical OHLCV candle data."""
-    params = {"interval": interval, "limit": limit}
-    if start:
-        params["start"] = start
-    if end:
-        params["end"] = end
+    """Query historical OHLCV candle data via the cloud market endpoint."""
     try:
-        resp = requests.get(f"{API_BASE}/ohlcv/{symbol.upper()}", params=params, timeout=10)
-        resp.raise_for_status()
-        bars = resp.json()
+        bars = _fetch_bars(symbol, interval, limit)
         if not bars:
             return f"No data for {symbol.upper()} ({interval})"
         lines = [f"{symbol.upper()} {interval} — {len(bars)} bars:"]
@@ -125,12 +135,18 @@ query_ohlcv = StructuredTool.from_function(
 # ── Get Latest Price ─────────────────────────────────────────
 
 def _get_latest_price(symbol: str) -> str:
-    """Get the latest price for a crypto symbol."""
+    """Get the latest price for a crypto symbol.
+
+    Cloud doesn't expose a separate /price endpoint, so we derive
+    the latest close from a 1-bar 1m OHLCV fetch. Cheap and matches
+    what the local data_api used to return.
+    """
     try:
-        resp = requests.get(f"{API_BASE}/price/{symbol.upper()}", timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-        return f"{data['symbol']}: ${data['price']:,.2f} (as of {data['ts'][:19]})"
+        bars = _fetch_bars(symbol, "1m", 1)
+        if not bars:
+            return f"Error getting price: no bars for {symbol.upper()}"
+        last = bars[-1]
+        return f"{symbol.upper()}: ${last['close']:,.2f} (as of {last['ts'][:19]})"
     except Exception as e:
         return f"Error getting price: {e}"
 
@@ -143,30 +159,46 @@ get_latest_price = StructuredTool.from_function(
 
 
 # ── List Symbols ─────────────────────────────────────────────
+#
+# The cloud market endpoint doesn't expose a /symbols discovery
+# route — the BingX feed it pulls from carries hundreds of pairs
+# and the gateway doesn't enumerate them. For the agent, the
+# practical move is to surface the most common large-cap symbols
+# as a hint, plus a note that any standard ticker can be tried
+# directly via query_ohlcv. The agent rarely needs an exhaustive
+# list; it usually queries by symbol it already knows.
+
+_COMMON_SYMBOLS = [
+    "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "DOGE",
+    "DOT", "LINK", "MATIC", "TRX", "LTC", "ATOM", "NEAR", "OP",
+    "ARB", "INJ", "TIA", "SUI", "APT", "SEI", "RNDR", "FIL",
+]
+
 
 def _list_symbols() -> str:
-    """List all available crypto symbols with latest prices."""
-    try:
-        resp = requests.get(f"{API_BASE}/symbols", timeout=10)
-        resp.raise_for_status()
-        symbols = resp.json()
-        lines = [f"{len(symbols)} symbols available:"]
-        lines.append(f"{'Symbol':<10} {'Price':>12}")
-        for s in sorted(symbols, key=lambda x: x.get("latest_price") or 0, reverse=True):
-            price = s.get("latest_price")
-            if price is not None:
-                lines.append(f"{s['symbol']:<10} ${price:>11,.2f}")
-            else:
-                lines.append(f"{s['symbol']:<10} {'N/A':>12}")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error listing symbols: {e}"
+    """Return a hint of commonly-available symbols on the cloud feed.
+
+    The cloud doesn't expose a discovery endpoint — agents should
+    just try ``query_ohlcv`` with any standard ticker. Returns a
+    short list of large-caps that are reliably supported.
+    """
+    lines = [
+        f"{len(_COMMON_SYMBOLS)} commonly-available symbols (try any standard ticker):",
+        ", ".join(_COMMON_SYMBOLS),
+        "",
+        "Use query_ohlcv(symbol, interval, limit) to fetch any specific pair.",
+    ]
+    return "\n".join(lines)
 
 
 list_symbols = StructuredTool.from_function(
     func=_list_symbols,
     name="list_symbols",
-    description="List all available crypto symbols with their latest prices.",
+    description=(
+        "Return a hint list of commonly-available crypto symbols on the "
+        "cloud feed. The cloud accepts any standard ticker — agents "
+        "should just try query_ohlcv directly with the symbol they need."
+    ),
 )
 
 
@@ -192,13 +224,7 @@ def _calculate_indicator(
         A formatted technical-indicator summary.
     """
     try:
-        resp = requests.get(
-            f"{API_BASE}/ohlcv/{symbol.upper()}",
-            params={"interval": interval, "limit": limit},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        bars = resp.json()
+        bars = _fetch_bars(symbol, interval, limit)
         if len(bars) < period + 1:
             return f"Not enough data ({len(bars)} bars) for {indicator}({period})"
 
