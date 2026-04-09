@@ -98,7 +98,10 @@
     "nano": {
       "description": "Primary trading assistant — the user's main interface",
       "endpoint": "kai-smart",
-      "fallback_endpoint": null,
+      "fallback_endpoints": [
+        {"endpoint": "kai-local", "model": "qwen35-gptq"},
+        {"endpoint": "codex-cli", "model": "gpt-5.4"}
+      ],
       "max_iterations": 2000
     },
     "ceo": {
@@ -166,16 +169,19 @@
     },
     "trader": {
       "description": "Execution specialist — places trades, manages positions, order lifecycle",
-      "endpoint": "kai-local",
-      "fallback_endpoint": null,
+      "endpoint": "kai-smart",
+      "fallback_endpoints": [
+        {"endpoint": "kai-local", "model": "qwen35-gptq"},
+        {"endpoint": "codex-cli", "model": "gpt-5.4"}
+      ],
       "workspace": "trader",
       "max_iterations": 200
     },
     "analyst": {
       "description": "Technical analysis — indicators, patterns, chart reading, trading signals",
-      "endpoint": "kai-local",
-      "model": "qwen35-gptq",
+      "endpoint": "kai-smart",
       "fallback_endpoints": [
+        {"endpoint": "kai-local", "model": "qwen35-gptq"},
         {"endpoint": "codex-cli", "model": "gpt-5.4"}
       ],
       "workspace": "analyst",
@@ -183,8 +189,11 @@
     },
     "risk-manager": {
       "description": "Capital guardian — position sizing, stop losses, exposure limits, drawdown monitoring",
-      "endpoint": "kai-local",
-      "fallback_endpoint": null,
+      "endpoint": "kai-smart",
+      "fallback_endpoints": [
+        {"endpoint": "kai-local", "model": "qwen35-gptq"},
+        {"endpoint": "codex-cli", "model": "gpt-5.4"}
+      ],
       "workspace": "risk-manager",
       "max_iterations": 200
     },
@@ -204,9 +213,9 @@
     },
     "mentor": {
       "description": "Reflection coach — reads other agents' sessions and authors reusable skills for them",
-      "endpoint": "codex-cli",
-      "model": "gpt-5.4",
+      "endpoint": "kai-smart",
       "fallback_endpoints": [
+        {"endpoint": "codex-cli", "model": "gpt-5.4"},
         {"endpoint": "kai-local", "model": "qwen35-gptq"}
       ],
       "workspace": "mentor",
