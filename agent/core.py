@@ -294,7 +294,7 @@ class AgentRunner:
         self.bus = bus
         self.tools = list(tools)  # copy so we can append the memory tool
         self.chat_history = []
-        self.agent_name = agent_name or "nano"
+        self.agent_name = agent_name or "kai"
         self.log = get_logger(self.agent_name)
 
         cfg = get_agent_config(agent_name) if agent_name else {}
@@ -303,7 +303,10 @@ class AgentRunner:
         fallback_chain = cfg.get("fallback_endpoints") or []
         # Backwards-compat alias preserved for any external readers
         self.fallback_endpoint = cfg.get("fallback_endpoint")
-        max_iterations = cfg.get("max_iterations", 200)
+        # Persisted so reload_llm() can rebuild the executors
+        # without rerunning all of __init__
+        self._max_iterations = cfg.get("max_iterations", 200)
+        max_iterations = self._max_iterations
         system_prompt = cfg.get("system_prompt")
 
         self.llm = create_llm(ep)
@@ -333,9 +336,14 @@ class AgentRunner:
         # stay visually distinct.
         identity_block = "\n\n".join(b for b in (memory_block, skill_catalog) if b)
 
-        prompt = create_prompt(
+        # Persist the assembled prompt so reload_llm() can reuse it
+        # without re-loading memory + skills (which is expensive
+        # and would also reset the frozen system-prompt snapshot
+        # the LLM has been working with mid-session).
+        self._prompt = create_prompt(
             build_main_system_prompt(system_prompt, memory_block=identity_block)
         )
+        prompt = self._prompt
         agent = create_tool_calling_agent(self.llm, self.tools, prompt)
         self.executor = AgentExecutor(
             agent=agent,
@@ -376,6 +384,82 @@ class AgentRunner:
             "fallback_chain": [(f.get("base_url"), f.get("model")) for f in fallback_chain],
             "tools": [t.name for t in self.tools],
         })
+
+    def reload_llm(self) -> dict:
+        """Re-read this agent's config and rebuild the LLM + executor in place.
+
+        Used by the TUI's ``/model`` slash command to swap the main
+        agent's endpoint at runtime without losing chat history,
+        memory, skills, or any tool wiring. Reads the (presumably
+        already-mutated) ``AGENTS`` dict via ``get_agent_config``,
+        builds a fresh primary executor and fallback chain on top of
+        the existing tools + prompt, then swaps the instance
+        attributes atomically.
+
+        Notes:
+        - Tools are NOT rebuilt — the existing list (with memory +
+          skills tools already appended) is reused.
+        - The system prompt is NOT rebuilt — ``self._prompt`` is the
+          frozen snapshot from __init__ time, which preserves the
+          memory/skills identity block the LLM has been operating
+          against. If the user wants the prompt regenerated they
+          should restart the TUI.
+        - Chat history is preserved (it's owned by the runner, not
+          the executor).
+
+        Returns a dict summarizing what got loaded — useful for
+        chat-message feedback after the swap.
+        """
+        cfg = get_agent_config(self.agent_name) or {}
+        ep = cfg.get("endpoint")
+        fallback_chain = cfg.get("fallback_endpoints") or []
+        max_iterations = cfg.get("max_iterations", self._max_iterations)
+        self._max_iterations = max_iterations
+
+        # Primary
+        self.llm = create_llm(ep)
+        primary_agent = create_tool_calling_agent(self.llm, self.tools, self._prompt)
+        self.executor = AgentExecutor(
+            agent=primary_agent,
+            tools=self.tools,
+            verbose=False,
+            max_iterations=max_iterations,
+            handle_parsing_errors=True,
+        )
+
+        # Fallback chain
+        self.fallback_executors = []
+        for fb_cfg in fallback_chain:
+            try:
+                fb_llm = create_llm(fb_cfg)
+                fb_agent = create_tool_calling_agent(fb_llm, self.tools, self._prompt)
+                self.fallback_executors.append(AgentExecutor(
+                    agent=fb_agent,
+                    tools=self.tools,
+                    verbose=False,
+                    max_iterations=max_iterations,
+                    handle_parsing_errors=True,
+                ))
+            except Exception as exc:
+                self.log.warning(
+                    "reload_llm fallback build failed for %s endpoint=%s: %s",
+                    self.agent_name, fb_cfg.get("base_url"), exc,
+                )
+        self.fallback_executor = self.fallback_executors[0] if self.fallback_executors else None
+        self.fallback_endpoint = cfg.get("fallback_endpoint")
+
+        log_agent_event(self.agent_name, "reload_llm", {
+            "endpoint": ep.get("base_url") if ep else None,
+            "model": ep.get("model") if ep else None,
+            "fallback_chain": [(f.get("base_url"), f.get("model")) for f in fallback_chain],
+        })
+
+        return {
+            "endpoint": ep.get("base_url") if ep else None,
+            "model": ep.get("model") if ep else None,
+            "provider": ep.get("provider") if ep else None,
+            "fallback_count": len(self.fallback_executors),
+        }
 
     async def run(self, user_input: str) -> AsyncIterator[dict]:
         """Stream agent events. Falls back to secondary endpoint on error."""

@@ -191,7 +191,7 @@ class TradingTerminal(App):
             # List available agents
             from config import AGENTS
             for name, cfg in AGENTS.items():
-                if name == "nano":
+                if name == "kai":
                     continue
                 desc = cfg.get("description", "")[:35]
                 self._nats_log(f"  [dim]{name}[/] [dim italic]{desc}[/]")
@@ -917,10 +917,31 @@ class TradingTerminal(App):
             )
             return True
 
-        # Mutate the config + respawn the sub-agent if it's running
+        # Mutate the in-memory config first so any subsequent
+        # rebuild reads the new endpoint/model.
         AGENTS[agent_name]["endpoint"] = ep_name
         AGENTS[agent_name]["model"] = model_name
         self._chat_msg(f"[dim]{agent_name} → {spec}[/]")
+
+        # Two rebuild paths depending on whether the target is the
+        # main agent or a sub-agent. Both end up with the new LLM
+        # active without losing chat history.
+        if agent_name == self.agent_runner.agent_name:
+            # Main agent (kai) — call AgentRunner.reload_llm() which
+            # rebuilds the primary executor + fallback chain in
+            # place. Tools, memory, skills, prompt, and chat_history
+            # are all preserved.
+            try:
+                summary = self.agent_runner.reload_llm()
+            except Exception as exc:
+                self._chat_msg(f"[red]reload_llm failed: {exc}[/]")
+                self.logger.warning("reload_llm failed for %s: %s", agent_name, exc)
+                return True
+            self._chat_msg(
+                f"[bold green]{agent_name} now on {summary['provider']}/{summary['model']}[/] "
+                f"[dim](+{summary['fallback_count']} fallback{'s' if summary['fallback_count'] != 1 else ''})[/]"
+            )
+            return True
 
         mgr = getattr(self, "_sub_agent_manager", None)
         if mgr and agent_name in mgr.agents:
@@ -928,6 +949,12 @@ class TradingTerminal(App):
             await mgr.stop(agent_name)
             await mgr.spawn(agent_name)
             self._chat_msg(f"[bold green]{agent_name} restarted on {spec}[/]")
+        else:
+            # Sub-agent isn't running yet — the mutation will take
+            # effect next time it spawns.
+            self._chat_msg(
+                f"[dim]{agent_name} not running — new model will take effect on next spawn[/]"
+            )
         return True
 
     async def _run_agent_task(self, agent_name: str, task: str):
