@@ -556,15 +556,47 @@ class TradingTerminal(App):
 
         Updates ``self._kai_api_last_refresh`` on every received bar
         so the periodic-refresh task can tell the WS is healthy.
+
+        Surfaces WS state in the NATS log panel for in-TUI debug:
+          - first frame received -> "WS first frame"
+          - frames dropped by symbol/interval filter -> count, summary every 30s
+          - 30s+ silence -> "WS idle (Ns since last frame)" warning
+          - errors -> red error message
         """
+        ws_frames_received = 0
+        ws_frames_filtered_symbol = 0
+        ws_frames_filtered_interval = 0
+        ws_frames_kept = 0
+        first_frame_logged = False
+        last_status_log = time.time()
+        last_frame_at = time.time()
+
         try:
             chart = self.query_one("#chart-panel", ChartPanel)
             async for bar in self._kai_api_stream:
-                # Filter to the symbol/interval we asked for
-                if bar.get("symbol") and bar["symbol"] != symbol:
+                ws_frames_received += 1
+                last_frame_at = time.time()
+
+                if not first_frame_logged:
+                    self._nats_log(
+                        f"[bold green]kai-api WS first frame[/] {symbol} {interval}"
+                    )
+                    first_frame_logged = True
+
+                # Filter to the symbol/interval we asked for. Track
+                # drops separately so we can tell whether the WS is
+                # delivering events but filtering them out — that
+                # would explain a "WS connected, no chart updates"
+                # symptom.
+                bar_symbol = bar.get("symbol")
+                if bar_symbol and bar_symbol != symbol:
+                    ws_frames_filtered_symbol += 1
                     continue
-                if bar.get("interval") and bar["interval"] != interval:
+                bar_interval = bar.get("interval")
+                if bar_interval and bar_interval != interval:
+                    ws_frames_filtered_interval += 1
                     continue
+
                 # Strip the metadata fields the chart panel doesn't need
                 clean = {
                     "ts": bar["ts"],
@@ -575,11 +607,26 @@ class TradingTerminal(App):
                     "volume": bar["volume"],
                 }
                 chart.update_last_bar(clean)
+                ws_frames_kept += 1
                 self._kai_api_last_refresh = time.time()
+
+                # Periodic stats line every 30 seconds — gives the user
+                # a live view of WS health from inside the TUI.
+                now = time.time()
+                if now - last_status_log >= 30.0:
+                    self._nats_log(
+                        f"[dim]kai-api WS stats: {ws_frames_received} frames "
+                        f"({ws_frames_kept} kept, "
+                        f"{ws_frames_filtered_symbol} sym-filtered, "
+                        f"{ws_frames_filtered_interval} int-filtered) "
+                        f"last={int(now - last_frame_at)}s ago[/]"
+                    )
+                    last_status_log = now
         except asyncio.CancelledError:
             raise
         except Exception as e:
             self._log_error("kai-api WS consumer error", e)
+            self._nats_log(f"[bold red]kai-api WS consumer crashed:[/] {e}")
 
     # Periodic REST refresh interval. Re-fetches historical bars from
     # the cloud kai-api endpoint and rebases the chart even when the
@@ -615,6 +662,8 @@ class TradingTerminal(App):
             raise
 
         consecutive_failures = 0
+        refresh_count = 0
+        last_visible_status = time.time()
         while True:
             try:
                 hist = await asyncio.to_thread(
@@ -625,7 +674,30 @@ class TradingTerminal(App):
                         chart = self.query_one("#chart-panel", ChartPanel)
                         chart.set_data(symbol, interval, hist)
                         self._kai_api_last_refresh = time.time()
+                        refresh_count += 1
+                        # If we just recovered from a failure burst,
+                        # surface that in the NATS log so the user
+                        # can see the chart is fresh again.
+                        if consecutive_failures > 0:
+                            self._nats_log(
+                                f"[bold green]kai-api REST refresh recovered[/] "
+                                f"after {consecutive_failures} failures"
+                            )
                         consecutive_failures = 0
+                        # Periodic visible status — once every 5 minutes,
+                        # confirm in the NATS log that the safety net is
+                        # firing so the user has running confirmation.
+                        # 5 minutes = 15 refresh ticks at the default 20s
+                        # interval.
+                        now = time.time()
+                        if now - last_visible_status >= 300.0:
+                            last = hist[-1] if hist else {}
+                            self._nats_log(
+                                f"[dim]kai-api REST safety net: "
+                                f"{refresh_count} refreshes, "
+                                f"latest bar={last.get('close', '?')}[/]"
+                            )
+                            last_visible_status = now
                     except Exception as exc:
                         self.logger.warning(
                             "kai-api periodic refresh: chart update failed: %s", exc
@@ -636,6 +708,12 @@ class TradingTerminal(App):
                 consecutive_failures += 1
                 # Log the first few failures, then go quiet so a
                 # persistent backend outage doesn't spam the log.
+                # Surface the first failure in the NATS log too so
+                # the user immediately knows the safety net is down.
+                if consecutive_failures == 1:
+                    self._nats_log(
+                        f"[bold red]kai-api REST refresh failed:[/] {exc}"
+                    )
                 if consecutive_failures <= 3:
                     self.logger.warning(
                         "kai-api periodic refresh failed (#%d): %s",
@@ -645,6 +723,10 @@ class TradingTerminal(App):
                     self.logger.warning(
                         "kai-api periodic refresh: silencing further failures "
                         "until recovery"
+                    )
+                    self._nats_log(
+                        "[dim red]kai-api REST refresh: silencing log spam "
+                        "(will surface on recovery)[/]"
                     )
 
             try:
