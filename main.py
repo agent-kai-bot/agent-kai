@@ -84,9 +84,16 @@ async def main():
         print("Running without NATS.\n")
         bus = None
 
+    # Create the signal consumer — buffers live signals from the
+    # vpn-stack signal scanners arriving on NATS subjects like
+    # ``signals.clucmay02.BTC``. Shared between the TUI (display)
+    # and all agent tools (``get_signals`` tool queries it).
+    from agent.signal_consumer import SignalConsumer
+    signal_consumer = SignalConsumer()
+
     # Create sub-agent manager and tools
     sub_agent_manager = SubAgentManager(bus) if bus else None
-    tools = create_tools(bus, sub_agent_manager)
+    tools = create_tools(bus, sub_agent_manager, signal_consumer=signal_consumer)
     agent_runner = AgentRunner(tools=tools, bus=bus, agent_name=args.name)
 
     try:
@@ -100,7 +107,10 @@ async def main():
             await asyncio.sleep(2)  # Let API start
             try:
                 from tui.terminal import TradingTerminal
-                terminal = TradingTerminal(agent_runner=agent_runner, bus=bus)
+                terminal = TradingTerminal(
+                    agent_runner=agent_runner, bus=bus,
+                    signal_consumer=signal_consumer,
+                )
                 terminal._sub_agent_manager = sub_agent_manager
                 await terminal.run_async()
             finally:

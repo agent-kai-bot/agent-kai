@@ -12,6 +12,7 @@ from agent.core import (
     render_memory_block,
     render_skill_catalog,
 )
+from agent.learning import SessionRecord, ToolCallRecorder
 from agent.memory_tool import create_memory_tool
 from agent.prompts import build_sub_agent_system_prompt
 from agent.runtime_utils import EMPTY_RESPONSE_ERROR, ensure_non_empty_response
@@ -114,6 +115,13 @@ class SubAgent:
         self._running = False
         self.log = get_logger(name)
 
+        # Reflection state — populated at the end of every task.
+        # The TUI's /learn command reads this via `get_last_session()`
+        # to build the reflection bundle for the mentor sub-agent.
+        # None means no task has run yet in this session.
+        self.last_session: SessionRecord | None = None
+        self._active_recorder: ToolCallRecorder | None = None
+
         log_agent_event(name, "sub_agent_init", {
             "endpoint": endpoint_cfg.get("base_url") if endpoint_cfg else None,
             "workspace": self.workspace,
@@ -154,7 +162,20 @@ class SubAgent:
             "state": "thinking", "task": task[:100],
         })
 
+        # Fresh recorder per task — the learning module reads this
+        # after the run completes to build the reflection bundle.
+        self._active_recorder = ToolCallRecorder()
+        import time
+        session = SessionRecord(agent=self.name, task=task, response="", started_at=time.time())
+
         output = await self._invoke_with_fallback(task, publish_status=True)
+
+        # Capture everything we learned this turn.
+        session.response = output
+        session.tool_calls = list(self._active_recorder.calls)
+        session.finished_at = time.time()
+        self.last_session = session
+        self._active_recorder = None
 
         log_llm_response(self.name, output)
         self.log.info("RESPONSE agent=%s length=%d", self.name, len(output))
@@ -166,12 +187,22 @@ class SubAgent:
         return {"response": output, "from": self.name}
 
     async def _invoke(self, executor, task):
-        """Run an executor and return the output string."""
+        """Run an executor and return the output string.
+
+        Attaches the currently-active ToolCallRecorder (if any) via the
+        LangChain ``config.callbacks`` channel so the recorder sees
+        every ``on_tool_start``/``on_tool_end`` during this run. The
+        recorder is created in ``_handle_request``/``run_once`` and
+        read after the run to populate ``self.last_session``.
+        """
         try:
-            result = await executor.ainvoke({
-                "input": task,
-                "chat_history": self.chat_history,
-            })
+            config: dict = {}
+            if self._active_recorder is not None:
+                config["callbacks"] = [self._active_recorder]
+            result = await executor.ainvoke(
+                {"input": task, "chat_history": self.chat_history},
+                config=config or None,
+            )
             output = ensure_non_empty_response(result.get("output", ""))
             if output.startswith("Error:"):
                 self.log.warning("EMPTY_RESPONSE agent=%s executor=%s", self.name, type(executor).__name__)
@@ -209,8 +240,37 @@ class SubAgent:
         return output
 
     async def run_once(self, task: str) -> str:
-        """Run a single task directly (without NATS)."""
-        return await self._invoke_with_fallback(task)
+        """Run a single task directly (without NATS).
+
+        Captures tool calls into ``self.last_session`` same as the
+        NATS path so the ``/learn`` flow works for direct dispatch too.
+        """
+        import time
+
+        self._active_recorder = ToolCallRecorder()
+        session = SessionRecord(agent=self.name, task=task, response="", started_at=time.time())
+        try:
+            output = await self._invoke_with_fallback(task)
+        finally:
+            session.response = output if 'output' in locals() else ""
+            session.tool_calls = list(self._active_recorder.calls) if self._active_recorder else []
+            session.finished_at = time.time()
+            self.last_session = session
+            self._active_recorder = None
+        return output
+
+    def get_last_session(self) -> SessionRecord | None:
+        """Return the most recent session record, or None if no task has run."""
+        return self.last_session
+
+    def list_existing_skills(self) -> list[dict[str, str]]:
+        """Return this agent's current skill catalog for reflection bundles."""
+        if self.skill_store is None:
+            return []
+        try:
+            return self.skill_store.list_skills()
+        except Exception:  # noqa: BLE001
+            return []
 
 
 class SubAgentManager:

@@ -1,0 +1,62 @@
+{
+  "cash": 49185.0,
+  "starting_balance": 100000.0,
+  "positions": {
+    "BTC": {
+      "symbol": "BTC",
+      "side": "long",
+      "quantity": 0.5,
+      "entry_price": 74000.0,
+      "current_price": 70800.0,
+      "stop_loss": 70000.0,
+      "take_profit": null,
+      "opened_at": "2026-04-08T08:00:00+00:00",
+      "unrealized_pnl": -1600.0,
+      "pnl_pct": -4.32
+    },
+    "ETH": {
+      "symbol": "ETH",
+      "side": "long",
+      "quantity": 4.0,
+      "entry_price": 2820.0,
+      "current_price": 2450.0,
+      "stop_loss": 2400.0,
+      "take_profit": null,
+      "opened_at": "2026-04-08T09:30:00+00:00",
+      "unrealized_pnl": -1480.0,
+      "pnl_pct": -13.12
+    },
+    "SOL": {
+      "symbol": "SOL",
+      "side": "long",
+      "quantity": 15.0,
+      "entry_price": 165.0,
+      "current_price": 145.0,
+      "stop_loss": 140.0,
+      "take_profit": null,
+      "opened_at": "2026-04-08T10:15:00+00:00",
+      "unrealized_pnl": -300.0,
+      "pnl_pct": -8.08
+    }
+  },
+  "closed_trades": [
+    {
+      "symbol": "LINK",
+      "side": "long",
+      "quantity": 50.0,
+      "entry_price": 14.5,
+      "exit_price": 13.9,
+      "pnl": -30.0,
+      "closed_at": "2026-04-08T12:00:00+00:00"
+    },
+    {
+      "symbol": "AVAX",
+      "side": "long",
+      "quantity": 20.0,
+      "entry_price": 38.0,
+      "exit_price": 36.5,
+      "pnl": -30.0,
+      "closed_at": "2026-04-08T13:30:00+00:00"
+    }
+  ]
+}

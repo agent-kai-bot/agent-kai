@@ -683,21 +683,36 @@ def create_list_agents_tool(sub_agent_manager):
 
 # ── Tool Registry ────────────────────────────────────────────
 
-def _get_crypto_tools():
-    """Import and return crypto tools (lazy to avoid import errors if data_api not running)."""
+def _get_crypto_tools(signal_consumer=None):
+    """Import and return crypto tools (lazy to avoid import errors if data_api not running).
+
+    Args:
+        signal_consumer: Optional ``SignalConsumer`` instance. When
+            provided, the ``get_signals`` tool is appended so agents
+            can query the live signal feed.
+    """
     try:
-        from agent.crypto_tools import ALL_CRYPTO_TOOLS
-        return list(ALL_CRYPTO_TOOLS)
+        from agent.crypto_tools import ALL_CRYPTO_TOOLS, create_get_signals_tool
+        tools = list(ALL_CRYPTO_TOOLS)
+        if signal_consumer is not None:
+            tools.append(create_get_signals_tool(signal_consumer))
+        # Backtest tool — lets agents validate TA strategies over historical data
+        try:
+            from agent.backtest_tool import run_backtest
+            tools.append(run_backtest)
+        except Exception:
+            pass
+        return tools
     except Exception:
         return []
 
 
-def create_tools(bus=None, sub_agent_manager=None):
+def create_tools(bus=None, sub_agent_manager=None, signal_consumer=None):
     """Create and return all agent tools."""
     tools = [file_read, file_write, file_edit, shell_exec, python_exec, web_fetch, codex_exec, claude_exec]
     # Main agent ("nano") has no workspace, so the sandbox is fully isolated.
     tools.append(create_docker_sandbox_tool(workspace_host_path=None))
-    tools.extend(_get_crypto_tools())
+    tools.extend(_get_crypto_tools(signal_consumer=signal_consumer))
     if bus:
         tools.append(create_nats_publish_tool(bus))
         tools.append(create_nats_request_tool(bus))
@@ -707,7 +722,7 @@ def create_tools(bus=None, sub_agent_manager=None):
     return tools
 
 
-def create_sub_agent_tools(bus, workspace_host_path: str | None = None):
+def create_sub_agent_tools(bus, workspace_host_path: str | None = None, signal_consumer=None):
     """Create the limited toolset for sub-agents (no spawning).
 
     Args:
@@ -716,10 +731,11 @@ def create_sub_agent_tools(bus, workspace_host_path: str | None = None):
             workspace directory. When provided, the docker_sandbox tool
             bind-mounts it as ``/work`` so the agent can write files via
             ``file_write`` and run them sandboxed in the same step.
+        signal_consumer: Optional ``SignalConsumer`` for the get_signals tool.
     """
     tools = [file_read, file_write, file_edit, shell_exec, python_exec, web_fetch, codex_exec, claude_exec]
     tools.append(create_docker_sandbox_tool(workspace_host_path=workspace_host_path))
-    tools.extend(_get_crypto_tools())
+    tools.extend(_get_crypto_tools(signal_consumer=signal_consumer))
     if bus:
         tools.append(create_nats_publish_tool(bus))
     return tools

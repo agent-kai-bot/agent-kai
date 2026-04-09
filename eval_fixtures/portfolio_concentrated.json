@@ -1,0 +1,43 @@
+{
+  "cash": 0.0,
+  "starting_balance": 100000.0,
+  "positions": {
+    "BTC": {
+      "symbol": "BTC",
+      "side": "long",
+      "quantity": 0.9181,
+      "entry_price": 70800.0,
+      "current_price": 70800.0,
+      "stop_loss": null,
+      "take_profit": null,
+      "opened_at": "2026-04-01T10:00:00+00:00",
+      "unrealized_pnl": 0.0,
+      "pnl_pct": 0.0
+    },
+    "ETH": {
+      "symbol": "ETH",
+      "side": "long",
+      "quantity": 10.2041,
+      "entry_price": 2450.0,
+      "current_price": 2450.0,
+      "stop_loss": null,
+      "take_profit": null,
+      "opened_at": "2026-04-01T10:00:00+00:00",
+      "unrealized_pnl": 0.0,
+      "pnl_pct": 0.0
+    },
+    "SOL": {
+      "symbol": "SOL",
+      "side": "long",
+      "quantity": 68.9655,
+      "entry_price": 145.0,
+      "current_price": 145.0,
+      "stop_loss": null,
+      "take_profit": null,
+      "opened_at": "2026-04-01T10:00:00+00:00",
+      "unrealized_pnl": 0.0,
+      "pnl_pct": 0.0
+    }
+  },
+  "closed_trades": []
+}

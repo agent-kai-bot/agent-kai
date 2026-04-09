@@ -23,6 +23,14 @@
       "max_tokens": 4096,
       "temperature": 0.6,
       "top_p": 0.95
+    },
+    "kai-local": {
+      "base_url": "http://192.168.222.45:8000/v1",
+      "model": "qwen35-gptq",
+      "api_key": "not-needed",
+      "max_tokens": 4096,
+      "temperature": 0.6,
+      "top_p": 0.95
     }
   },
 
@@ -98,21 +106,21 @@
     },
     "trader": {
       "description": "Execution specialist — places trades, manages positions, order lifecycle",
-      "endpoint": "kai-smart",
+      "endpoint": "kai-local",
       "fallback_endpoint": null,
       "workspace": "trader",
       "max_iterations": 200
     },
     "analyst": {
       "description": "Technical analysis — indicators, patterns, chart reading, trading signals",
-      "endpoint": "kai-smart",
+      "endpoint": "kai-local",
       "fallback_endpoint": null,
       "workspace": "analyst",
       "max_iterations": 200
     },
     "risk-manager": {
       "description": "Capital guardian — position sizing, stop losses, exposure limits, drawdown monitoring",
-      "endpoint": "kai-smart",
+      "endpoint": "kai-local",
       "fallback_endpoint": null,
       "workspace": "risk-manager",
       "max_iterations": 200
@@ -129,6 +137,13 @@
       "endpoint": "kai-smart",
       "fallback_endpoint": null,
       "workspace": "onchain",
+      "max_iterations": 200
+    },
+    "mentor": {
+      "description": "Reflection coach — reads other agents' sessions and authors reusable skills for them",
+      "endpoint": "kai-local",
+      "fallback_endpoint": null,
+      "workspace": "mentor",
       "max_iterations": 200
     }
   },

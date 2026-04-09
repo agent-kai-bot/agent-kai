@@ -1,0 +1,19 @@
+{
+  "cash": 32000.0,
+  "starting_balance": 100000.0,
+  "positions": {
+    "BTC": {
+      "symbol": "BTC",
+      "side": "long",
+      "quantity": 1.0,
+      "entry_price": 68000.0,
+      "current_price": 71500.0,
+      "stop_loss": 66000.0,
+      "take_profit": null,
+      "opened_at": "2026-04-05T14:30:00+00:00",
+      "unrealized_pnl": 3500.0,
+      "pnl_pct": 5.15
+    }
+  },
+  "closed_trades": []
+}

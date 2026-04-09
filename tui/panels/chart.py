@@ -1,8 +1,104 @@
-"""ASCII candlestick chart panel."""
+"""ASCII candlestick chart panel with pluggable color schemes."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from textual.widget import Widget
 from textual.app import RenderResult
 from rich.text import Text
+
+
+# ── Color schemes ───────────────────────────────────────────
+#
+# Each scheme defines Rich style strings for every visual element of
+# the chart. Adding a new scheme = adding a new instance to SCHEMES.
+
+
+@dataclass(frozen=True)
+class ChartColorScheme:
+    """Color mapping for the candlestick chart."""
+
+    name: str
+    # Candle body
+    bar_up: str     # bullish body
+    bar_down: str   # bearish body
+    # Wick
+    wick: str
+    # Doji / neutral bar
+    doji: str
+    # Header text
+    header_up: str
+    header_down: str
+    header_symbol: str
+    header_dim: str
+    # Price axis + frame
+    axis: str
+
+
+SCHEMES: dict[str, ChartColorScheme] = {
+    "default": ChartColorScheme(
+        name="default",
+        bar_up="green",
+        bar_down="red",
+        wick="dim",
+        doji="dim yellow",
+        header_up="bold green",
+        header_down="bold red",
+        header_symbol="bold",
+        header_dim="dim",
+        axis="dim",
+    ),
+    "classic": ChartColorScheme(
+        name="classic",
+        bar_up="bold bright_green",
+        bar_down="bold bright_red",
+        wick="grey70",
+        doji="yellow",
+        header_up="bold bright_green",
+        header_down="bold bright_red",
+        header_symbol="bold white",
+        header_dim="grey62",
+        axis="grey50",
+    ),
+    "mono": ChartColorScheme(
+        name="mono",
+        bar_up="bold white",
+        bar_down="dim white",
+        wick="grey50",
+        doji="grey62",
+        header_up="bold white",
+        header_down="dim white",
+        header_symbol="bold",
+        header_dim="dim",
+        axis="grey42",
+    ),
+    "ocean": ChartColorScheme(
+        name="ocean",
+        bar_up="bold cyan",
+        bar_down="bold magenta",
+        wick="blue",
+        doji="bright_blue",
+        header_up="bold cyan",
+        header_down="bold magenta",
+        header_symbol="bold bright_cyan",
+        header_dim="dark_cyan",
+        axis="dark_blue",
+    ),
+    "ember": ChartColorScheme(
+        name="ember",
+        bar_up="bold bright_yellow",
+        bar_down="bold bright_red",
+        wick="dark_orange",
+        doji="yellow",
+        header_up="bold bright_yellow",
+        header_down="bold bright_red",
+        header_symbol="bold bright_yellow",
+        header_dim="dark_orange",
+        axis="rgb(80,40,0)",
+    ),
+}
+
+DEFAULT_SCHEME = "default"
 
 
 class ChartPanel(Widget):
@@ -20,6 +116,38 @@ class ChartPanel(Widget):
         self.symbol = "BTC"
         self.interval = "1m"
         self.bars: list[dict] = []
+        self._scheme: ChartColorScheme = SCHEMES[DEFAULT_SCHEME]
+        self._visible = True
+
+    # ── Color scheme management ─────────────────────────────
+
+    @property
+    def color_scheme(self) -> str:
+        return self._scheme.name
+
+    def set_color_scheme(self, name: str) -> bool:
+        """Switch to a named color scheme. Returns True if found."""
+        scheme = SCHEMES.get(name.lower())
+        if scheme is None:
+            return False
+        self._scheme = scheme
+        self.refresh()
+        return True
+
+    @staticmethod
+    def available_schemes() -> list[str]:
+        return list(SCHEMES.keys())
+
+    # ── Visibility toggle ───────────────────────────────────
+
+    def toggle_visible(self, visible: bool | None = None) -> bool:
+        """Toggle or explicitly set chart visibility. Returns new state."""
+        if visible is None:
+            self._visible = not self._visible
+        else:
+            self._visible = visible
+        self.display = self._visible
+        return self._visible
 
     def set_data(self, symbol: str, interval: str, bars: list[dict]):
         """Set chart data and refresh."""
@@ -45,18 +173,22 @@ class ChartPanel(Widget):
         self.refresh()
 
     def render(self) -> RenderResult:
-        if not self.bars:
-            return Text(f"  {self.symbol}/{self.interval} — No data", style="dim")
+        if not self._visible:
+            return Text("  Chart hidden — /chart on to restore", style="dim")
 
+        if not self.bars:
+            return Text(f"  {self.symbol}/{self.interval} — No data", style=self._scheme.header_dim)
+
+        s = self._scheme  # shorthand
         width = self.size.width - 2
         height = self.size.height - 3  # Reserve for header + price axis
         if width < 10 or height < 5:
-            return Text("Panel too small", style="dim")
+            return Text("Panel too small", style=s.header_dim)
 
         # Use as many bars as fit
         visible_bars = self.bars[-width:]
         if not visible_bars:
-            return Text("No bars", style="dim")
+            return Text("No bars", style=s.header_dim)
 
         # Calculate price range
         all_highs = [b["high"] for b in visible_bars]
@@ -70,16 +202,18 @@ class ChartPanel(Widget):
         last = visible_bars[-1]
         change = last["close"] - visible_bars[0]["open"]
         change_pct = (change / visible_bars[0]["open"]) * 100 if visible_bars[0]["open"] else 0
-        arrow = "▲" if change >= 0 else "▼"
-        color = "green" if change >= 0 else "red"
+        is_up = change >= 0
+        arrow = "▲" if is_up else "▼"
+        hdr_color = s.header_up if is_up else s.header_down
 
         # Header
         text = Text()
-        text.append(f"  {self.symbol} ", style="bold")
-        text.append(f"{self.interval} ", style="dim")
-        text.append(f"{arrow} ${last['close']:,.2f} ", style=f"bold {color}")
-        text.append(f"({change_pct:+.2f}%) ", style=color)
-        text.append(f"H:{price_max:,.2f} L:{price_min:,.2f}", style="dim")
+        text.append(f"  {self.symbol} ", style=s.header_symbol)
+        text.append(f"{self.interval} ", style=s.header_dim)
+        text.append(f"{arrow} ${last['close']:,.2f} ", style=hdr_color)
+        text.append(f"({change_pct:+.2f}%) ", style=hdr_color)
+        text.append(f"H:{price_max:,.2f} L:{price_min:,.2f} ", style=s.header_dim)
+        text.append(f"[{s.name}]", style=s.header_dim)
         text.append("\n")
 
         # Build chart grid
@@ -91,7 +225,6 @@ class ChartPanel(Widget):
 
         for col, bar in enumerate(visible_bars):
             o, h, l, c = bar["open"], bar["high"], bar["low"], bar["close"]
-            is_green = c >= o
 
             wick_top = price_to_row(h)
             wick_bot = price_to_row(l)
@@ -106,30 +239,32 @@ class ChartPanel(Widget):
             if body_top == body_bot:
                 grid[body_top][col] = "─"
             else:
+                bar_up = c >= o
                 for row in range(body_top, body_bot + 1):
-                    grid[row][col] = "█" if is_green else "▓"
+                    grid[row][col] = "█" if bar_up else "▓"
 
-        # Render grid with colors
+        # Render grid with scheme colors
         for row_idx, row in enumerate(grid):
-            # Price label on left
             price_at_row = price_max - (row_idx / max(height - 1, 1)) * price_range
             if row_idx == 0 or row_idx == height - 1 or row_idx == height // 2:
-                text.append(f"{price_at_row:>9,.1f}│", style="dim")
+                text.append(f"{price_at_row:>9,.1f}│", style=s.axis)
             else:
-                text.append(f"{'':>9}│", style="dim")
+                text.append(f"{'':>9}│", style=s.axis)
 
             for col_idx, char in enumerate(row):
                 bar = visible_bars[col_idx] if col_idx < len(visible_bars) else None
-                if bar and char in ("█", "▓", "─"):
-                    style = "green" if bar["close"] >= bar["open"] else "red"
+                if bar and char in ("█", "▓"):
+                    style = s.bar_up if bar["close"] >= bar["open"] else s.bar_down
+                elif bar and char == "─":
+                    style = s.doji
                 elif char == "│":
-                    style = "dim"
+                    style = s.wick
                 else:
                     style = ""
                 text.append(char, style=style)
             text.append("\n")
 
         # Time axis
-        text.append(f"{'':>9}└{'─' * len(visible_bars)}", style="dim")
+        text.append(f"{'':>9}└{'─' * len(visible_bars)}", style=s.axis)
 
         return text

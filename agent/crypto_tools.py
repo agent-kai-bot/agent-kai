@@ -1,5 +1,6 @@
 """Crypto-specific tools for KAI agents."""
 
+import json
 import requests
 import pandas as pd
 from langchain_core.tools import StructuredTool
@@ -411,9 +412,168 @@ scan_tokens = StructuredTool.from_function(
 )
 
 
+# ── Signal Feed ──────────────────────────────────────────────
+#
+# The ``get_signals`` tool queries the SignalConsumer ring buffer
+# that receives live alerts from the vpn-stack signal scanners via
+# NATS. The tool is a closure that captures the consumer instance
+# so the same buffer is shared between the TUI and every agent.
+
+def create_get_signals_tool(signal_consumer):
+    """Build a ``get_signals`` tool bound to a live SignalConsumer."""
+
+    def _get_signals(symbol: str = "", strategy: str = "", signal_type: str = "", limit: int = 10) -> str:
+        """Query recent trading signals from the live signal feed.
+
+        Signals are produced by the vpn-stack signal scanners (ClucMay02,
+        DoubleTop, etc.) and the AI token analyzer, arriving via NATS in
+        real time. This tool queries the buffered history.
+
+        Args:
+            symbol: Filter by symbol (e.g. "BTC"). Empty = all symbols.
+            strategy: Filter by strategy name (e.g. "clucmay02"). Empty = all.
+            signal_type: Filter by signal type (e.g. "BUY", "SELL"). Empty = all.
+            limit: Max signals to return (default 10, newest first).
+        """
+        if signal_consumer is None:
+            return json.dumps({"success": False, "error": "Signal feed not available"})
+        results = signal_consumer.query(
+            symbol=symbol or None,
+            strategy=strategy or None,
+            signal_type=signal_type or None,
+            limit=limit,
+        )
+        return json.dumps({
+            "success": True,
+            "count": len(results),
+            "buffer_total": signal_consumer.count,
+            "signals": results,
+        }, default=str)
+
+    return StructuredTool.from_function(
+        func=_get_signals,
+        name="get_signals",
+        description=(
+            "Query recent trading signals from the live signal feed. "
+            "Signals come from the signal scanners (ClucMay02, DoubleTop, "
+            "EWO, etc.) and the AI token analyzer, arriving via NATS in "
+            "real time. Returns the most recent signals matching optional "
+            "filters (symbol, strategy, signal_type). Use this at the "
+            "start of analysis tasks to check if any scanner already "
+            "flagged the symbol you're looking at."
+        ),
+    )
+
+
+# ── Coinbase Data Source ─────────────────────────────────────
+#
+# Direct access to Coinbase Advanced Trade public market data — no
+# auth, no rate-limit juggling, independent of the project data API.
+# These tools let the agent pull Coinbase candles / prices directly
+# alongside whatever data the local data_api serves. Useful for
+# cross-venue validation ("does BTC look the same on Coinbase?")
+# and for trading pairs the local source doesn't cover.
+
+def _get_coinbase_candles(symbol: str, interval: str = "1h", limit: int = 200) -> str:
+    """Fetch historical OHLCV candles directly from Coinbase."""
+    try:
+        from agent.data_sources.coinbase import fetch_candles, normalize_product_id
+        bars = fetch_candles(symbol, interval=interval, limit=limit)
+        product_id = normalize_product_id(symbol)
+        # Condensed textual summary so the LLM can reason about trends
+        # without burning tokens on full OHLCV dumps.
+        latest = bars[-1] if bars else None
+        first = bars[0] if bars else None
+        change_pct = 0.0
+        if first and latest and first["open"]:
+            change_pct = ((latest["close"] - first["open"]) / first["open"]) * 100
+        high = max(b["high"] for b in bars) if bars else 0
+        low = min(b["low"] for b in bars) if bars else 0
+        lines = [
+            f"Coinbase {product_id} {interval} — {len(bars)} bars",
+            f"First: {first['ts']} open=${first['open']:,.2f}" if first else "",
+            f"Last:  {latest['ts']} close=${latest['close']:,.2f}" if latest else "",
+            f"Change: {change_pct:+.2f}%  High: ${high:,.2f}  Low: ${low:,.2f}",
+        ]
+        # Full bars as JSON for downstream tools / backtest consumption.
+        return json.dumps({
+            "summary": "\n".join(l for l in lines if l),
+            "product_id": product_id,
+            "interval": interval,
+            "count": len(bars),
+            "bars": bars,
+        }, default=str)
+    except Exception as e:
+        return json.dumps({"success": False, "error": f"Coinbase fetch failed: {e}"})
+
+
+get_coinbase_candles = StructuredTool.from_function(
+    func=_get_coinbase_candles,
+    name="get_coinbase_candles",
+    description=(
+        "Fetch historical OHLCV candles directly from Coinbase Advanced "
+        "Trade public API (no auth required). Supports standard intervals "
+        "(1m, 5m, 15m, 30m, 1h, 2h, 6h, 1d) and up to 350 bars per call. "
+        "Symbols can be bare ('BTC') or qualified ('BTC-USD', 'ETH-USDC'). "
+        "Bare symbols are assumed to be USD-quoted.\n\n"
+        "Use this when you want to cross-check the local data source, "
+        "query a symbol not in our database, or validate a signal against "
+        "a major venue's pricing. Returns a summary plus the full bar list."
+    ),
+)
+
+
+def _get_coinbase_price(symbol: str) -> str:
+    """Fetch the latest price for a Coinbase product."""
+    try:
+        from agent.data_sources.coinbase import fetch_latest_price
+        info = fetch_latest_price(symbol)
+        return json.dumps(info, default=str)
+    except Exception as e:
+        return json.dumps({"success": False, "error": f"Coinbase price fetch failed: {e}"})
+
+
+get_coinbase_price = StructuredTool.from_function(
+    func=_get_coinbase_price,
+    name="get_coinbase_price",
+    description=(
+        "Get the latest Coinbase spot price for a product. Returns price, "
+        "24h volume, and 24h percent change. Accepts bare symbols ('BTC') "
+        "or qualified ('BTC-USD', 'ETH-USDC'). No auth required."
+    ),
+)
+
+
+def _list_coinbase_products(quote: str = "USD", limit: int = 50) -> str:
+    """List available Coinbase spot products filtered by quote currency."""
+    try:
+        from agent.data_sources.coinbase import list_products
+        products = list_products(quote=quote, limit=limit)
+        return json.dumps({
+            "count": len(products),
+            "quote": quote.upper(),
+            "products": products,
+        }, default=str)
+    except Exception as e:
+        return json.dumps({"success": False, "error": f"Coinbase list failed: {e}"})
+
+
+list_coinbase_products = StructuredTool.from_function(
+    func=_list_coinbase_products,
+    name="list_coinbase_products",
+    description=(
+        "List available Coinbase spot trading products filtered by quote "
+        "currency (default USD). Returns product IDs, base/quote symbols, "
+        "and 24h volume. Useful for discovering what Coinbase supports "
+        "before querying specific candles."
+    ),
+)
+
+
 # ── Registry ─────────────────────────────────────────────────
 
 ALL_CRYPTO_TOOLS = [
     query_ohlcv, get_latest_price, list_symbols,
     calculate_indicator, place_order, get_positions, scan_tokens,
+    get_coinbase_candles, get_coinbase_price, list_coinbase_products,
 ]
