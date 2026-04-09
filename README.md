@@ -1,187 +1,107 @@
 # Agent KAI
 
-Terminal-first crypto analysis and paper-trading app powered by `agent-k.ai`.
+Terminal-first crypto analysis, paper-trading, and self-improving multi-agent platform powered by [`agent-k.ai`](https://agent-k.ai).
 
 ![Agent KAI terminal screenshot](docs/agent-kai-tui.png)
 
 ## What it is
 
-Agent KAI combines:
+Agent KAI is a Textual TUI for talking to a network of LLM-driven crypto agents. The main agent (`kai`) coordinates a roster of specialist sub-agents — analyst, trader, risk-manager, scanner, onchain, and a full org chart of org-roles (CEO, CTO, architect, developer, QA, project-manager, UX, SEO, sales-marketing) — over a local NATS message bus. Each agent has its own persistent memory, its own skill library, and its own LLM endpoint with a fallback chain.
 
-- a Textual terminal UI
-- an OpenAI-compatible agent runtime
-- local NATS messaging for agent coordination
-- live market data and AI inference from `https://agent-k.ai/`
+The cloud `agent-k.ai` API serves both market data (REST + WebSocket) and LLM inference (OpenAI-compatible) so the open-source agent works out of the box without you running your own model server. Local vLLM and the OpenAI Codex Responses API (your ChatGPT subscription) are first-class fallback endpoints.
 
-The repo ships a small local adapter process for the TUI and tools, but market data and model calls come from `agent-k.ai`, not a local database.
+## What makes it different
+
+- **Real sub-agent runtime, not a chatbot router.** Every sub-agent is a long-lived LangChain executor with its own workspace, system prompt, memory, skills, and request/reply NATS subject. The main agent delegates and synthesizes — it doesn't impersonate.
+- **Self-learning loop.** After any non-trivial sub-agent task, you run `/learn` and the mentor sub-agent reads the session's tool calls + chat + existing skills, then drafts a new skill or patches an existing one. Skills are markdown recipes that get loaded on demand the next time the same setup appears.
+- **Multi-endpoint with thinking levels.** Swap any agent to any endpoint at runtime via `/model agent endpoint/model`. Crank reasoning effort with `/think agent xhigh` for hard problems on GPT-5.x via Codex. Fallback chains automatically roll over on errors.
+- **Backtesting tool the agent can call.** Agents validate trading hypotheses with `run_backtest` over real OHLCV before recommending them. Win-rate, Sharpe, drawdown — all returned as structured data the LLM can reason about.
+- **Type-ahead queue, multi-line paste, history, click-to-copy.** The TUI is designed for fast iteration: paste a stack trace, hit Enter, queue 10 things while the agent runs, drop any of them with an `[X]` click.
+
+## Quick start
+
+```bash
+# 1. NATS for the sub-agent message bus
+docker compose up -d
+
+# 2. Python deps
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# 3. Linux clipboard helper (one of these — see docs/troubleshooting.md)
+sudo apt install wl-clipboard   # Wayland
+# or
+sudo apt install xclip          # X11
+
+# 4. Get an API key from https://agent-k.ai/ and export it
+export AGENT_KAI_API_KEY="kai-..."
+
+# 5. Launch the trading terminal
+python main.py --terminal
+```
+
+Then type `/analyze BTC` and watch the analyst sub-agent spin up.
+
+## Documentation
+
+Everything is in [`docs/`](docs/) — start with the index.
+
+| Doc | What it covers |
+|---|---|
+| [docs/README.md](docs/README.md) | Index of every doc with one-line descriptions |
+| [docs/getting-started.md](docs/getting-started.md) | Install, API key, first run, first chat, sample prompts |
+| [docs/commands.md](docs/commands.md) | Every slash command (`/analyze`, `/buy`, `/think`, `/learn`, `/queue`, …) |
+| [docs/keybindings.md](docs/keybindings.md) | Every keyboard shortcut |
+| [docs/chat-input.md](docs/chat-input.md) | History, multi-line paste, queue, copy/paste |
+| [docs/chart-panel.md](docs/chart-panel.md) | Symbols, timeframes, sources, color schemes |
+| [docs/watchlist-and-positions.md](docs/watchlist-and-positions.md) | Watchlist, positions, alerts panels |
+| [docs/agents.md](docs/agents.md) | Sub-agent runtime, the 14 built-in agents, NATS, workspaces |
+| [docs/models-and-thinking.md](docs/models-and-thinking.md) | `/model`, `/think`, endpoints, fallbacks, Codex OAuth |
+| [docs/learning-and-skills.md](docs/learning-and-skills.md) | `/learn`, mentor reflection, memory, skills (with a working example) |
+| [docs/configuration.md](docs/configuration.md) | `agent-config.json` schema, env vars, secrets |
+| [docs/data-sources.md](docs/data-sources.md) | kai-api, Coinbase, signals, backtesting |
+| [docs/architecture.md](docs/architecture.md) | Process model, NATS topics, storage layout, contributor guide |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Common issues + fixes |
 
 ## Requirements
 
 - Python 3.13+
-- Docker with Compose
-- An API key from `https://agent-k.ai/`
-- Linux only: a system clipboard helper for the TUI's copy shortcuts (see [Copy & paste](#copy--paste))
-  - Wayland: `sudo apt install wl-clipboard`
-  - X11: `sudo apt install xclip`
+- Docker with Compose (for NATS)
+- An API key from [`https://agent-k.ai/`](https://agent-k.ai/)
+- Linux only: `wl-clipboard` (Wayland) or `xclip` (X11) for the copy shortcuts
 
-## Get an API key
-
-1. Visit `https://agent-k.ai/`
-2. Create an account or sign in
-3. Open the account/dashboard area
-4. Generate an API key
-5. Export it as `AGENT_KAI_API_KEY`
-
-Example:
-
-```bash
-export AGENT_KAI_API_KEY="kai-..."
-```
-
-## Quick start
-
-Start NATS:
-
-```bash
-docker compose up -d
-```
-
-Create a virtual environment and install dependencies:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Launch the full terminal:
-
-```bash
-python main.py --terminal
-```
+See [docs/getting-started.md](docs/getting-started.md) for the complete walkthrough.
 
 ## Run modes
 
 ```bash
-python main.py --terminal
-python main.py
-python main.py --no-tui
-python main.py --log-level DEBUG
-```
-
-## Key environment variables
-
-```bash
-export AGENT_KAI_API_KEY="kai-..."
-export AGENT_KAI_BASE_URL="https://agent-k.ai"
-export AGENT_KAI_WS_URL="wss://agent-k.ai/v1/ws"
-```
-
-Optional local settings:
-
-```bash
-export KAI_API_PORT=8877
-export KAI_NATS_URL="nats://localhost:4222"
-export KAI_TRACKED_SYMBOLS="BTC,ETH,SOL"
-```
-
-## Commands
-
-- `/analyze BTC`
-- `/analyze SOL 15m`
-- `/buy BTC 0.1`
-- `/sell BTC 0.05`
-- `/scan trending`
-- `/risk`
-- `/chart BTC 1h`
-- `/watch DOGE`
-
-## Copy & paste
-
-The TUI supports three ways to get text out of the chat into your system clipboard:
-
-- **Click and drag** any panel — releases the mouse button to auto-copy the selection
-- **Ctrl+Shift+C** — copy the current mouse selection (with a chat confirmation showing the backend used)
-- **Ctrl+Y** — copy the most recent agent response in one keystroke, no selection needed
-
-All three routes write to the system clipboard via a runtime-detected backend, in this order: `wl-copy` (Wayland) → `xclip` → `xsel` → OSC 52 (terminal escape sequence). The detected backend is shown in the chat confirmation message — for example:
-
-```
-Copied 312 chars to clipboard via wl-copy — The market is currently…
-```
-
-### Linux setup
-
-VTE-based terminals on Linux (gnome-terminal, Tilix, Terminator, Konsole, MATE Terminal, XFCE Terminal) **disable OSC 52 clipboard writes by default for security reasons**, so the OSC 52 fallback is unreliable on most default Linux terminals — the bytes leave the program but the terminal silently drops them and your system clipboard never changes. Install one of the native clipboard CLIs and the TUI will pick it up automatically:
-
-```bash
-# Wayland sessions (the default on modern Ubuntu / Fedora / Pop!_OS)
-sudo apt install wl-clipboard
-
-# X11 sessions
-sudo apt install xclip
-# or
-sudo apt install xsel
-```
-
-If the chat confirmation says `via osc52`, your system clipboard probably did **not** receive the text — install one of the packages above and try again. The TUI also logs a warning at startup if no clipboard CLI is found.
-
-### macOS / Windows / SSH
-
-- macOS: OSC 52 works on **iTerm2** (enable in Preferences → General → Selection → "Applications in terminal may access clipboard"), **Kitty**, **Alacritty**, **WezTerm**. Apple's stock Terminal.app does not honor OSC 52 — use one of the alternatives.
-- Windows Terminal: OSC 52 works out of the box.
-- Over SSH: OSC 52 is the right path because there is no local CLI on the remote box — it tunnels through the SSH session and your local terminal handles the actual write. Same terminal-support caveats apply.
-
-## Sub-agent system
-
-One of the strongest features in this repo is the built-in sub-agent runtime.
-
-Agent KAI can spawn specialized background agents, keep them running, and send them targeted tasks over NATS. Each sub-agent gets:
-
-- its own agent identity
-- its own workspace directory
-- role-specific instructions from `SOUL.md`
-- a limited toolset appropriate for delegated work
-- request/reply messaging over `agent.{name}.request`
-
-Predefined specialist agents include:
-
-- `analyst`
-- `trader`
-- `risk-manager`
-- `scanner`
-- `onchain`
-- organization agents like `ceo`, `cto`, `architect`, `developer`, and `qa`
-
-The main agent can use these coordination tools:
-
-- `spawn_agent`
-- `nats_request`
-- `nats_publish`
-- `list_agents`
-
-In practice, this means the system can keep long-lived specialists around for monitoring, scanning, analysis, or delegated execution instead of forcing a single agent to do everything inline.
-
-Examples:
-
-- spawn an `analyst` and keep routing chart-analysis tasks to it
-- run a `scanner` in the background for token discovery
-- hand portfolio checks to `risk-manager`
-- have the main agent orchestrate multiple specialists in parallel over NATS
-
-## Architecture
-
-```text
-User
-  -> Textual terminal
-  -> local tool + data adapter
-  -> NATS message bus
-  -> agent-k.ai REST + WebSocket APIs
+python main.py --terminal              # Full trading terminal (recommended)
+python main.py                         # Plain agent TUI without trading panels
+python main.py --no-tui                # Headless — NATS only, for daemonized deployment
+python main.py --log-level DEBUG       # Override log level
 ```
 
 ## Tests
 
 ```bash
+.venv/bin/python test_learning_pipeline.py     # Self-learning pipeline (10 tests)
+.venv/bin/python test_signal_pipeline.py       # Signal consumer + tools (15 tests)
 .venv/bin/python -m unittest discover -s tests -v
-.venv/bin/python regression_harness.py
 ```
+
+See [docs/architecture.md](docs/architecture.md#testing) for the full test layout.
+
+## Project status
+
+Branch `kai/self-learning-platform` is the active development branch. Recent additions:
+
+- Bash-style up/down history in the chat input with disk persistence
+- Multi-line paste capture (paste a stack trace, send the whole thing as one prompt)
+- Type-ahead queue with `[X]` click-to-drop and `/queue clear` / `/queue drop N`
+- `/think agent level` runtime reasoning-effort overrides for GPT-5.x via Codex
+- `/model agent endpoint/model` runtime endpoint switching with fallback rebuild
+- `/login codex` to authenticate against your ChatGPT subscription via OAuth
+- Clipboard backend auto-detection (wl-copy → xclip → xsel → OSC 52)
+
+See `git log --oneline kai/self-learning-platform` for the full history.
