@@ -134,6 +134,8 @@ class TradingTerminal(App):
         self._chart_source: str = "kai-api"
         self._coinbase_stream = None  # CoinbaseCandleStream instance
         self._coinbase_task = None    # asyncio.Task running the feed loop
+        self._kai_api_stream = None   # KaiApiCandleStream instance
+        self._kai_api_task = None     # asyncio.Task running the WS consumer
 
         # Restore persisted chart state from workspaces/terminal/state.json.
         # Falls back to the BTC + 1m defaults on first run or corrupt file.
@@ -324,53 +326,126 @@ class TradingTerminal(App):
             self._nats_log(f"[red]Chart load error: {e}[/]")
 
     async def _load_chart_from_kai_api(self, symbol: str, interval: str) -> None:
-        """Fetch a chart window from the cloud agent-k.ai market endpoint.
+        """Hand off to the kai-api WebSocket feed lifecycle.
 
-        Runs the synchronous ``requests`` call off the event loop via
-        ``asyncio.to_thread`` so the TUI doesn't block on network I/O.
-        Cloud bars come back as positional ``[ts_ms, o, h, l, c, v]``
-        arrays which we adapt to the dict shape the chart panel
-        expects via ``_normalize_kai_bar``.
+        REST historical bootstrap (up to 200 bars) seeds the chart,
+        then a live WebSocket subscription on the same channel keeps
+        it updated as new candles tick. See ``_start_kai_api_feed``
+        for the full sequence.
+        """
+        await self._start_kai_api_feed(symbol, interval)
+
+    async def _start_kai_api_feed(self, symbol: str, interval: str) -> None:
+        """Start (or restart) the cloud agent-k.ai chart feed.
+
+        1) Stop any existing kai-api WS task and Coinbase feed
+        2) Fetch historical bars via REST (200 bars, oldest → newest)
+        3) Seed the chart panel with the historical window
+        4) Spin up a KaiApiCandleStream consumer task that listens for
+           live ``event`` frames and overwrites / appends bars on the
+           chart as they arrive
+        """
+        await self._stop_kai_api_feed()
+        await self._stop_coinbase_feed()
+
+        try:
+            from agent.data_sources.kai_api import (
+                KaiApiCandleStream,
+                fetch_candles,
+            )
+        except Exception as e:
+            self._nats_log(f"[red]kai-api module import failed: {e}[/]")
+            return
+
+        sym_upper = symbol.upper()
+
+        # 1) Historical bootstrap (off the event loop)
+        try:
+            hist = await asyncio.to_thread(fetch_candles, sym_upper, interval, 200)
+        except RuntimeError as e:
+            self._nats_log(
+                f"[red]kai-api requires an API key — drop AGENT-KAI-API-KEY.txt "
+                f"at the project root or set AGENT_KAI_API_KEY: {e}[/]"
+            )
+            return
+        except Exception as e:
+            self._nats_log(f"[red]kai-api REST fetch failed: {e}[/]")
+            return
+
+        # Populate the chart with the historical window
+        try:
+            chart = self.query_one("#chart-panel", ChartPanel)
+            chart.set_data(sym_upper, interval, hist)
+        except Exception as e:
+            self._nats_log(f"[red]chart set_data failed: {e}[/]")
+            return
+
+        self._chart_symbol = sym_upper
+        try:
+            self._current_tf_idx = self.TIMEFRAMES.index(interval)
+        except ValueError:
+            pass
+        self._save_chart_state(interval)
+
+        # 2) Live WebSocket consumer
+        self._kai_api_stream = KaiApiCandleStream(sym_upper, interval)
+        self._kai_api_task = asyncio.create_task(
+            self._run_kai_api_consumer(sym_upper, interval)
+        )
+        self._nats_log(
+            f"[bold cyan]kai-api WS[/] {sym_upper} {interval} live "
+            f"({len(hist)} bars seeded)"
+        )
+
+    async def _stop_kai_api_feed(self) -> None:
+        """Cleanly stop any running kai-api feed task + WS stream."""
+        if self._kai_api_stream is not None:
+            try:
+                self._kai_api_stream.stop()
+            except Exception:
+                pass
+        task = self._kai_api_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._kai_api_stream = None
+        self._kai_api_task = None
+
+    async def _run_kai_api_consumer(self, symbol: str, interval: str) -> None:
+        """Consume the kai-api WebSocket stream, updating the chart live.
+
+        Each event bar carries an ``is_closed`` flag — True means the
+        candle has finalized, False means it's the still-forming
+        current candle. We use ``update_last_bar`` for both because
+        the chart panel merges by ts: live updates overwrite the
+        in-progress bar, and the next ts boundary creates a new one
+        automatically.
         """
         try:
-            headers = _kai_api_headers()
-            if not headers:
-                self._nats_log(
-                    "[red]kai-api chart source requires AGENT_KAI_API_KEY "
-                    "(env var, .env, or AGENT-KAI-API-KEY.txt). "
-                    "Try /chart source local or /chart source coinbase instead.[/]"
-                )
-                return
-
-            def _fetch():
-                r = requests.get(
-                    f"{KAI_API_BASE}/market/ohlcv/{symbol}",
-                    params={"interval": interval, "limit": 120},
-                    headers=headers,
-                    timeout=15,
-                )
-                r.raise_for_status()
-                return r.json()
-
-            payload = await asyncio.to_thread(_fetch)
-            raw = payload.get("data") or payload.get("bars") or []
-            bars = [b for b in (_normalize_kai_bar(arr) for arr in raw) if b]
-
-            if not bars:
-                self._nats_log(f"[red]kai-api: no bars for {symbol} {interval}[/]")
-                return
-
             chart = self.query_one("#chart-panel", ChartPanel)
-            chart.set_data(symbol, interval, bars)
-            self._chart_symbol = symbol
-            try:
-                self._current_tf_idx = self.TIMEFRAMES.index(interval)
-            except ValueError:
-                pass
-            self._save_chart_state(interval)
-            self._nats_log(f"[dim]chart: kai-api {symbol} {interval} ({len(bars)} bars)[/]")
+            async for bar in self._kai_api_stream:
+                # Filter to the symbol/interval we asked for
+                if bar.get("symbol") and bar["symbol"] != symbol:
+                    continue
+                if bar.get("interval") and bar["interval"] != interval:
+                    continue
+                # Strip the metadata fields the chart panel doesn't need
+                clean = {
+                    "ts": bar["ts"],
+                    "open": bar["open"],
+                    "high": bar["high"],
+                    "low": bar["low"],
+                    "close": bar["close"],
+                    "volume": bar["volume"],
+                }
+                chart.update_last_bar(clean)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            self._nats_log(f"[red]kai-api chart load error: {e}[/]")
+            self._nats_log(f"[red]kai-api WS consumer error: {e}[/]")
 
     def _save_chart_state(self, interval: str) -> None:
         """Persist chart symbol/timeframe/source/scheme to state.json."""
@@ -677,8 +752,12 @@ class TradingTerminal(App):
                 if source_name == self._chart_source:
                     self._chat_msg(f"[dim]Already on {source_name} source[/]")
                     return True
-                # Stop any coinbase feed if we're moving away from it
+                # Stop any in-flight feeds before switching — both
+                # coinbase and kai-api own background tasks that need
+                # to be cancelled or they'll keep updating the chart
+                # with stale data from the previous source.
                 await self._stop_coinbase_feed()
+                await self._stop_kai_api_feed()
                 self._chart_source = source_name
                 symbol = self._chart_symbol
                 tf = self.TIMEFRAMES[self._current_tf_idx]
