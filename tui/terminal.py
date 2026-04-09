@@ -105,6 +105,7 @@ class TradingTerminal(App):
         ("ctrl+t", "cycle_timeframe", "Timeframe"),
         ("ctrl+s", "cycle_symbol", "Symbol"),
         ("ctrl+w", "toggle_watchlist_add", "Add symbol"),
+        ("ctrl+y", "copy_last_response", "Copy last reply"),
     ]
 
     TIMEFRAMES = ["1m", "5m", "15m", "1h"]
@@ -1331,3 +1332,96 @@ class TradingTerminal(App):
         inp = self.query_one("#input-area", Input)
         inp.value = "/watch "
         inp.focus()
+
+    def action_copy_last_response(self):
+        """Copy the most recent agent response to the system clipboard.
+
+        Uses Textual's built-in ``copy_to_clipboard`` which emits an
+        OSC 52 escape sequence the host terminal interprets as
+        "set system clipboard". Works through SSH and tmux as long
+        as the local terminal emulator supports OSC 52 (kitty,
+        alacritty, wezterm, iTerm2, Windows Terminal, gnome-terminal
+        on most builds — does NOT work on macOS Terminal.app).
+
+        Selection logic: walks the chat panel children newest-first
+        and grabs the first widget tagged ``agent-msg`` (the CSS
+        class our streaming response widgets carry). If nothing
+        agent-tagged exists yet, falls back to the most recent
+        non-user, non-error message so a freshly-started session
+        can still copy welcome banners or status messages.
+
+        Posts a brief confirmation to the chat panel showing how
+        many characters were copied — gives the user immediate
+        feedback that the OSC 52 fired.
+        """
+        try:
+            chat = self.query_one("#chat-panel", ChatPanel)
+        except Exception:
+            return
+
+        text = self._extract_last_agent_text(chat)
+        if not text:
+            self._chat_msg("[dim]Nothing to copy yet[/]")
+            return
+
+        try:
+            self.copy_to_clipboard(text)
+        except Exception as exc:
+            self.logger.warning("copy_to_clipboard failed: %s", exc)
+            self._chat_msg(f"[red]Copy failed: {exc}[/]")
+            return
+
+        n = len(text)
+        preview = text[:40].replace("\n", " ")
+        if len(text) > 40:
+            preview += "…"
+        self._chat_msg(f"[dim]Copied {n} chars to clipboard — {preview}[/]")
+        self.logger.info("copied %d chars to clipboard via OSC 52", n)
+
+    @staticmethod
+    def _extract_last_agent_text(chat: "ChatPanel") -> str:
+        """Walk the chat panel and return the most recent agent text.
+
+        Pulls the renderable off each Static child, strips Rich markup
+        tags so the clipboard contents are pure text the user can
+        paste into anything (Slack, an email, a notebook). Walks in
+        reverse so the very last response wins, which is what the
+        user almost always wants when they hit Ctrl+Y after the
+        agent finishes a turn.
+        """
+        from rich.text import Text
+
+        # Tags whose content is conversational output worth copying.
+        # Skip user-msg (the user already typed it) and tool-msg /
+        # error-msg (those are usually status noise the user does
+        # not want pasted).
+        agent_tags = {"agent-msg"}
+        fallback_tags = {"agent-msg", "tool-msg"}  # 2nd pass if no agent-msg yet
+
+        def _plain(widget) -> str:
+            r = getattr(widget, "renderable", "")
+            if isinstance(r, str):
+                return Text.from_markup(r).plain
+            if hasattr(r, "plain"):
+                return r.plain
+            return str(r)
+
+        # First pass: prefer the most recent agent message
+        for widget in reversed(list(chat.children)):
+            classes = getattr(widget, "classes", set()) or set()
+            if agent_tags.intersection(classes):
+                t = _plain(widget).strip()
+                if t:
+                    return t
+
+        # Second pass: fall back to any non-user, non-error message
+        for widget in reversed(list(chat.children)):
+            classes = getattr(widget, "classes", set()) or set()
+            if "user-msg" in classes or "error-msg" in classes:
+                continue
+            if fallback_tags.intersection(classes) or not classes:
+                t = _plain(widget).strip()
+                if t:
+                    return t
+
+        return ""
