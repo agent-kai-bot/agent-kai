@@ -143,6 +143,11 @@ class TradingTerminal(App):
         # OS clipboard. Used to suppress duplicate OSC 52 emissions
         # when TextSelected fires repeatedly during a single drag.
         self._last_auto_copied: str = ""
+        # System clipboard backend, lazily detected on first copy.
+        # One of: "wl-copy", "xclip", "xsel", "osc52".  See
+        # _detect_clipboard_backend for the picking logic and
+        # _set_system_clipboard for the actual write path.
+        self._clipboard_backend: str | None = None
 
         # Restore persisted chart state from workspaces/terminal/state.json.
         # Falls back to the BTC + 1m defaults on first run or corrupt file.
@@ -1366,6 +1371,108 @@ class TradingTerminal(App):
         inp.value = "/watch "
         inp.focus()
 
+    def _detect_clipboard_backend(self) -> str:
+        """Pick the best system clipboard backend available on this host.
+
+        Returns one of ``"wl-copy"``, ``"xclip"``, ``"xsel"``, ``"osc52"``.
+        Cached on ``self._clipboard_backend`` so we only run
+        ``shutil.which`` once per session.
+
+        Why we do not just rely on Textual's ``copy_to_clipboard``:
+        that method emits an OSC 52 escape sequence and trusts the
+        host terminal to honor it. VTE-based terminals on Linux
+        (gnome-terminal, Tilix, Terminator, Konsole, etc.) disable
+        OSC 52 clipboard writes by default for security, so the
+        sequence reaches the terminal and gets silently dropped —
+        the chat says "Copied" but the system clipboard never
+        changes. The CLI tools (wl-copy, xclip, xsel) bypass the
+        terminal entirely and talk to the Wayland / X11 selection
+        owner directly, which is the only reliable path on Linux.
+        OSC 52 is still the right fallback for SSH and for terminals
+        that DO honor it (kitty, alacritty, wezterm, iTerm2,
+        Windows Terminal).
+        """
+        if self._clipboard_backend is not None:
+            return self._clipboard_backend
+
+        import os
+        import shutil
+
+        on_wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
+        on_x11 = bool(os.environ.get("DISPLAY"))
+
+        # Probe order: native session backend first, then the other
+        # display server's tools (XWayland is common, so xclip on a
+        # Wayland session can still work for X-aware apps), then OSC 52.
+        candidates: list[str] = []
+        if on_wayland:
+            candidates.append("wl-copy")
+        if on_x11:
+            candidates.extend(["xclip", "xsel"])
+        if not on_wayland and shutil.which("wl-copy"):
+            candidates.append("wl-copy")
+
+        for tool in candidates:
+            if shutil.which(tool):
+                self._clipboard_backend = tool
+                self.logger.info("clipboard backend detected: %s", tool)
+                return tool
+
+        self._clipboard_backend = "osc52"
+        self.logger.warning(
+            "no system clipboard tool found (wl-copy / xclip / xsel) — "
+            "falling back to OSC 52 which is silently dropped by VTE-based "
+            "terminals (gnome-terminal, Tilix, etc). Install wl-clipboard "
+            "(`sudo apt install wl-clipboard`) for Wayland or xclip "
+            "(`sudo apt install xclip`) for X11."
+        )
+        return "osc52"
+
+    def _set_system_clipboard(self, text: str) -> str:
+        """Write text to the system clipboard via the best backend.
+
+        Returns the backend name so callers can surface it in the
+        chat confirmation message — useful for debugging "I clicked
+        copy but my paste shows old data" since the user immediately
+        sees whether we used wl-copy (reliable) or osc52 (terminal
+        roulette). Raises on subprocess failure so the caller can
+        show an error.
+        """
+        import subprocess
+
+        backend = self._detect_clipboard_backend()
+
+        if backend == "wl-copy":
+            subprocess.run(
+                ["wl-copy"],
+                input=text.encode("utf-8"),
+                check=True,
+                timeout=2,
+            )
+            return "wl-copy"
+
+        if backend == "xclip":
+            subprocess.run(
+                ["xclip", "-selection", "clipboard"],
+                input=text.encode("utf-8"),
+                check=True,
+                timeout=2,
+            )
+            return "xclip"
+
+        if backend == "xsel":
+            subprocess.run(
+                ["xsel", "--clipboard", "--input"],
+                input=text.encode("utf-8"),
+                check=True,
+                timeout=2,
+            )
+            return "xsel"
+
+        # Final fallback: OSC 52 via Textual.
+        self.copy_to_clipboard(text)
+        return "osc52"
+
     def action_copy_selection(self):
         """Copy the currently mouse-selected text to the system clipboard.
 
@@ -1375,10 +1482,9 @@ class TradingTerminal(App):
         for ``Static``, ``RichLog``, etc — i.e. everything in our TUI).
 
         This is the keyboard shortcut version of the auto-copy-on-mouse
-        -up handler below: same underlying call, same OSC 52 path,
+        -up handler below: same call into ``_set_system_clipboard``,
         different trigger. Use the keyboard one when you want explicit
-        confirmation in chat or when your terminal swallowed the
-        mouse-up auto-copy for some reason.
+        confirmation in chat or when the auto-copy didn't fire.
         """
         try:
             text = self.screen.get_selected_text()
@@ -1395,9 +1501,9 @@ class TradingTerminal(App):
             return
 
         try:
-            self.copy_to_clipboard(text)
+            backend = self._set_system_clipboard(text)
         except Exception as exc:
-            self.logger.warning("copy_to_clipboard (selection) failed: %s", exc)
+            self.logger.warning("set_system_clipboard (selection) failed: %s", exc)
             self._chat_msg(f"[red]Copy failed: {exc}[/]")
             return
 
@@ -1405,8 +1511,14 @@ class TradingTerminal(App):
         preview = text[:50].replace("\n", " ")
         if len(text) > 50:
             preview += "…"
-        self._chat_msg(f"[dim]Copied {n} chars from selection — {preview}[/]")
-        self.logger.info("copied %d chars from mouse selection via Ctrl+Shift+C", n)
+        self._chat_msg(
+            f"[dim]Copied {n} chars from selection via {backend} — {preview}[/]"
+        )
+        self.logger.info(
+            "copied %d chars from mouse selection via Ctrl+Shift+C (%s)",
+            n,
+            backend,
+        )
         self._last_auto_copied = text  # so the next auto-copy handler doesn't echo
 
     def on_text_selected(self, event) -> None:
@@ -1416,7 +1528,9 @@ class TradingTerminal(App):
         whenever a text selection is updated. The event itself carries
         no payload — we have to call ``screen.get_selected_text()`` to
         actually grab the highlighted text. We then push it through
-        ``copy_to_clipboard`` (OSC 52 → host terminal → system clipboard).
+        ``_set_system_clipboard`` which prefers wl-copy / xclip / xsel
+        over OSC 52 because OSC 52 is silently dropped by VTE-based
+        terminals (gnome-terminal, Tilix, etc).
 
         Guarded against duplicate emissions: if the selection text
         hasn't changed since the last copy, we skip. That's the
@@ -1426,7 +1540,8 @@ class TradingTerminal(App):
         Deliberately does NOT post a chat message — auto-copy should
         be invisible. The user knows they highlighted something; the
         proof is the paste working in the destination app. We do log
-        an INFO line so a post-mortem can verify the fire happened.
+        an INFO line so a post-mortem can verify the fire happened
+        and which backend handled it.
         """
         try:
             text = self.screen.get_selected_text()
@@ -1436,21 +1551,26 @@ class TradingTerminal(App):
         if not text or text == self._last_auto_copied:
             return
         try:
-            self.copy_to_clipboard(text)
+            backend = self._set_system_clipboard(text)
             self._last_auto_copied = text
-            self.logger.info("auto-copied %d chars from text selection", len(text))
+            self.logger.info(
+                "auto-copied %d chars from text selection (%s)",
+                len(text),
+                backend,
+            )
         except Exception as exc:
-            self.logger.warning("auto-copy_to_clipboard failed: %s", exc)
+            self.logger.warning("auto-copy set_system_clipboard failed: %s", exc)
 
     def action_copy_last_response(self):
         """Copy the most recent agent response to the system clipboard.
 
-        Uses Textual's built-in ``copy_to_clipboard`` which emits an
-        OSC 52 escape sequence the host terminal interprets as
-        "set system clipboard". Works through SSH and tmux as long
-        as the local terminal emulator supports OSC 52 (kitty,
-        alacritty, wezterm, iTerm2, Windows Terminal, gnome-terminal
-        on most builds — does NOT work on macOS Terminal.app).
+        Routes through ``_set_system_clipboard`` which prefers the
+        platform's native clipboard CLI (wl-copy on Wayland, xclip
+        or xsel on X11) and only falls back to OSC 52 if none of
+        those tools are installed. The CLI path is the only reliable
+        one on Linux because VTE-based terminals (gnome-terminal,
+        Tilix, Terminator, Konsole) silently drop OSC 52 clipboard
+        writes by default for security.
 
         Selection logic: walks the chat panel children newest-first
         and grabs the first widget tagged ``agent-msg`` (the CSS
@@ -1460,8 +1580,9 @@ class TradingTerminal(App):
         can still copy welcome banners or status messages.
 
         Posts a brief confirmation to the chat panel showing how
-        many characters were copied — gives the user immediate
-        feedback that the OSC 52 fired.
+        many characters were copied AND which backend handled it,
+        so the user can immediately see whether they got a reliable
+        wl-copy/xclip path or the unreliable osc52 fallback.
         """
         try:
             chat = self.query_one("#chat-panel", ChatPanel)
@@ -1474,9 +1595,9 @@ class TradingTerminal(App):
             return
 
         try:
-            self.copy_to_clipboard(text)
+            backend = self._set_system_clipboard(text)
         except Exception as exc:
-            self.logger.warning("copy_to_clipboard failed: %s", exc)
+            self.logger.warning("set_system_clipboard failed: %s", exc)
             self._chat_msg(f"[red]Copy failed: {exc}[/]")
             return
 
@@ -1484,8 +1605,10 @@ class TradingTerminal(App):
         preview = text[:40].replace("\n", " ")
         if len(text) > 40:
             preview += "…"
-        self._chat_msg(f"[dim]Copied {n} chars to clipboard — {preview}[/]")
-        self.logger.info("copied %d chars to clipboard via OSC 52", n)
+        self._chat_msg(
+            f"[dim]Copied {n} chars to clipboard via {backend} — {preview}[/]"
+        )
+        self.logger.info("copied %d chars to clipboard via %s", n, backend)
 
     @staticmethod
     def _extract_last_agent_text(chat: "ChatPanel") -> str:
