@@ -74,25 +74,113 @@ DOCKER_SANDBOX_MOUNT_WORKSPACE_DEFAULT = bool(
 )
 
 
-def get_endpoint(name):
-    """Get endpoint config by name. Returns dict with base_url, model, etc."""
+def get_endpoint(name, model_name=None):
+    """Resolve an (endpoint, model) pair into a flat config dict.
+
+    Two endpoint formats are supported, both can coexist in agent-config.json:
+
+    **New (multi-model)** — endpoint declares N models, each with its own
+    context, max_tokens, and provider-specific settings::
+
+        "openai-direct": {
+            "provider": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "api_key_env": "OPENAI_API_KEY",
+            "models": {
+                "gpt-5.4":   {"context_window": 200000, "max_tokens": 16384},
+                "gpt-4o":    {"context_window": 128000, "max_tokens":  4096},
+                "spark":     {"context_window": 128000, "max_tokens":  4096}
+            }
+        }
+
+    **Legacy (single-model)** — top-level ``model`` field::
+
+        "kai-local": {
+            "base_url": "http://...",
+            "model": "qwen35-gptq",
+            "max_tokens": 4096
+        }
+
+    The legacy form is auto-wrapped as a one-model endpoint so existing
+    agent configs keep working.
+
+    Args:
+        name: endpoint name in the registry
+        model_name: optional model id within the endpoint. If omitted,
+            uses the agent-supplied model OR the endpoint's first model.
+
+    Returns the flat dict the LLM factory expects: ``base_url``, ``model``,
+    ``api_key``, ``provider``, ``context_window``, ``max_tokens``,
+    ``temperature``, ``top_p``, plus any provider-specific keys
+    (``reasoning_effort``, ``text_verbosity``, …).
+    """
     ep = ENDPOINTS.get(name)
     if not ep:
         print(f"Warning: endpoint '{name}' not found in config, available: {list(ENDPOINTS.keys())}")
         return None
+
+    # Resolve API key (env var override takes precedence)
     api_key = ep.get("api_key", "not-needed")
     api_key_env = ep.get("api_key_env")
     if api_key_env:
         api_key = os.getenv(api_key_env, api_key)
+
+    provider = ep.get("provider", "openai")
+    base_url = ep.get("base_url", "")
+
+    # Multi-model endpoint
+    models = ep.get("models")
+    if isinstance(models, dict) and models:
+        # Pick the requested model, or the explicit endpoint default,
+        # or the first key in the dict.
+        chosen = model_name or ep.get("default_model") or next(iter(models))
+        if chosen not in models:
+            print(
+                f"Warning: model '{chosen}' not found in endpoint '{name}'. "
+                f"Available: {list(models)}. Falling back to {next(iter(models))}."
+            )
+            chosen = next(iter(models))
+        mcfg = models[chosen] or {}
+        return {
+            "base_url": base_url,
+            "provider": provider,
+            "model": chosen,
+            "api_key": api_key,
+            "api_key_env": api_key_env,
+            "context_window": mcfg.get("context_window") or ep.get("context_window") or 0,
+            "max_tokens": mcfg.get("max_tokens") or ep.get("max_tokens", 4096),
+            "temperature": mcfg.get("temperature", ep.get("temperature", 0.6)),
+            "top_p": mcfg.get("top_p", ep.get("top_p", 0.95)),
+            # Codex / responses-API specific knobs
+            "reasoning_effort": mcfg.get("reasoning_effort", ep.get("reasoning_effort")),
+            "text_verbosity": mcfg.get("text_verbosity", ep.get("text_verbosity")),
+        }
+
+    # Legacy single-model endpoint
     return {
-        "base_url": ep["base_url"],
-        "model": ep["model"],
+        "base_url": base_url,
+        "provider": provider,
+        "model": ep.get("model"),
         "api_key": api_key,
         "api_key_env": api_key_env,
+        "context_window": ep.get("context_window") or 0,
         "max_tokens": ep.get("max_tokens", 4096),
         "temperature": ep.get("temperature", 0.6),
         "top_p": ep.get("top_p", 0.95),
+        "reasoning_effort": ep.get("reasoning_effort"),
+        "text_verbosity": ep.get("text_verbosity"),
     }
+
+
+def list_endpoint_models(name: str) -> list[str]:
+    """Return the list of model ids exposed by a multi-model endpoint."""
+    ep = ENDPOINTS.get(name) or {}
+    models = ep.get("models")
+    if isinstance(models, dict) and models:
+        return list(models.keys())
+    if ep.get("model"):
+        return [ep["model"]]
+    return []
 
 
 def get_workspace_path(agent_name):
@@ -136,15 +224,77 @@ def load_soul(agent_name):
     return None
 
 
-def get_agent_config(agent_name):
-    """Get agent config by name. Returns dict with endpoint info + agent settings."""
-    agent_cfg = AGENTS.get(agent_name, {})
-    endpoint_name = agent_cfg.get("endpoint")
-    fallback_name = agent_cfg.get("fallback_endpoint")
+def _resolve_endpoint_ref(ref):
+    """Normalize an agent's endpoint/fallback reference into a flat config.
 
-    # If agent not in config, use first available endpoint as default
-    if not endpoint_name:
-        endpoint_name = next(iter(ENDPOINTS), None)
+    Accepts three shapes for maximum config-writing ergonomics:
+
+    - **String**: ``"kai-local"`` — endpoint name; uses default model
+    - **String w/ slash**: ``"openai-direct/gpt-5.4"`` — endpoint and model
+    - **Dict**: ``{"endpoint": "openai-direct", "model": "gpt-5.4"}``
+
+    Returns the flat dict from ``get_endpoint(name, model)`` or None
+    if the reference is malformed / unknown.
+    """
+    if ref is None:
+        return None
+    if isinstance(ref, str):
+        if "/" in ref:
+            ep_name, model_name = ref.split("/", 1)
+            return get_endpoint(ep_name, model_name=model_name)
+        return get_endpoint(ref)
+    if isinstance(ref, dict):
+        ep_name = ref.get("endpoint") or ref.get("name")
+        model_name = ref.get("model")
+        if not ep_name:
+            return None
+        return get_endpoint(ep_name, model_name=model_name)
+    return None
+
+
+def get_agent_config(agent_name):
+    """Get agent config by name. Returns dict with endpoint info + agent settings.
+
+    Supports:
+    - ``endpoint`` (string or dict) — primary endpoint
+    - ``model`` — optional model override applied to a string ``endpoint``
+    - ``fallback_endpoint`` (legacy single, string or dict)
+    - ``fallback_endpoints`` (list of refs in any of the supported shapes)
+
+    Returns:
+        endpoint: flat dict for the primary
+        fallback_endpoints: list of flat dicts in chain order (may be empty)
+        fallback_endpoint: alias for the first item in fallback_endpoints
+            (preserves backward compat with code that reads the singular)
+    """
+    agent_cfg = AGENTS.get(agent_name, {})
+    endpoint_ref = agent_cfg.get("endpoint")
+    explicit_model = agent_cfg.get("model")
+
+    # If endpoint is a bare string and the agent specified a model field,
+    # combine them into the slash form so _resolve handles both cases.
+    if isinstance(endpoint_ref, str) and explicit_model and "/" not in endpoint_ref:
+        endpoint_ref = f"{endpoint_ref}/{explicit_model}"
+
+    # Default to the first available endpoint if nothing was specified
+    if not endpoint_ref:
+        first = next(iter(ENDPOINTS), None)
+        endpoint_ref = first
+
+    # Build the fallback chain. Accept either the legacy singular field
+    # or the new plural list. The plural takes priority.
+    chain: list = []
+    plural = agent_cfg.get("fallback_endpoints")
+    if isinstance(plural, list) and plural:
+        chain = list(plural)
+    elif agent_cfg.get("fallback_endpoint"):
+        chain = [agent_cfg["fallback_endpoint"]]
+
+    resolved_chain: list[dict] = []
+    for ref in chain:
+        flat = _resolve_endpoint_ref(ref)
+        if flat:
+            resolved_chain.append(flat)
 
     # Load SOUL.md as system prompt if no explicit prompt is set
     system_prompt = agent_cfg.get("system_prompt")
@@ -154,8 +304,9 @@ def get_agent_config(agent_name):
             system_prompt = soul
 
     return {
-        "endpoint": get_endpoint(endpoint_name) if endpoint_name else None,
-        "fallback_endpoint": get_endpoint(fallback_name) if fallback_name else None,
+        "endpoint": _resolve_endpoint_ref(endpoint_ref),
+        "fallback_endpoint": resolved_chain[0] if resolved_chain else None,
+        "fallback_endpoints": resolved_chain,
         "system_prompt": system_prompt,
         "max_iterations": agent_cfg.get("max_iterations", 200),
         "description": agent_cfg.get("description", ""),

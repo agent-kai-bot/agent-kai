@@ -37,10 +37,28 @@ from config import (
 
 
 def create_llm(endpoint_cfg=None):
-    """Create a ChatOpenAI instance from an endpoint config dict."""
+    """Build a chat model instance from an endpoint config dict.
+
+    Routes by ``provider`` field on the config:
+
+    - ``codex-cli`` (or any ``base_url`` ending in chatgpt.com/codex):
+      uses ``ChatCodex``, a small subclass of ``ChatOpenAI`` that loads
+      OAuth credentials from ``~/.codex/auth.json`` and routes any
+      system message into the Responses API ``instructions`` field.
+
+    - everything else: standard ``ChatOpenAI`` against an
+      OpenAI-compatible endpoint (the existing path for vLLM, the
+      cloud kai-* endpoints, OpenAI direct, OpenRouter, etc.).
+    """
     if endpoint_cfg is None:
         first = next(iter(ENDPOINTS), None)
         endpoint_cfg = get_endpoint(first) if first else {}
+
+    provider = (endpoint_cfg.get("provider") or "").lower()
+    base_url = endpoint_cfg.get("base_url") or ""
+    if provider == "codex-cli" or "chatgpt.com" in base_url:
+        return _create_codex_chat_model(endpoint_cfg)
+
     return ChatOpenAI(
         base_url=endpoint_cfg["base_url"],
         api_key=endpoint_cfg.get("api_key", "not-needed"),
@@ -50,6 +68,119 @@ def create_llm(endpoint_cfg=None):
         max_tokens=endpoint_cfg.get("max_tokens", 4096),
         streaming=True,
     )
+
+
+def _create_codex_chat_model(endpoint_cfg: dict):
+    """Build a Codex Responses chat model bound to the user's ChatGPT subscription.
+
+    Loads (and refreshes if necessary) the OAuth credentials the
+    codex CLI stores at ``~/.codex/auth.json`` — the user must have
+    run ``codex login`` once OR ``python -m agent.codex_auth login``
+    OR called ``agent.codex_auth.login()`` from the TUI.
+
+    Returns a ``ChatCodex`` instance configured to talk to the
+    Codex Responses endpoint with the proper auth headers and
+    request body shape.
+    """
+    from agent.codex_auth import get_valid_credentials, DEFAULT_AUTH_PATH
+
+    creds = get_valid_credentials()
+    if creds is None:
+        raise RuntimeError(
+            "Codex endpoint requires OAuth credentials. Run "
+            "`codex login` (the official CLI) or "
+            "`python -m agent.codex_auth login` to authenticate, "
+            f"then ensure {DEFAULT_AUTH_PATH} exists."
+        )
+
+    base_url = endpoint_cfg.get("base_url") or "https://chatgpt.com/backend-api/codex"
+    model = endpoint_cfg.get("model") or "gpt-5.4"
+    reasoning_effort = endpoint_cfg.get("reasoning_effort", "medium")
+    text_verbosity = endpoint_cfg.get("text_verbosity", "medium")
+
+    extra_body = {
+        "store": False,
+        "include": ["reasoning.encrypted_content"],
+        "text": {"verbosity": text_verbosity},
+        "reasoning": {"effort": reasoning_effort, "summary": "auto"},
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+    }
+
+    return ChatCodex(
+        base_url=base_url,
+        api_key=creds.access_token,
+        model=model,
+        default_headers={
+            "chatgpt-account-id": creds.account_id,
+            "originator": "kai",
+            "User-Agent": "kai-agent (linux)",
+            "OpenAI-Beta": "responses=experimental",
+        },
+        use_responses_api=True,
+        streaming=True,  # Codex Responses requires stream=true
+        extra_body=extra_body,
+    )
+
+
+class ChatCodex(ChatOpenAI):
+    """ChatOpenAI subclass that adapts to Codex's Responses API quirks.
+
+    Two adjustments are needed on top of vanilla
+    ``ChatOpenAI(use_responses_api=True)``:
+
+    1. Codex requires ``instructions`` to be set on every request.
+       LangChain's default behavior would send the system message
+       as the first ``input`` entry, which Codex rejects with
+       "Instructions are required". This subclass intercepts the
+       payload, pulls any system message out of ``input``, and
+       moves its text into the top-level ``instructions`` field.
+
+    2. ``store=false`` and ``stream=true`` are required (Codex
+       refuses any other combination). Both are pre-set via
+       ``extra_body`` and ``streaming=True`` in ``_create_codex_chat_model``.
+    """
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        return _move_system_to_instructions(payload)
+
+
+def _move_system_to_instructions(payload: dict) -> dict:
+    """Pull system messages out of ``input`` and into ``instructions``.
+
+    LangChain's responses API path puts everything in ``input``. Codex
+    needs the system content as a top-level ``instructions`` string.
+    Mutates and returns the payload.
+    """
+    inp = payload.get("input")
+    if not isinstance(inp, list):
+        return payload
+
+    sys_chunks: list[str] = []
+    remaining: list = []
+    for msg in inp:
+        if not isinstance(msg, dict) or msg.get("role") != "system":
+            remaining.append(msg)
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            sys_chunks.append(content)
+        elif isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict):
+                    text = c.get("text") or c.get("input_text") or ""
+                    if text:
+                        sys_chunks.append(text)
+                elif isinstance(c, str):
+                    sys_chunks.append(c)
+
+    if sys_chunks:
+        existing = payload.get("instructions") or ""
+        merged = "\n\n".join([existing, *sys_chunks]) if existing else "\n\n".join(sys_chunks)
+        payload["instructions"] = merged
+        payload["input"] = remaining
+    return payload
 
 
 def create_prompt(system_prompt=None):
@@ -168,12 +299,14 @@ class AgentRunner:
 
         cfg = get_agent_config(agent_name) if agent_name else {}
         ep = cfg.get("endpoint")
+        # Full chain — first failure walks the list in order
+        fallback_chain = cfg.get("fallback_endpoints") or []
+        # Backwards-compat alias preserved for any external readers
         self.fallback_endpoint = cfg.get("fallback_endpoint")
         max_iterations = cfg.get("max_iterations", 200)
         system_prompt = cfg.get("system_prompt")
 
         self.llm = create_llm(ep)
-        self.fallback_llm = create_llm(self.fallback_endpoint) if self.fallback_endpoint else None
 
         # Load persistent memory and register the tool that mutates it.
         # The frozen snapshot is injected into the system prompt here;
@@ -212,21 +345,35 @@ class AgentRunner:
             handle_parsing_errors=True,
         )
 
-        self.fallback_executor = None
-        if self.fallback_llm:
-            fallback_agent = create_tool_calling_agent(self.fallback_llm, self.tools, prompt)
-            self.fallback_executor = AgentExecutor(
-                agent=fallback_agent,
-                tools=self.tools,
-                verbose=False,
-                max_iterations=max_iterations,
-                handle_parsing_errors=True,
-            )
+        # Build executors for each fallback in the chain. Skip any
+        # that fail to initialize (e.g. an unreachable endpoint or
+        # missing credentials) so a broken fallback never blocks
+        # agent startup.
+        self.fallback_executors: list[AgentExecutor] = []
+        for fb_cfg in fallback_chain:
+            try:
+                fb_llm = create_llm(fb_cfg)
+                fb_agent = create_tool_calling_agent(fb_llm, self.tools, prompt)
+                self.fallback_executors.append(AgentExecutor(
+                    agent=fb_agent,
+                    tools=self.tools,
+                    verbose=False,
+                    max_iterations=max_iterations,
+                    handle_parsing_errors=True,
+                ))
+            except Exception as exc:
+                self.log.warning(
+                    "fallback executor build failed for %s endpoint=%s: %s",
+                    self.agent_name, fb_cfg.get("base_url"), exc,
+                )
+        # Backwards-compat alias for callers that read the singular
+        self.fallback_executor = self.fallback_executors[0] if self.fallback_executors else None
 
         log_agent_event(self.agent_name, "init", {
             "endpoint": ep.get("base_url") if ep else None,
             "model": ep.get("model") if ep else None,
             "max_iterations": max_iterations,
+            "fallback_chain": [(f.get("base_url"), f.get("model")) for f in fallback_chain],
             "tools": [t.name for t in self.tools],
         })
 
@@ -264,21 +411,39 @@ class AgentRunner:
             self.log.error("PRIMARY_FAILED agent=%s error=%s", self.agent_name, str(e))
             yield {"type": "error", "data": f"Primary endpoint failed: {e}"}
 
-        if primary_failed and self.fallback_executor:
-            log_agent_event(self.agent_name, "fallback")
-            yield {"type": "status", "data": "Falling back to secondary endpoint..."}
+        # Walk the fallback chain. Each entry is tried in order until
+        # one returns a non-empty, non-error result.
+        attempt = 0
+        for fb_executor in self.fallback_executors:
+            if not primary_failed:
+                break
+            attempt += 1
+            label = f"fallback_{attempt}"
+            log_agent_event(self.agent_name, label)
+            yield {
+                "type": "status",
+                "data": f"Falling back to endpoint #{attempt} of {len(self.fallback_executors)}...",
+            }
+            primary_failed = False
             accumulated = ""
             try:
-                async for event in self._stream_executor(self.fallback_executor, user_input):
+                async for event in self._stream_executor(fb_executor, user_input):
                     yield event
                     if event["type"] == "token":
                         accumulated += event["data"]
                     elif event["type"] == "final":
                         final_text = event["data"]
                         emitted_final = True
+                    elif event["type"] == "error":
+                        primary_failed = True
+                if not primary_failed and not (final_text or accumulated).strip():
+                    primary_failed = True
+                    self.log.warning("EMPTY_RESPONSE agent=%s endpoint=%s", self.agent_name, label)
+                    yield {"type": "error", "data": f"Endpoint #{attempt} returned an empty response."}
             except Exception as e:
-                self.log.error("FALLBACK_FAILED agent=%s error=%s", self.agent_name, str(e))
-                yield {"type": "error", "data": f"Fallback also failed: {e}"}
+                primary_failed = True
+                self.log.error("FALLBACK_FAILED agent=%s attempt=%d error=%s", self.agent_name, attempt, str(e))
+                yield {"type": "error", "data": f"Endpoint #{attempt} failed: {e}"}
                 final_text = f"Error: {e}"
 
         response_text = ensure_non_empty_response(final_text or accumulated)
