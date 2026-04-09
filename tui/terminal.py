@@ -33,6 +33,13 @@ KAI_API_BASE = "https://agent-k.ai/v1"
 
 TRACKED_SYMBOLS = ["BTC", "ETH", "SOL"]
 
+# Maximum number of inputs that can stack up while the agent is busy.
+# Anything beyond this is rejected with a "queue full" message rather
+# than allowing unbounded type-ahead. 10 is a generous upper bound for
+# realistic interactive use; the user can always /queue clear and
+# retry if they hit the cap.
+MAX_INPUT_QUEUE = 10
+
 
 def _kai_api_headers() -> dict:
     """Bearer-auth headers for cloud agent-k.ai market data calls."""
@@ -716,7 +723,22 @@ class TradingTerminal(App):
         from this method (and ``_drain_input_queue`` /
         ``_drop_queue_item`` for removal) so the row index always
         maps to the matching string.
+
+        Enforces ``MAX_INPUT_QUEUE`` as a hard cap. Inputs beyond the
+        cap are rejected with a chat message rather than silently
+        accepted (which would lead to runaway memory + endless
+        replays). The user can ``/queue clear`` to flush and retry.
         """
+        if len(self._input_queue) >= MAX_INPUT_QUEUE:
+            preview = text[:60].replace("\n", " ")
+            self._chat_msg(
+                f"[bold red]queue full ({MAX_INPUT_QUEUE} max) — dropped:[/] "
+                f"[dim]{preview}[/]"
+            )
+            self._chat_msg(
+                "[dim]Use /queue clear to flush, or /queue drop N to remove a specific item.[/]"
+            )
+            return
         self._input_queue.append(text)
         position = len(self._input_queue)
         row = QueuedInputRow(text, position)
@@ -1070,18 +1092,25 @@ class TradingTerminal(App):
         return False
 
     def _handle_queue_command(self, parts: list[str]) -> bool:
-        """Inspect or clear the type-ahead input queue.
+        """Inspect or modify the type-ahead input queue.
 
         Forms:
-            /queue          show pending count + a hint about [X]
-            /queue clear    drop all queued items at once
+            /queue              show pending count + (#N): preview list
+            /queue clear        drop all queued items at once
+            /queue drop N       drop the item at position N (1-indexed)
 
         Individual items can also be removed by clicking the [X]
         button on each queued row in chat — that path goes through
         ``on_queued_input_row_removed`` -> ``_drop_queue_item``.
-        ``/queue clear`` is the bulk equivalent for the case where
-        the user has 30 things stacked up and doesn't want to click
-        each one.
+        ``/queue drop N`` is the keyboard equivalent: same code path,
+        different trigger. ``/queue clear`` flushes the entire queue
+        in one shot for the case where the user has 10 things stacked
+        up and doesn't want to click each one or count positions.
+
+        ``flush`` and ``wipe`` are aliases for ``clear``. ``drop``
+        with no N is rejected with a usage error (it would be
+        ambiguous: drop everything? drop the first? Better to make
+        the user be explicit).
         """
         sub = parts[1].lower() if len(parts) > 1 else ""
 
@@ -1091,12 +1120,19 @@ class TradingTerminal(App):
                 self._chat_msg("[dim]queue empty[/]")
                 return True
             self._chat_msg(
-                f"[dim]{n} item{'s' if n != 1 else ''} queued — "
-                f"click [X] on any row to drop it, or /queue clear to flush[/]"
+                f"[dim]{n} item{'s' if n != 1 else ''} queued (max {MAX_INPUT_QUEUE}):[/]"
+            )
+            for i, item in enumerate(self._input_queue, start=1):
+                preview = item[:60].replace("\n", " ")
+                if len(item) > 60:
+                    preview += "…"
+                self._chat_msg(f"[dim]  #{i}: {preview}[/]")
+            self._chat_msg(
+                "[dim]Click [X] on a row, or /queue drop N, or /queue clear[/]"
             )
             return True
 
-        if sub in ("clear", "drop", "flush", "wipe"):
+        if sub in ("clear", "flush", "wipe"):
             n = len(self._input_queue)
             if n == 0:
                 self._chat_msg("[dim]queue already empty[/]")
@@ -1111,8 +1147,43 @@ class TradingTerminal(App):
             )
             return True
 
+        if sub == "drop":
+            # /queue drop N — remove item at 1-indexed position N
+            if len(parts) < 3:
+                self._chat_msg(
+                    "[red]Usage:[/] [dim]/queue drop N[/]  "
+                    "[dim](1-indexed position; use /queue to see positions)[/]"
+                )
+                return True
+            try:
+                pos = int(parts[2])
+            except ValueError:
+                self._chat_msg(
+                    f"[red]Invalid position '{parts[2]}' — must be a number[/]"
+                )
+                return True
+            n = len(self._input_queue)
+            if n == 0:
+                self._chat_msg("[dim]queue empty — nothing to drop[/]")
+                return True
+            if pos < 1 or pos > n:
+                self._chat_msg(
+                    f"[red]Position {pos} out of range — queue has "
+                    f"{n} item{'s' if n != 1 else ''} (1..{n})[/]"
+                )
+                return True
+            # Convert 1-indexed user position to 0-indexed list slot
+            target_row = self._queue_widgets[pos - 1]
+            dropped_text = self._input_queue[pos - 1]
+            preview = dropped_text[:60].replace("\n", " ")
+            self._drop_queue_item(target_row)
+            self._chat_msg(
+                f"[dim]dropped #{pos}: {preview}[/]"
+            )
+            return True
+
         self._chat_msg(
-            "[red]Usage:[/] [dim]/queue  |  /queue clear[/]"
+            "[red]Usage:[/] [dim]/queue  |  /queue clear  |  /queue drop N[/]"
         )
         return True
 
