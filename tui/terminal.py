@@ -1491,12 +1491,17 @@ class TradingTerminal(App):
     def _extract_last_agent_text(chat: "ChatPanel") -> str:
         """Walk the chat panel and return the most recent agent text.
 
-        Pulls the renderable off each Static child, strips Rich markup
-        tags so the clipboard contents are pure text the user can
-        paste into anything (Slack, an email, a notebook). Walks in
-        reverse so the very last response wins, which is what the
-        user almost always wants when they hit Ctrl+Y after the
-        agent finishes a turn.
+        Pulls the markup string off each Static child via
+        ``widget.content`` (NOT ``widget.renderable`` — that attribute
+        does not exist on Textual's Static and the previous version
+        of this method was silently returning the empty default for
+        every widget, which is why Ctrl+Y kept reporting "Nothing to
+        copy yet"). Strips Rich markup tags so the clipboard contents
+        are pure text the user can paste into anything.
+
+        Walks in reverse so the very last response wins — that's
+        what the user almost always wants when they hit Ctrl+Y after
+        the agent finishes a turn.
         """
         from rich.text import Text
 
@@ -1508,12 +1513,19 @@ class TradingTerminal(App):
         fallback_tags = {"agent-msg", "tool-msg"}  # 2nd pass if no agent-msg yet
 
         def _plain(widget) -> str:
-            r = getattr(widget, "renderable", "")
-            if isinstance(r, str):
-                return Text.from_markup(r).plain
-            if hasattr(r, "plain"):
-                return r.plain
-            return str(r)
+            # Textual Static stores its markup on `.content`. As a
+            # final fallback we render the widget — render() returns
+            # a Rich Content object whose str() is the plain text
+            # already, no markup stripping needed.
+            content = getattr(widget, "content", None)
+            if isinstance(content, str):
+                return Text.from_markup(content).plain
+            if content is not None and hasattr(content, "plain"):
+                return content.plain
+            try:
+                return str(widget.render())
+            except Exception:
+                return ""
 
         # First pass: prefer the most recent agent message
         for widget in reversed(list(chat.children)):
