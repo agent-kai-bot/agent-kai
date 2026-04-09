@@ -126,7 +126,7 @@ def _create_codex_chat_model(endpoint_cfg: dict):
 class ChatCodex(ChatOpenAI):
     """ChatOpenAI subclass that adapts to Codex's Responses API quirks.
 
-    Two adjustments are needed on top of vanilla
+    Three adjustments are needed on top of vanilla
     ``ChatOpenAI(use_responses_api=True)``:
 
     1. Codex requires ``instructions`` to be set on every request.
@@ -139,11 +139,100 @@ class ChatCodex(ChatOpenAI):
     2. ``store=false`` and ``stream=true`` are required (Codex
        refuses any other combination). Both are pre-set via
        ``extra_body`` and ``streaming=True`` in ``_create_codex_chat_model``.
+
+    3. The Responses API returns ``AIMessage.content`` as a list of
+       structured content blocks (``[{'type': 'text', 'text': '...'},
+       ...]``) instead of a plain string. The LangChain agent loop's
+       ``OpenAIToolsAgentOutputParser`` expects ``message.content`` to
+       be a string and calls ``.strip()`` on it — which raises
+       ``'list' object has no attribute 'strip'`` and crashes the
+       primary executor (sending the agent down the fallback chain
+       to a different model). This subclass overrides every code
+       path that produces an AIMessage / AIMessageChunk and flattens
+       the text blocks into a plain string before they leave the
+       chat model. ``tool_calls`` live on a separate field on the
+       message and are unaffected.
     """
 
     def _get_request_payload(self, input_, *, stop=None, **kwargs):
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
         return _move_system_to_instructions(payload)
+
+    # ── Content-flattening overrides ────────────────────────────
+    # All four model code paths (sync/async × streaming/non-streaming)
+    # need the same fix because the agent executor reaches them via
+    # different routes depending on whether AgentExecutor.astream_events
+    # or AgentRunner.invoke is the entry point. Each override delegates
+    # to the parent and post-processes the result.
+
+    async def _astream(self, *args, **kwargs):
+        async for chunk in super()._astream(*args, **kwargs):
+            yield _flatten_chat_chunk(chunk)
+
+    def _stream(self, *args, **kwargs):
+        for chunk in super()._stream(*args, **kwargs):
+            yield _flatten_chat_chunk(chunk)
+
+    def _generate(self, *args, **kwargs):
+        result = super()._generate(*args, **kwargs)
+        for gen in result.generations:
+            _flatten_chat_message(gen.message)
+        return result
+
+    async def _agenerate(self, *args, **kwargs):
+        result = await super()._agenerate(*args, **kwargs)
+        for gen in result.generations:
+            _flatten_chat_message(gen.message)
+        return result
+
+
+def _flatten_chat_chunk(chunk):
+    """Flatten the content of an AIMessageChunk in-place.
+
+    Returns the same chunk so it can be used inline in a generator.
+    """
+    if chunk is not None and getattr(chunk, "message", None) is not None:
+        _flatten_chat_message(chunk.message)
+    return chunk
+
+
+def _flatten_chat_message(message):
+    """Convert AIMessage(Chunk) ``content`` from list-of-blocks to plain string.
+
+    Codex's Responses API and ``ChatOpenAI(use_responses_api=True)``
+    return content as a list shaped like::
+
+        [{"type": "text", "text": "...", "index": 0}, ...]
+
+    Some blocks may be reasoning summaries, refusals, or function-call
+    metadata — those get stored on ``message.additional_kwargs`` /
+    ``message.tool_calls`` by langchain-openai's v0 conversion already,
+    so by the time we see the message here only text blocks are
+    typically left in ``content``. We concatenate every text block's
+    ``text`` field into a single plain string and assign that back to
+    ``message.content``.
+
+    The agent loop's ``OpenAIToolsAgentOutputParser`` then sees a
+    normal string and ``.strip()`` works.
+
+    Mutates and returns the same message object.
+    """
+    if message is None or not hasattr(message, "content"):
+        return message
+    content = message.content
+    if not isinstance(content, list):
+        return message
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict):
+            if block.get("type") in ("text", "output_text"):
+                t = block.get("text")
+                if isinstance(t, str):
+                    parts.append(t)
+        elif isinstance(block, str):
+            parts.append(block)
+    message.content = "".join(parts)
+    return message
 
 
 def _move_system_to_instructions(payload: dict) -> dict:
