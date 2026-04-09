@@ -3,6 +3,7 @@
 import asyncio
 import io
 import os
+import shutil
 import subprocess
 import sys
 from contextlib import redirect_stdout
@@ -12,6 +13,17 @@ import requests
 from langchain_core.tools import StructuredTool
 
 from config import (
+    DOCKER_SANDBOX_ALLOWED_NETWORKS,
+    DOCKER_SANDBOX_CPUS,
+    DOCKER_SANDBOX_DEFAULT_NETWORK,
+    DOCKER_SANDBOX_DEFAULT_TIMEOUT,
+    DOCKER_SANDBOX_IMAGE,
+    DOCKER_SANDBOX_MAX_TIMEOUT,
+    DOCKER_SANDBOX_MEMORY,
+    DOCKER_SANDBOX_MOUNT_WORKSPACE_DEFAULT,
+    DOCKER_SANDBOX_PIDS,
+    DOCKER_SANDBOX_TMPFS_SIZE,
+    DOCKER_SANDBOX_USER,
     MAX_FILE_READ_CHARS,
     MAX_OUTPUT_CHARS,
     SHELL_TIMEOUT_SECONDS,
@@ -317,6 +329,211 @@ claude_exec = StructuredTool.from_function(
 )
 
 
+# ── Docker Sandbox ───────────────────────────────────────────
+#
+# Run arbitrary commands inside an ephemeral, locked-down container. This
+# is the safe counterpart to ``shell_exec`` / ``python_exec`` for code the
+# agent doesn't fully trust (output of frontier-model escalation,
+# untrusted user input, pip installs that would otherwise pollute the
+# host). Every run gets a fresh container, strict resource limits,
+# dropped capabilities, no network by default, and auto-cleanup via
+# ``--rm``. The root filesystem is read-only; a small tmpfs is mounted
+# at ``/tmp`` for scratch writes.
+#
+# The tool is created per-agent via ``create_docker_sandbox_tool`` so
+# the sub-agent's workspace directory can be bind-mounted as ``/work``
+# without the LLM having to know the host path. Sub-agents write a
+# file with ``file_write``, then run it in the sandbox — the output
+# comes back the same way ``shell_exec`` does.
+
+_DOCKER_PATH = shutil.which("docker")
+
+
+def _docker_sandbox(
+    command: str,
+    image: str = DOCKER_SANDBOX_IMAGE,
+    timeout: int = DOCKER_SANDBOX_DEFAULT_TIMEOUT,
+    network: str = DOCKER_SANDBOX_DEFAULT_NETWORK,
+    workdir: str | None = None,
+    mount_workspace: bool = DOCKER_SANDBOX_MOUNT_WORKSPACE_DEFAULT,
+    workspace_host_path: str | None = None,
+) -> str:
+    """Run a shell command inside a locked-down docker sandbox.
+
+    Args:
+        command: Shell command to run inside the container. Passed to ``sh -c``.
+        image: Container image. Defaults to the configured sandbox image.
+        timeout: Wall-clock timeout in seconds. Capped at the configured max.
+        network: Docker network mode. Must be one of the allowed values
+            (``none`` by default for offline runs, ``bridge`` to allow
+            outbound network).
+        workdir: Working directory inside the container. Defaults to
+            ``/work`` when a workspace is mounted, ``/tmp`` otherwise
+            (the tmpfs scratch area — the only writable place in a
+            mount-less run).
+        mount_workspace: If True and a workspace host path is available,
+            bind-mount it as ``/work`` read-write.
+        workspace_host_path: Bound at tool-creation time by
+            ``create_docker_sandbox_tool``; callers normally don't set
+            this directly.
+
+    Returns:
+        Combined stdout + stderr output with exit code, or an error
+        string if docker is unavailable or the container failed to
+        start.
+    """
+    if not _DOCKER_PATH:
+        return "Error: docker CLI not found in PATH; cannot run docker_sandbox."
+
+    if network not in DOCKER_SANDBOX_ALLOWED_NETWORKS:
+        return (
+            f"Error: network mode '{network}' is not allowed. "
+            f"Must be one of: {', '.join(DOCKER_SANDBOX_ALLOWED_NETWORKS)}."
+        )
+
+    # Clamp the timeout so an LLM can't ask for an 8-hour run.
+    timeout = max(1, min(int(timeout), DOCKER_SANDBOX_MAX_TIMEOUT))
+
+    # Decide whether to mount the workspace. This also decides the
+    # container user: with a mount we run as the host uid:gid so file
+    # permissions on the bound directory work naturally; without a
+    # mount we stay with the strict default (nobody) since there's
+    # nothing on the host to interact with anyway.
+    mount_arg: str | None = None
+    if mount_workspace and workspace_host_path:
+        host_path = os.path.abspath(os.path.expanduser(workspace_host_path))
+        if not os.path.isdir(host_path):
+            return (
+                f"Error: workspace path '{host_path}' does not exist; "
+                "cannot mount it into the sandbox."
+            )
+        mount_arg = f"--mount=type=bind,source={host_path},target=/work"
+
+    if workdir is None:
+        workdir = "/work" if mount_arg else "/tmp"
+
+    if mount_arg:
+        # Host-uid/gid so bind-mount files are readable + writable.
+        # All the other hardening (cap-drop, no-new-privileges,
+        # read-only root fs, network=none by default) still applies,
+        # so the sandbox stays sandboxed.
+        user_flag = f"--user={os.getuid()}:{os.getgid()}"
+    else:
+        user_flag = f"--user={DOCKER_SANDBOX_USER}"
+
+    cmd: list[str] = [
+        _DOCKER_PATH,
+        "run",
+        "--rm",
+        # Harden the runtime.
+        f"--network={network}",
+        user_flag,
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--read-only",
+        f"--tmpfs=/tmp:rw,noexec,nosuid,size={DOCKER_SANDBOX_TMPFS_SIZE}",
+        f"--memory={DOCKER_SANDBOX_MEMORY}",
+        f"--cpus={DOCKER_SANDBOX_CPUS}",
+        f"--pids-limit={DOCKER_SANDBOX_PIDS}",
+        # Don't leak the host env into the container.
+        "--env=HOME=/tmp",
+        "--env=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        f"--workdir={workdir}",
+    ]
+
+    if mount_arg:
+        cmd.append(mount_arg)
+
+    cmd.extend([image, "sh", "-c", command])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            f"Error: sandbox timed out after {timeout}s. The container "
+            "was killed; no output was captured."
+        )
+    except FileNotFoundError:
+        return "Error: docker CLI not found; cannot run docker_sandbox."
+    except Exception as exc:  # noqa: BLE001
+        return f"Error launching sandbox: {exc}"
+
+    parts: list[str] = []
+    if result.stdout:
+        parts.append(result.stdout)
+    if result.stderr:
+        parts.append(f"[stderr]\n{result.stderr}")
+    if result.returncode != 0:
+        parts.append(f"[exit code: {result.returncode}]")
+    output = "\n".join(p for p in parts if p).rstrip()
+    if not output:
+        output = "(no output)"
+    if len(output) > MAX_OUTPUT_CHARS:
+        output = output[:MAX_OUTPUT_CHARS] + f"\n... [truncated at {MAX_OUTPUT_CHARS} chars]"
+    return output
+
+
+def create_docker_sandbox_tool(workspace_host_path: str | None = None):
+    """Create a ``docker_sandbox`` tool bound to an optional workspace path.
+
+    The returned tool bakes in the sub-agent's workspace so the LLM
+    never has to know (or be trusted with) a host filesystem path. When
+    the main agent calls this without a workspace, sandbox runs are
+    fully isolated with only a tmpfs scratch area.
+    """
+
+    def _run(
+        command: str,
+        image: str = DOCKER_SANDBOX_IMAGE,
+        timeout: int = DOCKER_SANDBOX_DEFAULT_TIMEOUT,
+        network: str = DOCKER_SANDBOX_DEFAULT_NETWORK,
+    ) -> str:
+        return _docker_sandbox(
+            command=command,
+            image=image,
+            timeout=timeout,
+            network=network,
+            mount_workspace=bool(workspace_host_path),
+            workspace_host_path=workspace_host_path,
+        )
+
+    description = (
+        "Run a shell command inside a locked-down, ephemeral docker container. "
+        "Use this instead of shell_exec when running untrusted code, frontier-model "
+        "output, pip installs, or anything you don't want touching the host. "
+        "The container is auto-removed on exit, runs as nobody with dropped "
+        f"capabilities and a read-only root fs, uses {DOCKER_SANDBOX_MEMORY} memory / "
+        f"{DOCKER_SANDBOX_CPUS} CPU, and has no outbound network by default. "
+        "Inputs: "
+        "command (string, shell command to run via sh -c), "
+        f"image (string, optional, default '{DOCKER_SANDBOX_IMAGE}'), "
+        f"timeout (int, optional, default {DOCKER_SANDBOX_DEFAULT_TIMEOUT}s, max {DOCKER_SANDBOX_MAX_TIMEOUT}s), "
+        f"network (string, optional, '{DOCKER_SANDBOX_DEFAULT_NETWORK}' for isolated, "
+        "'bridge' for outbound network access)."
+    )
+    if workspace_host_path:
+        description += (
+            " The agent's workspace is bind-mounted read-write at /work so files "
+            "written with file_write appear inside the container."
+        )
+    else:
+        description += (
+            " No workspace mount is configured — the container is fully isolated "
+            "with only a small tmpfs at /tmp for scratch writes."
+        )
+
+    return StructuredTool.from_function(
+        func=_run,
+        name="docker_sandbox",
+        description=description,
+    )
+
+
 # ── NATS Publish ─────────────────────────────────────────────
 
 def create_nats_publish_tool(bus):
@@ -478,6 +695,8 @@ def _get_crypto_tools():
 def create_tools(bus=None, sub_agent_manager=None):
     """Create and return all agent tools."""
     tools = [file_read, file_write, file_edit, shell_exec, python_exec, web_fetch, codex_exec, claude_exec]
+    # Main agent ("nano") has no workspace, so the sandbox is fully isolated.
+    tools.append(create_docker_sandbox_tool(workspace_host_path=None))
     tools.extend(_get_crypto_tools())
     if bus:
         tools.append(create_nats_publish_tool(bus))
@@ -488,9 +707,18 @@ def create_tools(bus=None, sub_agent_manager=None):
     return tools
 
 
-def create_sub_agent_tools(bus):
-    """Create the limited toolset for sub-agents (no spawning)."""
+def create_sub_agent_tools(bus, workspace_host_path: str | None = None):
+    """Create the limited toolset for sub-agents (no spawning).
+
+    Args:
+        bus: NATS bus instance (or None for bus-less runs).
+        workspace_host_path: Absolute host path to the sub-agent's
+            workspace directory. When provided, the docker_sandbox tool
+            bind-mounts it as ``/work`` so the agent can write files via
+            ``file_write`` and run them sandboxed in the same step.
+    """
     tools = [file_read, file_write, file_edit, shell_exec, python_exec, web_fetch, codex_exec, claude_exec]
+    tools.append(create_docker_sandbox_tool(workspace_host_path=workspace_host_path))
     tools.extend(_get_crypto_tools())
     if bus:
         tools.append(create_nats_publish_tool(bus))
