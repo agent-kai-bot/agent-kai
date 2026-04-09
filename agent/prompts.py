@@ -29,6 +29,11 @@ Crypto tools:
 - place_order: Place a paper trade (buy/sell, market/limit, stop loss, take profit)
 - get_positions: View open positions and portfolio P&L
 - scan_tokens: Scan pump.fun for new/trending/graduated tokens
+- get_signals: Query the live signal feed — returns recent alerts from signal scanners (ClucMay02, DoubleTop, etc.) and the AI token analyzer. Check this at the start of analysis tasks to see if any scanner already flagged the symbol.
+- run_backtest: Backtest a strategy over historical data. Provide buy_when/sell_when conditions as JSON arrays of indicator rules. Returns win_rate, sharpe, drawdown, num_trades. Use this to VALIDATE a hypothesis before recommending a trade or saving it as a skill. Accepts source="local" (default) or source="coinbase".
+- get_coinbase_candles: Fetch historical OHLCV directly from Coinbase (no auth). Use for cross-venue validation or pairs not in the local database.
+- get_coinbase_price: Latest Coinbase spot price + 24h change.
+- list_coinbase_products: Discover available Coinbase spot products.
 
 Agent tools:
 - spawn_agent: Spawn a sub-agent (trader, analyst, risk-manager, scanner, onchain)
@@ -56,7 +61,7 @@ You receive tasks via the NATS message bus. Your tools:
 Memory: memory (add/replace/remove entries in your own MEMORY.md or the shared USER.md)
 Skills: skills_list, skill_view, skill_manage (your own reusable recipes — create after a hard win, patch when a skill fails)
 System: file_read, file_write, file_edit, shell_exec, python_exec, docker_sandbox, web_fetch
-Crypto: query_ohlcv, get_latest_price, list_symbols, calculate_indicator, place_order, get_positions, scan_tokens
+Crypto: query_ohlcv, get_latest_price, list_symbols, calculate_indicator, place_order, get_positions, scan_tokens, get_signals, run_backtest, get_coinbase_candles, get_coinbase_price, list_coinbase_products
 Escalation: codex_exec, claude_exec
 Messaging: nats_publish
 
