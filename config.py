@@ -130,6 +130,77 @@ DOCKER_SANDBOX_MOUNT_WORKSPACE_DEFAULT = bool(
 )
 
 
+# ── Reasoning effort (thinking levels) ─────────────────────────
+#
+# Reasoning-capable models — gpt-5.x via Codex Responses API,
+# gpt-5.x via the OpenAI direct API, o1/o3, etc — accept a
+# `reasoning_effort` field that controls how much hidden chain-of
+# -thought the model burns before producing its answer. Higher
+# levels = better answers on hard problems, but slower and more
+# expensive (the hidden tokens are billed).
+#
+# The valid set comes from the openai SDK's
+# ``openai.types.shared_params.reasoning_effort.ReasoningEffort``
+# typed literal. Aliases like "x-high" / "extreme" are mapped to
+# "xhigh" by ``normalize_reasoning_effort``.
+VALID_REASONING_EFFORTS: tuple[str, ...] = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+)
+
+# User-facing aliases — accepted on input, normalized to the
+# canonical form before being stored or sent on the wire.
+_REASONING_EFFORT_ALIASES: dict[str, str] = {
+    "x-high": "xhigh",
+    "extreme": "xhigh",
+    "max": "xhigh",
+    "extra": "xhigh",
+    "off": "none",
+    "min": "minimal",
+}
+
+
+def normalize_reasoning_effort(value: str) -> str | None:
+    """Lowercase + alias-resolve a reasoning_effort value.
+
+    Returns the canonical name if valid, else ``None`` (caller
+    should reject and show the valid set).
+    """
+    if not isinstance(value, str):
+        return None
+    v = value.strip().lower()
+    v = _REASONING_EFFORT_ALIASES.get(v, v)
+    return v if v in VALID_REASONING_EFFORTS else None
+
+
+def set_agent_reasoning_effort(agent_name: str, effort: str) -> str:
+    """Validate and apply a per-agent reasoning effort override.
+
+    Mutates ``AGENTS[agent_name]["reasoning_effort"]`` in memory so
+    the next call to ``get_agent_config`` (and the rebuild it
+    drives) sees the new value. Does NOT persist to disk — runtime
+    overrides are session-scoped, mirroring the existing /model
+    behavior. To make a change permanent, edit agent-config.json.
+
+    Returns the canonical effort name on success.
+    Raises ``ValueError`` on unknown agent or invalid effort.
+    """
+    if agent_name not in AGENTS:
+        raise ValueError(f"unknown agent '{agent_name}'")
+    canonical = normalize_reasoning_effort(effort)
+    if canonical is None:
+        raise ValueError(
+            f"invalid reasoning effort '{effort}' — "
+            f"valid: {', '.join(VALID_REASONING_EFFORTS)}"
+        )
+    AGENTS[agent_name]["reasoning_effort"] = canonical
+    return canonical
+
+
 def get_endpoint(name, model_name=None):
     """Resolve an (endpoint, model) pair into a flat config dict.
 
@@ -352,6 +423,27 @@ def get_agent_config(agent_name):
         if flat:
             resolved_chain.append(flat)
 
+    primary_ep = _resolve_endpoint_ref(endpoint_ref)
+
+    # Apply the per-agent reasoning_effort override (if set) to the
+    # primary endpoint AND every fallback. This is the only sane
+    # injection point: the resolved endpoint dicts come from
+    # get_endpoint(), which is shared across agents — mutating the
+    # endpoint registry directly would clobber every other agent
+    # using the same model. Per-agent overrides need to live on the
+    # agent's own copy of the dict, which is what we return here.
+    #
+    # Set via /think slash command at runtime, or by adding
+    # ``"reasoning_effort": "high"`` to the agent block in
+    # agent-config.json for a permanent override.
+    agent_effort = agent_cfg.get("reasoning_effort")
+    if agent_effort:
+        canonical = normalize_reasoning_effort(agent_effort) or agent_effort
+        if primary_ep is not None:
+            primary_ep["reasoning_effort"] = canonical
+        for fb in resolved_chain:
+            fb["reasoning_effort"] = canonical
+
     # Load SOUL.md as system prompt if no explicit prompt is set
     system_prompt = agent_cfg.get("system_prompt")
     if not system_prompt:
@@ -360,11 +452,12 @@ def get_agent_config(agent_name):
             system_prompt = soul
 
     return {
-        "endpoint": _resolve_endpoint_ref(endpoint_ref),
+        "endpoint": primary_ep,
         "fallback_endpoint": resolved_chain[0] if resolved_chain else None,
         "fallback_endpoints": resolved_chain,
         "system_prompt": system_prompt,
         "max_iterations": agent_cfg.get("max_iterations", 200),
         "description": agent_cfg.get("description", ""),
         "workspace": get_workspace_path(agent_name),
+        "reasoning_effort": agent_cfg.get("reasoning_effort"),
     }
