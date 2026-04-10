@@ -1,112 +1,142 @@
 # Agent KAI
 
-Terminal-first crypto analysis, paper-trading, and self-improving multi-agent platform powered by [`agent-k.ai`](https://agent-k.ai).
+Daemon-backed crypto analysis and paper-trading terminal with shared terminal and web clients, persistent sessions, scheduler jobs, and a real sub-agent runtime powered by [`agent-k.ai`](https://agent-k.ai).
 
 ![Agent KAI terminal screenshot](docs/agent-kai-tui.png)
 
 ## What it is
 
-Agent KAI is a Textual TUI for talking to a network of LLM-driven crypto agents. The main agent (`kai`) coordinates a roster of specialist sub-agents — analyst, trader, risk-manager, scanner, onchain, and a full org chart of org-roles (CEO, CTO, architect, developer, QA, project-manager, UX, SEO, sales-marketing) — over a local NATS message bus. Each agent has its own persistent memory, its own skill library, and its own LLM endpoint with a fallback chain.
+Agent KAI now runs as an always-on local daemon (`kaid`) that owns:
 
-The cloud `agent-k.ai` API serves both market data (REST + WebSocket) and LLM inference (OpenAI-compatible) so the open-source agent works out of the box without you running your own model server. Local vLLM and the OpenAI Codex Responses API (your ChatGPT subscription) are first-class fallback endpoints.
+- named sessions with persisted chat history and UI state
+- the main agent plus the sub-agent registry and NATS integration
+- scheduler jobs that survive client disconnects and daemon restarts
+- a WebSocket protocol shared by the terminal client and the web UI
+- REST endpoints for health, sessions, watchlist snapshots, portfolio, and chart history
 
-## What makes it different
-
-- **Real sub-agent runtime, not a chatbot router.** Every sub-agent is a long-lived LangChain executor with its own workspace, system prompt, memory, skills, and request/reply NATS subject. The main agent delegates and synthesizes — it doesn't impersonate.
-- **Self-learning loop.** After any non-trivial sub-agent task, you run `/learn` and the mentor sub-agent reads the session's tool calls + chat + existing skills, then drafts a new skill or patches an existing one. Skills are markdown recipes that get loaded on demand the next time the same setup appears.
-- **Multi-endpoint with thinking levels.** Swap any agent to any endpoint at runtime via `/model agent endpoint/model`. Crank reasoning effort with `/think agent xhigh` for hard problems on GPT-5.x via Codex. Fallback chains automatically roll over on errors.
-- **Backtesting tool the agent can call.** Agents validate trading hypotheses with `run_backtest` over real OHLCV before recommending them. Win-rate, Sharpe, drawdown — all returned as structured data the LLM can reason about.
-- **Type-ahead queue, multi-line paste, history, click-to-copy.** The TUI is designed for fast iteration: paste a stack trace, hit Enter, queue 10 things while the agent runs, drop any of them with an `[X]` click.
-
-## Quick start
-
-```bash
-# 1. NATS for the sub-agent message bus
-docker compose up -d
-
-# 2. Python deps
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# 3. Linux clipboard helper (one of these — see docs/troubleshooting.md)
-sudo apt install wl-clipboard   # Wayland
-# or
-sudo apt install xclip          # X11
-
-# 4. Get an API key from https://agent-k.ai/ and export it
-export AGENT_KAI_API_KEY="kai-..."
-
-# 5. Launch the trading terminal
-python main.py --terminal
-```
-
-`--terminal` now auto-starts the local daemon if it is not already
-running, then attaches to the default session. Use
-`python main.py --terminal --standalone` to force the old in-process path.
-
-Then type `/analyze BTC` and watch the analyst sub-agent spin up.
-
-## Documentation
-
-Everything is in [`docs/`](docs/) — start with the index.
-
-| Doc | What it covers |
-|---|---|
-| [docs/README.md](docs/README.md) | Index of every doc with one-line descriptions |
-| [docs/getting-started.md](docs/getting-started.md) | Install, API key, first run, first chat, sample prompts |
-| [docs/commands.md](docs/commands.md) | Every slash command (`/analyze`, `/buy`, `/think`, `/learn`, `/queue`, …) |
-| [docs/keybindings.md](docs/keybindings.md) | Every keyboard shortcut |
-| [docs/chat-input.md](docs/chat-input.md) | History, multi-line paste, queue, copy/paste |
-| [docs/chart-panel.md](docs/chart-panel.md) | Symbols, timeframes, sources, color schemes |
-| [docs/watchlist-and-positions.md](docs/watchlist-and-positions.md) | Watchlist, positions, alerts panels |
-| [docs/agents.md](docs/agents.md) | Sub-agent runtime, the 14 built-in agents, NATS, workspaces |
-| [docs/models-and-thinking.md](docs/models-and-thinking.md) | `/model`, `/think`, endpoints, fallbacks, Codex OAuth |
-| [docs/learning-and-skills.md](docs/learning-and-skills.md) | `/learn`, mentor reflection, memory, skills (with a working example) |
-| [docs/configuration.md](docs/configuration.md) | `agent-config.json` schema, env vars, secrets |
-| [docs/data-sources.md](docs/data-sources.md) | kai-api, Coinbase, signals, backtesting |
-| [docs/architecture.md](docs/architecture.md) | Process model, NATS topics, storage layout, contributor guide |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | Common issues + fixes |
+The default user path is still `python main.py --terminal`, but that command now auto-starts the daemon and attaches to the default session. The old single-process path is still available via `--standalone`.
 
 ## Requirements
 
 - Python 3.13+
-- Docker with Compose (for NATS)
-- An API key from [`https://agent-k.ai/`](https://agent-k.ai/)
-- Linux only: `wl-clipboard` (Wayland) or `xclip` (X11) for the copy shortcuts
+- Docker with Compose for NATS
+- an API key from [`https://agent-k.ai/`](https://agent-k.ai/)
+- Linux clipboard helper: `wl-clipboard` on Wayland or `xclip` on X11
+- Node.js + npm only if you want the web UI build locally
 
-See [docs/getting-started.md](docs/getting-started.md) for the complete walkthrough.
-
-## Run modes
-
-`--terminal` is now daemon-first. Use `--standalone` only when you
-explicitly want the old single-process path for debugging or regression
-checks.
+## Quick start
 
 ```bash
-python main.py --terminal                         # Auto-start local daemon and attach
-python main.py --terminal --session btc-scalper  # Same, named daemon session
-python main.py --terminal --remote ws://HOST:8765/ws  # Attach to an existing daemon
-python main.py --terminal --standalone           # Old in-process terminal path
-python main.py --daemon                          # Foreground daemon (debug/systemd)
-python main.py                                   # Plain agent TUI without trading panels
-python main.py --no-tui                          # Headless — NATS only
-python main.py --log-level DEBUG                 # Override log level
+# 1. Start NATS
+docker compose up -d
 
-bin/kaictl start              # Start the local daemon in the background
-bin/kaictl status             # Show daemon status
-bin/kaictl logs -n 200        # Show the latest daemon logs
-bin/kaictl stop               # Stop the kaictl-managed daemon
+# 2. Install Python deps
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# 3. Clipboard helper for the terminal UI
+sudo apt install wl-clipboard   # Wayland
+# or
+sudo apt install xclip          # X11
+
+# 4. Export your API key
+export AGENT_KAI_API_KEY="kai-..."
+
+# 5. Launch the daemon-backed terminal
+python main.py --terminal
 ```
 
-When `kaictl` or terminal auto-spawn starts the daemon, stdout/stderr land
-in `logs/kaid.log`.
+That command auto-starts the local daemon on `127.0.0.1:8765` if it is not already running, then attaches to the `terminal` session.
+
+## Common commands
+
+```bash
+python main.py --terminal                              # daemon-first terminal
+python main.py --terminal --session btc-scalper       # attach a named session
+python main.py --terminal --standalone                # old in-process mode
+python main.py --terminal --remote ws://HOST:8765/ws  # attach an existing daemon
+python main.py --daemon                               # foreground daemon on 127.0.0.1:8765
+
+bin/kaictl start
+bin/kaictl status
+bin/kaictl logs -n 200
+bin/kaictl stop
+```
+
+When `kaictl` or terminal auto-spawn starts the daemon, stdout and stderr go to `logs/kaid.log`.
+
+## Web UI
+
+The daemon serves the built Svelte web client at `/`. Until you build it, the root route shows a placeholder page instead of the dashboard.
+
+```bash
+cd web
+npm install
+npm run build
+cd ..
+
+python main.py --daemon
+# then open http://127.0.0.1:8765/
+```
+
+The browser client attaches to the same named sessions as the terminal and renders:
+
+- watchlist and positions sidebars
+- Lightweight Charts chart panel
+- markdown chat output with token streaming
+- signals, NATS traffic, and scheduler event panels
+- Ctrl+K slash-command palette
+
+## Scheduler
+
+Scheduler jobs live in the daemon, not the terminal client, so they keep firing after you close the UI.
+
+Examples:
+
+```text
+/schedule add at "in 30 minutes" "Check BTC and summarize the 1h chart"
+/schedule add cron "30 9 * * 1-5" "Open the day with BTC, ETH, and SOL"
+/schedule list
+/schedule show JOB_ID
+/schedule pause JOB_ID
+/schedule pause all
+/schedule resume JOB_ID
+/schedule cancel JOB_ID
+```
+
+Jobs persist in `workspaces/scheduler/jobs.json` and execute inside their owner session, so the resulting output lands in the same chat history as normal user turns.
+
+## Auth and remote access
+
+The daemon creates a bearer token at `workspaces/daemon-token.txt` on first start.
+
+- direct localhost terminal and browser clients can attach without a token
+- remote or proxied clients must present the token on both REST and WebSocket requests
+- the browser UI sends the token from its login field
+- the terminal remote client can use a tokenized URL such as `ws://HOST:8765/ws?token=...`
+
+Health and metrics endpoints:
+
+```bash
+curl -H "Authorization: Bearer $(cat workspaces/daemon-token.txt)" \
+  http://127.0.0.1:8765/api/health
+
+curl -H "Authorization: Bearer $(cat workspaces/daemon-token.txt)" \
+  http://127.0.0.1:8765/api/metrics
+```
+
+The built-in `python main.py --daemon` path binds `127.0.0.1` only. To expose the daemon on your LAN, run the ASGI app explicitly or put a reverse proxy in front of it:
+
+```bash
+.venv/bin/uvicorn daemon.server:app --host 0.0.0.0 --port 8765
+```
+
+If you expose the daemon outside localhost, treat `workspaces/daemon-token.txt` like a secret.
 
 ## systemd user service
 
-The repo ships a user-service template at `deploy/kaid.service`. It assumes
-the checkout lives at `~/git/claude-local-ai-agent`; edit the path if yours
-differs, then install it with:
+The repo ships a user-service template at `deploy/kaid.service`. It assumes the checkout lives at `~/git/claude-local-ai-agent`; adjust the path if yours differs.
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -120,23 +150,29 @@ journalctl --user -u kaid -f
 ## Tests
 
 ```bash
-.venv/bin/python test_learning_pipeline.py     # Self-learning pipeline (10 tests)
-.venv/bin/python test_signal_pipeline.py       # Signal consumer + tools (15 tests)
-.venv/bin/python -m unittest discover -s tests -v
+PYTHONPATH=. .venv/bin/pytest
+
+cd web
+npm run test
+npm run check
+npm run build
 ```
 
-See [docs/architecture.md](docs/architecture.md#testing) for the full test layout.
+## Documentation
 
-## Project status
+Start with [`docs/README.md`](docs/README.md), then use these as the main operator references:
 
-Branch `kai/self-learning-platform` is the active development branch. Recent additions:
-
-- Bash-style up/down history in the chat input with disk persistence
-- Multi-line paste capture (paste a stack trace, send the whole thing as one prompt)
-- Type-ahead queue with `[X]` click-to-drop and `/queue clear` / `/queue drop N`
-- `/think agent level` runtime reasoning-effort overrides for GPT-5.x via Codex
-- `/model agent endpoint/model` runtime endpoint switching with fallback rebuild
-- `/login codex` to authenticate against your ChatGPT subscription via OAuth
-- Clipboard backend auto-detection (wl-copy → xclip → xsel → OSC 52)
-
-See `git log --oneline kai/self-learning-platform` for the full history.
+| Doc | What it covers |
+|---|---|
+| [docs/getting-started.md](docs/getting-started.md) | install, API key, first run, sample prompts |
+| [docs/commands.md](docs/commands.md) | slash commands and operator workflows |
+| [docs/keybindings.md](docs/keybindings.md) | terminal shortcuts |
+| [docs/chart-panel.md](docs/chart-panel.md) | symbols, timeframes, data sources, chart controls |
+| [docs/watchlist-and-positions.md](docs/watchlist-and-positions.md) | watchlist, positions, alerts |
+| [docs/agents.md](docs/agents.md) | sub-agent runtime, workspaces, NATS |
+| [docs/models-and-thinking.md](docs/models-and-thinking.md) | `/model`, `/think`, endpoint switching, Codex auth |
+| [docs/learning-and-skills.md](docs/learning-and-skills.md) | `/learn`, memory, skills |
+| [docs/configuration.md](docs/configuration.md) | `agent-config.json`, env vars, secrets |
+| [docs/data-sources.md](docs/data-sources.md) | kai-api, Coinbase, signals, backtesting |
+| [docs/architecture.md](docs/architecture.md) | process model, storage, contributor guide |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | common failures and fixes |
