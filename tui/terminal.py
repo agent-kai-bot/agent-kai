@@ -152,6 +152,21 @@ class TradingTerminal(App):
         self._kai_api_refresh_task = None  # asyncio.Task running the periodic REST refresh
         self._kai_api_last_refresh: float = 0.0  # epoch timestamp of last successful REST refetch
         self._watchlist_refresh_task = None  # asyncio.Task keeping the watchlist prices fresh
+        # Activity-status text shown in the live status bar.
+        # _set_status mutates this and immediately re-renders;
+        # _refresh_status_bar pulls everything else (portfolio,
+        # chart, autotrade, queue, sub-agents) live each render.
+        self._activity_status: str = "idle"
+        self._status_bar_task = None  # asyncio.Task running the periodic status bar refresh
+        # Per-tool-call timing toggle. When True, _process_agent
+        # logs the start/end of every tool call to the NATS log
+        # panel with elapsed time. Off by default — turn on via
+        # /debug on for diagnosing slow agent runs.
+        self._debug_enabled: bool = False
+        # Per-tool start timestamps, keyed by tool name. Used by
+        # the per-tool timing in _process_agent to compute elapsed
+        # when tool_end fires.
+        self._tool_start_times: dict[str, float] = {}
         # Last text the auto-copy-on-mouseup handler pushed to the
         # OS clipboard. Used to suppress duplicate OSC 52 emissions
         # when TextSelected fires repeatedly during a single drag.
@@ -211,6 +226,16 @@ class TradingTerminal(App):
         # at runtime via /chart half | /chart full and re-applied in
         # on_mount via _apply_chart_size_mode.
         self._chart_size_mode: str = state.get("chart_size_mode", "full")
+        # Persisted watchlist symbol list. /watch add and /watch remove
+        # mutate the panel's tracked_symbols and immediately save back
+        # via _persist_watchlist_symbols. Falls back to TRACKED_SYMBOLS
+        # (BTC/ETH/SOL) on first run or corrupt state. Stored as
+        # uppercased symbols to match the panel's normalization.
+        saved_symbols = state.get("watchlist_symbols")
+        if isinstance(saved_symbols, list) and saved_symbols:
+            self._initial_watchlist_symbols = [s.upper() for s in saved_symbols if isinstance(s, str)]
+        else:
+            self._initial_watchlist_symbols = list(TRACKED_SYMBOLS)
         try:
             self._current_tf_idx = self.TIMEFRAMES.index(saved_tf)
         except ValueError:
@@ -224,7 +249,10 @@ class TradingTerminal(App):
             id="header",
         )
         # Left column
-        yield WatchlistPanel(tracked_symbols=list(TRACKED_SYMBOLS), id="watchlist-panel")
+        yield WatchlistPanel(
+            tracked_symbols=list(self._initial_watchlist_symbols),
+            id="watchlist-panel",
+        )
         # Center column
         yield ChartPanel(id="chart-panel")
         # Right column
@@ -313,6 +341,20 @@ class TradingTerminal(App):
         except Exception as exc:
             self.logger.warning("chart size restore failed: %s", exc)
 
+        # Initial status bar render and the periodic refresh task.
+        # The refresh task runs every STATUS_BAR_REFRESH_INTERVAL_S
+        # seconds as a safety net for fields whose state-change
+        # sites we don't explicitly hook (portfolio P&L drift,
+        # sub-agent registry changes from external paths, etc).
+        try:
+            self._refresh_status_bar()
+        except Exception as exc:
+            self.logger.warning("initial status bar render failed: %s", exc)
+        if self._status_bar_task is None or self._status_bar_task.done():
+            self._status_bar_task = asyncio.create_task(
+                self._run_status_bar_refresh()
+            )
+
         # Load initial data
         self.run_worker(self._load_initial_data(), thread=False)
 
@@ -320,7 +362,8 @@ class TradingTerminal(App):
         chat.append_message("[bold dim]Welcome to KAI. Type a message or use slash commands.[/]")
         chat.append_message(
             "[dim]/buy /sell /analyze /scan /risk /chart /watch /learn /remember "
-            "/react /autotrade /model /think /queue /login codex /exit /reset[/]"
+            "/react /autotrade /model /think /queue /status /debug "
+            "/login codex /exit /reset[/]"
         )
         chat.append_message("[dim]Mouse-drag any panel to copy. Ctrl+Y = last reply. Ctrl+Shift+C = current selection.[/]")
 
@@ -431,14 +474,27 @@ class TradingTerminal(App):
             for sym in symbols:
                 try:
                     info = fetch_latest_price(sym)
-                    watchlist.update_price(sym, info["price"], info.get("volume_24h"))
+                    watchlist.update_price(
+                        sym,
+                        info["price"],
+                        volume=info.get("volume_24h"),
+                        change_24h_pct=info.get("price_change_24h_pct"),
+                    )
                 except Exception as exc:
                     self.logger.warning("watchlist coinbase price %s failed: %s", sym, exc)
             return
 
-        # Default: kai-api. Derive the latest close from the most
-        # recent 1m bar — the cloud doesn't expose a separate /price
-        # endpoint and a 1-bar OHLCV call is cheap.
+        # Default: kai-api. Two REST calls per symbol:
+        #
+        #   1) Latest 1m bar — for the current price + volume.
+        #   2) Latest 2 daily bars — for the 24h percent change,
+        #      computed from the close of the previous daily bar.
+        #
+        # Both calls are tiny (~80 bytes per bar) and the second
+        # one is cached aggressively at the gateway, so the cost
+        # is negligible. We tolerate the daily fetch failing — if
+        # the change can't be computed, we pass None and the cell
+        # renders as "---".
         headers = _kai_api_headers()
         if not headers:
             self.logger.warning(
@@ -447,6 +503,7 @@ class TradingTerminal(App):
             return
         for sym in symbols:
             try:
+                # 1) Latest 1m bar
                 r = requests.get(
                     f"{KAI_API_BASE}/market/ohlcv/{sym}",
                     params={"interval": "1m", "limit": 1},
@@ -462,7 +519,48 @@ class TradingTerminal(App):
                 if not bars:
                     continue
                 last = _normalize_kai_bar(bars[-1])
-                watchlist.update_price(sym, last["close"], last["volume"])
+
+                # 2) 24h change from the daily bars. Pull two days
+                # so we have the previous close to compare against.
+                # The current price (from the 1m bar) compared to the
+                # previous daily close gives a "rolling 24h change"
+                # rather than a calendar-day change, which matches
+                # what most exchange tickers report.
+                change_pct: float | None = None
+                try:
+                    rd = requests.get(
+                        f"{KAI_API_BASE}/market/ohlcv/{sym}",
+                        params={"interval": "1d", "limit": 2},
+                        headers=headers,
+                        timeout=5,
+                    )
+                    if rd.status_code == 200:
+                        dbars = rd.json().get("data") or []
+                        if len(dbars) >= 2:
+                            prev = _normalize_kai_bar(dbars[-2])
+                            if prev and prev.get("close"):
+                                change_pct = (
+                                    (last["close"] - prev["close"]) / prev["close"]
+                                ) * 100.0
+                        elif len(dbars) == 1:
+                            # Only one daily bar — compare against its
+                            # open as a fallback.
+                            today = _normalize_kai_bar(dbars[-1])
+                            if today and today.get("open"):
+                                change_pct = (
+                                    (last["close"] - today["open"]) / today["open"]
+                                ) * 100.0
+                except Exception as dexc:
+                    self.logger.debug(
+                        "watchlist kai-api %s daily fetch failed: %s", sym, dexc
+                    )
+
+                watchlist.update_price(
+                    sym,
+                    last["close"],
+                    volume=last["volume"],
+                    change_24h_pct=change_pct,
+                )
             except Exception as exc:
                 self.logger.warning("watchlist kai-api %s exception: %s", sym, exc)
 
@@ -1442,6 +1540,10 @@ class TradingTerminal(App):
             else:
                 watchlist.add_symbol(symbol)
                 self._chat_msg(f"[dim]Added {symbol} to watchlist[/]")
+            # Persist the new symbol list so the change survives a
+            # TUI restart. Saved via load-then-merge so other state
+            # fields (autotrade, chart, etc) aren't clobbered.
+            self._persist_watchlist_symbols(list(watchlist.tracked_symbols))
             return True
 
         elif cmd == "/positions" or cmd == "/pos":
@@ -1494,6 +1596,17 @@ class TradingTerminal(App):
             # /queue                  — show how many items are pending
             # /queue clear            — drop everything in the queue
             return self._handle_queue_command(parts)
+
+        elif cmd == "/status":
+            # /status                 — dump every background task state
+            #                           in one chat message for debugging
+            return self._handle_status_command(parts)
+
+        elif cmd == "/debug":
+            # /debug                  — show current debug state
+            # /debug on|off           — toggle per-tool-call timing in
+            #                           the NATS log
+            return self._handle_debug_command(parts)
 
         elif cmd == "/remember":
             # /remember [hint]        — ask kai to summarize the recent
@@ -1739,6 +1852,22 @@ class TradingTerminal(App):
         except Exception as exc:
             self.logger.warning("persist autotrade state failed: %s", exc)
 
+    def _persist_watchlist_symbols(self, symbols: list[str]) -> None:
+        """Save the current watchlist symbol list to state.json.
+
+        Called from /watch add and /watch remove so the user's
+        custom watchlist survives a TUI restart. Uses load-then-
+        merge so other state fields aren't clobbered. Symbols are
+        normalized to uppercase for consistency with the panel's
+        own normalization in update_price / add_symbol.
+        """
+        try:
+            state = _load_terminal_state()
+            state["watchlist_symbols"] = [s.upper() for s in symbols]
+            _save_terminal_state(state)
+        except Exception as exc:
+            self.logger.warning("persist watchlist symbols failed: %s", exc)
+
     def _handle_queue_command(self, parts: list[str]) -> bool:
         """Inspect or modify the type-ahead input queue.
 
@@ -1833,6 +1962,173 @@ class TradingTerminal(App):
         self._chat_msg(
             "[red]Usage:[/] [dim]/queue  |  /queue clear  |  /queue drop N[/]"
         )
+        return True
+
+    def _handle_status_command(self, parts: list[str]) -> bool:
+        """Dump every background task / state-machine state in chat.
+
+        The single most useful command for diagnosing "something
+        feels off" — instead of grepping log files for clues, the
+        user runs /status and sees:
+
+          - chart source + symbol/timeframe + size + visibility
+          - kai-api WS connect status + last frame age + REST
+            refresh count + autotrade flag + queue depth
+          - signal consumer subscription state + buffer count
+          - sub-agent registry (which agents are running)
+          - signal handler runner status (if any)
+          - autotrade flag and the trader-gating story
+          - per-tool timing (/debug) flag
+
+        Each line is its own chat message so the formatting is
+        easy to scan top-to-bottom.
+        """
+        self._chat_msg("[bold dim]── status ──────────────────────[/]")
+
+        # Activity + chart
+        try:
+            tf = self.TIMEFRAMES[self._current_tf_idx]
+            self._chat_msg(
+                f"[dim]activity:[/] {self._activity_status}    "
+                f"[dim]chart:[/] {self._chart_symbol}/{tf} "
+                f"([cyan]{self._chart_source}[/], "
+                f"size={getattr(self, '_chart_size_mode', 'full')})"
+            )
+        except Exception:
+            pass
+
+        # kai-api WS health
+        last = getattr(self, "_kai_api_last_refresh", 0.0)
+        if last:
+            age = time.time() - last
+            health = "[green]fresh[/]" if age < 30 else (
+                "[yellow]stale[/]" if age < 120 else "[red]frozen[/]"
+            )
+            self._chat_msg(
+                f"[dim]kai-api WS:[/] last frame {age:.0f}s ago {health}"
+            )
+        else:
+            self._chat_msg(
+                "[dim]kai-api WS:[/] [yellow]no frames received yet[/]"
+            )
+
+        # Background tasks alive?
+        def _task_state(t):
+            if t is None:
+                return "[dim]not started[/]"
+            if t.done():
+                if t.cancelled():
+                    return "[dim]cancelled[/]"
+                if t.exception() is not None:
+                    return f"[red]CRASHED: {t.exception()}[/]"
+                return "[dim]finished[/]"
+            return "[green]running[/]"
+
+        self._chat_msg(
+            f"[dim]bg tasks:[/]  ws_consumer={_task_state(self._kai_api_task)}  "
+            f"rest_refresh={_task_state(self._kai_api_refresh_task)}  "
+            f"watchlist_refresh={_task_state(self._watchlist_refresh_task)}  "
+            f"status_bar={_task_state(self._status_bar_task)}"
+        )
+
+        # Signal consumer
+        try:
+            sc = self.signal_consumer
+            self._chat_msg(
+                f"[dim]signals:[/] buffer={sc.count} subscribed={sc._subscribed}"
+            )
+        except Exception:
+            pass
+
+        # Signal handler runner
+        runner = getattr(self, "_signal_handler_runner", None)
+        if runner is not None:
+            n = len(getattr(runner, "handlers", []) or [])
+            enabled = sum(1 for h in (runner.handlers or []) if h.enabled)
+            self._chat_msg(
+                f"[dim]signal handlers:[/] {enabled}/{n} enabled"
+            )
+        else:
+            self._chat_msg(
+                "[dim]signal handlers:[/] [dim](none configured)[/]"
+            )
+
+        # Sub-agent registry
+        try:
+            mgr = getattr(self, "_sub_agent_manager", None)
+            if mgr is not None:
+                running = list(mgr.agents.keys())
+                if running:
+                    self._chat_msg(
+                        f"[dim]sub-agents:[/] {len(running)} running ({', '.join(running)})"
+                    )
+                else:
+                    self._chat_msg(
+                        "[dim]sub-agents:[/] [dim]none spawned yet[/]"
+                    )
+        except Exception:
+            pass
+
+        # Autotrade gate + queue depth
+        autotrade = "[bold yellow]ON[/]" if self._autotrade_enabled else "[dim]off[/]"
+        q = len(getattr(self, "_input_queue", []) or [])
+        self._chat_msg(
+            f"[dim]autotrade:[/] {autotrade}    "
+            f"[dim]input queue:[/] {q}    "
+            f"[dim]debug:[/] {'on' if self._debug_enabled else 'off'}"
+        )
+
+        # Chat history persistence
+        try:
+            n_msgs = len(getattr(self.agent_runner, "chat_history", []) or [])
+            self._chat_msg(
+                f"[dim]chat history:[/] {n_msgs} messages    "
+                f"[dim]save path:[/] {self._chat_history_path}"
+            )
+        except Exception:
+            pass
+
+        self._chat_msg("[bold dim]────────────────────────────────[/]")
+        return True
+
+    def _handle_debug_command(self, parts: list[str]) -> bool:
+        """Toggle per-tool-call timing in the NATS log.
+
+        When debug is ON, _process_agent's tool_start / tool_end
+        handlers stash a timestamp and emit a log line with the
+        elapsed milliseconds when the tool finishes. Useful for
+        diagnosing "which tool is making this agent slow."
+
+        Forms:
+          /debug             show current state
+          /debug on          enable timing
+          /debug off         disable timing
+        """
+        sub = parts[1].lower() if len(parts) > 1 else "status"
+        if sub in ("", "status"):
+            state = "[bold green]ON[/]" if self._debug_enabled else "[dim]off[/]"
+            self._chat_msg(f"[dim]debug per-tool timing: {state}[/]")
+            self._chat_msg("[dim]/debug on  |  /debug off[/]")
+            return True
+        if sub in ("on", "enable", "true", "yes"):
+            if self._debug_enabled:
+                self._chat_msg("[dim]debug already ON[/]")
+                return True
+            self._debug_enabled = True
+            self._chat_msg(
+                "[bold green]debug ON[/] [dim]— per-tool timing will appear "
+                "in the NATS log on the next agent run[/]"
+            )
+            return True
+        if sub in ("off", "disable", "false", "no"):
+            if not self._debug_enabled:
+                self._chat_msg("[dim]debug already off[/]")
+                return True
+            self._debug_enabled = False
+            self._tool_start_times.clear()
+            self._chat_msg("[dim]debug off[/]")
+            return True
+        self._chat_msg("[red]Usage:[/] [dim]/debug  |  /debug on  |  /debug off[/]")
         return True
 
     async def _run_codex_login(self) -> None:
@@ -2354,10 +2650,22 @@ class TradingTerminal(App):
     # ── Agent streaming ───────────────────────────────────────
 
     async def _process_agent(self, user_input: str):
-        """Stream agent output to chat."""
+        """Stream agent output to chat.
+
+        Two-phase rendering:
+          1. While streaming, raw token text is appended to the
+             response widget so the user sees it grow live.
+          2. When the stream completes (``final`` event OR loop
+             exits naturally), the final text is rendered as Rich
+             Markdown via ``chat.render_widget_as_markdown(...)``
+             so bold / italic / code blocks / lists / headings /
+             tables actually format. The raw text is preserved on
+             ``widget._raw_text`` for the Ctrl+Y copy path.
+        """
         chat = self.query_one("#chat-panel", ChatPanel)
         response_widget = chat.create_response_widget()
         accumulated = ""
+        final_text: str | None = None
 
         try:
             async for event in self.agent_runner.run(user_input):
@@ -2370,19 +2678,52 @@ class TradingTerminal(App):
                     tool = event["data"]["tool"]
                     self._nats_log(f"[yellow]>> {tool}[/]")
                     self._set_status(f"running {tool}...")
+                    if self._debug_enabled:
+                        # Stash a start timestamp so tool_end can
+                        # compute elapsed. Keyed on the tool name —
+                        # not bullet-proof against parallel calls
+                        # to the same tool, but the agent loop
+                        # mostly runs tools sequentially so this is
+                        # good enough for "is this tool slow?"
+                        # diagnosis.
+                        self._tool_start_times[tool] = time.time()
                 elif etype == "tool_end":
                     tool = event["data"]["tool"]
-                    self._nats_log(f"[yellow]<< {tool}[/]")
+                    if self._debug_enabled:
+                        start = self._tool_start_times.pop(tool, None)
+                        if start is not None:
+                            elapsed_ms = (time.time() - start) * 1000.0
+                            color = (
+                                "green" if elapsed_ms < 500 else
+                                "yellow" if elapsed_ms < 5000 else
+                                "red"
+                            )
+                            self._nats_log(
+                                f"[yellow]<< {tool}[/] "
+                                f"[{color}]{elapsed_ms:.0f}ms[/]"
+                            )
+                        else:
+                            self._nats_log(f"[yellow]<< {tool}[/]")
+                    else:
+                        self._nats_log(f"[yellow]<< {tool}[/]")
                     self._set_status("thinking...")
                 elif etype == "final":
-                    final = event["data"]
-                    if final and final != accumulated:
-                        response_widget.update(final)
+                    final_text = event["data"]
                     chat.scroll_end(animate=False)
                 elif etype == "error":
                     chat.append_message(f"[bold red]Error: {event['data']}[/]", "error-msg")
         except Exception as e:
             chat.append_message(f"[bold red]Error: {e}[/]", "error-msg")
+        else:
+            # Stream completed without raising — swap the streaming
+            # plain-text widget for a markdown-rendered version. Use
+            # the explicit final_text from the `final` event if we
+            # got one (truncations / corrections), otherwise the
+            # accumulated stream text.
+            text_to_render = final_text if final_text else accumulated
+            if text_to_render and text_to_render.strip():
+                chat.render_widget_as_markdown(response_widget, text_to_render)
+                chat.scroll_end(animate=False)
         finally:
             self._agent_working = False
             self._set_status("idle")
@@ -2406,7 +2747,12 @@ class TradingTerminal(App):
 
         if msg_type == "price":
             watchlist = self.query_one("#watchlist-panel", WatchlistPanel)
-            watchlist.update_price(symbol, payload.get("price", 0), payload.get("volume"))
+            watchlist.update_price(
+                symbol,
+                payload.get("price", 0),
+                volume=payload.get("volume"),
+                change_24h_pct=payload.get("change_24h_pct"),
+            )
 
         elif msg_type == "1m":
             chart = self.query_one("#chart-panel", ChartPanel)
@@ -2659,16 +3005,115 @@ class TradingTerminal(App):
         chat = self.query_one("#chat-panel", ChatPanel)
         chat.append_message(markup)
 
-    def _set_status(self, text: str):
+    def _set_status(self, text: str) -> None:
+        """Set the activity-status string and re-render the status bar.
+
+        Activity is the "what is the agent doing right now" cell —
+        thinking, running a tool, idle, etc. The bar also shows
+        portfolio, chart, autotrade, queue, and sub-agent counts
+        which are pulled live each render via _refresh_status_bar.
+        """
+        self._activity_status = text or "idle"
+        self._refresh_status_bar()
+
+    def _refresh_status_bar(self) -> None:
+        """Re-render the bottom status bar from current live state.
+
+        Cheap — one Static.update with a stitched markup string.
+        Called from _set_status on activity changes, from the
+        periodic _run_status_bar_refresh task every 1.5s as a
+        safety net, and explicitly from any state-change site that
+        wants the bar to update immediately.
+
+        Bar format (left → right):
+            <activity> | <chart> | <portfolio> | <autotrade> | <queue> | <agents>
+
+        Each field uses Rich markup so colors / styles render via
+        the existing Static markup support.
+        """
+        try:
+            bar = self.query_one("#status-bar", Static)
+        except Exception:
+            return
+
+        parts: list[str] = []
+
+        # Activity
+        activity = self._activity_status or "idle"
+        parts.append(f"[bold]{activity}[/]")
+
+        # Chart symbol/timeframe
+        try:
+            tf = self.TIMEFRAMES[self._current_tf_idx]
+            parts.append(f"[cyan]{self._chart_symbol}/{tf}[/]")
+        except Exception:
+            pass
+
+        # Portfolio + P&L
         try:
             from data_api.paper_trading import portfolio
             pnl = portfolio.get_pnl()
-            self.query_one("#status-bar", Static).update(
-                f"Status: {text} | Portfolio: ${pnl['total_value']:,.2f} | "
-                f"P&L: ${pnl['total_pnl']:+,.2f} ({pnl['total_pnl_pct']:+.1f}%)"
+            total = pnl.get("total_value", 0.0)
+            pnl_v = pnl.get("total_pnl", 0.0)
+            pnl_pct = pnl.get("total_pnl_pct", 0.0)
+            pnl_color = "green" if pnl_v >= 0 else "red"
+            parts.append(
+                f"${total:,.2f} [{pnl_color}]{pnl_v:+,.2f} "
+                f"({pnl_pct:+.1f}%)[/]"
             )
         except Exception:
-            self.query_one("#status-bar", Static).update(f"Status: {text}")
+            pass
+
+        # Autotrade gate. Yellow when ON because it's a "warning"
+        # state — real trades can fire — and dim when OFF.
+        if getattr(self, "_autotrade_enabled", False):
+            parts.append("[bold yellow]AUTOTRADE ON[/]")
+        else:
+            parts.append("[dim]autotrade off[/]")
+
+        # Queue depth
+        q = len(getattr(self, "_input_queue", []) or [])
+        if q > 0:
+            parts.append(f"[bold magenta]queue:{q}[/]")
+
+        # Running sub-agent count
+        try:
+            mgr = getattr(self, "_sub_agent_manager", None)
+            if mgr is not None:
+                n = len(getattr(mgr, "agents", {}))
+                if n > 0:
+                    parts.append(f"agents:{n}")
+        except Exception:
+            pass
+
+        bar.update(" │ ".join(parts))
+
+    # Periodic status bar refresh interval. 1.5s is fast enough that
+    # changes feel immediate but slow enough to be effectively free
+    # (one Static update per 1.5s vs the 60Hz event loop is rounding
+    # error).
+    STATUS_BAR_REFRESH_INTERVAL_S = 1.5
+
+    async def _run_status_bar_refresh(self) -> None:
+        """Periodic safety-net refresh of the status bar.
+
+        The status bar is also refreshed explicitly from many sites
+        (_set_status, /autotrade, /watch, _queue_item, etc.) but a
+        periodic refresh covers any state change we forget to hook
+        — portfolio P&L drifting between trades, sub-agent count
+        going up via spawn from another path, etc.
+
+        Cancels cleanly on asyncio.CancelledError on TUI teardown.
+        """
+        while True:
+            try:
+                await asyncio.sleep(self.STATUS_BAR_REFRESH_INTERVAL_S)
+            except asyncio.CancelledError:
+                raise
+            try:
+                self._refresh_status_bar()
+            except Exception as exc:
+                self.logger.debug("status bar refresh failed: %s", exc)
 
     def _on_nats_message(self, direction: str, subject: str, payload: dict):
         arrows = {"pub": ">", "sub": "<", "req": ">>", "rep": "<<"}
@@ -3158,6 +3603,15 @@ class TradingTerminal(App):
         fallback_tags = {"agent-msg", "tool-msg"}  # 2nd pass if no agent-msg yet
 
         def _plain(widget) -> str:
+            # Prefer the raw markdown source if the chat panel
+            # stashed it (set by render_widget_as_markdown after a
+            # streaming response completes — the renderable is now
+            # a Rich Markdown object whose .content / .render output
+            # is the formatted markup, not the original text). The
+            # raw text is the cleanest thing to copy.
+            raw = getattr(widget, "_raw_text", None)
+            if isinstance(raw, str) and raw:
+                return raw
             # Textual Static stores its markup on `.content`. As a
             # final fallback we render the widget — render() returns
             # a Rich Content object whose str() is the plain text
