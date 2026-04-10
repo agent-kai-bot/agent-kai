@@ -5,6 +5,8 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timedelta, timezone
 
+from textual import events
+
 from tui.panels.chart import (
     ChartPanel,
     ChartViewportState,
@@ -148,6 +150,43 @@ class ChartPanelDataTests(unittest.TestCase):
             before_volume,
             panel.get_view_state(plot_width=30)["show_volume"],
         )
+
+    def test_mouse_wheel_zoom_updates_viewport(self):
+        """Mouse wheel should zoom the chart when hovering the panel."""
+
+        panel = ChartPanel()
+        panel.set_data("BTC", "1m", _sample_bars(80))
+
+        before_zoom = panel.get_view_state(plot_width=30)["zoom"]
+        panel.on_mouse_scroll_up(
+            events.MouseScrollUp(panel, 0, 0, 0, -1, 0, False, False, False)
+        )
+        after_zoom = panel.get_view_state(plot_width=30)["zoom"]
+        self.assertNotEqual(before_zoom, after_zoom)
+
+        panel.on_mouse_scroll_down(
+            events.MouseScrollDown(panel, 0, 0, 0, 1, 0, False, False, False)
+        )
+        self.assertEqual(
+            before_zoom,
+            panel.get_view_state(plot_width=30)["zoom"],
+        )
+
+    def test_shift_mouse_wheel_pans_chart(self):
+        """Shift plus mouse wheel should pan horizontally through history."""
+
+        panel = ChartPanel()
+        panel.set_data("BTC", "1m", _sample_bars(80))
+
+        panel.on_mouse_scroll_up(
+            events.MouseScrollUp(panel, 0, 0, 0, -1, 0, True, False, False)
+        )
+        self.assertEqual(panel.get_view_state(plot_width=30)["right_offset"], 3)
+
+        panel.on_mouse_scroll_down(
+            events.MouseScrollDown(panel, 0, 0, 0, 1, 0, True, False, False)
+        )
+        self.assertEqual(panel.get_view_state(plot_width=30)["right_offset"], 0)
 
 
 if __name__ == "__main__":

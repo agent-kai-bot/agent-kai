@@ -9,7 +9,7 @@ from typing import Any
 from rich.text import Text
 from textual.app import RenderResult
 from textual.binding import Binding
-from textual.events import Click
+from textual.events import Click, MouseScrollDown, MouseScrollUp
 from textual.widget import Widget
 
 
@@ -500,7 +500,32 @@ class ChartPanel(Widget):
     def on_click(self, _event: Click) -> None:
         """Focus the chart when it is clicked."""
 
-        self.focus()
+        if self.is_attached:
+            self.focus()
+
+    def on_mouse_scroll_up(self, event: MouseScrollUp) -> None:
+        """Zoom in on wheel-up, or pan left when shift is held."""
+
+        if self.is_attached:
+            self.focus()
+        event.stop()
+        event.prevent_default()
+        if event.shift:
+            self.pan_left(3)
+            return
+        self.zoom_in()
+
+    def on_mouse_scroll_down(self, event: MouseScrollDown) -> None:
+        """Zoom out on wheel-down, or pan right when shift is held."""
+
+        if self.is_attached:
+            self.focus()
+        event.stop()
+        event.prevent_default()
+        if event.shift:
+            self.pan_right(3)
+            return
+        self.zoom_out()
 
     def toggle_visible(self, visible: bool | None = None) -> bool:
         """Toggle or explicitly set chart visibility."""
@@ -772,8 +797,8 @@ class ChartPanel(Widget):
         text.append(" " * axis_width, style=scheme.axis)
         text.append(" ", style=scheme.axis)
         hud = (
-            "Tab/click focus  <- -> pan  Up/Down zoom  Home latest  "
-            "V volume  Ctrl+G mode"
+            "Tab/click focus  wheel zoom  Shift+wheel pan  <- -> pan  "
+            "Up/Down zoom  Home latest  V volume  Ctrl+G mode"
         )
         text.append(hud[:plot_width], style=scheme.header_dim)
         return text
