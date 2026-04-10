@@ -562,6 +562,13 @@ class AgentRunner:
         final_text = ""
         primary_failed = False
         emitted_final = False
+        fallback_executors = list(
+            getattr(
+                self,
+                "fallback_executors",
+                ([] if getattr(self, "fallback_executor", None) is None else [self.fallback_executor]),
+            )
+        )
 
         try:
             async for event in self._stream_executor(self.executor, user_input):
@@ -587,7 +594,7 @@ class AgentRunner:
         # Walk the fallback chain. Each entry is tried in order until
         # one returns a non-empty, non-error result.
         attempt = 0
-        for fb_executor in self.fallback_executors:
+        for fb_executor in fallback_executors:
             if not primary_failed:
                 break
             attempt += 1
@@ -595,7 +602,7 @@ class AgentRunner:
             log_agent_event(self.agent_name, label)
             yield {
                 "type": "status",
-                "data": f"Falling back to endpoint #{attempt} of {len(self.fallback_executors)}...",
+                "data": f"Falling back to endpoint #{attempt} of {len(fallback_executors)}...",
             }
             primary_failed = False
             accumulated = ""

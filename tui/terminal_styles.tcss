@@ -5,18 +5,36 @@ Screen {
     grid-rows: auto 3fr 2fr;
 }
 
-/* Chart-vs-chat row sizing modes. Toggled at runtime by
- * /chart half | /chart full via Screen.add_class / remove_class.
- * The default (Screen { grid-rows: auto 3fr 2fr }) is "full" — chart
- * gets the larger middle row. The .chart-half rule below flips the
- * ratio so the chat panel dominates and the chart shrinks. */
+/* Chart workspace modes. The default dashboard keeps every panel
+ * visible. Inspect makes the chart dominant without hiding the rails.
+ * Focus is the near-fullscreen chart view. Chat keeps the chart
+ * present but lets the conversation dominate the center column. */
 
-Screen.chart-half {
+Screen.chart-mode-dashboard {
+    grid-columns: 1fr 3fr 1fr;
+    grid-rows: auto 3fr 2fr;
+}
+
+Screen.chart-mode-inspect {
+    grid-columns: 0.9fr 5.4fr 1.1fr;
+    grid-rows: auto 5fr 1.1fr;
+}
+
+Screen.chart-mode-chat {
+    grid-columns: 1fr 3fr 1fr;
     grid-rows: auto 1fr 4fr;
 }
 
-Screen.chart-full {
-    grid-rows: auto 3fr 2fr;
+Screen.chart-mode-focus {
+    grid-columns: 0.001fr 1fr 0.001fr;
+    grid-rows: auto 5.5fr 1fr;
+}
+
+Screen.chart-mode-focus #watchlist-panel,
+Screen.chart-mode-focus #positions-panel,
+Screen.chart-mode-focus #alerts-panel,
+Screen.chart-mode-focus #nats-panel {
+    display: none;
 }
 
 #header {

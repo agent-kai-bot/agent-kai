@@ -243,14 +243,20 @@ class SubAgent:
         active_executor = self.executor
         output = await self._invoke(active_executor, task)
 
-        chain = list(self.fallback_executors)
+        chain = list(
+            getattr(
+                self,
+                "fallback_executors",
+                ([] if getattr(self, "fallback_executor", None) is None else [self.fallback_executor]),
+            )
+        )
         attempt = 0
         while output.startswith("Error:") and chain:
             attempt += 1
             next_executor = chain.pop(0)
             self.log.warning(
                 "PRIMARY_FAILED agent=%s attempt=%d/%d trying fallback",
-                self.name, attempt, len(self.fallback_executors),
+                self.name, attempt, len(chain) + 1,
             )
             log_agent_event(self.name, f"fallback_{attempt}")
             if publish_status and self.bus:
