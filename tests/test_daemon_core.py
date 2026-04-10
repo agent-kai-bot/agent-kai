@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from daemon.core import DEFAULT_WATCHLIST_SYMBOLS, Session
 from config import WORKSPACES_DIR
@@ -51,6 +52,41 @@ class SessionTests(unittest.TestCase):
             session.paths.memory_dir,
             workspaces_dir / "sessions" / "swing-trader" / "memory",
         )
+
+    @mock.patch("daemon.core.AgentRunner")
+    @mock.patch("daemon.core.create_tools")
+    @mock.patch("daemon.core.SignalConsumer")
+    def test_attach_runtime_builds_session_runtime(
+        self,
+        signal_consumer_cls,
+        create_tools,
+        agent_runner_cls,
+    ):
+        session = Session("alpha")
+        bus = object()
+        signal_consumer = object()
+        runner = mock.Mock(chat_history=[])
+
+        signal_consumer_cls.return_value = signal_consumer
+        create_tools.return_value = ["tool-a", "tool-b"]
+        agent_runner_cls.return_value = runner
+
+        attached = session.attach_runtime(bus=bus, agent_name="kai")
+
+        self.assertIs(attached, runner)
+        self.assertIs(session.signal_consumer, signal_consumer)
+        create_tools.assert_called_once_with(
+            bus,
+            session.sub_agent_registry,
+            signal_consumer=signal_consumer,
+        )
+        agent_runner_cls.assert_called_once_with(
+            tools=["tool-a", "tool-b"],
+            bus=bus,
+            agent_name="kai",
+        )
+        self.assertIs(session.agent_runner, runner)
+        self.assertIs(runner.chat_history, session.chat_history)
 
 
 if __name__ == "__main__":
