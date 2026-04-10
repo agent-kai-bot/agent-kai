@@ -1,10 +1,31 @@
 export type CommandPaletteItem = {
   command: string;
   description: string;
+  title?: string;
   sample?: string;
 };
 
 export const PALETTE_ITEMS: CommandPaletteItem[] = [
+  {
+    command: "/chart full",
+    title: "Chart: Full",
+    description: "Resize the center column to the default 60/40 chart-first split.",
+  },
+  {
+    command: "/chart half",
+    title: "Chart: Half",
+    description: "Split the chart and chat panels evenly in the center column.",
+  },
+  {
+    command: "/chart mini",
+    title: "Chart: Mini",
+    description: "Shrink the chart to a compact strip and give most of the height to chat.",
+  },
+  {
+    command: "/chart hide",
+    title: "Chart: Hidden",
+    description: "Collapse the chart into a slim status bar and dedicate the column to chat.",
+  },
   {
     command: "/status",
     description: "Summarize the current session state.",
@@ -37,7 +58,7 @@ export function filterPaletteItems(query: string): CommandPaletteItem[] {
     return PALETTE_ITEMS;
   }
   return PALETTE_ITEMS.filter((item) => {
-    const haystack = `${item.command} ${item.description}`.toLowerCase();
+    const haystack = `${item.title ?? ""} ${item.command} ${item.description}`.toLowerCase();
     return haystack.includes(normalized);
   });
 }

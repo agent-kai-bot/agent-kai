@@ -10,6 +10,7 @@ describe("command palette helpers", () => {
       "/schedule list",
     );
     expect(filterPaletteItems("current session")[0]?.command).toBe("/status");
+    expect(filterPaletteItems("chart: mini")[0]?.command).toBe("/chart mini");
   });
 
   it("splits slash input into command and args", () => {
