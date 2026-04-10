@@ -1872,6 +1872,10 @@ class TradingTerminal(App):
             # /session kill NAME      — delete NAME
             return await self._handle_session_command(parts)
 
+        elif cmd == "/schedule":
+            # /schedule ...          — handled by the daemon in remote mode
+            return await self._handle_schedule_command(parts)
+
         elif cmd == "/status":
             # /status                 — dump every background task state
             #                           in one chat message for debugging
@@ -1968,6 +1972,14 @@ class TradingTerminal(App):
             return self._request_session_switch(parts[2])
 
         return self._request_session_switch(parts[1])
+
+    async def _handle_schedule_command(self, parts: list[str]) -> bool:
+        """Route scheduler commands to the daemon or reject them locally."""
+        del parts
+        if getattr(self.session, "is_remote", False):
+            return False
+        self._chat_msg("[red]Scheduling is only available when connected to the daemon.[/]")
+        return True
 
     async def _list_known_sessions(self) -> list[dict[str, Any]]:
         """Load session summaries from either the daemon or local index."""
@@ -3285,6 +3297,52 @@ class TradingTerminal(App):
             self._agent_working = False
             self._set_status("idle")
             self._drain_input_queue()
+            return
+
+        if etype == "scheduled_job_created":
+            job = event["data"].get("job", {})
+            self._chat_msg(
+                f"[dim]Scheduled job created:[/] {job.get('id')} "
+                f"({job.get('type')})"
+            )
+            return
+
+        if etype == "scheduled_job_triggered":
+            data = event["data"]
+            self._chat_msg(
+                f"[dim]Scheduled job fired:[/] {data.get('job_id')} "
+                f"at {data.get('fired_at')}"
+            )
+            return
+
+        if etype == "scheduled_job_completed":
+            data = event["data"]
+            preview = data.get("result_preview") or ""
+            suffix = f" [dim]- {preview}[/]" if preview else ""
+            self._chat_msg(
+                f"[dim]Scheduled job completed:[/] {data.get('job_id')}{suffix}"
+            )
+            return
+
+        if etype == "scheduled_job_failed":
+            data = event["data"]
+            self._chat_msg(
+                f"[red]Scheduled job failed:[/] {data.get('job_id')} "
+                f"- {data.get('error')}"
+            )
+            return
+
+        if etype in {
+            "scheduled_job_cancelled",
+            "scheduled_job_paused",
+            "scheduled_job_resumed",
+        }:
+            data = event["data"]
+            verb = etype.replace("scheduled_job_", "").replace("_", " ")
+            self._chat_msg(
+                f"[dim]Scheduled job {verb}:[/] {data.get('job_id')}"
+            )
+            return
 
     # ── NATS handlers ─────────────────────────────────────────
 

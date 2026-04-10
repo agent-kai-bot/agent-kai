@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import shlex
 import shutil
 import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
@@ -62,6 +65,68 @@ DEFAULT_DAEMON_WS_PATH = "/ws"
 DEFAULT_DAEMON_WS_URL = (
     f"ws://{DEFAULT_DAEMON_HOST}:{DEFAULT_DAEMON_PORT}{DEFAULT_DAEMON_WS_PATH}"
 )
+_SCHEDULE_IN_PATTERN = re.compile(
+    r"^in\s+(?P<count>\d+)\s+(?P<unit>minute|minutes|hour|hours|day|days)$",
+    re.IGNORECASE,
+)
+_SCHEDULE_TOMORROW_PATTERN = re.compile(
+    r"^tomorrow(?:\s+(?P<time>.+))?$",
+    re.IGNORECASE,
+)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_schedule_at_value(raw: str, *, now: datetime | None = None) -> str:
+    """Parse a minimal slash-command time expression into an ISO timestamp."""
+    reference = now or _utc_now()
+    text = raw.strip()
+    if not text:
+        raise ValueError("schedule time cannot be empty")
+
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        parsed = None
+    if parsed is not None:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.replace(microsecond=0).isoformat()
+
+    in_match = _SCHEDULE_IN_PATTERN.match(text)
+    if in_match:
+        count = int(in_match.group("count"))
+        unit = in_match.group("unit").lower()
+        if "minute" in unit:
+            target = reference + timedelta(minutes=count)
+        elif "hour" in unit:
+            target = reference + timedelta(hours=count)
+        else:
+            target = reference + timedelta(days=count)
+        return target.replace(microsecond=0).isoformat()
+
+    tomorrow_match = _SCHEDULE_TOMORROW_PATTERN.match(text)
+    if tomorrow_match:
+        tomorrow = (reference + timedelta(days=1)).astimezone(timezone.utc)
+        clock = (tomorrow_match.group("time") or "09:00").strip().lower()
+        for fmt in ("%H:%M", "%H", "%I%p", "%I:%M%p", "%I %p", "%I:%M %p"):
+            try:
+                parsed_time = datetime.strptime(clock, fmt)
+            except ValueError:
+                continue
+            target = tomorrow.replace(
+                hour=parsed_time.hour,
+                minute=parsed_time.minute,
+                second=0,
+                microsecond=0,
+            )
+            return target.isoformat()
+        raise ValueError("unsupported tomorrow time format; use ISO, 'in N minutes', or 'tomorrow 7am'")
+
+    raise ValueError("unsupported schedule time format; use ISO, 'in N minutes', or 'tomorrow 7am'")
 
 
 @dataclass
@@ -190,6 +255,7 @@ class DaemonServer:
         *,
         source: str = "user",
         job_id: str | None = None,
+        tool_budget: int | None = None,
     ) -> InputRunResult:
         """Run one input turn through the target session."""
         result = InputRunResult()
@@ -200,6 +266,7 @@ class DaemonServer:
                     text,
                     source=source,
                     job_id=job_id,
+                    tool_budget=tool_budget,
                 ):
                     if event.get("type") == "final":
                         result.final_text = str(event.get("data") or "")
@@ -247,6 +314,7 @@ class DaemonServer:
             job.prompt,
             source="scheduler",
             job_id=job.id,
+            tool_budget=job.tool_budget,
         )
         if outcome.error:
             self.scheduler.record_failure(job.id, fired_at=fired_at, error=outcome.error)
@@ -292,6 +360,116 @@ class DaemonServer:
             event_payload = {"job_id": job.id}
 
         managed.session.publish_event(topic, event_payload)
+
+    async def handle_schedule_command(self, managed: ManagedSession, command_text: str) -> str:
+        """Execute one scheduler slash command for the attached session."""
+        if self.scheduler is None:
+            raise RuntimeError("scheduler is unavailable")
+
+        try:
+            parts = shlex.split(command_text)
+        except ValueError as exc:
+            raise ValueError(f"invalid schedule command: {exc}") from exc
+
+        if not parts or parts[0] != "/schedule":
+            raise ValueError("unsupported schedule command")
+
+        session_name = managed.session.name
+        sub = parts[1].lower() if len(parts) > 1 else "list"
+
+        if sub == "list":
+            show_all = len(parts) > 2 and parts[2].lower() == "all"
+            jobs = (
+                self.scheduler.list_jobs()
+                if show_all
+                else self.scheduler.list_jobs_for_session(session_name)
+            )
+            visible = [job for job in jobs if job.status in {"active", "paused"}]
+            if not visible:
+                scope = "all sessions" if show_all else f"session {session_name}"
+                return f"No scheduled jobs for {scope}."
+            return "\n".join(self._format_scheduled_job(job) for job in visible)
+
+        if sub == "show":
+            if len(parts) < 3:
+                raise ValueError("usage: /schedule show JOB_ID")
+            job = self._require_session_job(session_name, parts[2])
+            return self._format_scheduled_job(job, include_prompt=True)
+
+        if sub == "add":
+            if len(parts) < 5:
+                raise ValueError("usage: /schedule add at|cron ...")
+            mode = parts[2].lower()
+            if mode == "at":
+                when = _parse_schedule_at_value(parts[3])
+                job = self.scheduler.create_absolute_job(
+                    when=when,
+                    prompt=parts[4],
+                    owner_session=session_name,
+                    created_by="user",
+                )
+                return f"Scheduled {job.id} at {job.next_run} for session {job.owner_session}."
+            if mode == "cron":
+                job = self.scheduler.create_recurring_job(
+                    cron=parts[3],
+                    prompt=parts[4],
+                    owner_session=session_name,
+                    created_by="user",
+                )
+                return f"Scheduled recurring job {job.id} next={job.next_run}."
+            raise ValueError("usage: /schedule add at|cron ...")
+
+        if sub == "cancel":
+            if len(parts) < 3:
+                raise ValueError("usage: /schedule cancel JOB_ID")
+            job = self._require_session_job(session_name, parts[2])
+            self.scheduler.cancel_job(job.id)
+            return f"Cancelled scheduled job {job.id}."
+
+        if sub == "pause":
+            if len(parts) < 3:
+                raise ValueError("usage: /schedule pause JOB_ID|all [--global]")
+            target = parts[2].lower()
+            if target == "all":
+                global_scope = "--global" in parts[3:]
+                paused = self.scheduler.pause_all_jobs(None if global_scope else session_name)
+                scope = "all sessions" if global_scope else f"session {session_name}"
+                if not paused:
+                    return f"No active scheduled jobs to pause for {scope}."
+                return f"Paused {len(paused)} scheduled jobs for {scope}."
+            job = self._require_session_job(session_name, parts[2])
+            self.scheduler.pause_job(job.id)
+            return f"Paused scheduled job {job.id}."
+
+        if sub == "resume":
+            if len(parts) < 3:
+                raise ValueError("usage: /schedule resume JOB_ID")
+            job = self._require_session_job(session_name, parts[2])
+            self.scheduler.resume_job(job.id)
+            return f"Resumed scheduled job {job.id}."
+
+        raise ValueError("unsupported schedule command")
+
+    def _require_session_job(self, session_name: str, job_id: str):
+        if self.scheduler is None:
+            raise RuntimeError("scheduler is unavailable")
+        job = self.scheduler.get_job(job_id)
+        if job is None:
+            raise ValueError(f"scheduled job '{job_id}' was not found")
+        if job.owner_session != session_name:
+            raise ValueError(f"scheduled job '{job_id}' belongs to session '{job.owner_session}'")
+        return job
+
+    @staticmethod
+    def _format_scheduled_job(job, *, include_prompt: bool = False) -> str:
+        next_run = job.next_run or ("event-driven" if job.type == "event" else "n/a")
+        text = (
+            f"{job.id} [{job.status}] session={job.owner_session} "
+            f"type={job.type} next={next_run}"
+        )
+        if include_prompt:
+            text = f"{text} prompt={job.prompt}"
+        return text
 
     def _handle_signal(self, signal: Signal) -> None:
         """Fan out shared signal events to live sessions and the daemon bus."""
@@ -701,10 +879,55 @@ def create_app(
                     continue
 
                 if isinstance(payload, InputEnvelope):
+                    if payload.text.strip().startswith("/schedule"):
+                        try:
+                            response_text = await daemon_server.handle_schedule_command(
+                                managed,
+                                payload.text,
+                            )
+                            await _send_server_envelope(
+                                websocket,
+                                FinalEnvelope(type="final", text=response_text),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            await _send_error(websocket, "schedule_failed", str(exc))
+                        await _send_server_envelope(
+                            websocket,
+                            StatusEnvelope(
+                                type="status",
+                                activity=session.activity_status,
+                                queue=len(session.input_queue),
+                            ),
+                        )
+                        continue
                     await daemon_server.run_input(managed, payload.text)
                     continue
 
                 if isinstance(payload, SlashEnvelope):
+                    if payload.command.strip() == "/schedule":
+                        command_text = payload.command.strip()
+                        if payload.args.strip():
+                            command_text = f"{command_text} {payload.args.strip()}"
+                        try:
+                            response_text = await daemon_server.handle_schedule_command(
+                                managed,
+                                command_text,
+                            )
+                            await _send_server_envelope(
+                                websocket,
+                                FinalEnvelope(type="final", text=response_text),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            await _send_error(websocket, "schedule_failed", str(exc))
+                        await _send_server_envelope(
+                            websocket,
+                            StatusEnvelope(
+                                type="status",
+                                activity=session.activity_status,
+                                queue=len(session.input_queue),
+                            ),
+                        )
+                        continue
                     parts = [payload.command.strip()]
                     if payload.args.strip():
                         parts.append(payload.args.strip())

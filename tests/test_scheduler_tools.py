@@ -91,6 +91,51 @@ class SchedulerToolTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await scheduler.shutdown()
 
+    async def test_loop_guard_blocks_likely_self_scheduling(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scheduler = Scheduler(
+                dispatch_callback=lambda *_args: None,
+                jobs_path=Path(tmpdir) / "scheduler" / "jobs.json",
+            )
+            await scheduler.start()
+            try:
+                current_job = scheduler.create_event_job(
+                    condition={
+                        "channel": "signals",
+                        "filter": {"symbol": "BTC", "score": {"gte": 0.9}},
+                    },
+                    prompt="Summarize the signal",
+                    owner_session="alpha",
+                    created_by="user",
+                )
+                session = SimpleNamespace(
+                    name="alpha",
+                    current_source="scheduler",
+                    current_job_id=current_job.id,
+                )
+                tool_map = {
+                    tool.name: tool
+                    for tool in create_tools(
+                        scheduler=scheduler,
+                        session=session,
+                    )
+                }
+
+                blocked = tool_map["schedule_when"].invoke(
+                    {
+                        "condition": {
+                            "channel": "signals",
+                            "filter": {"symbol": "BTC", "score": {"gte": 0.9}},
+                        },
+                        "prompt": "Summarize the signal",
+                    }
+                )
+
+                self.assertIn("Refusing to create a likely self-scheduling loop", blocked)
+                self.assertEqual(len(scheduler.list_jobs_for_session("alpha")), 1)
+            finally:
+                await scheduler.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

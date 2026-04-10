@@ -778,21 +778,46 @@ def _format_scheduled_job_summary(job) -> str:
 
 def create_scheduler_tools(scheduler, session):
     """Create scheduler-management tools bound to the current session."""
+    session_obj = session
 
     def _resolve_session(target_session: str | None = None) -> str:
-        name = target_session or getattr(session, "name", "")
+        name = target_session or getattr(session_obj, "name", "")
         return str(name).strip()
+
+    def _loop_guard(job_type: str, target_session: str, prompt: str, spec: dict | None = None) -> str | None:
+        if getattr(session_obj, "current_source", "user") != "scheduler":
+            return None
+        current_job_id = getattr(session_obj, "current_job_id", None)
+        current_job = scheduler.get_job(current_job_id) if current_job_id else None
+        if current_job is None:
+            return None
+        if current_job.owner_session != target_session or current_job.type != job_type:
+            return None
+        if current_job.prompt.strip() != prompt.strip():
+            return None
+        if spec is not None and job_type != "absolute" and current_job.spec != spec:
+            return None
+        return (
+            f"Refusing to create a likely self-scheduling loop from job {current_job.id}. "
+            "Confirm it manually with /schedule add if you really want it."
+        )
 
     def _schedule_at(
         when: str,
         prompt: str,
         session: str | None = None,
+        tool_budget: int | None = None,
     ) -> str:
+        owner_session = _resolve_session(session)
+        warning = _loop_guard("absolute", owner_session, prompt)
+        if warning:
+            return warning
         job = scheduler.create_absolute_job(
             when=when,
             prompt=prompt,
-            owner_session=_resolve_session(session),
+            owner_session=owner_session,
             created_by="agent",
+            tool_budget=tool_budget,
         )
         return f"Scheduled {job.id} at {job.next_run} for session {job.owner_session}."
 
@@ -801,13 +826,20 @@ def create_scheduler_tools(scheduler, session):
         prompt: str,
         session: str | None = None,
         max_runs: int | None = None,
+        tool_budget: int | None = None,
     ) -> str:
+        owner_session = _resolve_session(session)
+        spec = {"cron": cron, "tz": scheduler.timezone_name}
+        warning = _loop_guard("cron", owner_session, prompt, spec)
+        if warning:
+            return warning
         job = scheduler.create_recurring_job(
             cron=cron,
             prompt=prompt,
-            owner_session=_resolve_session(session),
+            owner_session=owner_session,
             created_by="agent",
             max_runs=max_runs,
+            tool_budget=tool_budget,
         )
         return f"Scheduled recurring job {job.id} next={job.next_run} for session {job.owner_session}."
 
@@ -816,31 +848,35 @@ def create_scheduler_tools(scheduler, session):
         prompt: str,
         session: str | None = None,
         max_runs: int | None = None,
+        tool_budget: int | None = None,
     ) -> str:
+        owner_session = _resolve_session(session)
+        spec = {
+            "channel": condition.get("channel"),
+            "filter": condition.get("filter"),
+        }
+        warning = _loop_guard("event", owner_session, prompt, spec)
+        if warning:
+            return warning
         job = scheduler.create_event_job(
             condition=condition,
             prompt=prompt,
-            owner_session=_resolve_session(session),
+            owner_session=owner_session,
             created_by="agent",
             max_runs=max_runs,
+            tool_budget=tool_budget,
         )
         return f"Scheduled event job {job.id} on channel {job.spec['channel']} for session {job.owner_session}."
 
-    def _list_scheduled_jobs(session: str | None = None) -> str:
+    def _list_scheduled_jobs(target_session: str | None = None) -> str:
+        session_name = _resolve_session(target_session) if target_session is not None else getattr(session_obj, "name", "")
         jobs = [
             job
-            for job in scheduler.list_jobs_for_session(_resolve_session(session) if session is not None else getattr(session_obj, "name", None))
+            for job in scheduler.list_jobs_for_session(session_name)
             if job.status in {"active", "paused"}
         ]
-        if session is None:
-            jobs = [
-                job
-                for job in scheduler.list_jobs_for_session(getattr(session_obj, "name", ""))
-                if job.status in {"active", "paused"}
-            ]
         if not jobs:
-            target = _resolve_session(session) if session is not None else getattr(session_obj, "name", "")
-            return f"No scheduled jobs for session {target}."
+            return f"No scheduled jobs for session {session_name}."
         return "\n".join(_format_scheduled_job_summary(job) for job in jobs)
 
     def _cancel_scheduled_job(job_id: str) -> str:
@@ -864,7 +900,6 @@ def create_scheduler_tools(scheduler, session):
         updated = scheduler.resume_job(job_id)
         return f"Resumed scheduled job {updated.id}."
 
-    session_obj = session
     return [
         StructuredTool.from_function(
             func=_schedule_at,

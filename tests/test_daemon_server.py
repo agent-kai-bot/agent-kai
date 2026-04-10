@@ -204,6 +204,75 @@ class DaemonServerTests(unittest.TestCase):
                 self.assertEqual(completed["job_id"], "job-1")
                 self.assertEqual(completed["result_preview"], "done")
 
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    def test_schedule_slash_commands_create_and_pause_jobs(self, attach_runtime):
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+
+            def scheduler_factory(*, dispatch_callback, event_bus, event_callback, **_kwargs):
+                return Scheduler(
+                    dispatch_callback=dispatch_callback,
+                    event_bus=event_bus,
+                    event_callback=event_callback,
+                    jobs_path=base_dir / "scheduler" / "jobs.json",
+                )
+
+            app = create_app(
+                agent_name="kai",
+                nats_url="nats://unit-test",
+                bus_factory=_FakeBus,
+                scheduler_factory=scheduler_factory,
+            )
+
+            with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+            ):
+                with TestClient(app) as client:
+                    with client.websocket_connect("/ws") as websocket:
+                        websocket.send_json(
+                            {
+                                "type": "attach",
+                                "session": "terminal",
+                                "create_if_missing": True,
+                            }
+                        )
+                        websocket.receive_json()
+                        websocket.receive_json()
+
+                        websocket.send_json(
+                            {
+                                "type": "input",
+                                "text": '/schedule add at "in 1 minute" "Check BTC"',
+                            }
+                        )
+
+                        add_messages = [websocket.receive_json() for _ in range(3)]
+                        created = next(
+                            message for message in add_messages if message["type"] == "scheduled_job_created"
+                        )
+                        final = next(
+                            message for message in add_messages if message["type"] == "final"
+                        )
+                        job_id = created["job"]["id"]
+
+                        self.assertIn("Scheduled", final["text"])
+
+                        websocket.send_json({"type": "input", "text": "/schedule list"})
+                        listed = [websocket.receive_json() for _ in range(2)]
+                        list_final = next(
+                            message for message in listed if message["type"] == "final"
+                        )
+                        self.assertIn(job_id, list_final["text"])
+
+                        websocket.send_json({"type": "input", "text": "/schedule pause all"})
+                        paused = [websocket.receive_json() for _ in range(3)]
+                        pause_final = next(
+                            message for message in paused if message["type"] == "final"
+                        )
+                        self.assertIn("Paused 1 scheduled jobs", pause_final["text"])
+
     def test_websocket_requires_attach_as_first_message(self):
         with self._make_client() as client:
             with client.websocket_connect("/ws") as websocket:
