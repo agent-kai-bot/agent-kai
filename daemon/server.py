@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import secrets
 import shlex
 import shutil
 import time
+from collections import Counter
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -197,6 +199,18 @@ def _load_chart_history(
     raise ValueError(f"unsupported chart source '{source}'")
 
 
+def _process_memory_bytes() -> int | None:
+    """Return the current process RSS when the host exposes /proc."""
+    statm_path = Path("/proc/self/statm")
+    try:
+        fields = statm_path.read_text(encoding="utf-8").split()
+        resident_pages = int(fields[1])
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    except (IndexError, OSError, ValueError):
+        return None
+    return resident_pages * page_size
+
+
 @dataclass
 class ManagedSession:
     """Server-owned session plus per-session coordination state."""
@@ -296,6 +310,60 @@ class DaemonServer:
             with suppress(Exception):
                 await self.bus.disconnect()
             self.bus = None
+
+    def uptime_seconds(self) -> float:
+        """Return daemon uptime in seconds since the current process booted."""
+        if self.started_at_monotonic is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self.started_at_monotonic)
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        """Return detailed daemon metrics for diagnostics and smoke tests."""
+        queue_depth_by_session = {
+            name: len(managed.session.input_queue)
+            for name, managed in sorted(self.sessions.items())
+        }
+        scheduler_jobs = self.scheduler.list_jobs() if self.scheduler is not None else []
+        scheduler_status_counts = Counter(job.status for job in scheduler_jobs)
+        return {
+            "agent_name": self.agent_name,
+            "uptime_seconds": round(self.uptime_seconds(), 3),
+            "bus_connected": self.bus is not None,
+            "process": {
+                "pid": os.getpid(),
+                "memory_rss_bytes": _process_memory_bytes(),
+            },
+            "sessions": {
+                "live_count": len(self.sessions),
+                "indexed_count": len(list_indexed_sessions()),
+                "queue_depth": {
+                    "total": sum(queue_depth_by_session.values()),
+                    "per_session": queue_depth_by_session,
+                },
+                "activity": {
+                    name: managed.session.activity_status
+                    for name, managed in sorted(self.sessions.items())
+                },
+            },
+            "scheduler": {
+                "job_count": len(scheduler_jobs),
+                "status_counts": dict(sorted(scheduler_status_counts.items())),
+            },
+        }
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Return a compact health payload for readiness checks."""
+        metrics = self.metrics_snapshot()
+        return {
+            "status": "ok",
+            "agent_name": self.agent_name,
+            "bus_connected": metrics["bus_connected"],
+            "session_count": metrics["sessions"]["live_count"],
+            "uptime_seconds": metrics["uptime_seconds"],
+            "memory_rss_bytes": metrics["process"]["memory_rss_bytes"],
+            "agent_queue_depth": metrics["sessions"]["queue_depth"]["total"],
+            "scheduler_job_count": metrics["scheduler"]["job_count"],
+        }
 
     def _is_authorized(self, *, token: str | None, client_host: str | None) -> bool:
         if token and self.daemon_token and secrets.compare_digest(token, self.daemon_token):
@@ -903,12 +971,12 @@ def create_app(
     @app.get("/api/health")
     async def health_endpoint(request: Request) -> dict[str, Any]:
         daemon_server.require_http_auth(request)
-        return {
-            "status": "ok",
-            "agent_name": daemon_server.agent_name,
-            "bus_connected": daemon_server.bus is not None,
-            "session_count": len(daemon_server.sessions),
-        }
+        return daemon_server.health_snapshot()
+
+    @app.get("/api/metrics")
+    async def metrics_endpoint(request: Request) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
+        return daemon_server.metrics_snapshot()
 
     @app.get("/api/sessions")
     async def list_sessions_endpoint(request: Request) -> dict[str, Any]:
