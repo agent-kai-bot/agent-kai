@@ -11,6 +11,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from agent.core import AgentRunner
+from agent.signal_consumer import SignalConsumer
+from agent.sub_agents import SubAgentManager
+from agent.tools import create_tools
 from config import AGENTS, WORKSPACES_DIR
 
 DEFAULT_SESSION_NAME = "terminal"
@@ -143,6 +147,60 @@ class SessionSubAgentPool:
         return len(self._states)
 
 
+class SessionSubAgentRegistry:
+    """Session-scoped facade over the existing sub-agent manager."""
+
+    def __init__(self, pool: SessionSubAgentPool) -> None:
+        self.pool = pool
+        self._manager: SubAgentManager | None = None
+
+    @property
+    def agents(self) -> dict[str, Any]:
+        if self._manager is None:
+            return {}
+        return self._manager.agents
+
+    def bind_bus(self, bus: Any) -> None:
+        self._manager = SubAgentManager(bus) if bus is not None else None
+
+    async def spawn(
+        self,
+        name: str,
+        system_prompt: str | None = None,
+        initial_task: str | None = None,
+    ) -> str:
+        if self._manager is None:
+            return "Sub-agents require a connected bus."
+        result = await self._manager.spawn(
+            name,
+            system_prompt=system_prompt,
+            initial_task=initial_task,
+        )
+        if name in self.pool and name in self._manager.agents:
+            self.pool.get(name).runtime = self._manager.agents[name]
+        return result
+
+    async def stop(self, name: str) -> str:
+        if self._manager is None:
+            return f"No agent named '{name}'."
+        result = await self._manager.stop(name)
+        if name in self.pool:
+            self.pool.get(name).runtime = None
+        return result
+
+    def list_agents(self) -> list[str]:
+        if self._manager is None:
+            return []
+        return self._manager.list_agents()
+
+    async def stop_all(self) -> None:
+        if self._manager is None:
+            return
+        await self._manager.stop_all()
+        for _name, state in self.pool.items():
+            state.runtime = None
+
+
 class Session:
     """Named in-process session with isolated mutable state."""
 
@@ -156,11 +214,15 @@ class Session:
         self.agent_runner: Any = None
         self.signal_consumer: Any = None
         self.event_bus: Any = None
+        self.agent_name: str | None = None
 
         self.sub_agent_pool = SessionSubAgentPool(
             session_name=self.name,
             paths=self.paths,
         )
+        self.sub_agent_registry = SessionSubAgentRegistry(self.sub_agent_pool)
+        # Backwards-compat alias for the current terminal wiring.
+        self.sub_agent_manager = self.sub_agent_registry
 
     @property
     def activity_status(self) -> str:
@@ -168,6 +230,31 @@ class Session:
 
     def set_activity_status(self, status: str) -> None:
         self.ui_state.activity_status = status or "idle"
+
+    def attach_runtime(
+        self,
+        *,
+        bus: Any = None,
+        agent_name: str = "kai",
+        signal_consumer: SignalConsumer | None = None,
+    ) -> AgentRunner:
+        """Attach the in-process agent runtime to this session."""
+        self.agent_name = agent_name
+        self.signal_consumer = signal_consumer or SignalConsumer()
+        self.sub_agent_registry.bind_bus(bus)
+
+        tools = create_tools(
+            bus,
+            self.sub_agent_registry if bus is not None else None,
+            signal_consumer=self.signal_consumer,
+        )
+        self.agent_runner = AgentRunner(
+            tools=tools,
+            bus=bus,
+            agent_name=agent_name,
+        )
+        self.agent_runner.chat_history = self.chat_history
+        return self.agent_runner
 
     def __repr__(self) -> str:
         return (
