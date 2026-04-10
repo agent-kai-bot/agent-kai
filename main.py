@@ -5,10 +5,8 @@ import argparse
 import asyncio
 import sys
 
-from agent.core import AgentRunner
-from agent.sub_agents import SubAgentManager
-from agent.tools import create_tools
 from config import DEFAULT_AGENT, NATS_URL
+from daemon.core import Session
 from nats_bus.bus import NatsBus
 from tui.app import AgentTUI
 
@@ -84,17 +82,9 @@ async def main():
         print("Running without NATS.\n")
         bus = None
 
-    # Create the signal consumer — buffers live signals from the
-    # vpn-stack signal scanners arriving on NATS subjects like
-    # ``signals.clucmay02.BTC``. Shared between the TUI (display)
-    # and all agent tools (``get_signals`` tool queries it).
-    from agent.signal_consumer import SignalConsumer
-    signal_consumer = SignalConsumer()
-
-    # Create sub-agent manager and tools
-    sub_agent_manager = SubAgentManager(bus) if bus else None
-    tools = create_tools(bus, sub_agent_manager, signal_consumer=signal_consumer)
-    agent_runner = AgentRunner(tools=tools, bus=bus, agent_name=args.name)
+    session = Session("terminal" if args.terminal else args.name)
+    agent_runner = session.attach_runtime(bus=bus, agent_name=args.name)
+    sub_agent_manager = session.sub_agent_manager if bus else None
 
     try:
         if args.terminal:
@@ -103,11 +93,7 @@ async def main():
             # spawn here — the chart panel and the crypto tools all
             # hit cloud endpoints with the user's AGENT_KAI_API_KEY.
             from tui.terminal import TradingTerminal
-            terminal = TradingTerminal(
-                agent_runner=agent_runner, bus=bus,
-                signal_consumer=signal_consumer,
-            )
-            terminal._sub_agent_manager = sub_agent_manager
+            terminal = TradingTerminal(session=session, bus=bus)
             await terminal.run_async()
         elif args.no_tui:
             if not bus:
