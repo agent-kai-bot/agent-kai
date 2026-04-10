@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from daemon.core import DEFAULT_WATCHLIST_SYMBOLS, Session
+from daemon.core import (
+    DEFAULT_WATCHLIST_SYMBOLS,
+    Session,
+    SessionPaths,
+    SessionSubAgentPool,
+)
 from config import WORKSPACES_DIR
+from langchain_core.messages import AIMessage, HumanMessage
 
 
 class SessionTests(unittest.TestCase):
@@ -124,6 +131,76 @@ class SessionEventBusTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(events[0]["type"], "token")
         self.assertEqual(token_event.payload["value"], "hello")
+
+
+class SessionPersistenceTests(unittest.TestCase):
+    """Validate Phase 1 session persistence layout and serialization."""
+
+    @staticmethod
+    def _retarget_session(session: Session, base_dir: Path) -> None:
+        session.paths = SessionPaths(
+            root_dir=base_dir / session.name,
+            state_path=base_dir / f"{session.name}.json",
+            sub_agents_dir=base_dir / session.name / "sub_agents",
+            memory_dir=base_dir / session.name / "memory",
+        )
+        session.sub_agent_pool = SessionSubAgentPool(
+            session_name=session.name,
+            paths=session.paths,
+            templates=session.sub_agent_pool.templates,
+        )
+        session.sub_agent_registry.pool = session.sub_agent_pool
+
+    def test_save_and_load_round_trip_session_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            session = Session("alpha")
+            self._retarget_session(session, base_dir)
+            session.chat_history.extend(
+                [HumanMessage(content="hello"), AIMessage(content="world")]
+            )
+            session.input_queue.extend(["/analyze BTC"])
+            session.ui_state.chart_symbol = "ETH"
+            session.ui_state.watchlist_symbols = ["ETH", "SOL"]
+            session.sub_agent_pool.get("analyst").chat_history.append(
+                HumanMessage(content="sub-agent note")
+            )
+            session.save()
+
+            state_payload = session.paths.state_path.read_text(encoding="utf-8")
+            self.assertIn('"chart_symbol": "ETH"', state_payload)
+            self.assertTrue(session.paths.memory_dir.is_dir())
+
+            restored = Session("alpha")
+            self._retarget_session(restored, base_dir)
+            restored.load()
+
+            self.assertEqual(restored.ui_state.chart_symbol, "ETH")
+            self.assertEqual(restored.ui_state.watchlist_symbols, ["ETH", "SOL"])
+            self.assertEqual(restored.input_queue, ["/analyze BTC"])
+            self.assertEqual(len(restored.chat_history), 2)
+            self.assertEqual(
+                restored.sub_agent_pool.get("analyst").chat_history[0].content,
+                "sub-agent note",
+            )
+
+    def test_save_merges_existing_state_keys(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            session = Session("alpha")
+            self._retarget_session(session, base_dir)
+            session.paths.state_path.parent.mkdir(parents=True, exist_ok=True)
+            session.paths.state_path.write_text(
+                '{"custom":"keep-me","ui_state":{"chart_symbol":"BTC"}}',
+                encoding="utf-8",
+            )
+
+            session.ui_state.chart_symbol = "SOL"
+            session.save()
+
+            payload = session.paths.state_path.read_text(encoding="utf-8")
+            self.assertIn('"custom": "keep-me"', payload)
+            self.assertIn('"chart_symbol": "SOL"', payload)
 
 
 if __name__ == "__main__":

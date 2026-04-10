@@ -7,7 +7,13 @@ or multi-client support is introduced.
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import json
+import os
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -17,6 +23,7 @@ from agent.signal_consumer import SignalConsumer
 from agent.sub_agents import SubAgentManager
 from agent.tools import create_tools
 from config import AGENTS, WORKSPACES_DIR
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 DEFAULT_SESSION_NAME = "terminal"
 DEFAULT_WATCHLIST_SYMBOLS = ("BTC", "ETH", "SOL")
@@ -32,6 +39,117 @@ def _normalize_session_name(name: str) -> str:
     if normalized in {".", ".."} or "/" in normalized:
         raise ValueError("session name must not contain path separators")
     return normalized
+
+
+def _flatten_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text") or block.get("content") or ""
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return str(content) if content is not None else ""
+
+
+def _role_for_message(message: Any) -> str:
+    cls = type(message).__name__.lower()
+    if "human" in cls:
+        return "human"
+    if "system" in cls:
+        return "system"
+    return "ai"
+
+
+def serialize_messages(messages: list[Any]) -> list[dict[str, str]]:
+    """Convert LangChain messages into the persisted JSON format."""
+    serialized: list[dict[str, str]] = []
+    for message in messages:
+        content = _flatten_message_content(getattr(message, "content", ""))
+        if not content:
+            continue
+        serialized.append(
+            {
+                "role": _role_for_message(message),
+                "content": content,
+            }
+        )
+    return serialized
+
+
+def deserialize_messages(entries: list[dict[str, Any]]) -> list[Any]:
+    """Rebuild LangChain messages from persisted JSON."""
+    restored: list[Any] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        content = entry.get("content", "")
+        if not isinstance(content, str) or not content:
+            continue
+        role = entry.get("role", "")
+        if role == "human":
+            restored.append(HumanMessage(content=content))
+        elif role == "system":
+            restored.append(SystemMessage(content=content))
+        else:
+            restored.append(AIMessage(content=content))
+    return restored
+
+
+@contextmanager
+def _json_file_lock(path: Path):
+    """Lock a sidecar file so load-merge-write stays serialized."""
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(lock_path, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
+
+
+def _read_json_dict(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_merge_write_json(path: Path, patch: dict[str, Any]) -> dict[str, Any]:
+    """Atomically merge a JSON patch into an on-disk dict."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _json_file_lock(path):
+        merged = _read_json_dict(path)
+        merged.update(patch)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent),
+            prefix=f".{path.stem}.",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(merged, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+    return merged
 
 
 @dataclass(frozen=True)
@@ -333,6 +451,80 @@ class Session:
             {"agent_name": agent_name, "bus_enabled": bus is not None},
         )
         return self.agent_runner
+
+    def ensure_layout(self) -> None:
+        """Create the on-disk directories reserved for this session."""
+        self.paths.root_dir.mkdir(parents=True, exist_ok=True)
+        self.paths.sub_agents_dir.mkdir(parents=True, exist_ok=True)
+        self.paths.memory_dir.mkdir(parents=True, exist_ok=True)
+
+    def save(self) -> None:
+        """Persist the session state and every sub-agent buffer."""
+        self.ensure_layout()
+        state_patch = {
+            "name": self.name,
+            "agent_name": self.agent_name,
+            "chat_history": serialize_messages(self.chat_history),
+            "input_queue": list(self.input_queue),
+            "ui_state": asdict(self.ui_state),
+        }
+        _load_merge_write_json(self.paths.state_path, state_patch)
+        for name, state in self.sub_agent_pool.items():
+            _load_merge_write_json(
+                state.buffer_path,
+                {
+                    "name": name,
+                    "chat_history": serialize_messages(state.chat_history),
+                },
+            )
+        self.publish_event(
+            "session.persisted",
+            {"path": str(self.paths.state_path)},
+        )
+
+    def load(self) -> None:
+        """Load persisted state from disk if it exists."""
+        self.ensure_layout()
+        state = _read_json_dict(self.paths.state_path)
+        ui_state = state.get("ui_state")
+        if isinstance(ui_state, dict):
+            for field_name in (
+                "chart_symbol",
+                "chart_timeframe",
+                "chart_source",
+                "chart_layout_mode",
+                "chart_color_scheme",
+                "watchlist_symbols",
+                "autotrade_enabled",
+                "activity_status",
+            ):
+                if field_name in ui_state:
+                    setattr(self.ui_state, field_name, ui_state[field_name])
+
+        messages = state.get("chat_history")
+        if isinstance(messages, list):
+            self.chat_history.clear()
+            self.chat_history.extend(deserialize_messages(messages))
+
+        queue_items = state.get("input_queue")
+        if isinstance(queue_items, list):
+            self.input_queue[:] = [item for item in queue_items if isinstance(item, str)]
+
+        self.agent_name = state.get("agent_name") or self.agent_name
+
+        for name, sub_agent_state in self.sub_agent_pool.items():
+            payload = _read_json_dict(sub_agent_state.buffer_path)
+            messages = payload.get("chat_history")
+            if isinstance(messages, list):
+                sub_agent_state.chat_history[:] = deserialize_messages(messages)
+
+        if self.agent_runner is not None:
+            self.agent_runner.chat_history = self.chat_history
+
+        self.publish_event(
+            "session.loaded",
+            {"path": str(self.paths.state_path)},
+        )
 
     async def stream_agent_events(self, user_input: str):
         """Stream agent events through the session bus."""
