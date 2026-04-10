@@ -5,8 +5,12 @@
 
   let {
     portfolio,
+    mobileCollapsible = false,
+    initiallyOpen = true,
   }: {
     portfolio: PortfolioSnapshot;
+    mobileCollapsible?: boolean;
+    initiallyOpen?: boolean;
   } = $props();
 
   function money(value?: number): string {
@@ -18,7 +22,13 @@
   }
 </script>
 
-<Panel eyebrow="Portfolio" title="Positions" subtitle={`${portfolio.positions.length} open`}>
+<Panel
+  eyebrow="Portfolio"
+  initiallyOpen={initiallyOpen}
+  mobileCollapsible={mobileCollapsible}
+  title="Positions"
+  subtitle={`${portfolio.positions.length} open`}
+>
   {#if portfolio.positions.length}
     <table>
       <thead>
@@ -32,10 +42,14 @@
       <tbody>
         {#each portfolio.positions as position (position.symbol)}
           <tr>
-            <td>{position.symbol}</td>
-            <td>{position.side}</td>
-            <td>{position.quantity.toFixed(4)}</td>
-            <td class:loss={position.unrealized_pnl < 0} class:gain={position.unrealized_pnl > 0}>
+            <td data-label="Symbol">{position.symbol}</td>
+            <td data-label="Side">{position.side}</td>
+            <td data-label="Qty">{position.quantity.toFixed(4)}</td>
+            <td
+              class:gain={position.unrealized_pnl > 0}
+              class:loss={position.unrealized_pnl < 0}
+              data-label="P&L"
+            >
               {money(position.unrealized_pnl)} · {signedPct(position.pnl_pct)}
             </td>
           </tr>
@@ -100,5 +114,50 @@
   .empty {
     color: var(--muted);
     margin: 0;
+  }
+
+  @media (max-width: 700px) {
+    thead {
+      display: none;
+    }
+
+    table,
+    tbody,
+    tr {
+      display: block;
+    }
+
+    tr {
+      border: 1px solid rgba(145, 181, 221, 0.08);
+      border-radius: 0.9rem;
+      background: rgba(7, 19, 31, 0.68);
+      padding: 0.75rem 0.8rem;
+    }
+
+    tr + tr {
+      margin-top: 0.7rem;
+    }
+
+    td {
+      display: flex;
+      justify-content: space-between;
+      gap: 1rem;
+      border-bottom: 0;
+      padding: 0.25rem 0;
+      text-align: left;
+    }
+
+    td:last-child {
+      text-align: left;
+    }
+
+    td::before {
+      content: attr(data-label);
+      color: var(--muted);
+      font-size: 0.76rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
   }
 </style>

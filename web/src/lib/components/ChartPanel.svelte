@@ -23,12 +23,16 @@
     timeframe,
     source,
     status = "",
+    mobileCollapsible = false,
+    initiallyOpen = true,
   }: {
     bars: CandleBar[];
     symbol: string;
     timeframe: string;
     source: string;
     status?: string;
+    mobileCollapsible?: boolean;
+    initiallyOpen?: boolean;
   } = $props();
 
   let container: HTMLDivElement;
@@ -70,9 +74,10 @@
   }
 
   onMount(() => {
+    const initialHeight = Math.max(container.clientHeight, 320);
     chart = createChart(container, {
       width: container.clientWidth,
-      height: 360,
+      height: initialHeight,
       layout: {
         background: { type: ColorType.Solid, color: "#06131f" },
         textColor: "#f2f6fb",
@@ -118,7 +123,7 @@
     const observer = new ResizeObserver(() => {
       chart?.applyOptions({
         width: container.clientWidth,
-        height: Math.max(container.clientHeight, 360),
+        height: Math.max(container.clientHeight, 320),
       });
     });
     observer.observe(container);
@@ -139,7 +144,14 @@
   });
 </script>
 
-<Panel eyebrow="Visualization" title="Chart" subtitle={`${symbol} ${timeframe} · ${source}`}>
+<Panel
+  bodyScroll={false}
+  eyebrow="Visualization"
+  initiallyOpen={initiallyOpen}
+  mobileCollapsible={mobileCollapsible}
+  title="Chart"
+  subtitle={`${symbol} ${timeframe} · ${source}`}
+>
   <div class="chart-shell">
     <div bind:this={container} class="chart-canvas"></div>
     <div class="chart-meta">
@@ -152,11 +164,14 @@
 <style>
   .chart-shell {
     display: grid;
+    grid-template-rows: minmax(0, 1fr) auto;
     gap: 0.8rem;
+    height: 100%;
+    min-height: 0;
   }
 
   .chart-canvas {
-    min-height: 22rem;
+    min-height: clamp(24rem, 46vh, 34rem);
     border: 1px solid rgba(145, 181, 221, 0.1);
     border-radius: 1rem;
     overflow: hidden;
@@ -167,9 +182,27 @@
     justify-content: space-between;
     gap: 1rem;
     color: var(--muted);
+    flex-wrap: wrap;
   }
 
   .chart-meta strong {
     color: var(--text);
+  }
+
+  @media (max-width: 1024px) {
+    .chart-canvas {
+      min-height: clamp(22rem, 44vh, 30rem);
+    }
+  }
+
+  @media (max-width: 700px) {
+    .chart-shell {
+      height: auto;
+      grid-template-rows: auto auto;
+    }
+
+    .chart-canvas {
+      min-height: 40vh;
+    }
   }
 </style>

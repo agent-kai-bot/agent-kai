@@ -13,16 +13,26 @@
     subtitle = "",
     emptyMessage,
     items,
+    mobileCollapsible = false,
+    initiallyOpen = true,
   }: {
     eyebrow?: string;
     title: string;
     subtitle?: string;
     emptyMessage: string;
     items: EventRow[];
+    mobileCollapsible?: boolean;
+    initiallyOpen?: boolean;
   } = $props();
 </script>
 
-<Panel {eyebrow} {title} {subtitle}>
+<Panel
+  {eyebrow}
+  {title}
+  {subtitle}
+  initiallyOpen={initiallyOpen}
+  mobileCollapsible={mobileCollapsible}
+>
   {#if items.length}
     <ul class="events">
       {#each items as item, index (item.headline + item.detail + index)}
@@ -44,6 +54,7 @@
     list-style: none;
     margin: 0;
     padding: 0;
+    min-height: 0;
   }
 
   .events li {
