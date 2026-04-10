@@ -5,6 +5,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import requests
 from textual.app import App, ComposeResult
