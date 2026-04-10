@@ -1,12 +1,30 @@
 """Watchlist panel — live prices for tracked symbols."""
 
-import json
+import logging
+
 from textual.widgets import DataTable
-from textual.widget import Widget
+
+logger = logging.getLogger(__name__)
 
 
 class WatchlistPanel(DataTable):
-    """Shows live prices for tracked symbols."""
+    """Shows live prices for tracked symbols.
+
+    Built on Textual's ``DataTable``. The schema is three columns
+    (Symbol / Price / Vol) with explicit string keys so
+    ``update_cell(row_key, column_key, ...)`` actually matches.
+
+    The previous version used ``add_columns("Symbol", "Price", "Vol")``
+    without keys, which made Textual auto-generate column keys like
+    ``ColumnKey('column_1')``. Subsequent ``update_cell(symbol, "Price", ...)``
+    calls raised ``CellDoesNotExist`` (because "Price" wasn't the actual
+    column key) and the bare ``except Exception: pass`` silently
+    swallowed the error. The seed would run, try to update, fail
+    silently, and the initial "---" placeholders stayed on screen
+    forever. That's why the user saw symbols but "--- ---" for
+    price and volume. Fixed by using ``add_column`` (singular) with
+    explicit ``key=`` arguments.
+    """
 
     DEFAULT_CSS = """
     WatchlistPanel {
@@ -14,34 +32,70 @@ class WatchlistPanel(DataTable):
     }
     """
 
+    # Column keys — used in update_cell calls. Must match what
+    # on_mount passes to add_column.
+    COL_SYMBOL = "symbol"
+    COL_PRICE = "price"
+    COL_VOL = "vol"
+
     def __init__(self, tracked_symbols=None, **kwargs):
         super().__init__(**kwargs)
         self.tracked_symbols = tracked_symbols or ["BTC", "ETH", "SOL"]
+        # Live price + volume state, keyed by symbol. Kept alongside
+        # the DataTable so consumers can query the latest value
+        # without parsing rendered cell text.
         self._prices: dict[str, dict] = {}
         self.cursor_type = "row"
 
     def on_mount(self):
-        self.add_columns("Symbol", "Price", "Vol")
+        # add_column (singular) lets us set explicit string keys so
+        # update_cell(row_key, column_key, value) works against a
+        # stable identifier instead of auto-generated ColumnKey
+        # objects. See the class docstring for the full history.
+        self.add_column("Symbol", key=self.COL_SYMBOL)
+        self.add_column("Price", key=self.COL_PRICE)
+        self.add_column("Vol", key=self.COL_VOL)
         for sym in self.tracked_symbols:
             self.add_row(sym, "---", "---", key=sym)
 
-    def update_price(self, symbol: str, price: float, volume: float = None):
-        """Update a symbol's price in the table."""
+    def update_price(self, symbol: str, price: float, volume: float | None = None):
+        """Update a symbol's price in the table.
+
+        Adds the symbol as a new row if it's not already tracked.
+        Otherwise updates the Price and Vol cells on the existing
+        row via the column keys declared at mount time.
+        """
         symbol = symbol.upper()
+        price_str = f"${price:,.2f}" if price is not None else "---"
+        vol_str = f"{volume:,.1f}" if volume else "---"
+
         if symbol not in self.tracked_symbols:
             self.tracked_symbols.append(symbol)
-            self.add_row(symbol, f"${price:,.2f}", f"{volume or 0:.1f}", key=symbol)
-        else:
-            price_str = f"${price:,.2f}"
-            vol_str = f"{volume:.1f}" if volume else "---"
             try:
-                row_key = self.get_row(symbol)
-                self.update_cell(symbol, "Price", price_str)
-                self.update_cell(symbol, "Vol", vol_str)
-            except Exception:
-                pass
+                self.add_row(symbol, price_str, vol_str, key=symbol)
+            except Exception as exc:
+                logger.warning(
+                    "watchlist add_row failed for %s: %s", symbol, exc
+                )
+        else:
+            # Update the two live cells via column key. No silent
+            # swallow — log any failure so a future regression is
+            # visible instead of showing "--- ---" forever.
+            try:
+                self.update_cell(symbol, self.COL_PRICE, price_str)
+            except Exception as exc:
+                logger.warning(
+                    "watchlist update_cell price failed for %s: %s",
+                    symbol, exc,
+                )
+            try:
+                self.update_cell(symbol, self.COL_VOL, vol_str)
+            except Exception as exc:
+                logger.warning(
+                    "watchlist update_cell vol failed for %s: %s",
+                    symbol, exc,
+                )
 
-        old_price = self._prices.get(symbol, {}).get("price", 0)
         self._prices[symbol] = {"price": price, "volume": volume}
 
     def get_selected_symbol(self) -> str | None:
@@ -51,18 +105,26 @@ class WatchlistPanel(DataTable):
         return None
 
     def add_symbol(self, symbol: str):
-        """Add a symbol to the watchlist."""
+        """Add a symbol to the watchlist (empty price/vol until populated)."""
         symbol = symbol.upper()
         if symbol not in self.tracked_symbols:
             self.tracked_symbols.append(symbol)
-            self.add_row(symbol, "---", "---", key=symbol)
+            try:
+                self.add_row(symbol, "---", "---", key=symbol)
+            except Exception as exc:
+                logger.warning(
+                    "watchlist add_symbol failed for %s: %s", symbol, exc
+                )
 
     def remove_symbol(self, symbol: str):
         """Remove a symbol from the watchlist."""
         symbol = symbol.upper()
         if symbol in self.tracked_symbols:
             self.tracked_symbols.remove(symbol)
+            self._prices.pop(symbol, None)
             try:
                 self.remove_row(symbol)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "watchlist remove_row failed for %s: %s", symbol, exc
+                )
