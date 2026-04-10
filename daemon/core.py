@@ -667,12 +667,25 @@ class Session:
             {"path": str(self.paths.state_path)},
         )
 
-    async def stream_agent_events(self, user_input: str):
+    async def stream_agent_events(
+        self,
+        user_input: str,
+        *,
+        source: str = "user",
+        job_id: str | None = None,
+    ):
         """Stream agent events through the session bus."""
         if self.agent_runner is None:
             raise RuntimeError("session runtime is not attached")
 
-        self.publish_event("input.received", {"text": user_input})
+        if source == "scheduler" and job_id:
+            self.chat_history.append(SystemMessage(content=f"[scheduled job: {job_id}]"))
+            self.agent_runner.chat_history = self.chat_history
+
+        self.publish_event(
+            "input.received",
+            {"text": user_input, "source": source, "job_id": job_id},
+        )
         async for event in self.agent_runner.run(user_input):
             etype = event.get("type", "unknown")
             data = event.get("data")

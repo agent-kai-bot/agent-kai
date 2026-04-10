@@ -10,7 +10,7 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from daemon.server import DaemonServer, create_app
-from daemon.scheduler import Scheduler
+from daemon.scheduler import Scheduler, _utc_now
 
 
 class _FakeBus:
@@ -252,6 +252,66 @@ class DaemonServerIndexTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await server.shutdown()
             tmpdir.cleanup()
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    async def test_scheduled_job_dispatch_runs_in_target_session(self, attach_runtime):
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+
+            def scheduler_factory(*, dispatch_callback, event_bus, **_kwargs):
+                return Scheduler(
+                    dispatch_callback=dispatch_callback,
+                    event_bus=event_bus,
+                    jobs_path=base_dir / "scheduler" / "jobs.json",
+                )
+
+            with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+            ):
+                server = DaemonServer(
+                    agent_name="kai",
+                    nats_url="nats://unit-test",
+                    bus_factory=_FakeBus,
+                    scheduler_factory=scheduler_factory,
+                )
+
+                await server.startup()
+                try:
+                    managed = await server.get_or_create_session(
+                        "btc-scalper",
+                        create_if_missing=True,
+                    )
+                    self.assertIsNotNone(server.scheduler)
+
+                    server.scheduler.schedule_job(
+                        {
+                            "id": "job-turn",
+                            "type": "absolute",
+                            "spec": {"at": "2026-04-10T00:01:00+00:00"},
+                            "prompt": "Check BTC",
+                            "owner_session": "btc-scalper",
+                            "created_at": "2026-04-10T00:00:00+00:00",
+                            "created_by": "user",
+                        },
+                        persist=False,
+                    )
+
+                    job = server.scheduler.get_job("job-turn")
+                    self.assertIsNotNone(job)
+                    await server._handle_scheduled_job_trigger(job, _utc_now())
+
+                    updated = server.scheduler.get_job("job-turn")
+                    self.assertEqual(updated.run_count, 1)
+                    self.assertEqual(updated.status, "completed")
+                    self.assertEqual(updated.last_result_preview, "done:Check BTC")
+                    self.assertIn(
+                        "[scheduled job: job-turn]",
+                        [message.content for message in managed.session.chat_history],
+                    )
+                finally:
+                    await server.shutdown()
 
 
 class DaemonServerRestTests(unittest.TestCase):

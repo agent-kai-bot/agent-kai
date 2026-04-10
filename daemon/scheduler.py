@@ -9,7 +9,7 @@ import logging
 import os
 import re
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, Literal
@@ -80,6 +80,17 @@ STRUCTURED_FILTER_VALIDATOR = Draft202012Validator(STRUCTURED_FILTER_SCHEMA)
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _truncate_preview(text: str | None, limit: int = 160) -> str | None:
+    if text is None:
+        return None
+    collapsed = " ".join(text.split())
+    if not collapsed:
+        return None
+    if len(collapsed) <= limit:
+        return collapsed
+    return f"{collapsed[: limit - 3]}..."
 
 
 def _parse_datetime(value: str) -> datetime:
@@ -409,6 +420,62 @@ class Scheduler:
             if not matches_structured_filter(payload, filter_spec):
                 continue
             await self.fire_event_job(job.id, payload)
+
+    def update_job(self, job_id: str, **updates: Any) -> ScheduledJob:
+        job = self._jobs[job_id]
+        updated = job.model_copy(update=updates)
+        self._jobs[job_id] = updated
+        self._persist_jobs()
+        return updated
+
+    def record_completion(
+        self,
+        job_id: str,
+        *,
+        fired_at: datetime,
+        result_preview: str | None = None,
+    ) -> ScheduledJob:
+        job = self._jobs[job_id]
+        run_count = job.run_count + 1
+        next_run = self.next_run(job_id)
+        next_run_iso = next_run.isoformat() if next_run is not None else None
+        status: JobStatus = "active"
+        if job.type in {"absolute", "event"}:
+            next_run_iso = None
+        if job.type == "absolute":
+            status = "completed"
+        if job.max_runs is not None and run_count >= job.max_runs:
+            status = "completed"
+            next_run_iso = None
+            with suppress(Exception):
+                self._scheduler.remove_job(job_id)
+        return self.update_job(
+            job_id,
+            last_run=fired_at.isoformat(),
+            last_result_preview=_truncate_preview(result_preview),
+            next_run=next_run_iso,
+            run_count=run_count,
+            status=status,
+        )
+
+    def record_failure(
+        self,
+        job_id: str,
+        *,
+        fired_at: datetime,
+        error: str,
+    ) -> ScheduledJob:
+        job = self._jobs[job_id]
+        if job.type == "absolute":
+            with suppress(Exception):
+                self._scheduler.remove_job(job_id)
+        return self.update_job(
+            job_id,
+            last_run=fired_at.isoformat(),
+            last_result_preview=_truncate_preview(error),
+            next_run=None if job.type in {"absolute", "event"} else job.next_run,
+            status="failed",
+        )
 
     async def _fire_scheduled_job(self, job_id: str) -> None:
         job = self._jobs[job_id]

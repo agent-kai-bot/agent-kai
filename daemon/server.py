@@ -65,6 +65,14 @@ class ManagedSession:
     input_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+@dataclass
+class InputRunResult:
+    """Outcome of running one input turn through a session."""
+
+    final_text: str = ""
+    error: str | None = None
+
+
 class SessionCreateRequest(BaseModel):
     """Payload for REST session creation."""
 
@@ -166,27 +174,78 @@ class DaemonServer:
         self.sessions[session.name] = managed
         return managed
 
-    async def run_input(self, managed: ManagedSession, text: str) -> None:
+    async def run_input(
+        self,
+        managed: ManagedSession,
+        text: str,
+        *,
+        source: str = "user",
+        job_id: str | None = None,
+    ) -> InputRunResult:
         """Run one input turn through the target session."""
+        result = InputRunResult()
         async with managed.input_lock:
             managed.session.set_activity_status("thinking...")
             try:
-                async for _event in managed.session.stream_agent_events(text):
-                    pass
+                async for event in managed.session.stream_agent_events(
+                    text,
+                    source=source,
+                    job_id=job_id,
+                ):
+                    if event.get("type") == "final":
+                        result.final_text = str(event.get("data") or "")
+                    elif event.get("type") == "error":
+                        result.error = str(event.get("data") or "agent stream failed")
             except Exception as exc:  # noqa: BLE001
+                result.error = str(exc)
                 managed.session.publish_event("agent.error", {"value": str(exc)})
             finally:
                 managed.session.set_activity_status("idle")
                 with suppress(Exception):
                     managed.session.save()
+        return result
 
     async def publish_daemon_event(self, channel: str, payload: dict[str, Any]) -> None:
         """Publish one daemon-scoped event to scheduler subscribers."""
         await self.event_bus.publish(channel, payload)
 
     async def _handle_scheduled_job_trigger(self, job, fired_at) -> None:
-        """Placeholder until Phase 5 wires scheduler dispatch into sessions."""
-        self.log.info("scheduled job fired job_id=%s at %s", job.id, fired_at.isoformat())
+        """Dispatch one scheduled job into its owner session."""
+        if self.scheduler is None:
+            return
+
+        try:
+            managed = await self.get_or_create_session(
+                job.owner_session,
+                create_if_missing=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.scheduler.record_failure(job.id, fired_at=fired_at, error=str(exc))
+            self.log.warning("scheduled job %s failed to attach session: %s", job.id, exc)
+            return
+
+        if job.concurrency == "skip" and managed.input_lock.locked():
+            self.log.info(
+                "scheduled job %s skipped because session %s is busy",
+                job.id,
+                job.owner_session,
+            )
+            return
+
+        outcome = await self.run_input(
+            managed,
+            job.prompt,
+            source="scheduler",
+            job_id=job.id,
+        )
+        if outcome.error:
+            self.scheduler.record_failure(job.id, fired_at=fired_at, error=outcome.error)
+            return
+        self.scheduler.record_completion(
+            job.id,
+            fired_at=fired_at,
+            result_preview=outcome.final_text,
+        )
 
     def _handle_signal(self, signal: Signal) -> None:
         """Fan out shared signal events to live sessions and the daemon bus."""
