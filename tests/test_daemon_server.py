@@ -203,5 +203,81 @@ class DaemonServerIndexTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(reopened.session.paths.state_path.exists())
 
 
+class DaemonServerRestTests(unittest.TestCase):
+    """Validate the Phase 3 REST session lifecycle endpoints."""
+
+    @staticmethod
+    def _make_client() -> TestClient:
+        app = create_app(
+            agent_name="kai",
+            nats_url="nats://unit-test",
+            bus_factory=_FakeBus,
+        )
+        return TestClient(app)
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    def test_rest_session_lifecycle(self, attach_runtime):
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+            ):
+                with self._make_client() as client:
+                    listed = client.get("/api/sessions")
+                    self.assertEqual(listed.status_code, 200)
+                    self.assertEqual(listed.json(), {"sessions": []})
+
+                    created = client.post(
+                        "/api/sessions",
+                        json={"name": "btc-scalper"},
+                    )
+                    self.assertEqual(created.status_code, 201)
+                    payload = created.json()["session"]
+                    self.assertEqual(payload["name"], "btc-scalper")
+                    self.assertEqual(payload["activity_status"], "idle")
+                    self.assertTrue((base_dir / "btc-scalper.json").exists())
+
+                    listed = client.get("/api/sessions")
+                    self.assertEqual(listed.status_code, 200)
+                    sessions = listed.json()["sessions"]
+                    self.assertEqual([item["name"] for item in sessions], ["btc-scalper"])
+                    self.assertIn("last_activity", sessions[0])
+
+                    deleted = client.delete("/api/sessions/btc-scalper")
+                    self.assertEqual(deleted.status_code, 200)
+                    self.assertEqual(
+                        deleted.json(),
+                        {"deleted": True, "name": "btc-scalper"},
+                    )
+                    self.assertFalse((base_dir / "btc-scalper.json").exists())
+
+                    listed = client.get("/api/sessions")
+                    self.assertEqual(listed.status_code, 200)
+                    self.assertEqual(listed.json(), {"sessions": []})
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    def test_rest_rejects_duplicate_and_missing_sessions(self, attach_runtime):
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+            ):
+                with self._make_client() as client:
+                    created = client.post("/api/sessions", json={"name": "alpha"})
+                    self.assertEqual(created.status_code, 201)
+
+                    duplicate = client.post("/api/sessions", json={"name": "alpha"})
+                    self.assertEqual(duplicate.status_code, 409)
+                    self.assertIn("already exists", duplicate.json()["detail"])
+
+                    missing = client.delete("/api/sessions/missing")
+                    self.assertEqual(missing.status_code, 404)
+                    self.assertIn("does not exist", missing.json()["detail"])
+
+
 if __name__ == "__main__":
     unittest.main()
