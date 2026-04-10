@@ -447,7 +447,9 @@ class TradingTerminal(App):
     def _load_session_state(self) -> None:
         """Load the daemon-backed session state, falling back to legacy files."""
         try:
-            if self.session.paths.state_path.exists():
+            if getattr(self.session, "is_remote", False):
+                self.session.load()
+            elif self.session.paths.state_path.exists():
                 self.session.load()
             else:
                 self._migrate_legacy_state_into_session()
