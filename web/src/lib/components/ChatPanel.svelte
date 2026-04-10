@@ -17,18 +17,17 @@
     initiallyOpen?: boolean;
   } = $props();
 
-  let chatLogEl: HTMLDivElement | undefined = $state();
+  let scrollAnchor: HTMLDivElement | undefined = $state();
 
-  // Auto-scroll to bottom when messages change or streaming text grows
+  // Auto-scroll to bottom when messages change or streaming text grows.
+  // Uses scrollIntoView on a sentinel element instead of scrollTop on
+  // a specific container — this works regardless of which ancestor
+  // (.chat-log or .panel-body) is the actual overflow-scroll target.
   $effect(() => {
-    // Touch the reactive deps so the effect re-runs
     void messages.length;
     void streamingReply;
-    // Wait for DOM update, then scroll
     tick().then(() => {
-      if (chatLogEl) {
-        chatLogEl.scrollTop = chatLogEl.scrollHeight;
-      }
+      scrollAnchor?.scrollIntoView({ block: 'end', behavior: 'instant' });
     });
   });
 
@@ -50,7 +49,7 @@
   title="Chat"
   subtitle={`${messages.length} messages`}
 >
-  <div class="chat-log" bind:this={chatLogEl}>
+  <div class="chat-log">
     {#if messages.length || streamingReply}
       {#each messages as message, index (message.role + message.content + index)}
         <article class={`message ${message.role}`}>
@@ -69,6 +68,7 @@
     {:else}
       <p class="empty">No chat history in this session yet.</p>
     {/if}
+    <div bind:this={scrollAnchor} class="scroll-anchor"></div>
   </div>
 </Panel>
 
@@ -175,6 +175,11 @@
 
   .message :global(a) {
     color: var(--accent);
+  }
+
+  .scroll-anchor {
+    height: 1px;
+    width: 100%;
   }
 
   .empty {
