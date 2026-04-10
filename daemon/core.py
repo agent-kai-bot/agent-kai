@@ -14,6 +14,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from dataclasses import asdict
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,16 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 DEFAULT_SESSION_NAME = "terminal"
 DEFAULT_WATCHLIST_SYMBOLS = ("BTC", "ETH", "SOL")
+SESSIONS_ROOT_DIR = Path(WORKSPACES_DIR) / "sessions"
+SESSION_INDEX_PATH = SESSIONS_ROOT_DIR / "index.json"
+RESERVED_SESSION_NAMES = frozenset({"index"})
+
+
+def _utc_now_iso() -> str:
+    """Return a stable UTC ISO-8601 timestamp for persistence metadata."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
 
 
 def _normalize_session_name(name: str) -> str:
@@ -38,6 +49,8 @@ def _normalize_session_name(name: str) -> str:
         raise ValueError("session name cannot be empty")
     if normalized in {".", ".."} or "/" in normalized:
         raise ValueError("session name must not contain path separators")
+    if normalized.casefold() in {reserved.casefold() for reserved in RESERVED_SESSION_NAMES}:
+        raise ValueError(f"session name '{normalized}' is reserved")
     return normalized
 
 
@@ -137,19 +150,138 @@ def _load_merge_write_json(path: Path, patch: dict[str, Any]) -> dict[str, Any]:
     with _json_file_lock(path):
         merged = _read_json_dict(path)
         merged.update(patch)
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(path.parent),
-            prefix=f".{path.stem}.",
-            suffix=".tmp",
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(merged, handle, ensure_ascii=False, indent=2)
-            os.replace(tmp_name, path)
-        finally:
-            if os.path.exists(tmp_name):
-                os.unlink(tmp_name)
+        _write_json_dict_unlocked(path, merged)
     return merged
+
+
+def _write_json_dict(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically replace a JSON file with the supplied dict."""
+    with _json_file_lock(path):
+        _write_json_dict_unlocked(path, payload)
+
+
+@dataclass(frozen=True)
+class SessionIndexEntry:
+    """Persisted metadata for one known session."""
+
+    name: str
+    state_path: str
+    created_at: str
+    last_activity: str
+
+
+def _load_session_index_entries(
+    index_path: Path | None = None,
+) -> dict[str, SessionIndexEntry]:
+    index_path = index_path or SESSION_INDEX_PATH
+    payload = _read_json_dict(index_path)
+    raw_sessions = payload.get("sessions")
+    if not isinstance(raw_sessions, dict):
+        return {}
+
+    entries: dict[str, SessionIndexEntry] = {}
+    for name, raw_entry in raw_sessions.items():
+        if not isinstance(name, str) or not isinstance(raw_entry, dict):
+            continue
+        state_path = raw_entry.get("state_path")
+        created_at = raw_entry.get("created_at")
+        last_activity = raw_entry.get("last_activity")
+        if not isinstance(state_path, str) or not state_path:
+            state_path = str(SessionPaths.for_name(name).state_path)
+        if not isinstance(created_at, str) or not created_at:
+            created_at = last_activity if isinstance(last_activity, str) and last_activity else _utc_now_iso()
+        if not isinstance(last_activity, str) or not last_activity:
+            last_activity = created_at
+        entries[name] = SessionIndexEntry(
+            name=name,
+            state_path=state_path,
+            created_at=created_at,
+            last_activity=last_activity,
+        )
+    return entries
+
+
+def list_indexed_sessions(index_path: Path | None = None) -> list[SessionIndexEntry]:
+    """Return the persisted session index in stable alphabetical order."""
+    return sorted(_load_session_index_entries(index_path).values(), key=lambda entry: entry.name)
+
+
+def get_indexed_session(
+    name: str,
+    index_path: Path | None = None,
+) -> SessionIndexEntry | None:
+    """Look up one session in the persisted session index."""
+    return _load_session_index_entries(index_path).get(_normalize_session_name(name))
+
+
+def upsert_indexed_session(
+    name: str,
+    *,
+    state_path: Path | None = None,
+    last_activity: str | None = None,
+    index_path: Path | None = None,
+) -> SessionIndexEntry:
+    """Create or refresh one session entry in the persisted index."""
+    normalized = _normalize_session_name(name)
+    activity_at = last_activity or _utc_now_iso()
+    entry_path = str(state_path or SessionPaths.for_name(normalized).state_path)
+    index_path = index_path or SESSION_INDEX_PATH
+
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    with _json_file_lock(index_path):
+        payload = _read_json_dict(index_path)
+        raw_sessions = payload.get("sessions")
+        sessions = raw_sessions if isinstance(raw_sessions, dict) else {}
+        existing = sessions.get(normalized) if isinstance(sessions.get(normalized), dict) else {}
+        created_at = existing.get("created_at") if isinstance(existing.get("created_at"), str) else activity_at
+        entry = SessionIndexEntry(
+            name=normalized,
+            state_path=entry_path,
+            created_at=created_at,
+            last_activity=activity_at,
+        )
+        sessions[normalized] = asdict(entry)
+        payload["version"] = 1
+        payload["sessions"] = sessions
+        _write_json_dict_unlocked(index_path, payload)
+    return entry
+
+
+def remove_indexed_session(
+    name: str,
+    index_path: Path | None = None,
+) -> bool:
+    """Remove one session from the persisted session index."""
+    normalized = _normalize_session_name(name)
+    index_path = index_path or SESSION_INDEX_PATH
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    with _json_file_lock(index_path):
+        payload = _read_json_dict(index_path)
+        raw_sessions = payload.get("sessions")
+        sessions = raw_sessions if isinstance(raw_sessions, dict) else {}
+        if normalized not in sessions:
+            return False
+        sessions.pop(normalized, None)
+        payload["version"] = 1
+        payload["sessions"] = sessions
+        _write_json_dict_unlocked(index_path, payload)
+    return True
+
+
+def _write_json_dict_unlocked(path: Path, payload: dict[str, Any]) -> None:
+    """Write a JSON dict assuming the caller already holds the file lock."""
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.stem}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
 
 
 @dataclass(frozen=True)
@@ -163,7 +295,7 @@ class SessionPaths:
 
     @classmethod
     def for_name(cls, name: str) -> "SessionPaths":
-        root_dir = Path(WORKSPACES_DIR) / "sessions" / name
+        root_dir = SESSIONS_ROOT_DIR / name
         return cls(
             root_dir=root_dir,
             state_path=root_dir.with_suffix(".json"),
@@ -458,6 +590,14 @@ class Session:
         self.paths.sub_agents_dir.mkdir(parents=True, exist_ok=True)
         self.paths.memory_dir.mkdir(parents=True, exist_ok=True)
 
+    def touch_index(self) -> SessionIndexEntry:
+        """Ensure this session is discoverable in the persisted session index."""
+        self.ensure_layout()
+        return upsert_indexed_session(
+            self.name,
+            state_path=self.paths.state_path,
+        )
+
     def save(self) -> None:
         """Persist the session state and every sub-agent buffer."""
         self.ensure_layout()
@@ -477,6 +617,7 @@ class Session:
                     "chat_history": serialize_messages(state.chat_history),
                 },
             )
+        self.touch_index()
         self.publish_event(
             "session.persisted",
             {"path": str(self.paths.state_path)},
