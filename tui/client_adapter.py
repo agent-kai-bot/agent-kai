@@ -7,7 +7,9 @@ import json
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote, urlparse, urlunparse
+
+import aiohttp
 
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -55,6 +57,7 @@ class RemoteSession:
         connection_factory=None,
     ) -> None:
         self.remote_url = self._normalize_remote_url(remote_url)
+        self.api_base_url = self._derive_api_base_url(self.remote_url)
         self.name = session_name
         self.create_if_missing = create_if_missing
         self.ui_state = SessionUIState()
@@ -78,6 +81,24 @@ class RemoteSession:
         if not path or path == "/":
             path = DEFAULT_DAEMON_WS_PATH
         return urlunparse(parsed._replace(path=path))
+
+    @staticmethod
+    def _derive_api_base_url(remote_url: str) -> str:
+        """Translate a daemon websocket URL into the matching HTTP base URL."""
+        parsed = urlparse(remote_url)
+        scheme = "https" if parsed.scheme == "wss" else "http"
+        path = parsed.path or ""
+        if path.endswith(DEFAULT_DAEMON_WS_PATH):
+            path = path[: -len(DEFAULT_DAEMON_WS_PATH)]
+        return urlunparse(
+            parsed._replace(
+                scheme=scheme,
+                path=path.rstrip("/"),
+                params="",
+                query="",
+                fragment="",
+            )
+        )
 
     async def connect(self) -> None:
         """Open the WS connection and attach to the target daemon session."""
@@ -132,6 +153,19 @@ class RemoteSession:
         if not self.input_queue:
             return None
         return self.input_queue.pop(0)
+
+    async def list_sessions(self) -> list[dict[str, Any]]:
+        """Fetch the daemon's known session list over REST."""
+        payload = await self._request_json("GET", "/api/sessions")
+        sessions = payload.get("sessions")
+        return sessions if isinstance(sessions, list) else []
+
+    async def delete_session(self, name: str) -> dict[str, Any]:
+        """Delete a named session through the daemon REST API."""
+        return await self._request_json(
+            "DELETE",
+            f"/api/sessions/{quote(name, safe='')}",
+        )
 
     async def stream_agent_events(self, user_input: str):
         """Send one input turn to the daemon and translate the reply stream."""
@@ -214,6 +248,23 @@ class RemoteSession:
         if not isinstance(envelope, dict):
             payload = encode_envelope(envelope)
         await self._websocket.send(json.dumps(payload))
+
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Issue one JSON REST request against the daemon HTTP API."""
+        url = f"{self.api_base_url}{path}"
+        async with aiohttp.ClientSession() as client:
+            async with client.request(method, url, json=payload) as response:
+                data = await response.json()
+                if response.status >= 400:
+                    detail = data.get("detail") if isinstance(data, dict) else None
+                    raise RuntimeError(detail or f"{method} {path} failed")
+                return data if isinstance(data, dict) else {}
 
     async def _recv_envelope(self):
         if self._websocket is None:

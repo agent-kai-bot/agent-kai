@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest import mock
 
 from tui.client_adapter import RemoteSession
 
@@ -153,6 +154,30 @@ class RemoteSessionTests(unittest.IsolatedAsyncioTestCase):
         sent_messages = [json.loads(payload) for payload in websocket.sent]
         self.assertEqual(sent_messages[0]["type"], "attach")
         self.assertEqual(sent_messages[1], {"type": "input", "text": "hello"})
+
+    async def test_list_sessions_uses_http_api_helper(self):
+        session = RemoteSession("ws://127.0.0.1:8765/ws")
+        request_json = mock.AsyncMock(
+            return_value={"sessions": [{"name": "alpha"}]}
+        )
+        session._request_json = request_json
+
+        sessions = await session.list_sessions()
+
+        self.assertEqual(sessions, [{"name": "alpha"}])
+        request_json.assert_awaited_once_with("GET", "/api/sessions")
+
+    async def test_delete_session_quotes_the_session_name(self):
+        session = RemoteSession("ws://127.0.0.1:8765/ws")
+        request_json = mock.AsyncMock(return_value={"deleted": True})
+        session._request_json = request_json
+
+        await session.delete_session("swing trader")
+
+        request_json.assert_awaited_once_with(
+            "DELETE",
+            "/api/sessions/swing%20trader",
+        )
 
 
 if __name__ == "__main__":

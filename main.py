@@ -135,16 +135,50 @@ async def _run_remote_terminal(args: argparse.Namespace) -> None:
     """Launch the trading terminal against a remote daemon."""
     from tui.terminal import TradingTerminal
 
-    session = RemoteSession(
-        args.remote,
-        session_name=_resolve_terminal_session_name(args),
-    )
-    await session.connect()
-    try:
-        terminal = TradingTerminal(session=session, bus=None)
-        await terminal.run_async()
-    finally:
-        await session.close()
+    session_name = _resolve_terminal_session_name(args)
+    while True:
+        session = RemoteSession(
+            args.remote,
+            session_name=session_name,
+        )
+        await session.connect()
+        try:
+            terminal = TradingTerminal(session=session, bus=None)
+            result = await terminal.run_async()
+        finally:
+            await session.close()
+
+        if not isinstance(result, dict) or result.get("action") != "switch_session":
+            return
+        next_session = result.get("session")
+        if not isinstance(next_session, str) or not next_session.strip():
+            return
+        session_name = next_session.strip()
+
+
+async def _run_local_terminal(args: argparse.Namespace, bus) -> None:
+    """Launch the in-process terminal and recreate it when switching sessions."""
+    from tui.terminal import TradingTerminal
+
+    session_name = _resolve_terminal_session_name(args)
+    while True:
+        session = Session(session_name)
+        session.touch_index()
+        session.attach_runtime(bus=bus, agent_name=args.name)
+        sub_agent_manager = session.sub_agent_manager if bus else None
+        try:
+            terminal = TradingTerminal(session=session, bus=bus)
+            result = await terminal.run_async()
+        finally:
+            if sub_agent_manager:
+                await sub_agent_manager.stop_all()
+
+        if not isinstance(result, dict) or result.get("action") != "switch_session":
+            return
+        next_session = result.get("session")
+        if not isinstance(next_session, str) or not next_session.strip():
+            return
+        session_name = next_session.strip()
 
 
 async def main(argv: list[str] | None = None):
@@ -174,33 +208,21 @@ async def main(argv: list[str] | None = None):
     # Connect to NATS
     bus = await _connect_bus(args)
 
-    session = Session(
-        _resolve_terminal_session_name(args) if args.terminal else args.name
-    )
-    if args.terminal:
-        session.touch_index()
-    agent_runner = session.attach_runtime(bus=bus, agent_name=args.name)
-    sub_agent_manager = session.sub_agent_manager if bus else None
-
     try:
         if args.terminal:
-            # Open-source agent talks to the cloud agent-k.ai API for
-            # both LLM and market data. There is no local data_api to
-            # spawn here — the chart panel and the crypto tools all
-            # hit cloud endpoints with the user's AGENT_KAI_API_KEY.
-            from tui.terminal import TradingTerminal
-            terminal = TradingTerminal(session=session, bus=bus)
-            await terminal.run_async()
+            await _run_local_terminal(args, bus)
         elif args.no_tui:
+            session = Session(args.name)
+            agent_runner = session.attach_runtime(bus=bus, agent_name=args.name)
             if not bus:
                 print("Error: headless mode requires NATS connection.")
                 sys.exit(1)
             await run_headless(bus, agent_runner)
         else:
+            session = Session(args.name)
+            agent_runner = session.attach_runtime(bus=bus, agent_name=args.name)
             await run_tui(bus, agent_runner)
     finally:
-        if sub_agent_manager:
-            await sub_agent_manager.stop_all()
         if bus:
             await bus.disconnect()
 
