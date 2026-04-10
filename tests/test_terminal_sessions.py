@@ -30,6 +30,39 @@ class _RemoteSessionStub:
         return {"deleted": True, "name": name}
 
 
+class _FakeResponseWidget:
+    """Minimal response widget stub for remote streaming tests."""
+
+    def __init__(self) -> None:
+        self.updates: list[str] = []
+
+    def update(self, text: str) -> None:
+        self.updates.append(text)
+
+
+class _FakeChatPanel:
+    """Minimal chat panel stub for remote streaming tests."""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+        self.rendered: list[tuple[_FakeResponseWidget, str]] = []
+        self.widgets: list[_FakeResponseWidget] = []
+
+    def append_message(self, text: str, _style: str | None = None) -> None:
+        self.messages.append(text)
+
+    def create_response_widget(self) -> _FakeResponseWidget:
+        widget = _FakeResponseWidget()
+        self.widgets.append(widget)
+        return widget
+
+    def render_widget_as_markdown(self, widget: _FakeResponseWidget, text: str) -> None:
+        self.rendered.append((widget, text))
+
+    def scroll_end(self, animate: bool = False) -> None:
+        del animate
+
+
 class TradingTerminalSessionCommandTests(unittest.IsolatedAsyncioTestCase):
     """Validate session listing, switching, and deletion commands."""
 
@@ -107,6 +140,38 @@ class TradingTerminalSessionCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(handled)
         self.assertEqual(session.deleted, ["beta"])
         self.assertIn("Deleted session beta", terminal._chat_lines[-1])
+
+    async def test_remote_event_stream_renders_broadcast_turn(self):
+        terminal = self._make_terminal(_RemoteSessionStub("alpha"))
+        chat = _FakeChatPanel()
+        terminal.query_one = lambda _selector, _widget_type=None: chat
+        terminal._nats_log = mock.Mock()
+        terminal._set_status = mock.Mock()
+        terminal._refresh_positions = mock.AsyncMock()
+        terminal._save_chat_history = mock.Mock()
+        terminal._drain_input_queue = mock.Mock()
+        terminal._debug_enabled = False
+        terminal._tool_start_times = {}
+        terminal._remote_response_widget = None
+        terminal._remote_response_text = ""
+
+        await terminal._handle_remote_session_event(
+            {"type": "status", "data": "thinking..."}
+        )
+        await terminal._handle_remote_session_event(
+            {"type": "token", "data": "partial"}
+        )
+        await terminal._handle_remote_session_event(
+            {"type": "final", "data": "answer"}
+        )
+        await terminal._handle_remote_session_event(
+            {"type": "status", "data": "idle"}
+        )
+
+        self.assertEqual(chat.rendered[-1][1], "answer")
+        terminal._refresh_positions.assert_awaited_once_with()
+        terminal._save_chat_history.assert_called_once_with()
+        terminal._drain_input_queue.assert_called_once_with()
 
 
 class TradingTerminalLocalSessionTests(unittest.TestCase):
