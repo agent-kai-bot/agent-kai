@@ -42,6 +42,12 @@ def _sample_bars(count: int) -> list[dict]:
 class ChartPanelDataTests(unittest.TestCase):
     """Validate the viewport math that drives the chart renderer."""
 
+    def test_chart_panel_is_focusable(self):
+        """The chart must participate in focus traversal for arrow-key UX."""
+
+        panel = ChartPanel()
+        self.assertTrue(panel.can_focus)
+
     def test_aggregate_view_bars_preserves_ohlcv_semantics(self):
         """Aggregation should preserve open/high/low/close/volume correctly."""
 
@@ -118,6 +124,30 @@ class ChartPanelDataTests(unittest.TestCase):
         reset = panel.reset_view()
         self.assertEqual(reset["right_offset"], 0)
         self.assertTrue(reset["show_volume"])
+
+    def test_chart_panel_action_helpers_mutate_view_state(self):
+        """Widget actions should drive the same viewport controls as commands."""
+
+        panel = ChartPanel()
+        panel.set_data("BTC", "1m", _sample_bars(80))
+
+        panel.action_pan_left()
+        self.assertGreater(panel.get_view_state(plot_width=30)["right_offset"], 0)
+
+        panel.action_pan_to_latest()
+        self.assertEqual(panel.get_view_state(plot_width=30)["right_offset"], 0)
+
+        before_zoom = panel.get_view_state(plot_width=30)["zoom"]
+        panel.action_zoom_in()
+        after_zoom = panel.get_view_state(plot_width=30)["zoom"]
+        self.assertNotEqual(before_zoom, after_zoom)
+
+        before_volume = panel.get_view_state(plot_width=30)["show_volume"]
+        panel.action_toggle_volume()
+        self.assertNotEqual(
+            before_volume,
+            panel.get_view_state(plot_width=30)["show_volume"],
+        )
 
 
 if __name__ == "__main__":

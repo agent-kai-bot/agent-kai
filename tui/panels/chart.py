@@ -8,6 +8,8 @@ from typing import Any
 
 from rich.text import Text
 from textual.app import RenderResult
+from textual.binding import Binding
+from textual.events import Click
 from textual.widget import Widget
 
 
@@ -328,6 +330,18 @@ def _make_grid(height: int, width: int) -> tuple[list[list[str]], list[list[str]
 class ChartPanel(Widget):
     """Render a serious terminal chart with viewport controls and modes."""
 
+    can_focus = True
+
+    BINDINGS = [
+        Binding("left", "pan_left", "Pan Left", show=False),
+        Binding("right", "pan_right", "Pan Right", show=False),
+        Binding("up", "zoom_in", "Zoom In", show=False),
+        Binding("down", "zoom_out", "Zoom Out", show=False),
+        Binding("home", "pan_to_latest", "Latest", show=False),
+        Binding("end", "pan_to_latest", "Latest", show=False),
+        Binding("v", "toggle_volume", "Volume", show=False),
+    ]
+
     DEFAULT_CSS = """
     ChartPanel {
         height: 1fr;
@@ -452,6 +466,41 @@ class ChartPanel(Widget):
             self._viewport.show_volume = bool(visible)
         self.refresh()
         return self.get_view_state()
+
+    def action_pan_left(self) -> None:
+        """Pan the viewport toward older history."""
+
+        self.pan_left()
+
+    def action_pan_right(self) -> None:
+        """Pan the viewport toward the latest candles."""
+
+        self.pan_right()
+
+    def action_zoom_in(self) -> None:
+        """Zoom the chart in."""
+
+        self.zoom_in()
+
+    def action_zoom_out(self) -> None:
+        """Zoom the chart out."""
+
+        self.zoom_out()
+
+    def action_pan_to_latest(self) -> None:
+        """Jump back to the live edge."""
+
+        self.pan_to_latest()
+
+    def action_toggle_volume(self) -> None:
+        """Toggle the volume pane."""
+
+        self.toggle_volume()
+
+    def on_click(self, _event: Click) -> None:
+        """Focus the chart when it is clicked."""
+
+        self.focus()
 
     def toggle_visible(self, visible: bool | None = None) -> bool:
         """Toggle or explicitly set chart visibility."""
@@ -722,6 +771,9 @@ class ChartPanel(Widget):
 
         text.append(" " * axis_width, style=scheme.axis)
         text.append(" ", style=scheme.axis)
-        hud = "Alt+<- -> pan  Alt+Up/Down zoom  Ctrl+G mode  /chart view for controls"
+        hud = (
+            "Tab/click focus  <- -> pan  Up/Down zoom  Home latest  "
+            "V volume  Ctrl+G mode"
+        )
         text.append(hud[:plot_width], style=scheme.header_dim)
         return text

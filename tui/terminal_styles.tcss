@@ -62,6 +62,10 @@ Screen.chart-mode-focus #nats-panel {
     border: solid $primary;
 }
 
+#chart-panel:focus {
+    border: tall $accent;
+}
+
 #chat-panel {
     border: solid $primary;
     padding: 0 1;
