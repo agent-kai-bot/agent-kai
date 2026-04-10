@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -87,6 +88,42 @@ class SessionTests(unittest.TestCase):
         )
         self.assertIs(session.agent_runner, runner)
         self.assertIs(runner.chat_history, session.chat_history)
+
+
+class SessionEventBusTests(unittest.IsolatedAsyncioTestCase):
+    """Validate per-session event delivery."""
+
+    async def test_status_updates_publish_to_session_bus(self):
+        session = Session("alpha")
+        any_events = session.subscribe_events()
+        status_events = session.subscribe_events("status.updated")
+
+        session.set_activity_status("thinking")
+
+        any_event = await asyncio.wait_for(any_events.get(), timeout=0.1)
+        status_event = await asyncio.wait_for(status_events.get(), timeout=0.1)
+
+        self.assertEqual(any_event.topic, "status.updated")
+        self.assertEqual(any_event.payload["status"], "thinking")
+        self.assertEqual(status_event.topic, "status.updated")
+        self.assertEqual(status_event.session_name, "alpha")
+
+    async def test_stream_agent_events_republishes_runner_events(self):
+        session = Session("alpha")
+        token_events = session.subscribe_events("agent.token")
+
+        async def fake_run(_user_input):
+            yield {"type": "token", "data": "hello"}
+            yield {"type": "final", "data": "done"}
+
+        session.agent_runner = mock.Mock()
+        session.agent_runner.run = fake_run
+
+        events = [event async for event in session.stream_agent_events("ping")]
+        token_event = await asyncio.wait_for(token_events.get(), timeout=0.1)
+
+        self.assertEqual(events[0]["type"], "token")
+        self.assertEqual(token_event.payload["value"], "hello")
 
 
 if __name__ == "__main__":

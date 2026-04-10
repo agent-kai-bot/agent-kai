@@ -6,6 +6,7 @@ or multi-client support is introduced.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -201,6 +202,51 @@ class SessionSubAgentRegistry:
             state.runtime = None
 
 
+@dataclass(frozen=True)
+class SessionEvent:
+    """One event emitted on a session-local bus."""
+
+    session_name: str
+    topic: str
+    payload: dict[str, Any]
+
+
+class SessionEventBus:
+    """Minimal per-session pub/sub bus backed by asyncio queues."""
+
+    def __init__(self, session_name: str) -> None:
+        self.session_name = session_name
+        self._subscriptions: dict[str, list[asyncio.Queue[SessionEvent]]] = {}
+
+    def subscribe(self, topic: str = "*") -> asyncio.Queue[SessionEvent]:
+        queue: asyncio.Queue[SessionEvent] = asyncio.Queue()
+        self._subscriptions.setdefault(topic, []).append(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[SessionEvent]) -> None:
+        for queues in self._subscriptions.values():
+            if queue in queues:
+                queues.remove(queue)
+
+    def publish(self, topic: str, payload: dict[str, Any] | None = None) -> SessionEvent:
+        event = SessionEvent(
+            session_name=self.session_name,
+            topic=topic,
+            payload=dict(payload or {}),
+        )
+        recipients: list[asyncio.Queue[SessionEvent]] = []
+        recipients.extend(self._subscriptions.get("*", []))
+        recipients.extend(self._subscriptions.get(topic, []))
+        seen: set[int] = set()
+        for queue in recipients:
+            qid = id(queue)
+            if qid in seen:
+                continue
+            seen.add(qid)
+            queue.put_nowait(event)
+        return event
+
+
 class Session:
     """Named in-process session with isolated mutable state."""
 
@@ -213,7 +259,7 @@ class Session:
         self.ui_state = SessionUIState()
         self.agent_runner: Any = None
         self.signal_consumer: Any = None
-        self.event_bus: Any = None
+        self.event_bus = SessionEventBus(self.name)
         self.agent_name: str | None = None
 
         self.sub_agent_pool = SessionSubAgentPool(
@@ -230,6 +276,34 @@ class Session:
 
     def set_activity_status(self, status: str) -> None:
         self.ui_state.activity_status = status or "idle"
+        self.publish_event("status.updated", {"status": self.ui_state.activity_status})
+
+    def subscribe_events(self, topic: str = "*") -> asyncio.Queue[SessionEvent]:
+        return self.event_bus.subscribe(topic)
+
+    def publish_event(
+        self,
+        topic: str,
+        payload: dict[str, Any] | None = None,
+    ) -> SessionEvent:
+        return self.event_bus.publish(topic, payload)
+
+    def queue_input(self, text: str) -> None:
+        self.input_queue.append(text)
+        self.publish_event(
+            "input.queued",
+            {"text": text, "depth": len(self.input_queue)},
+        )
+
+    def pop_input(self) -> str | None:
+        if not self.input_queue:
+            return None
+        text = self.input_queue.pop(0)
+        self.publish_event(
+            "input.dequeued",
+            {"text": text, "depth": len(self.input_queue)},
+        )
+        return text
 
     def attach_runtime(
         self,
@@ -254,7 +328,24 @@ class Session:
             agent_name=agent_name,
         )
         self.agent_runner.chat_history = self.chat_history
+        self.publish_event(
+            "runtime.attached",
+            {"agent_name": agent_name, "bus_enabled": bus is not None},
+        )
         return self.agent_runner
+
+    async def stream_agent_events(self, user_input: str):
+        """Stream agent events through the session bus."""
+        if self.agent_runner is None:
+            raise RuntimeError("session runtime is not attached")
+
+        self.publish_event("input.received", {"text": user_input})
+        async for event in self.agent_runner.run(user_input):
+            etype = event.get("type", "unknown")
+            data = event.get("data")
+            payload = data if isinstance(data, dict) else {"value": data}
+            self.publish_event(f"agent.{etype}", payload)
+            yield event
 
     def __repr__(self) -> str:
         return (
