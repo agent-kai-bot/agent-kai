@@ -293,6 +293,7 @@ class Scheduler:
         event_bus: DaemonEventBus | None = None,
         event_callback: SchedulerEventCallback | None = None,
         session_job_limit: int = 50,
+        catch_up_window_seconds: int = 300,
     ) -> None:
         self.dispatch_callback = dispatch_callback
         self.timezone_name = timezone_name
@@ -302,9 +303,11 @@ class Scheduler:
         self.event_bus = event_bus
         self.event_callback = event_callback
         self.session_job_limit = session_job_limit
+        self.catch_up_window_seconds = catch_up_window_seconds
         self._jobs: dict[str, ScheduledJob] = {}
         self._started = False
         self._event_callback: EventCallback | None = None
+        self._startup_tasks: set[asyncio.Task] = set()
         self.log = logging.getLogger(__name__)
 
     @property
@@ -316,9 +319,9 @@ class Scheduler:
             return
         self.load_jobs()
         self._scheduler.start()
-        self._register_loaded_jobs()
         if self.event_bus is not None and self._event_callback is None:
             self._event_callback = self.event_bus.subscribe(self.handle_event)
+        self._recover_loaded_jobs()
         self._started = True
 
     async def shutdown(self) -> None:
@@ -327,6 +330,9 @@ class Scheduler:
         if self.event_bus is not None and self._event_callback is not None:
             self.event_bus.unsubscribe(self._event_callback)
             self._event_callback = None
+        for task in list(self._startup_tasks):
+            task.cancel()
+        self._startup_tasks.clear()
         self._scheduler.shutdown(wait=False)
         self._started = False
 
@@ -682,12 +688,41 @@ class Scheduler:
             payload["jobs"] = jobs_payload
             _write_json_dict_unlocked(self.jobs_path, payload)
 
-    def _register_loaded_jobs(self) -> None:
+    def _recover_loaded_jobs(self) -> None:
+        now = _utc_now()
         for job in list(self._jobs.values()):
             if job.status != "active":
                 continue
-            if job.type in {"absolute", "cron"}:
+            if job.type == "event":
+                continue
+
+            persisted_next_run = None
+            if job.next_run:
+                persisted_next_run = _parse_datetime(job.next_run)
+
+            if job.type == "absolute":
+                run_at = persisted_next_run or _parse_datetime(str(job.spec.get("at", "")))
+                if run_at <= now:
+                    age = (now - run_at).total_seconds()
+                    if age <= self.catch_up_window_seconds:
+                        self._schedule_catch_up(job.id)
+                    else:
+                        self.update_job(job.id, status="completed", next_run=None)
+                    continue
                 self.schedule_job(job, persist=False)
+                continue
+
+            self.schedule_job(job, persist=False)
+            if persisted_next_run is None or persisted_next_run > now:
+                continue
+            age = (now - persisted_next_run).total_seconds()
+            if age <= self.catch_up_window_seconds:
+                self._schedule_catch_up(job.id)
+
+    def _schedule_catch_up(self, job_id: str) -> None:
+        task = asyncio.create_task(self._fire_scheduled_job(job_id))
+        self._startup_tasks.add(task)
+        task.add_done_callback(self._startup_tasks.discard)
 
     @staticmethod
     def _next_job_id() -> str:
