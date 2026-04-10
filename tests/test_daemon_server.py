@@ -853,6 +853,76 @@ class DaemonServerAuthTests(unittest.TestCase):
                         self.assertEqual(attached["session"], "terminal")
 
 
+class DaemonServerHealthTests(unittest.TestCase):
+    """Validate the Phase 7 health and metrics payloads."""
+
+    @staticmethod
+    def _make_client(token_path: Path) -> TestClient:
+        app = create_app(
+            agent_name="kai",
+            nats_url="nats://unit-test",
+            bus_factory=_FakeBus,
+            token_path=token_path,
+            allow_unauthenticated_local=False,
+        )
+        return TestClient(app)
+
+    @mock.patch("daemon.server._process_memory_bytes", return_value=2_097_152)
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    def test_health_and_metrics_report_daemon_runtime_state(
+        self,
+        attach_runtime,
+        _process_memory_bytes,
+    ):
+        del _process_memory_bytes
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir) / "sessions"
+            token_path = Path(tmpdir) / "daemon-token.txt"
+            token_path.write_text("secret-token\n", encoding="utf-8")
+            headers = {"Authorization": "Bearer secret-token"}
+
+            with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+            ):
+                with self._make_client(token_path) as client:
+                    created = client.post(
+                        "/api/sessions",
+                        headers=headers,
+                        json={"name": "alpha"},
+                    )
+                    self.assertEqual(created.status_code, 201)
+
+                    health = client.get("/api/health", headers=headers)
+                    self.assertEqual(health.status_code, 200)
+                    health_payload = health.json()
+                    self.assertEqual(health_payload["status"], "ok")
+                    self.assertEqual(health_payload["agent_name"], "kai")
+                    self.assertEqual(health_payload["session_count"], 1)
+                    self.assertEqual(health_payload["memory_rss_bytes"], 2_097_152)
+                    self.assertEqual(health_payload["agent_queue_depth"], 0)
+                    self.assertEqual(health_payload["scheduler_job_count"], 0)
+                    self.assertGreaterEqual(health_payload["uptime_seconds"], 0)
+
+                    metrics = client.get("/api/metrics", headers=headers)
+                    self.assertEqual(metrics.status_code, 200)
+                    metrics_payload = metrics.json()
+                    self.assertEqual(metrics_payload["agent_name"], "kai")
+                    self.assertTrue(metrics_payload["bus_connected"])
+                    self.assertEqual(metrics_payload["process"]["memory_rss_bytes"], 2_097_152)
+                    self.assertEqual(metrics_payload["sessions"]["live_count"], 1)
+                    self.assertEqual(metrics_payload["sessions"]["indexed_count"], 1)
+                    self.assertEqual(metrics_payload["sessions"]["queue_depth"]["total"], 0)
+                    self.assertEqual(
+                        metrics_payload["sessions"]["queue_depth"]["per_session"],
+                        {"alpha": 0},
+                    )
+                    self.assertEqual(metrics_payload["sessions"]["activity"], {"alpha": "idle"})
+                    self.assertEqual(metrics_payload["scheduler"]["job_count"], 0)
+                    self.assertEqual(metrics_payload["scheduler"]["status_counts"], {})
+
+
 class DaemonServerWebAssetTests(unittest.TestCase):
     """Validate the Phase 6 static web asset mounting."""
 
