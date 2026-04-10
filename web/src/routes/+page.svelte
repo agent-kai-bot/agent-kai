@@ -302,8 +302,7 @@
     void attachSession();
   }
 
-  function onInputSubmit(event: SubmitEvent): void {
-    event.preventDefault();
+  function sendMessage(): void {
     if (!daemonConnection || !inputDraft.trim()) {
       return;
     }
@@ -319,6 +318,19 @@
       return;
     }
     daemonConnection.sendInput(text);
+  }
+
+  function onInputSubmit(event: SubmitEvent): void {
+    event.preventDefault();
+    sendMessage();
+  }
+
+  function onInputKeydown(event: KeyboardEvent): void {
+    if (event.key !== "Enter" || event.shiftKey) {
+      return;
+    }
+    event.preventDefault();
+    sendMessage();
   }
 
   function executePaletteCommand(raw: string): void {
@@ -397,7 +409,7 @@
             <p class="eyebrow">KAI</p>
             <strong>Web Terminal</strong>
           </div>
-          <div class="dashboard-meta">
+          <div class="dashboard-meta status-strip">
             <span>session: <strong>{activeSession}</strong></span>
             <span>status: <strong>{currentStatus}</strong></span>
             <span>queue: <strong>{queueDepth}</strong></span>
@@ -453,6 +465,7 @@
           <form class="chat-input" onsubmit={onInputSubmit}>
             <textarea
               bind:value={inputDraft}
+              onkeydown={onInputKeydown}
               placeholder="Type a prompt or slash command for this session"
               rows="3"
             ></textarea>
