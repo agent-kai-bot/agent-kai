@@ -83,9 +83,32 @@ body {
   color: var(--muted);
 }
 
-  .status-banner strong {
-    color: var(--accent);
-  }
+.status-banner strong {
+  color: var(--accent);
+}
+
+.shortcut-hint {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  margin-bottom: 1rem;
+  color: var(--muted);
+}
+
+.shortcut-hint span {
+  border: 1px solid rgba(145, 181, 221, 0.16);
+  border-radius: 999px;
+  background: rgba(7, 19, 31, 0.72);
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 700;
+  padding: 0.35rem 0.7rem;
+}
+
+.shortcut-hint p {
+  margin: 0;
+  line-height: 1.5;
+}
 
 .connect-grid {
   display: grid;
