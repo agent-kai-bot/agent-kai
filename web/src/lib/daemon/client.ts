@@ -1,4 +1,5 @@
 import type {
+  CandleBar,
   PortfolioSnapshot,
   ServerEnvelope,
   SessionAttachedEnvelope,
@@ -206,6 +207,26 @@ export class DaemonClient {
       positions: Array.isArray(payload.positions) ? payload.positions : [],
       pnl: payload.pnl && typeof payload.pnl === "object" ? payload.pnl : {},
     };
+  }
+
+  async fetchChartHistory(options: {
+    symbol: string;
+    interval: string;
+    source: string;
+    token?: string;
+    limit?: number;
+  }): Promise<CandleBar[]> {
+    const params = new URLSearchParams({
+      symbol: options.symbol,
+      interval: options.interval,
+      source: options.source,
+      limit: String(options.limit ?? 300),
+    });
+    const payload = (await this.requestJson(
+      `/api/market/ohlcv?${params.toString()}`,
+      options.token ?? "",
+    )) as { bars?: CandleBar[] };
+    return Array.isArray(payload.bars) ? payload.bars : [];
   }
 
   async attach(options: AttachOptions): Promise<DaemonConnection> {
