@@ -1,10 +1,10 @@
-"""Tests for the Phase 2 daemon and remote CLI flags."""
+"""Tests for daemon and remote CLI flag semantics."""
 
 from __future__ import annotations
 
 import unittest
 
-from main import build_parser, validate_args
+from main import _resolve_terminal_session_name, build_parser, validate_args
 
 
 class MainCliTests(unittest.TestCase):
@@ -41,6 +41,27 @@ class MainCliTests(unittest.TestCase):
         validate_args(parser, args)
         self.assertTrue(args.terminal)
         self.assertEqual(args.remote, "ws://example.com:9999")
+
+    def test_session_requires_terminal(self):
+        parser = build_parser()
+        args = parser.parse_args(["--session", "btc-scalper"])
+
+        with self.assertRaises(SystemExit):
+            validate_args(parser, args)
+
+    def test_terminal_session_is_valid_and_resolved(self):
+        parser = build_parser()
+        args = parser.parse_args(["--terminal", "--session", "btc-scalper"])
+
+        validate_args(parser, args)
+        self.assertEqual(_resolve_terminal_session_name(args), "btc-scalper")
+
+    def test_terminal_session_defaults_to_terminal(self):
+        parser = build_parser()
+        args = parser.parse_args(["--terminal"])
+
+        validate_args(parser, args)
+        self.assertEqual(_resolve_terminal_session_name(args), "terminal")
 
 
 if __name__ == "__main__":

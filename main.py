@@ -69,6 +69,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Force the in-process runtime path for terminal mode",
     )
+    parser.add_argument(
+        "--session",
+        metavar="NAME",
+        help="Attach the terminal to the named daemon/session context",
+    )
     parser.add_argument("--name", default=DEFAULT_AGENT, help=f"Agent name (default: {DEFAULT_AGENT})")
     parser.add_argument("--nats-url", default=NATS_URL, help=f"NATS URL (default: {NATS_URL})")
     parser.add_argument("--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -88,6 +93,13 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--remote requires --terminal")
     if args.remote and args.standalone:
         parser.error("--remote and --standalone are mutually exclusive")
+    if args.session and not args.terminal:
+        parser.error("--session requires --terminal")
+
+
+def _resolve_terminal_session_name(args: argparse.Namespace) -> str:
+    """Return the target session name for terminal mode."""
+    return args.session or "terminal"
 
 
 async def _run_daemon(args: argparse.Namespace) -> None:
@@ -123,7 +135,10 @@ async def _run_remote_terminal(args: argparse.Namespace) -> None:
     """Launch the trading terminal against a remote daemon."""
     from tui.terminal import TradingTerminal
 
-    session = RemoteSession(args.remote, session_name="terminal")
+    session = RemoteSession(
+        args.remote,
+        session_name=_resolve_terminal_session_name(args),
+    )
     await session.connect()
     try:
         terminal = TradingTerminal(session=session, bus=None)
@@ -159,7 +174,9 @@ async def main(argv: list[str] | None = None):
     # Connect to NATS
     bus = await _connect_bus(args)
 
-    session = Session("terminal" if args.terminal else args.name)
+    session = Session(
+        _resolve_terminal_session_name(args) if args.terminal else args.name
+    )
     agent_runner = session.attach_runtime(bus=bus, agent_name=args.name)
     sub_agent_manager = session.sub_agent_manager if bus else None
 
