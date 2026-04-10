@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ChatHistoryEntry } from "$lib/daemon/types";
+  import { renderMarkdown } from "$lib/markdown";
 
   import Panel from "$lib/components/Panel.svelte";
 
@@ -28,7 +29,9 @@
       {#each messages as message, index (message.role + message.content + index)}
         <article class={`message ${message.role}`}>
           <span>{label(message.role)}</span>
-          <pre>{message.content}</pre>
+          <div class="markdown-body">
+            {@html renderMarkdown(message.content)}
+          </div>
         </article>
       {/each}
       {#if streamingReply}
@@ -89,6 +92,63 @@
     line-height: 1.6;
     white-space: pre-wrap;
     word-break: break-word;
+  }
+
+  .message :global(.markdown-body > :first-child) {
+    margin-top: 0;
+  }
+
+  .message :global(.markdown-body > :last-child) {
+    margin-bottom: 0;
+  }
+
+  .message :global(p),
+  .message :global(li),
+  .message :global(blockquote) {
+    color: var(--text);
+    line-height: 1.65;
+  }
+
+  .message :global(h1),
+  .message :global(h2),
+  .message :global(h3),
+  .message :global(h4) {
+    margin: 1rem 0 0.5rem;
+    line-height: 1.2;
+  }
+
+  .message :global(ul),
+  .message :global(ol) {
+    margin: 0.6rem 0;
+    padding-left: 1.35rem;
+  }
+
+  .message :global(pre) {
+    overflow: auto;
+    border-radius: 0.8rem;
+    background: rgba(2, 8, 14, 0.72);
+    padding: 0.8rem;
+  }
+
+  .message :global(code) {
+    font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+  }
+
+  .message :global(table) {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.75rem 0;
+  }
+
+  .message :global(th),
+  .message :global(td) {
+    border: 1px solid rgba(145, 181, 221, 0.1);
+    padding: 0.45rem 0.55rem;
+    text-align: left;
+  }
+
+  .message :global(a) {
+    color: var(--accent);
   }
 
   .empty {
