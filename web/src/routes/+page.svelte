@@ -7,11 +7,18 @@
   } from "$lib/daemon/client";
   import { readStoredToken, writeStoredToken } from "$lib/daemon/storage";
   import type {
-    ErrorEnvelope,
+    ChatHistoryEntry,
+    PortfolioSnapshot,
+    ScheduledJobEnvelope,
     ServerEnvelope,
     SessionSummary,
+    WatchlistQuote,
   } from "$lib/daemon/types";
-  import { landingCards } from "$lib/web-shell";
+  import ChatPanel from "$lib/components/ChatPanel.svelte";
+  import EventPanel, { type EventRow } from "$lib/components/EventPanel.svelte";
+  import Panel from "$lib/components/Panel.svelte";
+  import PositionsPanel from "$lib/components/PositionsPanel.svelte";
+  import WatchlistPanel from "$lib/components/WatchlistPanel.svelte";
 
   const client = new DaemonClient();
   const localhostHosts = new Set(["localhost", "127.0.0.1", "::1"]);
@@ -28,54 +35,141 @@
   let queueDepth = 0;
   let watchlist: string[] = [];
   let snapshotSummary = "";
-  let recentEvents: string[] = [];
+  let chatMessages: ChatHistoryEntry[] = [];
+  let streamingReply = "";
+  let watchlistQuotes: WatchlistQuote[] = [];
+  let portfolio: PortfolioSnapshot = { positions: [], pnl: {} };
+  let alerts: EventRow[] = [];
+  let natsEvents: EventRow[] = [];
+  let schedulerEvents: EventRow[] = [];
+  let inputDraft = "";
+  let pollingHandle: number | null = null;
   let daemonConnection: Awaited<ReturnType<DaemonClient["attach"]>> | null = null;
 
-  function logEvent(summary: string): void {
-    recentEvents = [summary, ...recentEvents].slice(0, 8);
+  function isScheduledJobEnvelope(envelope: ServerEnvelope): envelope is ScheduledJobEnvelope {
+    return envelope.type.startsWith("scheduled_job_");
   }
 
-  function summarizeEnvelope(envelope: ServerEnvelope): string {
-    if (envelope.type === "status") {
-      return `status: ${envelope.activity} (queue ${envelope.queue})`;
+  function pushRow(
+    items: EventRow[],
+    next: EventRow,
+    limit = 8,
+  ): EventRow[] {
+    return [next, ...items].slice(0, limit);
+  }
+
+  function stopPolling(): void {
+    if (pollingHandle !== null) {
+      window.clearInterval(pollingHandle);
+      pollingHandle = null;
     }
-    if (envelope.type === "token") {
-      return `token: ${envelope.text}`;
+  }
+
+  async function refreshSidebarData(): Promise<void> {
+    if (!daemonConnection) {
+      return;
     }
-    if (envelope.type === "final") {
-      return `final: ${envelope.text.slice(0, 80)}`;
+    watchlistQuotes = await client.fetchWatchlistQuotes(watchlist, token);
+    portfolio = await client.fetchPortfolio(token);
+  }
+
+  function startPolling(): void {
+    stopPolling();
+    if (typeof window === "undefined") {
+      return;
     }
-    if (envelope.type === "error") {
-      return `error: ${envelope.message}`;
+    pollingHandle = window.setInterval(() => {
+      void refreshSidebarData();
+    }, 15_000);
+  }
+
+  function schedulerSummary(envelope: ScheduledJobEnvelope): EventRow {
+    const headline = envelope.type.replace("scheduled_job_", "").replaceAll("_", " ");
+    if ("job_id" in envelope) {
+      const tail =
+        "result_preview" in envelope && envelope.result_preview
+          ? envelope.result_preview
+          : "error" in envelope
+            ? envelope.error
+            : "job update";
+      return {
+        headline: `${headline} · ${envelope.job_id}`,
+        detail: tail,
+        tone: envelope.type.includes("failed") ? "danger" : "warning",
+      };
     }
-    if (envelope.type === "tool_start") {
-      return `tool start: ${envelope.tool}`;
-    }
-    if (envelope.type === "tool_end") {
-      return `tool end: ${envelope.tool}`;
-    }
-    return envelope.type.replaceAll("_", " ");
+    return {
+      headline: `${headline} · ${String(envelope.job?.id ?? "job")}`,
+      detail: String(envelope.job?.status ?? "created"),
+      tone: "warning",
+    };
   }
 
   function applyEnvelope(envelope: ServerEnvelope): void {
     if (envelope.type === "status") {
       currentStatus = envelope.activity;
       queueDepth = envelope.queue;
-    } else if (envelope.type === "error") {
-      attachError = envelope.message;
+      return;
     }
-    logEvent(summarizeEnvelope(envelope));
+
+    if (envelope.type === "token") {
+      streamingReply += envelope.text;
+      return;
+    }
+
+    if (envelope.type === "final") {
+      chatMessages = [...chatMessages, { role: "ai", content: envelope.text }];
+      streamingReply = "";
+      return;
+    }
+
+    if (envelope.type === "signal") {
+      const symbol = String(envelope.signal.symbol ?? "?");
+      const side = String(envelope.signal.side ?? envelope.signal.direction ?? "signal");
+      const score = envelope.signal.score;
+      alerts = pushRow(alerts, {
+        headline: `${symbol} ${side.toUpperCase()}`,
+        detail: typeof score === "number" ? `score ${score.toFixed(2)}` : "signal received",
+        tone: "positive",
+      });
+      return;
+    }
+
+    if (envelope.type === "nats_event") {
+      natsEvents = pushRow(natsEvents, {
+        headline: `${envelope.direction.toUpperCase()} ${envelope.subject}`,
+        detail: JSON.stringify(envelope.payload).slice(0, 140),
+      });
+      return;
+    }
+
+    if (isScheduledJobEnvelope(envelope)) {
+      schedulerEvents = pushRow(schedulerEvents, schedulerSummary(envelope));
+      return;
+    }
+
+    if (envelope.type === "error") {
+      attachError = envelope.message;
+      alerts = pushRow(alerts, {
+        headline: envelope.code,
+        detail: envelope.message,
+        tone: "danger",
+      });
+      return;
+    }
   }
 
   function applySnapshot(): void {
     if (!daemonConnection) {
       snapshotSummary = "";
       watchlist = [];
+      chatMessages = [];
       return;
     }
     const snapshot = daemonConnection.snapshot;
     watchlist = snapshot.watchlist_symbols;
     snapshotSummary = `${snapshot.chart_symbol} ${snapshot.chart_timeframe} · ${snapshot.chart_source} · ${snapshot.chat_history.length} chat messages`;
+    chatMessages = [...snapshot.chat_history];
   }
 
   async function refreshSessions(): Promise<void> {
@@ -97,7 +191,10 @@
     isConnecting = true;
     writeStoredToken(token);
     try {
-      daemonConnection?.close(1000, "reconnect");
+      if (daemonConnection) {
+        daemonConnection.onClose = undefined;
+        daemonConnection.close(1000, "reconnect");
+      }
       daemonConnection = await client.attach({
         session: sessionName,
         token,
@@ -108,14 +205,18 @@
         connectionStatus = `daemon disconnected (${code ?? 1000})`;
         activeSession = "";
         daemonConnection = null;
+        stopPolling();
       };
+      daemonConnection.subscribe("signals");
+      daemonConnection.subscribe("nats");
       activeSession = daemonConnection.session;
       currentStatus = daemonConnection.activityStatus;
       queueDepth = daemonConnection.queueDepth;
       connectionStatus = `attached to session ${activeSession}`;
       applySnapshot();
-      logEvent(`session attached: ${activeSession}`);
       await refreshSessions();
+      await refreshSidebarData();
+      startPolling();
     } catch (error) {
       attachError = error instanceof Error ? error.message : String(error);
       connectionStatus = "attach failed";
@@ -133,11 +234,38 @@
     connectionStatus = "disconnected";
     snapshotSummary = "";
     watchlist = [];
+    watchlistQuotes = [];
+    portfolio = { positions: [], pnl: {} };
+    alerts = [];
+    natsEvents = [];
+    schedulerEvents = [];
+    chatMessages = [];
+    streamingReply = "";
+    stopPolling();
   }
 
   function onConnectSubmit(event: SubmitEvent): void {
     event.preventDefault();
     void attachSession();
+  }
+
+  function onInputSubmit(event: SubmitEvent): void {
+    event.preventDefault();
+    if (!daemonConnection || !inputDraft.trim()) {
+      return;
+    }
+    const text = inputDraft.trim();
+    chatMessages = [...chatMessages, { role: "human", content: text }];
+    streamingReply = "";
+    inputDraft = "";
+    if (text.startsWith("/")) {
+      const firstSpace = text.indexOf(" ");
+      const command = firstSpace === -1 ? text : text.slice(0, firstSpace);
+      const args = firstSpace === -1 ? "" : text.slice(firstSpace + 1);
+      daemonConnection.sendSlash(command, args);
+      return;
+    }
+    daemonConnection.sendInput(text);
   }
 
   onMount(() => {
@@ -147,6 +275,7 @@
   });
 
   onDestroy(() => {
+    stopPolling();
     daemonConnection?.close(1000, "page teardown");
   });
 </script>
@@ -165,9 +294,10 @@
     <h1>KAI Web Terminal</h1>
     <p class="summary">
       The browser client attaches to the same daemon sessions as the terminal and
-      reuses the daemon websocket protocol directly. This slice adds the browser
-      attach flow and local token storage so the later dashboard can build on a
-      real session transport instead of a mock shell.
+      reuses the daemon websocket protocol directly. The web dashboard now mirrors
+      the terminal layout with live watchlist, positions, alerts, NATS traffic,
+      scheduler events, and a raw chat stream, while keeping the chart panel ready
+      for the dedicated `P6.5` Lightweight Charts integration.
     </p>
 
     <div class="status-banner">
@@ -258,25 +388,80 @@
       </div>
     </div>
 
-    <div class="event-panel">
-      <div class="panel-header">
-        <h2>Protocol Activity</h2>
-        <span>{recentEvents.length} recent</span>
-      </div>
-      <ul class="event-list">
-        {#each recentEvents as eventLine, index (eventLine + index)}
-          <li>{eventLine}</li>
-        {/each}
-      </ul>
-    </div>
-
-    <dl class="checklist">
-      {#each landingCards as card (card.title)}
-        <div>
-          <dt>{card.title}</dt>
-          <dd>{card.detail}</dd>
+    {#if daemonConnection}
+      <div class="dashboard-grid">
+        <div class="dashboard-column left">
+          <WatchlistPanel quotes={watchlistQuotes} />
+          <PositionsPanel {portfolio} />
         </div>
-      {/each}
-    </dl>
+
+        <div class="dashboard-column center">
+          <Panel eyebrow="Visualization" title="Chart" subtitle={snapshotSummary}>
+            <div class="chart-placeholder">
+              <strong>{daemonConnection.snapshot.chart_symbol} {daemonConnection.snapshot.chart_timeframe}</strong>
+              <p>{daemonConnection.snapshot.chart_source} source attached. Lightweight Charts lands in `P6.5`.</p>
+            </div>
+          </Panel>
+
+          <ChatPanel messages={chatMessages} {streamingReply} />
+
+          <form class="chat-input" on:submit={onInputSubmit}>
+            <textarea
+              bind:value={inputDraft}
+              placeholder="Type a prompt or slash command for this session"
+              rows="3"
+            ></textarea>
+            <button type="submit">Send</button>
+          </form>
+        </div>
+
+        <div class="dashboard-column right">
+          <EventPanel
+            eyebrow="Signals"
+            title="Alerts"
+            subtitle={`${alerts.length} recent`}
+            emptyMessage="No alert envelopes yet."
+            items={alerts}
+          />
+          <EventPanel
+            eyebrow="Bus"
+            title="NATS"
+            subtitle={`${natsEvents.length} recent`}
+            emptyMessage="No NATS traffic has hit this session yet."
+            items={natsEvents}
+          />
+          <EventPanel
+            eyebrow="Scheduler"
+            title="Scheduled Jobs"
+            subtitle={`${schedulerEvents.length} recent`}
+            emptyMessage="No scheduler activity yet."
+            items={schedulerEvents}
+          />
+        </div>
+      </div>
+
+      <footer class="status-strip">
+        <span>session {activeSession}</span>
+        <span>status {currentStatus}</span>
+        <span>queue {queueDepth}</span>
+        <span>watchlist {watchlist.length}</span>
+        <span>positions {portfolio.positions.length}</span>
+      </footer>
+    {:else}
+      <dl class="checklist">
+        <div>
+          <dt>Transport</dt>
+          <dd>WebSocket session attach plus REST snapshots for sidebar panels.</dd>
+        </div>
+        <div>
+          <dt>Layout</dt>
+          <dd>Left rail for market state, center stack for chart and chat, right rail for events.</dd>
+        </div>
+        <div>
+          <dt>Next Slice</dt>
+          <dd>Replace the chart placeholder with Lightweight Charts and live candles.</dd>
+        </div>
+      </dl>
+    {/if}
   </div>
 </section>

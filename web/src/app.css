@@ -83,9 +83,9 @@ body {
   color: var(--muted);
 }
 
-.status-banner strong {
-  color: var(--accent);
-}
+  .status-banner strong {
+    color: var(--accent);
+  }
 
 .connect-grid {
   display: grid;
@@ -247,6 +247,88 @@ body {
   justify-content: flex-start;
 }
 
+.dashboard-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(16rem, 20rem) minmax(0, 1.5fr) minmax(16rem, 20rem);
+  margin-bottom: 1rem;
+}
+
+.dashboard-column {
+  display: grid;
+  gap: 1rem;
+  min-height: 0;
+}
+
+.dashboard-column.center {
+  grid-template-rows: minmax(16rem, 20rem) minmax(0, 1fr) auto;
+}
+
+.chart-placeholder {
+  display: grid;
+  place-items: center;
+  gap: 0.8rem;
+  min-height: 16rem;
+  border: 1px dashed rgba(145, 181, 221, 0.18);
+  border-radius: 1rem;
+  background:
+    radial-gradient(circle at top, rgba(77, 211, 168, 0.12), transparent 40%),
+    linear-gradient(180deg, rgba(7, 19, 31, 0.95), rgba(5, 14, 24, 0.95));
+  text-align: center;
+  padding: 1.25rem;
+}
+
+.chart-placeholder p {
+  margin: 0;
+  color: var(--muted);
+  max-width: 22rem;
+  line-height: 1.6;
+}
+
+.chat-input {
+  display: grid;
+  gap: 0.75rem;
+  border: 1px solid rgba(145, 181, 221, 0.14);
+  border-radius: 1rem;
+  background: rgba(5, 17, 28, 0.46);
+  padding: 1rem;
+}
+
+.chat-input textarea {
+  width: 100%;
+  min-height: 5.5rem;
+  resize: vertical;
+  border: 1px solid rgba(145, 181, 221, 0.18);
+  border-radius: 0.9rem;
+  background: rgba(7, 19, 31, 0.92);
+  color: var(--text);
+  font: inherit;
+  padding: 0.9rem;
+}
+
+.chat-input button {
+  justify-self: end;
+  border: 0;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #4dd3a8, #72d7f3);
+  color: #052334;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  padding: 0.75rem 1.1rem;
+}
+
+.status-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  border: 1px solid rgba(145, 181, 221, 0.12);
+  border-radius: 999px;
+  background: rgba(7, 19, 31, 0.72);
+  color: var(--muted);
+  padding: 0.85rem 1rem;
+}
+
 .checklist {
   display: grid;
   gap: 1rem;
@@ -294,6 +376,15 @@ body {
   }
 
   .button-row {
+    flex-direction: column;
+  }
+
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .status-strip {
+    border-radius: 1rem;
     flex-direction: column;
   }
 }

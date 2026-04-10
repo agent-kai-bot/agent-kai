@@ -6,6 +6,7 @@ import unittest
 
 from daemon.protocol import (
     ChartBarEnvelope,
+    NatsEventEnvelope,
     ScheduledJobCreatedEnvelope,
     ScheduledJobTriggeredEnvelope,
     SessionAttachedEnvelope,
@@ -98,6 +99,22 @@ class ServerEnvelopeTests(unittest.TestCase):
         self.assertEqual(chart_bar.symbol, "BTC-USD")
         self.assertEqual(status.type, "status")
         self.assertEqual(status.queue, 2)
+
+    def test_nats_event_round_trip(self):
+        decoded = decode_server_envelope(
+            encode_envelope(
+                NatsEventEnvelope(
+                    type="nats_event",
+                    direction="pub",
+                    subject="agent.broadcast",
+                    payload={"message": "hello"},
+                )
+            )
+        )
+
+        self.assertEqual(decoded.type, "nats_event")
+        self.assertEqual(decoded.direction, "pub")
+        self.assertEqual(decoded.subject, "agent.broadcast")
 
     def test_scheduled_job_envelopes_round_trip(self):
         created = decode_server_envelope(

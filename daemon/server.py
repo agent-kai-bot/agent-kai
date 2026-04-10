@@ -39,6 +39,7 @@ from daemon.protocol import (
     HeartbeatEnvelope,
     InputEnvelope,
     InterruptEnvelope,
+    NatsEventEnvelope,
     ScheduledJobCancelledEnvelope,
     ScheduledJobCompletedEnvelope,
     ScheduledJobCreatedEnvelope,
@@ -161,6 +162,21 @@ def _missing_web_build_response(build_dir: Path) -> HTMLResponse:
     )
 
 
+def _fetch_watchlist_quote(symbol: str) -> dict[str, Any]:
+    from agent.data_sources.coinbase import fetch_latest_price
+
+    return fetch_latest_price(symbol)
+
+
+def _load_portfolio_snapshot() -> dict[str, Any]:
+    from data_api.paper_trading import portfolio
+
+    return {
+        "positions": portfolio.get_positions(),
+        "pnl": portfolio.get_pnl(),
+    }
+
+
 @dataclass
 class ManagedSession:
     """Server-owned session plus per-session coordination state."""
@@ -225,6 +241,8 @@ class DaemonServer:
                 self.bus = None
             else:
                 self.bus = bus
+                with suppress(Exception):
+                    self.bus.on_message(self._handle_nats_message)
                 with suppress(Exception):
                     await self.signal_consumer.subscribe(bus)
 
@@ -514,6 +532,16 @@ class DaemonServer:
             return
         loop.create_task(self.publish_daemon_event("signals", payload))
 
+    def _handle_nats_message(self, direction: str, subject: str, payload: dict[str, Any]) -> None:
+        """Mirror shared NATS traffic into each live session bus."""
+        event_payload = {
+            "direction": direction,
+            "subject": subject,
+            "payload": payload,
+        }
+        for managed in self.sessions.values():
+            managed.session.publish_event("nats.message", event_payload)
+
     def describe_session(self, name: str) -> dict[str, Any]:
         """Return one session summary suitable for REST and slash listings."""
         entry = get_indexed_session(name)
@@ -691,6 +719,20 @@ class DaemonServer:
                 bar=payload.get("bar"),
             )
 
+        if topic == "nats.message":
+            if not subscriptions.get("nats"):
+                return None
+            direction = str(payload.get("direction") or "")
+            subject = str(payload.get("subject") or "")
+            if not direction or not subject:
+                return None
+            return NatsEventEnvelope(
+                type="nats_event",
+                direction=direction,
+                subject=subject,
+                payload=payload.get("payload"),
+            )
+
         if topic == "scheduled_job.created":
             return ScheduledJobCreatedEnvelope(
                 type="scheduled_job_created",
@@ -814,6 +856,37 @@ def create_app(
     async def list_sessions_endpoint() -> dict[str, Any]:
         return {"sessions": daemon_server.list_sessions()}
 
+    @app.get("/api/market/watchlist")
+    async def watchlist_endpoint(symbols: str = "") -> dict[str, Any]:
+        requested = []
+        seen: set[str] = set()
+        for raw_symbol in symbols.split(","):
+            symbol = raw_symbol.strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            requested.append(symbol)
+
+        quotes: list[dict[str, Any]] = []
+        for symbol in requested:
+            try:
+                quote = await asyncio.to_thread(_fetch_watchlist_quote, symbol)
+            except Exception as exc:  # noqa: BLE001
+                quote = {"symbol": symbol, "error": str(exc)}
+            quotes.append(quote)
+        return {"quotes": quotes}
+
+    @app.get("/api/portfolio")
+    async def portfolio_endpoint() -> dict[str, Any]:
+        try:
+            snapshot = await asyncio.to_thread(_load_portfolio_snapshot)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        return snapshot
+
     @app.post("/api/sessions", status_code=status.HTTP_201_CREATED)
     async def create_session_endpoint(payload: SessionCreateRequest) -> dict[str, Any]:
         try:
@@ -876,7 +949,7 @@ def create_app(
             return
 
         session = managed.session
-        subscriptions: dict[str, Any] = {"signals": False, "chart": set()}
+        subscriptions: dict[str, Any] = {"signals": False, "chart": set(), "nats": False}
         event_queue = session.subscribe_events()
         forward_task = asyncio.create_task(
             daemon_server.forward_session_events(
@@ -984,6 +1057,8 @@ def create_app(
                         subscriptions["signals"] = True
                     elif payload.channel == "chart":
                         subscriptions["chart"].add((payload.symbol, payload.tf))
+                    elif payload.channel == "nats":
+                        subscriptions["nats"] = True
                     continue
 
                 if isinstance(payload, UnsubscribeEnvelope):
@@ -991,6 +1066,8 @@ def create_app(
                         subscriptions["signals"] = False
                     elif payload.channel == "chart":
                         subscriptions["chart"].discard((payload.symbol, payload.tf))
+                    elif payload.channel == "nats":
+                        subscriptions["nats"] = False
                     continue
 
                 await _send_error(
