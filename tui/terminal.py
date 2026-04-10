@@ -202,6 +202,9 @@ class TradingTerminal(App):
         self._activity_status: str = "idle"
         self.session.set_activity_status("idle")
         self._status_bar_task = None  # asyncio.Task running the periodic status bar refresh
+        self._remote_event_task = None  # asyncio.Task draining daemon events in remote mode
+        self._remote_response_widget = None  # live response widget for remote streaming
+        self._remote_response_text = ""  # raw token buffer for remote streaming
         # Per-tool-call timing toggle. When True, _process_agent
         # logs the start/end of every tool call to the NATS log
         # panel with elapsed time. Off by default — turn on via
@@ -408,6 +411,11 @@ class TradingTerminal(App):
             self._status_bar_task = asyncio.create_task(
                 self._run_status_bar_refresh()
             )
+        if getattr(self.session, "is_remote", False):
+            if self._remote_event_task is None or self._remote_event_task.done():
+                self._remote_event_task = asyncio.create_task(
+                    self._run_remote_session_events()
+                )
 
         # Load initial data
         self.run_worker(self._load_initial_data(), thread=False)
@@ -2837,6 +2845,7 @@ class TradingTerminal(App):
     async def _run_agent_task(self, agent_name: str, task: str):
         """Spawn an agent (if needed) and send it a task, display results in chat."""
         chat = self.query_one("#chat-panel", ChatPanel)
+        remote_stream_handles_cleanup = False
         try:
             # Use nats_request if bus available
             if self.bus:
@@ -2873,15 +2882,23 @@ class TradingTerminal(App):
                     self._maybe_nudge_learn(agent_name)
                 else:
                     # Fallback to main agent
+                    remote_stream_handles_cleanup = bool(
+                        getattr(self.session, "is_remote", False)
+                    )
                     await self._process_agent(f"[For {agent_name}]: {task}")
                     return
             else:
+                remote_stream_handles_cleanup = bool(
+                    getattr(self.session, "is_remote", False)
+                )
                 await self._process_agent(task)
                 return
 
         except Exception as e:
             chat.append_message(f"[bold red]Error from {agent_name}: {e}[/]", "error-msg")
         finally:
+            if remote_stream_handles_cleanup:
+                return
             self._agent_working = False
             self._set_status("idle")
             await self._refresh_positions()
@@ -3080,6 +3097,10 @@ class TradingTerminal(App):
              tables actually format. The raw text is preserved on
              ``widget._raw_text`` for the Ctrl+Y copy path.
         """
+        if getattr(self.session, "is_remote", False):
+            await self._submit_remote_input(user_input)
+            return
+
         chat = self.query_one("#chat-panel", ChatPanel)
         response_widget = chat.create_response_widget()
         accumulated = ""
@@ -3151,6 +3172,118 @@ class TradingTerminal(App):
             # crashes before on_unmount runs. The save is cheap and
             # idempotent — overwrite-and-rename of one small JSON file.
             self._save_chat_history()
+            self._drain_input_queue()
+
+    async def _submit_remote_input(self, user_input: str) -> None:
+        """Send one remote input and let the background event loop render it."""
+        try:
+            await self.session.send_input(user_input)
+        except Exception as exc:
+            chat = self.query_one("#chat-panel", ChatPanel)
+            chat.append_message(f"[bold red]Error: {exc}[/]", "error-msg")
+            self._agent_working = False
+            self._set_status("idle")
+            self._drain_input_queue()
+
+    async def _run_remote_session_events(self) -> None:
+        """Continuously render daemon events for a remote-attached session."""
+        try:
+            while True:
+                event = await self.session.next_event()
+                await self._handle_remote_session_event(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._chat_msg(f"[bold red]Remote session stream failed: {exc}[/]")
+
+    def _ensure_remote_response_widget(self, chat: ChatPanel):
+        """Create the live response widget used for remote token streaming."""
+        if self._remote_response_widget is None:
+            self._remote_response_widget = chat.create_response_widget()
+            self._remote_response_text = ""
+        return self._remote_response_widget
+
+    def _finalize_remote_response(self, chat: ChatPanel, text: str | None = None) -> None:
+        """Render and clear the currently-buffered remote response widget."""
+        widget = self._remote_response_widget
+        raw_text = text if text is not None else self._remote_response_text
+        if widget is not None and raw_text and raw_text.strip():
+            chat.render_widget_as_markdown(widget, raw_text)
+            chat.scroll_end(animate=False)
+        self._remote_response_widget = None
+        self._remote_response_text = ""
+
+    async def _handle_remote_session_event(self, event: dict[str, Any]) -> None:
+        """Render one daemon event that arrived while attached remotely."""
+        chat = self.query_one("#chat-panel", ChatPanel)
+        etype = event.get("type")
+
+        if etype == "status":
+            activity = str(event.get("data") or "idle")
+            if activity != "idle":
+                self._agent_working = True
+            self._set_status(activity)
+            if activity == "idle":
+                self._finalize_remote_response(chat)
+                self._agent_working = False
+                await self._refresh_positions()
+                self._save_chat_history()
+                self._drain_input_queue()
+            return
+
+        if etype == "token":
+            widget = self._ensure_remote_response_widget(chat)
+            self._remote_response_text += str(event.get("data") or "")
+            widget.update(self._remote_response_text)
+            chat.scroll_end(animate=False)
+            return
+
+        if etype == "tool_start":
+            tool = event["data"]["tool"]
+            self._nats_log(f"[yellow]>> {tool}[/]")
+            self._set_status(f"running {tool}...")
+            if self._debug_enabled:
+                self._tool_start_times[tool] = time.time()
+            return
+
+        if etype == "tool_end":
+            tool = event["data"]["tool"]
+            if self._debug_enabled:
+                start = self._tool_start_times.pop(tool, None)
+                if start is not None:
+                    elapsed_ms = (time.time() - start) * 1000.0
+                    color = (
+                        "green" if elapsed_ms < 500 else
+                        "yellow" if elapsed_ms < 5000 else
+                        "red"
+                    )
+                    self._nats_log(
+                        f"[yellow]<< {tool}[/] "
+                        f"[{color}]{elapsed_ms:.0f}ms[/]"
+                    )
+                else:
+                    self._nats_log(f"[yellow]<< {tool}[/]")
+            else:
+                self._nats_log(f"[yellow]<< {tool}[/]")
+            self._set_status("thinking...")
+            return
+
+        if etype == "final":
+            final_text = str(event.get("data") or "")
+            if final_text and not self._remote_response_widget:
+                self._ensure_remote_response_widget(chat)
+            self._finalize_remote_response(chat, final_text)
+            return
+
+        if etype == "error":
+            chat.append_message(
+                f"[bold red]Error: {event.get('data', '')}[/]",
+                "error-msg",
+            )
+            self._remote_response_widget = None
+            self._remote_response_text = ""
+            self._agent_working = False
+            self._set_status("idle")
             self._drain_input_queue()
 
     # ── NATS handlers ─────────────────────────────────────────
@@ -3630,6 +3763,13 @@ class TradingTerminal(App):
         per-turn save — same content gets written twice in the
         common case, no harm done.
         """
+        if self._remote_event_task is not None:
+            self._remote_event_task.cancel()
+            try:
+                await self._remote_event_task
+            except asyncio.CancelledError:
+                pass
+            self._remote_event_task = None
         try:
             self._save_chat_history()
         except Exception as exc:

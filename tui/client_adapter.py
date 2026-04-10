@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import suppress
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -70,6 +71,8 @@ class RemoteSession:
         self._connection_factory = connection_factory or websocket_connect
         self._websocket = None
         self._connected = False
+        self._event_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._reader_task: asyncio.Task | None = None
         self._stream_lock = asyncio.Lock()
 
     @staticmethod
@@ -129,13 +132,20 @@ class RemoteSession:
             self.set_activity_status(status.activity)
 
         self._connected = True
+        if self._reader_task is None or self._reader_task.done():
+            self._reader_task = asyncio.create_task(self._reader_loop())
 
     async def close(self) -> None:
         """Close the underlying websocket if it is open."""
+        self._connected = False
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._reader_task
+        self._reader_task = None
         if self._websocket is not None:
             await self._websocket.close()
         self._websocket = None
-        self._connected = False
 
     def load(self) -> None:
         """Remote sessions are loaded during the attach handshake."""
@@ -167,64 +177,35 @@ class RemoteSession:
             f"/api/sessions/{quote(name, safe='')}",
         )
 
-    async def stream_agent_events(self, user_input: str):
-        """Send one input turn to the daemon and translate the reply stream."""
+    async def send_input(self, user_input: str) -> None:
+        """Send one user input into the attached daemon session."""
         await self.connect()
         async with self._stream_lock:
             self.chat_history.append(HumanMessage(content=user_input))
             self.agent_runner.chat_history = self.chat_history
-            await self._send_envelope(
-                {"type": "input", "text": user_input}
-            )
+            await self._send_envelope({"type": "input", "text": user_input})
 
-            saw_terminal_event = False
-            while True:
-                envelope = await self._recv_envelope()
+    async def next_event(self) -> dict[str, Any]:
+        """Read the next translated daemon event from the shared inbox."""
+        await self.connect()
+        return await self._event_queue.get()
 
-                if isinstance(envelope, StatusEnvelope):
-                    self.set_activity_status(envelope.activity)
-                    yield {"type": "status", "data": envelope.activity}
-                    if saw_terminal_event and envelope.activity == "idle":
-                        break
-                    continue
+    async def stream_agent_events(self, user_input: str):
+        """Send one input turn to the daemon and translate the reply stream."""
+        await self.send_input(user_input)
 
-                if isinstance(envelope, TokenEnvelope):
-                    yield {"type": "token", "data": envelope.text}
-                    continue
-
-                if isinstance(envelope, ToolStartEnvelope):
-                    yield {
-                        "type": "tool_start",
-                        "data": {"tool": envelope.tool, "input": envelope.args},
-                    }
-                    continue
-
-                if isinstance(envelope, ToolEndEnvelope):
-                    yield {
-                        "type": "tool_end",
-                        "data": {"tool": envelope.tool, "output": ""},
-                    }
-                    continue
-
-                if isinstance(envelope, FinalEnvelope):
-                    saw_terminal_event = True
-                    self.chat_history.append(AIMessage(content=envelope.text))
-                    self.agent_runner.chat_history = self.chat_history
-                    yield {"type": "final", "data": envelope.text}
-                    continue
-
-                if isinstance(envelope, ErrorEnvelope):
-                    saw_terminal_event = True
-                    yield {"type": "error", "data": envelope.message}
-                    continue
-
-                if isinstance(envelope, SessionAttachedEnvelope):
-                    self._apply_snapshot(envelope)
-                    continue
-
-                if isinstance(envelope, SignalEnvelope | ChartBarEnvelope):
-                    # Phase 2 keeps the terminal's market-data rendering local.
-                    continue
+        saw_terminal_event = False
+        while True:
+            event = await self.next_event()
+            etype = event["type"]
+            if etype == "status":
+                yield event
+                if saw_terminal_event and event["data"] == "idle":
+                    break
+                continue
+            if etype in {"final", "error"}:
+                saw_terminal_event = True
+            yield event
 
     def _apply_snapshot(self, envelope: SessionAttachedEnvelope) -> None:
         state = envelope.state
@@ -249,6 +230,20 @@ class RemoteSession:
             payload = encode_envelope(envelope)
         await self._websocket.send(json.dumps(payload))
 
+    async def _reader_loop(self) -> None:
+        """Continuously translate daemon envelopes into adapter events."""
+        try:
+            while True:
+                envelope = await self._recv_envelope()
+                event = self._translate_envelope(envelope)
+                if event is not None:
+                    await self._event_queue.put(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if self._connected:
+                await self._event_queue.put({"type": "error", "data": str(exc)})
+
     async def _request_json(
         self,
         method: str,
@@ -265,6 +260,45 @@ class RemoteSession:
                     detail = data.get("detail") if isinstance(data, dict) else None
                     raise RuntimeError(detail or f"{method} {path} failed")
                 return data if isinstance(data, dict) else {}
+
+    def _translate_envelope(self, envelope) -> dict[str, Any] | None:
+        """Translate one validated server envelope into terminal-facing events."""
+        if isinstance(envelope, StatusEnvelope):
+            self.set_activity_status(envelope.activity)
+            return {"type": "status", "data": envelope.activity}
+
+        if isinstance(envelope, TokenEnvelope):
+            return {"type": "token", "data": envelope.text}
+
+        if isinstance(envelope, ToolStartEnvelope):
+            return {
+                "type": "tool_start",
+                "data": {"tool": envelope.tool, "input": envelope.args},
+            }
+
+        if isinstance(envelope, ToolEndEnvelope):
+            return {
+                "type": "tool_end",
+                "data": {"tool": envelope.tool, "output": ""},
+            }
+
+        if isinstance(envelope, FinalEnvelope):
+            self.chat_history.append(AIMessage(content=envelope.text))
+            self.agent_runner.chat_history = self.chat_history
+            return {"type": "final", "data": envelope.text}
+
+        if isinstance(envelope, ErrorEnvelope):
+            return {"type": "error", "data": envelope.message}
+
+        if isinstance(envelope, SessionAttachedEnvelope):
+            self._apply_snapshot(envelope)
+            return None
+
+        if isinstance(envelope, SignalEnvelope | ChartBarEnvelope):
+            # The terminal still owns local chart/watchlist rendering.
+            return None
+
+        return None
 
     async def _recv_envelope(self):
         if self._websocket is None:
