@@ -59,7 +59,10 @@
       {#each items as item (item.command)}
         <li>
           <button onclick={() => onSelect(item.command)} type="button">
-            <strong>{item.command}</strong>
+            <strong>{item.title ?? item.command}</strong>
+            {#if item.title}
+              <code>{item.command}</code>
+            {/if}
             <span>{item.description}</span>
           </button>
         </li>
@@ -159,6 +162,12 @@
   li span {
     color: var(--muted);
     line-height: 1.4;
+  }
+
+  li code {
+    color: var(--accent-strong);
+    font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+    font-size: 0.8rem;
   }
 
   @media (max-width: 700px) {

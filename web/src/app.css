@@ -316,6 +316,26 @@ body.dashboard-active {
   color: var(--text);
 }
 
+.dashboard-chart-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.chart-mode-toggle,
+.chart-status-bar button {
+  border: 1px solid rgba(145, 181, 221, 0.18);
+  border-radius: 999px;
+  background: rgba(7, 19, 31, 0.78);
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.76rem;
+  font-weight: 700;
+  padding: 0.35rem 0.7rem;
+}
+
 .dashboard-actions {
   display: flex;
   flex-wrap: wrap;
@@ -363,12 +383,64 @@ body.dashboard-active {
 
 .dashboard-column.center {
   grid-area: center;
-  grid-template-rows: minmax(clamp(23rem, 45vh, 34rem), 1.35fr) minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 3fr) minmax(0, 2fr) auto;
+}
+
+.dashboard-column.center[data-chart-mode="full"] {
+  grid-template-rows: minmax(0, 3fr) minmax(0, 2fr) auto;
+}
+
+.dashboard-column.center[data-chart-mode="half"] {
+  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) auto;
+}
+
+.dashboard-column.center[data-chart-mode="mini"] {
+  grid-template-rows: minmax(0, 1fr) minmax(0, 3fr) auto;
+}
+
+.dashboard-column.center[data-chart-mode="hide"] {
+  grid-template-rows: minmax(3.4rem, auto) minmax(0, 1fr) auto;
 }
 
 .dashboard-column.right {
   grid-area: right;
   grid-template-rows: repeat(3, minmax(0, 1fr));
+}
+
+.chart-status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  border: 1px solid rgba(145, 181, 221, 0.14);
+  border-radius: 1rem;
+  background: rgba(5, 17, 28, 0.46);
+  padding: 0.75rem 1rem;
+  overflow: hidden;
+}
+
+.chart-status-copy {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.chart-status-copy span {
+  color: var(--muted);
+}
+
+.chart-status-copy strong {
+  color: var(--text);
+}
+
+.chart-status-copy .positive {
+  color: var(--accent);
+}
+
+.chart-status-copy .negative {
+  color: #ff8f8f;
 }
 
 .chat-input {
@@ -457,6 +529,10 @@ body.dashboard-active {
     grid-template-columns: repeat(3, minmax(0, 1fr));
     grid-template-rows: 1fr;
   }
+
+  .chart-status-bar {
+    padding: 0.7rem 0.85rem;
+  }
 }
 
 @media (max-width: 700px) {
@@ -522,6 +598,10 @@ body.dashboard-active {
     justify-content: space-between;
   }
 
+  .dashboard-chart-pill {
+    align-items: flex-start;
+  }
+
   .dashboard-actions {
     width: 100%;
   }
@@ -561,6 +641,15 @@ body.dashboard-active {
   .dashboard-column.center > *:last-child,
   .dashboard-column.right > *:last-child {
     margin-bottom: 0;
+  }
+
+  .chart-status-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .chart-status-copy {
+    gap: 0.5rem;
   }
 
   .chat-input {

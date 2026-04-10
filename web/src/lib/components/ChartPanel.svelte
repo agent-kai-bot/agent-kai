@@ -13,6 +13,7 @@
     type UTCTimestamp,
   } from "lightweight-charts";
 
+  import type { ChartMode } from "$lib/chart-mode";
   import type { CandleBar } from "$lib/daemon/types";
 
   import Panel from "$lib/components/Panel.svelte";
@@ -22,6 +23,7 @@
     symbol,
     timeframe,
     source,
+    mode = "full",
     status = "",
     mobileCollapsible = false,
     initiallyOpen = true,
@@ -30,6 +32,7 @@
     symbol: string;
     timeframe: string;
     source: string;
+    mode?: ChartMode;
     status?: string;
     mobileCollapsible?: boolean;
     initiallyOpen?: boolean;
@@ -40,6 +43,16 @@
   let candleSeries: ISeriesApi<"Candlestick"> | null = null;
   let volumeSeries: ISeriesApi<"Histogram"> | null = null;
   let hasFitted = false;
+
+  function minimumCanvasHeight(currentMode: ChartMode): number {
+    if (currentMode === "mini") {
+      return 120;
+    }
+    if (currentMode === "half") {
+      return 180;
+    }
+    return 240;
+  }
 
   function toUtcTimestamp(value: CandleBar["ts"]): UTCTimestamp {
     if (typeof value === "number") {
@@ -74,7 +87,7 @@
   }
 
   onMount(() => {
-    const initialHeight = Math.max(container.clientHeight, 320);
+    const initialHeight = Math.max(container.clientHeight, minimumCanvasHeight(mode));
     chart = createChart(container, {
       width: container.clientWidth,
       height: initialHeight,
@@ -123,7 +136,7 @@
     const observer = new ResizeObserver(() => {
       chart?.applyOptions({
         width: container.clientWidth,
-        height: Math.max(container.clientHeight, 320),
+        height: Math.max(container.clientHeight, minimumCanvasHeight(mode)),
       });
     });
     observer.observe(container);
@@ -142,6 +155,17 @@
     bars;
     applyBars();
   });
+
+  $effect(() => {
+    mode;
+    if (!chart) {
+      return;
+    }
+    chart.applyOptions({
+      width: container.clientWidth,
+      height: Math.max(container.clientHeight, minimumCanvasHeight(mode)),
+    });
+  });
 </script>
 
 <Panel
@@ -153,7 +177,7 @@
   subtitle={`${symbol} ${timeframe} · ${source}`}
 >
   <div class="chart-shell">
-    <div bind:this={container} class="chart-canvas"></div>
+    <div bind:this={container} class="chart-canvas" data-mode={mode}></div>
     <div class="chart-meta">
       <strong>{bars.length} bars</strong>
       <span>{status || "live snapshot"}</span>
@@ -171,9 +195,10 @@
   }
 
   .chart-canvas {
-    min-height: clamp(24rem, 46vh, 34rem);
     border: 1px solid rgba(145, 181, 221, 0.1);
     border-radius: 1rem;
+    height: 100%;
+    min-height: 0;
     overflow: hidden;
   }
 
@@ -191,7 +216,7 @@
 
   @media (max-width: 1024px) {
     .chart-canvas {
-      min-height: clamp(22rem, 44vh, 30rem);
+      min-height: 0;
     }
   }
 
@@ -203,6 +228,7 @@
 
     .chart-canvas {
       min-height: 40vh;
+      height: auto;
     }
   }
 </style>

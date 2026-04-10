@@ -2,6 +2,15 @@
   import { onDestroy, onMount } from "svelte";
 
   import {
+    chartModeLabel,
+    cycleChartMode,
+    normalizeChartMode,
+    readStoredChartMode,
+    resolveChartModeCommand,
+    writeStoredChartMode,
+    type ChartMode,
+  } from "$lib/chart-mode";
+  import {
     filterPaletteItems,
     resolvePaletteQuery,
     splitSlashInput,
@@ -43,8 +52,14 @@
   let queueDepth = $state(0);
   let watchlist = $state<string[]>([]);
   let snapshotSummary = $state("");
+  let chartMode = $state<ChartMode>("full");
+  let lastVisibleChartMode = $state<Exclude<ChartMode, "hide">>("full");
+  let chartSymbol = $state("BTC");
+  let chartTimeframe = $state("1m");
+  let chartSource = $state("kai-api");
   let chatMessages = $state<ChatHistoryEntry[]>([]);
   let streamingReply = $state("");
+  let chartQuote = $state<WatchlistQuote | null>(null);
   let watchlistQuotes = $state<WatchlistQuote[]>([]);
   let portfolio = $state<PortfolioSnapshot>({ positions: [], pnl: {} });
   let chartBars = $state<CandleBar[]>([]);
@@ -94,21 +109,81 @@
     updatePaletteItems();
   }
 
+  function applyChartMode(nextMode: ChartMode): void {
+    if (nextMode !== "hide") {
+      lastVisibleChartMode = nextMode;
+    }
+    chartMode = nextMode;
+    if (daemonConnection) {
+      daemonConnection.snapshot.chart_layout_mode = nextMode;
+      writeStoredChartMode(daemonConnection.session, nextMode);
+    }
+    if (snapshotSummary) {
+      snapshotSummary = `${chartSymbol} ${chartTimeframe} · ${chartSource} · chart ${chartMode} · ${chatMessages.length} chat messages`;
+    }
+  }
+
+  function restoreChartMode(rawMode: string): void {
+    const persistedMode =
+      daemonConnection ? readStoredChartMode(daemonConnection.session) : null;
+    chartMode = persistedMode ?? normalizeChartMode(rawMode);
+    if (chartMode !== "hide") {
+      lastVisibleChartMode = chartMode;
+    }
+    if (daemonConnection) {
+      daemonConnection.snapshot.chart_layout_mode = chartMode;
+    }
+  }
+
+  function formatPrice(value: number | undefined): string {
+    if (typeof value !== "number" || Number.isNaN(value)) {
+      return "price n/a";
+    }
+    if (Math.abs(value) >= 1000) {
+      return `$${value.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+    }
+    if (Math.abs(value) >= 1) {
+      return `$${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}`;
+    }
+    return `$${value.toPrecision(4)}`;
+  }
+
+  function formatChange(value: number | undefined): string {
+    if (typeof value !== "number" || Number.isNaN(value)) {
+      return "24h n/a";
+    }
+    const sign = value > 0 ? "+" : "";
+    return `${sign}${value.toFixed(2)}%`;
+  }
+
+  function chartPrice(): number | undefined {
+    return chartQuote?.price ?? chartBars.at(-1)?.close;
+  }
+
+  function setChartModeFromCommand(raw: string): boolean {
+    const split = splitSlashInput(raw);
+    const nextMode = resolveChartModeCommand(split.command, split.args);
+    if (!nextMode) {
+      return false;
+    }
+    applyChartMode(nextMode);
+    return true;
+  }
+
   async function refreshChartData(): Promise<void> {
     if (!daemonConnection) {
       chartBars = [];
       chartStatus = "waiting for a session";
       return;
     }
-    const snapshot = daemonConnection.snapshot;
     try {
       chartBars = await client.fetchChartHistory({
-        symbol: snapshot.chart_symbol,
-        interval: snapshot.chart_timeframe,
-        source: snapshot.chart_source,
+        symbol: chartSymbol,
+        interval: chartTimeframe,
+        source: chartSource,
         token,
       });
-      chartStatus = `${chartBars.length} bars refreshed from ${snapshot.chart_source}`;
+      chartStatus = `${chartBars.length} bars refreshed from ${chartSource}`;
     } catch (error) {
       chartStatus = error instanceof Error ? error.message : String(error);
     }
@@ -118,10 +193,14 @@
     if (!daemonConnection) {
       return;
     }
-    [watchlistQuotes, portfolio] = await Promise.all([
+    const [quotes, chartQuotes, portfolioSnapshot] = await Promise.all([
       client.fetchWatchlistQuotes(watchlist, token),
+      client.fetchWatchlistQuotes([chartSymbol], token),
       client.fetchPortfolio(token),
     ]);
+    watchlistQuotes = quotes;
+    chartQuote = chartQuotes[0] ?? null;
+    portfolio = portfolioSnapshot;
   }
 
   function startPolling(): void {
@@ -157,6 +236,12 @@
   }
 
   function applyEnvelope(envelope: ServerEnvelope): void {
+    if (envelope.type === "session_attached") {
+      applySnapshot();
+      void Promise.all([refreshSidebarData(), refreshChartData()]);
+      return;
+    }
+
     if (envelope.type === "status") {
       currentStatus = envelope.activity;
       queueDepth = envelope.queue;
@@ -213,13 +298,23 @@
   function applySnapshot(): void {
     if (!daemonConnection) {
       snapshotSummary = "";
+      chartMode = "full";
+      lastVisibleChartMode = "full";
+      chartSymbol = "BTC";
+      chartTimeframe = "1m";
+      chartSource = "kai-api";
+      chartQuote = null;
       watchlist = [];
       chatMessages = [];
       return;
     }
     const snapshot = daemonConnection.snapshot;
+    chartSymbol = snapshot.chart_symbol;
+    chartTimeframe = snapshot.chart_timeframe;
+    chartSource = snapshot.chart_source;
+    restoreChartMode(snapshot.chart_layout_mode);
     watchlist = snapshot.watchlist_symbols;
-    snapshotSummary = `${snapshot.chart_symbol} ${snapshot.chart_timeframe} · ${snapshot.chart_source} · ${snapshot.chat_history.length} chat messages`;
+    snapshotSummary = `${chartSymbol} ${chartTimeframe} · ${chartSource} · chart ${chartMode} · ${snapshot.chat_history.length} chat messages`;
     chatMessages = [...snapshot.chat_history];
   }
 
@@ -256,6 +351,7 @@
         connectionStatus = `daemon disconnected (${code ?? 1000})`;
         activeSession = "";
         daemonConnection = null;
+        chartQuote = null;
         stopPolling();
       };
       daemonConnection.subscribe("signals");
@@ -284,6 +380,12 @@
     activeSession = "";
     connectionStatus = "disconnected";
     snapshotSummary = "";
+    chartMode = "full";
+    lastVisibleChartMode = "full";
+    chartSymbol = "BTC";
+    chartTimeframe = "1m";
+    chartSource = "kai-api";
+    chartQuote = null;
     watchlist = [];
     watchlistQuotes = [];
     portfolio = { positions: [], pnl: {} };
@@ -307,9 +409,12 @@
       return;
     }
     const text = inputDraft.trim();
+    inputDraft = "";
+    if (setChartModeFromCommand(text)) {
+      return;
+    }
     chatMessages = [...chatMessages, { role: "human", content: text }];
     streamingReply = "";
-    inputDraft = "";
     if (text.startsWith("/")) {
       const firstSpace = text.indexOf(" ");
       const command = firstSpace === -1 ? text : text.slice(0, firstSpace);
@@ -337,7 +442,12 @@
     if (!daemonConnection) {
       return;
     }
-    const split = splitSlashInput(resolvePaletteQuery(raw, paletteItems));
+    const resolved = resolvePaletteQuery(raw, paletteItems);
+    if (setChartModeFromCommand(resolved)) {
+      closePalette();
+      return;
+    }
+    const split = splitSlashInput(resolved);
     if (!split.command) {
       return;
     }
@@ -413,11 +523,19 @@
             <span>session: <strong>{activeSession}</strong></span>
             <span>status: <strong>{currentStatus}</strong></span>
             <span>queue: <strong>{queueDepth}</strong></span>
-            <span>
+            <span class="dashboard-chart-pill">
               chart:
               <strong>
-                {daemonConnection.snapshot.chart_symbol} {daemonConnection.snapshot.chart_timeframe}
+                {chartSymbol} {chartTimeframe} [{chartMode}]
               </strong>
+              <button
+                aria-label="Cycle chart size"
+                class="chart-mode-toggle"
+                onclick={() => applyChartMode(cycleChartMode(chartMode))}
+                type="button"
+              >
+                {chartModeLabel(chartMode)}
+              </button>
             </span>
             <span>positions: <strong>{portfolio.positions.length}</strong></span>
             <span>watchlist: <strong>{watchlist.length}</strong></span>
@@ -444,16 +562,35 @@
           <PositionsPanel initiallyOpen={false} mobileCollapsible={true} {portfolio} />
         </div>
 
-        <div class="dashboard-column center">
-          <ChartPanel
-            bars={chartBars}
-            initiallyOpen={false}
-            mobileCollapsible={true}
-            source={daemonConnection.snapshot.chart_source}
-            status={chartStatus}
-            symbol={daemonConnection.snapshot.chart_symbol}
-            timeframe={daemonConnection.snapshot.chart_timeframe}
-          />
+        <div class="dashboard-column center" data-chart-mode={chartMode}>
+          {#if chartMode === "hide"}
+            <section class="chart-status-bar">
+              <div class="chart-status-copy">
+                <span>{chartSymbol}</span>
+                <strong>{formatPrice(chartPrice())}</strong>
+                <span
+                  class:negative={Boolean(chartQuote && typeof chartQuote.price_change_24h_pct === "number" && chartQuote.price_change_24h_pct < 0)}
+                  class:positive={Boolean(chartQuote && typeof chartQuote.price_change_24h_pct === "number" && chartQuote.price_change_24h_pct > 0)}
+                >
+                  {formatChange(chartQuote?.price_change_24h_pct)}
+                </span>
+              </div>
+              <button onclick={() => applyChartMode(lastVisibleChartMode)} type="button">
+                Show Chart
+              </button>
+            </section>
+          {:else}
+            <ChartPanel
+              bars={chartBars}
+              initiallyOpen={false}
+              mobileCollapsible={true}
+              mode={chartMode}
+              source={chartSource}
+              status={chartStatus}
+              symbol={chartSymbol}
+              timeframe={chartTimeframe}
+            />
+          {/if}
 
           <ChatPanel
             initiallyOpen={false}
