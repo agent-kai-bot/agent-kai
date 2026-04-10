@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -427,6 +430,161 @@ class DaemonServerIndexTests(unittest.IsolatedAsyncioTestCase):
                     )
                 finally:
                     await server.shutdown()
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    async def test_restart_catchup_replays_recent_absolute_job(self, attach_runtime):
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            jobs_path = base_dir / "scheduler" / "jobs.json"
+
+            def scheduler_factory(*, dispatch_callback, event_bus, event_callback, **_kwargs):
+                return Scheduler(
+                    dispatch_callback=dispatch_callback,
+                    event_bus=event_bus,
+                    event_callback=event_callback,
+                    jobs_path=jobs_path,
+                )
+
+            with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+            ):
+                seed = DaemonServer(
+                    agent_name="kai",
+                    nats_url="nats://unit-test",
+                    bus_factory=_FakeBus,
+                    scheduler_factory=scheduler_factory,
+                )
+                await seed.startup()
+                try:
+                    managed = await seed.get_or_create_session("alpha", create_if_missing=True)
+                    managed.session.save()
+                finally:
+                    await seed.shutdown()
+
+                fired_at = (_utc_now() - timedelta(minutes=2)).replace(microsecond=0).isoformat()
+                jobs_path.parent.mkdir(parents=True, exist_ok=True)
+                jobs_path.write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "jobs": {
+                                "job-catchup": {
+                                    "id": "job-catchup",
+                                    "type": "absolute",
+                                    "spec": {"at": fired_at},
+                                    "prompt": "Catch up BTC",
+                                    "owner_session": "alpha",
+                                    "created_at": "2026-04-10T00:00:00+00:00",
+                                    "created_by": "user",
+                                    "next_run": fired_at,
+                                    "run_count": 0,
+                                    "status": "active",
+                                    "concurrency": "queue",
+                                }
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                server = DaemonServer(
+                    agent_name="kai",
+                    nats_url="nats://unit-test",
+                    bus_factory=_FakeBus,
+                    scheduler_factory=scheduler_factory,
+                )
+                await server.startup()
+                try:
+                    for _ in range(50):
+                        job = server.scheduler.get_job("job-catchup")
+                        if job.run_count == 1:
+                            break
+                        await asyncio.sleep(0.02)
+                    else:
+                        self.fail("catch-up job did not replay after restart")
+
+                    managed = server.sessions["alpha"]
+                    self.assertEqual(job.status, "completed")
+                    self.assertEqual(job.last_result_preview, "done:Catch up BTC")
+                    self.assertIn(
+                        "[scheduled job: job-catchup]",
+                        [message.content for message in managed.session.chat_history],
+                    )
+                finally:
+                    await server.shutdown()
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    async def test_event_jobs_survive_restart_and_list_from_slash_command(self, attach_runtime):
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            jobs_path = base_dir / "scheduler" / "jobs.json"
+
+            def scheduler_factory(*, dispatch_callback, event_bus, event_callback, **_kwargs):
+                return Scheduler(
+                    dispatch_callback=dispatch_callback,
+                    event_bus=event_bus,
+                    event_callback=event_callback,
+                    jobs_path=jobs_path,
+                )
+
+            with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+            ):
+                first = DaemonServer(
+                    agent_name="kai",
+                    nats_url="nats://unit-test",
+                    bus_factory=_FakeBus,
+                    scheduler_factory=scheduler_factory,
+                )
+                await first.startup()
+                try:
+                    managed = await first.get_or_create_session("alpha", create_if_missing=True)
+                    managed.session.save()
+                    job = first.scheduler.create_event_job(
+                        condition={
+                            "channel": "signals",
+                            "filter": {"symbol": "BTC", "score": {"gt": 0.9}},
+                        },
+                        prompt="Summarize signal",
+                        owner_session="alpha",
+                        created_by="agent",
+                    )
+                finally:
+                    await first.shutdown()
+
+                second = DaemonServer(
+                    agent_name="kai",
+                    nats_url="nats://unit-test",
+                    bus_factory=_FakeBus,
+                    scheduler_factory=scheduler_factory,
+                )
+                await second.startup()
+                try:
+                    managed = await second.get_or_create_session("alpha", create_if_missing=False)
+                    listed = await second.handle_schedule_command(managed, "/schedule list")
+                    self.assertIn(job.id, listed)
+
+                    await second.publish_daemon_event("signals", {"symbol": "BTC", "score": 0.95})
+
+                    for _ in range(50):
+                        updated = second.scheduler.get_job(job.id)
+                        if updated.run_count == 1:
+                            break
+                        await asyncio.sleep(0.02)
+                    else:
+                        self.fail("event-triggered job did not fire after restart")
+
+                    self.assertEqual(updated.last_result_preview, "done:Summarize signal")
+                    self.assertIn(
+                        "[scheduled job: " + job.id + "]",
+                        [message.content for message in managed.session.chat_history],
+                    )
+                finally:
+                    await second.shutdown()
 
 
 class DaemonServerRestTests(unittest.TestCase):
