@@ -663,5 +663,56 @@ class DaemonServerRestTests(unittest.TestCase):
                     self.assertIn("does not exist", missing.json()["detail"])
 
 
+class DaemonServerWebAssetTests(unittest.TestCase):
+    """Validate the Phase 6 static web asset mounting."""
+
+    @staticmethod
+    def _make_client(build_dir: Path | None = None) -> TestClient:
+        app = create_app(
+            agent_name="kai",
+            nats_url="nats://unit-test",
+            bus_factory=_FakeBus,
+            web_build_dir=build_dir,
+        )
+        return TestClient(app)
+
+    def test_root_and_spa_routes_serve_built_index(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            build_dir = Path(tmpdir)
+            asset_dir = build_dir / "_app" / "immutable"
+            asset_dir.mkdir(parents=True)
+            (build_dir / "index.html").write_text(
+                "<!doctype html><html><body>web shell</body></html>",
+                encoding="utf-8",
+            )
+            (asset_dir / "app.js").write_text("console.log('web shell');", encoding="utf-8")
+
+            with self._make_client(build_dir) as client:
+                root = client.get("/")
+                self.assertEqual(root.status_code, 200)
+                self.assertIn("web shell", root.text)
+
+                deep_link = client.get("/session/terminal")
+                self.assertEqual(deep_link.status_code, 200)
+                self.assertIn("web shell", deep_link.text)
+
+                asset = client.get("/_app/immutable/app.js")
+                self.assertEqual(asset.status_code, 200)
+                self.assertIn("console.log", asset.text)
+
+                missing_asset = client.get("/_app/immutable/missing.js")
+                self.assertEqual(missing_asset.status_code, 404)
+
+    def test_missing_build_returns_placeholder_page(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            build_dir = Path(tmpdir) / "missing-build"
+
+            with self._make_client(build_dir) as client:
+                response = client.get("/")
+                self.assertEqual(response.status_code, 503)
+                self.assertIn("Web UI build not found", response.text)
+                self.assertIn(str(build_dir), response.text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,9 +12,11 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent.signal_consumer import Signal, SignalConsumer
@@ -65,6 +67,7 @@ DEFAULT_DAEMON_WS_PATH = "/ws"
 DEFAULT_DAEMON_WS_URL = (
     f"ws://{DEFAULT_DAEMON_HOST}:{DEFAULT_DAEMON_PORT}{DEFAULT_DAEMON_WS_PATH}"
 )
+DEFAULT_WEB_BUILD_DIR = Path(__file__).resolve().parent.parent / "web" / "build"
 _SCHEDULE_IN_PATTERN = re.compile(
     r"^in\s+(?P<count>\d+)\s+(?P<unit>minute|minutes|hour|hours|day|days)$",
     re.IGNORECASE,
@@ -127,6 +130,35 @@ def _parse_schedule_at_value(raw: str, *, now: datetime | None = None) -> str:
         raise ValueError("unsupported tomorrow time format; use ISO, 'in N minutes', or 'tomorrow 7am'")
 
     raise ValueError("unsupported schedule time format; use ISO, 'in N minutes', or 'tomorrow 7am'")
+
+
+def _looks_like_web_asset_request(asset_path: str) -> bool:
+    normalized = asset_path.strip("/")
+    if not normalized:
+        return False
+    tail = normalized.rsplit("/", 1)[-1]
+    return normalized.startswith("_app/") or "." in tail
+
+
+def _resolve_web_asset_path(build_dir: Path, asset_path: str) -> Path | None:
+    normalized = asset_path.strip("/")
+    candidate = (build_dir / normalized).resolve() if normalized else (build_dir / "index.html").resolve()
+    try:
+        candidate.relative_to(build_dir.resolve())
+    except ValueError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _missing_web_build_response(build_dir: Path) -> HTMLResponse:
+    return HTMLResponse(
+        content=(
+            "<!doctype html><html><head><title>KAI Web UI unavailable</title></head>"
+            "<body><h1>Web UI build not found</h1>"
+            f"<p>Expected built assets under <code>{build_dir}</code>.</p></body></html>"
+        ),
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+    )
 
 
 @dataclass
@@ -747,6 +779,7 @@ def create_app(
     nats_url: str = NATS_URL,
     bus_factory: Callable[[str, str], Any] | None = None,
     scheduler_factory: Callable[..., Scheduler] | None = None,
+    web_build_dir: str | Path | None = None,
 ) -> FastAPI:
     """Build the FastAPI app that exposes the daemon WebSocket server."""
     daemon_server = DaemonServer(
@@ -766,6 +799,7 @@ def create_app(
             await daemon_server.shutdown()
 
     app = FastAPI(lifespan=lifespan)
+    build_dir = Path(web_build_dir) if web_build_dir is not None else DEFAULT_WEB_BUILD_DIR
 
     @app.get("/api/health")
     async def health_endpoint() -> dict[str, Any]:
@@ -971,6 +1005,30 @@ def create_app(
             forward_task.cancel()
             with suppress(asyncio.CancelledError):
                 await forward_task
+
+    @app.get("/", include_in_schema=False)
+    async def web_index():
+        index_path = _resolve_web_asset_path(build_dir, "")
+        if index_path is None:
+            return _missing_web_build_response(build_dir)
+        return FileResponse(index_path)
+
+    @app.get("/{asset_path:path}", include_in_schema=False)
+    async def web_asset(asset_path: str):
+        index_path = _resolve_web_asset_path(build_dir, "")
+        if index_path is None:
+            return _missing_web_build_response(build_dir)
+
+        resolved = _resolve_web_asset_path(build_dir, asset_path)
+        if resolved is not None:
+            return FileResponse(resolved)
+
+        if _looks_like_web_asset_request(asset_path):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="web asset not found",
+            )
+        return FileResponse(index_path)
 
     return app
 
