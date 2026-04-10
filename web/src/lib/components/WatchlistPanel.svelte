@@ -5,8 +5,12 @@
 
   let {
     quotes,
+    mobileCollapsible = false,
+    initiallyOpen = true,
   }: {
     quotes: WatchlistQuote[];
+    mobileCollapsible?: boolean;
+    initiallyOpen?: boolean;
   } = $props();
 
   function formatPrice(value?: number): string {
@@ -38,7 +42,13 @@
   }
 </script>
 
-<Panel eyebrow="Market" title="Watchlist" subtitle={`${quotes.length} tracked`}>
+<Panel
+  eyebrow="Market"
+  initiallyOpen={initiallyOpen}
+  mobileCollapsible={mobileCollapsible}
+  title="Watchlist"
+  subtitle={`${quotes.length} tracked`}
+>
   {#if quotes.length}
     <ul class="watchlist">
       {#each quotes as quote (quote.symbol)}
@@ -68,6 +78,7 @@
     list-style: none;
     margin: 0;
     padding: 0;
+    min-height: 0;
   }
 
   .watchlist li {
@@ -106,5 +117,16 @@
 
   .flat {
     color: var(--muted);
+  }
+
+  @media (max-width: 700px) {
+    .watchlist li {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+
+    .pricing {
+      justify-items: start;
+    }
   }
 </style>

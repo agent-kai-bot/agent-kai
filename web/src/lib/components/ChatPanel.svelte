@@ -7,9 +7,13 @@
   let {
     messages,
     streamingReply = "",
+    mobileCollapsible = false,
+    initiallyOpen = true,
   }: {
     messages: ChatHistoryEntry[];
     streamingReply?: string;
+    mobileCollapsible?: boolean;
+    initiallyOpen?: boolean;
   } = $props();
 
   function label(role: string): string {
@@ -23,7 +27,13 @@
   }
 </script>
 
-<Panel eyebrow="Conversation" title="Chat" subtitle={`${messages.length} messages`}>
+<Panel
+  eyebrow="Conversation"
+  initiallyOpen={initiallyOpen}
+  mobileCollapsible={mobileCollapsible}
+  title="Chat"
+  subtitle={`${messages.length} messages`}
+>
   <div class="chat-log">
     {#if messages.length || streamingReply}
       {#each messages as message, index (message.role + message.content + index)}
@@ -50,8 +60,7 @@
   .chat-log {
     display: grid;
     gap: 0.75rem;
-    max-height: 32rem;
-    overflow: auto;
+    min-height: 0;
     padding-right: 0.2rem;
   }
 
@@ -154,5 +163,12 @@
   .empty {
     margin: 0;
     color: var(--muted);
+  }
+
+  @media (max-width: 700px) {
+    .chat-log {
+      max-height: 36vh;
+      overflow: auto;
+    }
   }
 </style>

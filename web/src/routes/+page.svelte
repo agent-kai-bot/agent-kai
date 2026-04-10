@@ -31,33 +31,33 @@
   const client = new DaemonClient();
   const localhostHosts = new Set(["localhost", "127.0.0.1", "::1"]);
 
-  let token = "";
-  let sessionName = DEFAULT_SESSION_NAME;
-  let knownSessions: SessionSummary[] = [];
-  let connectionStatus = "checking daemon...";
-  let attachError = "";
-  let isConnecting = false;
-  let tokenRequired = false;
-  let activeSession = "";
-  let currentStatus = "idle";
-  let queueDepth = 0;
-  let watchlist: string[] = [];
-  let snapshotSummary = "";
-  let chatMessages: ChatHistoryEntry[] = [];
-  let streamingReply = "";
-  let watchlistQuotes: WatchlistQuote[] = [];
-  let portfolio: PortfolioSnapshot = { positions: [], pnl: {} };
-  let chartBars: CandleBar[] = [];
-  let chartStatus = "waiting for a session";
-  let alerts: EventRow[] = [];
-  let natsEvents: EventRow[] = [];
-  let schedulerEvents: EventRow[] = [];
-  let inputDraft = "";
-  let paletteOpen = false;
-  let paletteQuery = "";
-  let paletteItems: CommandPaletteItem[] = filterPaletteItems("");
+  let token = $state("");
+  let sessionName = $state(DEFAULT_SESSION_NAME);
+  let knownSessions = $state<SessionSummary[]>([]);
+  let connectionStatus = $state("checking daemon...");
+  let attachError = $state("");
+  let isConnecting = $state(false);
+  let tokenRequired = $state(false);
+  let activeSession = $state("");
+  let currentStatus = $state("idle");
+  let queueDepth = $state(0);
+  let watchlist = $state<string[]>([]);
+  let snapshotSummary = $state("");
+  let chatMessages = $state<ChatHistoryEntry[]>([]);
+  let streamingReply = $state("");
+  let watchlistQuotes = $state<WatchlistQuote[]>([]);
+  let portfolio = $state<PortfolioSnapshot>({ positions: [], pnl: {} });
+  let chartBars = $state<CandleBar[]>([]);
+  let chartStatus = $state("waiting for a session");
+  let alerts = $state<EventRow[]>([]);
+  let natsEvents = $state<EventRow[]>([]);
+  let schedulerEvents = $state<EventRow[]>([]);
+  let inputDraft = $state("");
+  let paletteOpen = $state(false);
+  let paletteQuery = $state("");
+  let paletteItems = $state<CommandPaletteItem[]>(filterPaletteItems(""));
   let pollingHandle: number | null = null;
-  let daemonConnection: Awaited<ReturnType<DaemonClient["attach"]>> | null = null;
+  let daemonConnection = $state<Awaited<ReturnType<DaemonClient["attach"]>> | null>(null);
 
   function isScheduledJobEnvelope(envelope: ServerEnvelope): envelope is ScheduledJobEnvelope {
     return envelope.type.startsWith("scheduled_job_");
@@ -342,8 +342,8 @@
   }
 
   onMount(() => {
-    token = readStoredToken();
     tokenRequired = !localhostHosts.has(window.location.hostname);
+    token = tokenRequired ? readStoredToken() : "";
     void refreshSessions();
     const onKeydown = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
@@ -367,6 +367,17 @@
     stopPolling();
     daemonConnection?.close(1000, "page teardown");
   });
+
+  $effect(() => {
+    if (typeof document === "undefined") {
+      return;
+    }
+    const connected = Boolean(daemonConnection);
+    document.body.classList.toggle("dashboard-active", connected);
+    return () => {
+      document.body.classList.remove("dashboard-active");
+    };
+  });
 </script>
 
 <svelte:head>
@@ -377,130 +388,69 @@
   />
 </svelte:head>
 
-<section class="landing-shell">
-  <div class="landing-card">
-    <p class="eyebrow">Daemon Client</p>
-    <h1>KAI Web Terminal</h1>
-    <p class="summary">
-      The browser client attaches to the same daemon sessions as the terminal and
-      reuses the daemon websocket protocol directly. The web dashboard now mirrors
-      the terminal layout with live watchlist, positions, alerts, NATS traffic,
-      scheduler events, and a raw chat stream, while keeping the chart panel ready
-      for the dedicated `P6.5` Lightweight Charts integration.
-    </p>
-
-    <div class="status-banner">
-      <span>{connectionStatus}</span>
-      {#if activeSession}
-        <strong>{activeSession}</strong>
-      {/if}
-    </div>
-
-    <div class="shortcut-hint">
-      <span>Ctrl+K</span>
-      <p>Open the slash command palette and execute daemon-side commands without leaving the dashboard.</p>
-    </div>
-
-    <div class="connect-grid">
-      <form class="connect-panel" on:submit={onConnectSubmit}>
-        <label>
-          <span>Daemon token</span>
-          <input
-            bind:value={token}
-            autocomplete="off"
-            name="token"
-            placeholder="Paste bearer token if required"
-            required={tokenRequired}
-            type="password"
-          />
-        </label>
-
-        <label>
-          <span>Session</span>
-          <input
-            bind:value={sessionName}
-            list="known-sessions"
-            name="session"
-            placeholder="terminal"
-            required
-            type="text"
-          />
-        </label>
-
-        <datalist id="known-sessions">
-          {#each knownSessions as session (session.name)}
-            <option value={session.name}></option>
-          {/each}
-        </datalist>
-
-        <div class="button-row">
-          <button disabled={isConnecting} type="submit">
-            {#if isConnecting}Attaching...{:else}Attach Session{/if}
-          </button>
-          <button disabled={!daemonConnection} on:click={disconnectSession} type="button">
-            Disconnect
-          </button>
-          <button disabled={isConnecting} on:click={() => void refreshSessions()} type="button">
-            Refresh
-          </button>
+<section class="landing-shell" class:dashboard-mode={Boolean(daemonConnection)}>
+  {#if daemonConnection}
+    <div class="dashboard-shell">
+      <header class="dashboard-topbar">
+        <div class="dashboard-heading">
+          <div class="dashboard-brand">
+            <p class="eyebrow">KAI</p>
+            <strong>Web Terminal</strong>
+          </div>
+          <div class="dashboard-meta">
+            <span>session: <strong>{activeSession}</strong></span>
+            <span>status: <strong>{currentStatus}</strong></span>
+            <span>queue: <strong>{queueDepth}</strong></span>
+            <span>
+              chart:
+              <strong>
+                {daemonConnection.snapshot.chart_symbol} {daemonConnection.snapshot.chart_timeframe}
+              </strong>
+            </span>
+            <span>positions: <strong>{portfolio.positions.length}</strong></span>
+            <span>watchlist: <strong>{watchlist.length}</strong></span>
+          </div>
         </div>
 
-        <p class="token-hint">
-          Remote or proxied clients should use the daemon bearer token from
-          <code>workspaces/daemon-token.txt</code>. Direct localhost sessions can
-          still attach without one.
-        </p>
+        <div class="dashboard-actions">
+          <button onclick={disconnectSession} type="button">Disconnect</button>
+          <button class="secondary" onclick={openPalette} type="button">Ctrl+K</button>
+        </div>
+      </header>
 
-        {#if attachError}
-          <p class="error-text">{attachError}</p>
-        {/if}
-      </form>
+      {#if snapshotSummary}
+        <p class="dashboard-summary">{snapshotSummary}</p>
+      {/if}
 
-      <div class="session-panel">
-        <h2>Session Snapshot</h2>
-        {#if daemonConnection}
-          <p>{snapshotSummary}</p>
-          <p>status: {currentStatus} · queue: {queueDepth}</p>
-          <div class="chip-row">
-            {#each watchlist as symbol (symbol)}
-              <span>{symbol}</span>
-            {/each}
-          </div>
-        {:else}
-          <p>No session attached yet.</p>
-        {/if}
+      {#if attachError}
+        <p class="dashboard-error">{attachError}</p>
+      {/if}
 
-        <h3>Known Sessions</h3>
-        <ul class="session-list">
-          {#each knownSessions as session (session.name)}
-            <li>
-              <strong>{session.name}</strong>
-              <span>{session.activity_status ?? "idle"}</span>
-            </li>
-          {/each}
-        </ul>
-      </div>
-    </div>
-
-    {#if daemonConnection}
       <div class="dashboard-grid">
         <div class="dashboard-column left">
-          <WatchlistPanel quotes={watchlistQuotes} />
-          <PositionsPanel {portfolio} />
+          <WatchlistPanel initiallyOpen={false} mobileCollapsible={true} quotes={watchlistQuotes} />
+          <PositionsPanel initiallyOpen={false} mobileCollapsible={true} {portfolio} />
         </div>
 
         <div class="dashboard-column center">
           <ChartPanel
             bars={chartBars}
+            initiallyOpen={false}
+            mobileCollapsible={true}
             source={daemonConnection.snapshot.chart_source}
             status={chartStatus}
             symbol={daemonConnection.snapshot.chart_symbol}
             timeframe={daemonConnection.snapshot.chart_timeframe}
           />
 
-          <ChatPanel messages={chatMessages} {streamingReply} />
+          <ChatPanel
+            initiallyOpen={false}
+            messages={chatMessages}
+            mobileCollapsible={true}
+            {streamingReply}
+          />
 
-          <form class="chat-input" on:submit={onInputSubmit}>
+          <form class="chat-input" onsubmit={onInputSubmit}>
             <textarea
               bind:value={inputDraft}
               placeholder="Type a prompt or slash command for this session"
@@ -513,36 +463,124 @@
         <div class="dashboard-column right">
           <EventPanel
             eyebrow="Signals"
-            title="Alerts"
-            subtitle={`${alerts.length} recent`}
             emptyMessage="No alert envelopes yet."
+            initiallyOpen={false}
             items={alerts}
+            mobileCollapsible={true}
+            subtitle={`${alerts.length} recent`}
+            title="Alerts"
           />
           <EventPanel
             eyebrow="Bus"
-            title="NATS"
-            subtitle={`${natsEvents.length} recent`}
             emptyMessage="No NATS traffic has hit this session yet."
+            initiallyOpen={false}
             items={natsEvents}
+            mobileCollapsible={true}
+            subtitle={`${natsEvents.length} recent`}
+            title="NATS"
           />
           <EventPanel
             eyebrow="Scheduler"
-            title="Scheduled Jobs"
-            subtitle={`${schedulerEvents.length} recent`}
             emptyMessage="No scheduler activity yet."
+            initiallyOpen={false}
             items={schedulerEvents}
+            mobileCollapsible={true}
+            subtitle={`${schedulerEvents.length} recent`}
+            title="Scheduled Jobs"
           />
         </div>
       </div>
+    </div>
+  {:else}
+    <div class="landing-card">
+      <p class="eyebrow">Daemon Client</p>
+      <h1>KAI Web Terminal</h1>
+      <p class="summary">
+        The browser client attaches to the same daemon sessions as the terminal and
+        reuses the daemon websocket protocol directly. The web dashboard now mirrors
+        the terminal layout with live watchlist, positions, alerts, NATS traffic,
+        scheduler events, and a raw chat stream, while keeping the chart panel ready
+        for the dedicated `P6.5` Lightweight Charts integration.
+      </p>
 
-      <footer class="status-strip">
-        <span>session {activeSession}</span>
-        <span>status {currentStatus}</span>
-        <span>queue {queueDepth}</span>
-        <span>watchlist {watchlist.length}</span>
-        <span>positions {portfolio.positions.length}</span>
-      </footer>
-    {:else}
+      <div class="status-banner">
+        <span>{connectionStatus}</span>
+      </div>
+
+      <div class="shortcut-hint">
+        <span>Ctrl+K</span>
+        <p>Open the slash command palette and execute daemon-side commands without leaving the dashboard.</p>
+      </div>
+
+      <div class="connect-grid">
+        <form class="connect-panel" onsubmit={onConnectSubmit}>
+          <label>
+            <span>Session</span>
+            <input
+              bind:value={sessionName}
+              list="known-sessions"
+              name="session"
+              placeholder="terminal"
+              required
+              type="text"
+            />
+          </label>
+
+          <label>
+            <span>Daemon token</span>
+            <input
+              bind:value={token}
+              autocomplete="off"
+              name="token"
+              placeholder="Paste bearer token if required"
+              required={tokenRequired}
+              type="password"
+            />
+          </label>
+
+          <datalist id="known-sessions">
+            {#each knownSessions as session (session.name)}
+              <option value={session.name}></option>
+            {/each}
+          </datalist>
+
+          <div class="button-row">
+            <button disabled={isConnecting} type="submit">
+              {#if isConnecting}Attaching...{:else}Attach Session{/if}
+            </button>
+            <button disabled={isConnecting} onclick={() => void refreshSessions()} type="button">
+              Refresh
+            </button>
+          </div>
+
+          <p class="token-hint">
+            Remote or proxied clients should use the daemon bearer token from
+            <code>workspaces/daemon-token.txt</code>. Direct localhost sessions can
+            still attach without one.
+          </p>
+
+          {#if attachError}
+            <p class="error-text">{attachError}</p>
+          {/if}
+        </form>
+
+        <div class="session-panel">
+          <h2>Known Sessions</h2>
+          {#if knownSessions.length}
+            <ul class="session-list">
+              {#each knownSessions as session (session.name)}
+                <li>
+                  <strong>{session.name}</strong>
+                  <span>{session.activity_status ?? "idle"}</span>
+                </li>
+              {/each}
+            </ul>
+          {:else}
+            <p>No session attached yet.</p>
+          {/if}
+        </div>
+      </div>
+
       <dl class="checklist">
         <div>
           <dt>Transport</dt>
@@ -557,8 +595,8 @@
           <dd>Replace the chart placeholder with Lightweight Charts and live candles.</dd>
         </div>
       </dl>
-    {/if}
-  </div>
+    </div>
+  {/if}
 </section>
 
 <CommandPalette
