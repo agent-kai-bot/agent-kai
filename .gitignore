@@ -24,6 +24,7 @@ ANTHROPIC-API-KEY.txt
 # Per-user runtime state
 workspaces/terminal/state.json
 workspaces/kaid.pid
+workspaces/daemon-token.txt
 
 # Internal design proposals — drafts, not part of published docs
 docs/proposals/
