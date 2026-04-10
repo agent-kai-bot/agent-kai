@@ -160,4 +160,11 @@
     color: var(--muted);
     line-height: 1.4;
   }
+
+  @media (max-width: 700px) {
+    header button {
+      min-height: 2.75rem;
+      padding: 0.65rem 0.95rem;
+    }
+  }
 </style>

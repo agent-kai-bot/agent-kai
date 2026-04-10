@@ -460,6 +460,16 @@ body.dashboard-active {
 }
 
 @media (max-width: 700px) {
+  button,
+  a,
+  input,
+  select,
+  textarea,
+  [role="button"],
+  .session-list li {
+    min-height: 2.75rem;
+  }
+
   .landing-shell {
     padding: 1rem;
   }
