@@ -395,6 +395,15 @@ def create_app(
 
     app = FastAPI(lifespan=lifespan)
 
+    @app.get("/api/health")
+    async def health_endpoint() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "agent_name": daemon_server.agent_name,
+            "bus_connected": daemon_server.bus is not None,
+            "session_count": len(daemon_server.sessions),
+        }
+
     @app.get("/api/sessions")
     async def list_sessions_endpoint() -> dict[str, Any]:
         return {"sessions": daemon_server.list_sessions()}
