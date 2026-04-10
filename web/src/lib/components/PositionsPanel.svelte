@@ -22,50 +22,57 @@
   }
 </script>
 
-<Panel
-  eyebrow="Portfolio"
-  initiallyOpen={initiallyOpen}
-  mobileCollapsible={mobileCollapsible}
-  title="Positions"
-  subtitle={`${portfolio.positions.length} open`}
->
-  {#if portfolio.positions.length}
-    <table>
-      <thead>
-        <tr>
-          <th>Symbol</th>
-          <th>Side</th>
-          <th>Qty</th>
-          <th>P&L</th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each portfolio.positions as position (position.symbol)}
+<div class="positions-panel" data-panel="positions">
+  <Panel
+    eyebrow="Portfolio"
+    initiallyOpen={initiallyOpen}
+    mobileCollapsible={mobileCollapsible}
+    title="Positions"
+    subtitle={`${portfolio.positions.length} open`}
+  >
+    {#if portfolio.positions.length}
+      <table>
+        <thead>
           <tr>
-            <td data-label="Symbol">{position.symbol}</td>
-            <td data-label="Side">{position.side}</td>
-            <td data-label="Qty">{position.quantity.toFixed(4)}</td>
-            <td
-              class:gain={position.unrealized_pnl > 0}
-              class:loss={position.unrealized_pnl < 0}
-              data-label="P&L"
-            >
-              {money(position.unrealized_pnl)} · {signedPct(position.pnl_pct)}
-            </td>
+            <th>Symbol</th>
+            <th>Side</th>
+            <th>Qty</th>
+            <th>P&L</th>
           </tr>
-        {/each}
-      </tbody>
-    </table>
-    <footer>
-      <span>Total value</span>
-      <strong>{money(portfolio.pnl.total_value as number | undefined)}</strong>
-    </footer>
-  {:else}
-    <p class="empty">No open paper positions.</p>
-  {/if}
-</Panel>
+        </thead>
+        <tbody>
+          {#each portfolio.positions as position (position.symbol)}
+            <tr>
+              <td data-label="Symbol">{position.symbol}</td>
+              <td data-label="Side">{position.side}</td>
+              <td data-label="Qty">{position.quantity.toFixed(4)}</td>
+              <td
+                class:gain={position.unrealized_pnl > 0}
+                class:loss={position.unrealized_pnl < 0}
+                data-label="P&L"
+              >
+                {money(position.unrealized_pnl)} · {signedPct(position.pnl_pct)}
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+      <footer>
+        <span>Total value</span>
+        <strong>{money(portfolio.pnl.total_value as number | undefined)}</strong>
+      </footer>
+    {:else}
+      <p class="empty">No open paper positions.</p>
+    {/if}
+  </Panel>
+</div>
 
 <style>
+  .positions-panel {
+    min-height: 0;
+    height: 100%;
+  }
+
   table {
     width: 100%;
     border-collapse: collapse;
