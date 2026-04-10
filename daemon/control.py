@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import signal
 import subprocess
@@ -37,6 +38,27 @@ class DaemonStartResult:
     remote_url: str
     pid: int | None = None
     already_running: bool = False
+
+
+@dataclass(frozen=True)
+class DaemonStatus:
+    """Current view of the daemon's runtime state."""
+
+    running: bool
+    healthy: bool
+    managed: bool
+    pid: int | None = None
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class DaemonStopResult:
+    """Outcome of a stop request issued through kaictl."""
+
+    stopped: bool
+    pid: int | None = None
+    already_stopped: bool = False
+    detail: str = ""
 
 
 def build_daemon_command(
@@ -237,3 +259,197 @@ def ensure_local_daemon_started(
         log_level=log_level,
     )
     return result.remote_url
+
+
+def get_daemon_status(
+    *,
+    pid_path: Path = DAEMON_PID_PATH,
+    health_url: str = DEFAULT_DAEMON_HEALTH_URL,
+) -> DaemonStatus:
+    """Summarize the daemon state for status output."""
+    pid = read_daemon_pid(pid_path)
+    if pid is not None and not pid_is_running(pid):
+        clear_daemon_pid(pid_path)
+        pid = None
+
+    health = daemon_healthcheck(health_url=health_url)
+    if health is not None and pid is not None:
+        return DaemonStatus(
+            running=True,
+            healthy=True,
+            managed=True,
+            pid=pid,
+            detail=f"running (pid {pid})",
+        )
+    if health is not None:
+        return DaemonStatus(
+            running=True,
+            healthy=True,
+            managed=False,
+            detail="running (not managed by kaictl)",
+        )
+    if pid is not None:
+        return DaemonStatus(
+            running=True,
+            healthy=False,
+            managed=True,
+            pid=pid,
+            detail=f"pid {pid} exists but the health endpoint is unavailable",
+        )
+    return DaemonStatus(
+        running=False,
+        healthy=False,
+        managed=False,
+        detail="stopped",
+    )
+
+
+def stop_local_daemon(
+    *,
+    pid_path: Path = DAEMON_PID_PATH,
+    health_url: str = DEFAULT_DAEMON_HEALTH_URL,
+    timeout: float = DEFAULT_DAEMON_START_TIMEOUT,
+    poll_interval: float = DEFAULT_DAEMON_POLL_INTERVAL,
+) -> DaemonStopResult:
+    """Stop the kaictl-managed daemon process if one is running."""
+    pid = read_daemon_pid(pid_path)
+    if pid is None:
+        if daemon_healthcheck(health_url=health_url) is not None:
+            return DaemonStopResult(
+                stopped=False,
+                already_stopped=False,
+                detail="daemon is running but not managed by kaictl",
+            )
+        return DaemonStopResult(
+            stopped=False,
+            already_stopped=True,
+            detail="daemon is already stopped",
+        )
+
+    if not pid_is_running(pid):
+        clear_daemon_pid(pid_path)
+        return DaemonStopResult(
+            stopped=False,
+            pid=pid,
+            already_stopped=True,
+            detail=f"removed stale pid file for {pid}",
+        )
+
+    with suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not pid_is_running(pid):
+            clear_daemon_pid(pid_path)
+            return DaemonStopResult(
+                stopped=True,
+                pid=pid,
+                detail=f"stopped pid {pid}",
+            )
+        time.sleep(poll_interval)
+
+    with suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if not pid_is_running(pid):
+            clear_daemon_pid(pid_path)
+            return DaemonStopResult(
+                stopped=True,
+                pid=pid,
+                detail=f"stopped pid {pid} with SIGKILL",
+            )
+        time.sleep(poll_interval)
+
+    return DaemonStopResult(
+        stopped=False,
+        pid=pid,
+        detail=f"failed to stop pid {pid}",
+    )
+
+
+def read_log_tail(
+    *,
+    log_path: Path = DAEMON_LOG_PATH,
+    lines: int = 100,
+) -> str:
+    """Return the tail of the daemon log file."""
+    if not log_path.exists():
+        return ""
+    with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+        return "".join(handle.readlines()[-max(lines, 0):])
+
+
+def _print_log_stream(*, log_path: Path, lines: int) -> int:
+    """Print the daemon log tail and optionally follow new lines."""
+    if not log_path.exists():
+        print(f"No daemon log at {log_path}")
+        return 1
+    tail = read_log_tail(log_path=log_path, lines=lines)
+    if tail:
+        print(tail, end="")
+    return 0
+
+
+def build_cli_parser() -> argparse.ArgumentParser:
+    """Build the kaictl CLI parser."""
+    parser = argparse.ArgumentParser(prog="kaictl", description="Control the local kaid daemon")
+    subcommands = parser.add_subparsers(dest="command", required=True)
+
+    start = subcommands.add_parser("start", help="Start the local daemon if needed")
+    start.add_argument("--name", default=DEFAULT_AGENT, help=f"Agent name (default: {DEFAULT_AGENT})")
+    start.add_argument("--nats-url", default=NATS_URL, help=f"NATS URL (default: {NATS_URL})")
+    start.add_argument(
+        "--log-level",
+        default=None,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Override log level from config",
+    )
+
+    subcommands.add_parser("stop", help="Stop the kaictl-managed daemon")
+    subcommands.add_parser("status", help="Show the daemon status")
+
+    logs = subcommands.add_parser("logs", help="Print the daemon log tail")
+    logs.add_argument("-n", "--lines", type=int, default=100, help="Lines of log history to print")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the kaictl command-line interface."""
+    parser = build_cli_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "start":
+        result = start_local_daemon(
+            agent_name=args.name,
+            nats_url=args.nats_url,
+            log_level=args.log_level,
+        )
+        if result.already_running:
+            print(f"kaid is already running at {result.remote_url}")
+        else:
+            print(f"Started kaid (pid {result.pid}) at {result.remote_url}")
+        return 0
+
+    if args.command == "stop":
+        result = stop_local_daemon()
+        print(result.detail)
+        return 0 if result.stopped or result.already_stopped else 1
+
+    if args.command == "status":
+        status = get_daemon_status()
+        print(status.detail)
+        return 0
+
+    if args.command == "logs":
+        return _print_log_stream(log_path=DAEMON_LOG_PATH, lines=args.lines)
+
+    parser.error(f"unknown command: {args.command}")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
