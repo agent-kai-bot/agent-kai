@@ -4,16 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
+from pydantic import BaseModel, ConfigDict, Field
 
 from config import DEFAULT_AGENT, NATS_URL
-from daemon.core import Session, SessionEvent, get_indexed_session, serialize_messages
+from daemon.core import (
+    Session,
+    SessionEvent,
+    get_indexed_session,
+    list_indexed_sessions,
+    remove_indexed_session,
+    serialize_messages,
+)
 from daemon.protocol import (
     AttachEnvelope,
     ChartBarEnvelope,
@@ -52,6 +61,14 @@ class ManagedSession:
 
     session: Session
     input_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+class SessionCreateRequest(BaseModel):
+    """Payload for REST session creation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
 
 
 class DaemonServer:
@@ -139,6 +156,71 @@ class DaemonServer:
                 managed.session.set_activity_status("idle")
                 with suppress(Exception):
                     managed.session.save()
+
+    def describe_session(self, name: str) -> dict[str, Any]:
+        """Return one session summary suitable for REST and slash listings."""
+        entry = get_indexed_session(name)
+        if entry is None:
+            raise KeyError(f"session '{name}' does not exist")
+        managed = self.sessions.get(entry.name)
+        activity_status = managed.session.activity_status if managed else "idle"
+        queued_inputs = len(managed.session.input_queue) if managed else 0
+        return {
+            "name": entry.name,
+            "created_at": entry.created_at,
+            "last_activity": entry.last_activity,
+            "state_path": entry.state_path,
+            "activity_status": activity_status,
+            "queued_inputs": queued_inputs,
+        }
+
+    def list_sessions(self) -> list[dict[str, Any]]:
+        """Return the persisted session index merged with live runtime state."""
+        return [self.describe_session(entry.name) for entry in list_indexed_sessions()]
+
+    async def create_session(self, name: str) -> dict[str, Any]:
+        """Create a new named session and persist its initial state."""
+        normalized = Session(name).name
+        if (
+            normalized in self.sessions
+            or get_indexed_session(normalized) is not None
+            or Session(normalized).paths.state_path.exists()
+        ):
+            raise FileExistsError(f"session '{normalized}' already exists")
+
+        managed = await self.get_or_create_session(
+            normalized,
+            create_if_missing=True,
+        )
+        managed.session.save()
+        return self.describe_session(normalized)
+
+    async def delete_session(self, name: str) -> dict[str, Any]:
+        """Delete a named session from memory, disk, and the session index."""
+        session = Session(name)
+        normalized = session.name
+        state_exists = session.paths.state_path.exists()
+        indexed_entry = get_indexed_session(normalized)
+        managed = self.sessions.pop(normalized, None)
+        if managed is None and not state_exists and indexed_entry is None:
+            raise KeyError(f"session '{normalized}' does not exist")
+
+        if managed is not None:
+            with suppress(Exception):
+                await managed.session.sub_agent_registry.stop_all()
+
+        for path in (
+            session.paths.state_path,
+            session.paths.state_path.with_suffix(session.paths.state_path.suffix + ".lock"),
+        ):
+            with suppress(FileNotFoundError):
+                path.unlink()
+
+        if session.paths.root_dir.exists():
+            shutil.rmtree(session.paths.root_dir, ignore_errors=True)
+
+        remove_indexed_session(normalized)
+        return {"deleted": True, "name": normalized}
 
     async def forward_session_events(
         self,
@@ -312,6 +394,41 @@ def create_app(
             await daemon_server.shutdown()
 
     app = FastAPI(lifespan=lifespan)
+
+    @app.get("/api/sessions")
+    async def list_sessions_endpoint() -> dict[str, Any]:
+        return {"sessions": daemon_server.list_sessions()}
+
+    @app.post("/api/sessions", status_code=status.HTTP_201_CREATED)
+    async def create_session_endpoint(payload: SessionCreateRequest) -> dict[str, Any]:
+        try:
+            session_info = await daemon_server.create_session(payload.name)
+        except FileExistsError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+        return {"session": session_info}
+
+    @app.delete("/api/sessions/{session_name}")
+    async def delete_session_endpoint(session_name: str) -> dict[str, Any]:
+        try:
+            return await daemon_server.delete_session(session_name)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
 
     @app.websocket(DEFAULT_DAEMON_WS_PATH)
     async def websocket_endpoint(websocket: WebSocket) -> None:
