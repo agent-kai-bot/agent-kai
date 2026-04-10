@@ -167,6 +167,7 @@ class DaemonServer:
             bus=self.bus,
             agent_name=self.agent_name,
             signal_consumer=self.signal_consumer,
+            scheduler=self.scheduler,
         )
         session.touch_index()
 

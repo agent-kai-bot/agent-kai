@@ -768,7 +768,149 @@ def _get_crypto_tools(signal_consumer=None):
         return []
 
 
-def create_tools(bus=None, sub_agent_manager=None, signal_consumer=None):
+def _format_scheduled_job_summary(job) -> str:
+    next_run = job.next_run or ("event-driven" if job.type == "event" else "n/a")
+    return (
+        f"{job.id} [{job.status}] session={job.owner_session} "
+        f"type={job.type} next={next_run} prompt={job.prompt}"
+    )
+
+
+def create_scheduler_tools(scheduler, session):
+    """Create scheduler-management tools bound to the current session."""
+
+    def _resolve_session(target_session: str | None = None) -> str:
+        name = target_session or getattr(session, "name", "")
+        return str(name).strip()
+
+    def _schedule_at(
+        when: str,
+        prompt: str,
+        session: str | None = None,
+    ) -> str:
+        job = scheduler.create_absolute_job(
+            when=when,
+            prompt=prompt,
+            owner_session=_resolve_session(session),
+            created_by="agent",
+        )
+        return f"Scheduled {job.id} at {job.next_run} for session {job.owner_session}."
+
+    def _schedule_recurring(
+        cron: str,
+        prompt: str,
+        session: str | None = None,
+        max_runs: int | None = None,
+    ) -> str:
+        job = scheduler.create_recurring_job(
+            cron=cron,
+            prompt=prompt,
+            owner_session=_resolve_session(session),
+            created_by="agent",
+            max_runs=max_runs,
+        )
+        return f"Scheduled recurring job {job.id} next={job.next_run} for session {job.owner_session}."
+
+    def _schedule_when(
+        condition: dict,
+        prompt: str,
+        session: str | None = None,
+        max_runs: int | None = None,
+    ) -> str:
+        job = scheduler.create_event_job(
+            condition=condition,
+            prompt=prompt,
+            owner_session=_resolve_session(session),
+            created_by="agent",
+            max_runs=max_runs,
+        )
+        return f"Scheduled event job {job.id} on channel {job.spec['channel']} for session {job.owner_session}."
+
+    def _list_scheduled_jobs(session: str | None = None) -> str:
+        jobs = [
+            job
+            for job in scheduler.list_jobs_for_session(_resolve_session(session) if session is not None else getattr(session_obj, "name", None))
+            if job.status in {"active", "paused"}
+        ]
+        if session is None:
+            jobs = [
+                job
+                for job in scheduler.list_jobs_for_session(getattr(session_obj, "name", ""))
+                if job.status in {"active", "paused"}
+            ]
+        if not jobs:
+            target = _resolve_session(session) if session is not None else getattr(session_obj, "name", "")
+            return f"No scheduled jobs for session {target}."
+        return "\n".join(_format_scheduled_job_summary(job) for job in jobs)
+
+    def _cancel_scheduled_job(job_id: str) -> str:
+        job = scheduler.get_job(job_id)
+        if job is None:
+            return f"Scheduled job {job_id} was not found."
+        updated = scheduler.cancel_job(job_id)
+        return f"Cancelled scheduled job {updated.id}."
+
+    def _pause_scheduled_job(job_id: str) -> str:
+        job = scheduler.get_job(job_id)
+        if job is None:
+            return f"Scheduled job {job_id} was not found."
+        updated = scheduler.pause_job(job_id)
+        return f"Paused scheduled job {updated.id}."
+
+    def _resume_scheduled_job(job_id: str) -> str:
+        job = scheduler.get_job(job_id)
+        if job is None:
+            return f"Scheduled job {job_id} was not found."
+        updated = scheduler.resume_job(job_id)
+        return f"Resumed scheduled job {updated.id}."
+
+    session_obj = session
+    return [
+        StructuredTool.from_function(
+            func=_schedule_at,
+            name="schedule_at",
+            description="Schedule a one-shot prompt at an ISO 8601 timestamp. Inputs: when, prompt, optional session.",
+        ),
+        StructuredTool.from_function(
+            func=_schedule_recurring,
+            name="schedule_recurring",
+            description="Schedule a recurring prompt on a cron expression. Inputs: cron, prompt, optional session, optional max_runs.",
+        ),
+        StructuredTool.from_function(
+            func=_schedule_when,
+            name="schedule_when",
+            description="Schedule a prompt on an event condition. Inputs: condition object, prompt, optional session, optional max_runs.",
+        ),
+        StructuredTool.from_function(
+            func=_list_scheduled_jobs,
+            name="list_scheduled_jobs",
+            description="List scheduled jobs for the current session or an optional session override.",
+        ),
+        StructuredTool.from_function(
+            func=_cancel_scheduled_job,
+            name="cancel_scheduled_job",
+            description="Cancel a scheduled job by id.",
+        ),
+        StructuredTool.from_function(
+            func=_pause_scheduled_job,
+            name="pause_scheduled_job",
+            description="Pause a scheduled job by id.",
+        ),
+        StructuredTool.from_function(
+            func=_resume_scheduled_job,
+            name="resume_scheduled_job",
+            description="Resume a scheduled job by id.",
+        ),
+    ]
+
+
+def create_tools(
+    bus=None,
+    sub_agent_manager=None,
+    signal_consumer=None,
+    scheduler=None,
+    session=None,
+):
     """Create and return all agent tools."""
     tools = [file_read, file_write, file_edit, shell_exec, python_exec, web_fetch, codex_exec, claude_exec]
     # Main agent ("kai") has no workspace, so the sandbox is fully isolated.
@@ -780,6 +922,8 @@ def create_tools(bus=None, sub_agent_manager=None, signal_consumer=None):
     if sub_agent_manager:
         tools.append(create_spawn_agent_tool(sub_agent_manager))
         tools.append(create_list_agents_tool(sub_agent_manager))
+    if scheduler is not None and session is not None:
+        tools.extend(create_scheduler_tools(scheduler, session))
     return tools
 
 

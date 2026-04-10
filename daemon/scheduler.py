@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import tempfile
+import uuid
 from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -326,8 +327,103 @@ class Scheduler:
     def list_jobs(self) -> list[ScheduledJob]:
         return [self._jobs[key] for key in sorted(self._jobs)]
 
+    def list_jobs_for_session(self, session_name: str | None = None) -> list[ScheduledJob]:
+        jobs = self.list_jobs()
+        if session_name is None:
+            return jobs
+        return [job for job in jobs if job.owner_session == session_name]
+
     def get_job(self, job_id: str) -> ScheduledJob | None:
         return self._jobs.get(job_id)
+
+    def create_absolute_job(
+        self,
+        *,
+        when: str,
+        prompt: str,
+        owner_session: str,
+        created_by: Literal["user", "agent"],
+        max_runs: int | None = 1,
+        concurrency: JobConcurrency = "queue",
+        tool_budget: int | None = None,
+    ) -> ScheduledJob:
+        job = ScheduledJob.model_validate(
+            {
+                "id": self._next_job_id(),
+                "type": "absolute",
+                "spec": {"at": when},
+                "prompt": prompt,
+                "owner_session": owner_session,
+                "created_at": _utc_now().replace(microsecond=0).isoformat(),
+                "created_by": created_by,
+                "max_runs": max_runs,
+                "concurrency": concurrency,
+                "tool_budget": tool_budget,
+            }
+        )
+        self.schedule_job(job)
+        return self._jobs[job.id]
+
+    def create_recurring_job(
+        self,
+        *,
+        cron: str,
+        prompt: str,
+        owner_session: str,
+        created_by: Literal["user", "agent"],
+        max_runs: int | None = None,
+        concurrency: JobConcurrency = "queue",
+        tool_budget: int | None = None,
+        timezone_name: str | None = None,
+    ) -> ScheduledJob:
+        job = ScheduledJob.model_validate(
+            {
+                "id": self._next_job_id(),
+                "type": "cron",
+                "spec": {"cron": cron, "tz": timezone_name or self.timezone_name},
+                "prompt": prompt,
+                "owner_session": owner_session,
+                "created_at": _utc_now().replace(microsecond=0).isoformat(),
+                "created_by": created_by,
+                "max_runs": max_runs,
+                "concurrency": concurrency,
+                "tool_budget": tool_budget,
+            }
+        )
+        self.schedule_job(job)
+        return self._jobs[job.id]
+
+    def create_event_job(
+        self,
+        *,
+        condition: dict[str, Any],
+        prompt: str,
+        owner_session: str,
+        created_by: Literal["user", "agent"],
+        max_runs: int | None = None,
+        concurrency: JobConcurrency = "queue",
+        tool_budget: int | None = None,
+    ) -> ScheduledJob:
+        spec = {
+            "channel": condition.get("channel"),
+            "filter": condition.get("filter"),
+        }
+        job = ScheduledJob.model_validate(
+            {
+                "id": self._next_job_id(),
+                "type": "event",
+                "spec": spec,
+                "prompt": prompt,
+                "owner_session": owner_session,
+                "created_at": _utc_now().replace(microsecond=0).isoformat(),
+                "created_by": created_by,
+                "max_runs": max_runs,
+                "concurrency": concurrency,
+                "tool_budget": tool_budget,
+            }
+        )
+        self.schedule_job(job)
+        return self._jobs[job.id]
 
     def load_jobs(self) -> list[ScheduledJob]:
         payload = _read_json_dict(self.jobs_path)
@@ -379,23 +475,28 @@ class Scheduler:
         self._persist_jobs()
         return True
 
-    def pause_job(self, job_id: str) -> None:
-        self._scheduler.pause_job(job_id)
-        job = self._jobs[job_id]
-        self._jobs[job_id] = job.model_copy(update={"status": "paused", "next_run": None})
-        self._persist_jobs()
+    def cancel_job(self, job_id: str) -> ScheduledJob:
+        with suppress(Exception):
+            self._scheduler.remove_job(job_id)
+        return self.update_job(job_id, status="cancelled", next_run=None)
 
-    def resume_job(self, job_id: str) -> None:
-        self._scheduler.resume_job(job_id)
-        next_run = self.next_run(job_id)
+    def pause_job(self, job_id: str) -> ScheduledJob:
         job = self._jobs[job_id]
-        self._jobs[job_id] = job.model_copy(
-            update={
-                "status": "active",
-                "next_run": next_run.isoformat() if next_run is not None else None,
-            }
-        )
-        self._persist_jobs()
+        if job.type in {"absolute", "cron"}:
+            self._scheduler.pause_job(job_id)
+        return self.update_job(job_id, status="paused", next_run=None)
+
+    def resume_job(self, job_id: str) -> ScheduledJob:
+        job = self._jobs[job_id]
+        if job.type in {"absolute", "cron"}:
+            self._scheduler.resume_job(job_id)
+            next_run = self.next_run(job_id)
+            return self.update_job(
+                job_id,
+                status="active",
+                next_run=next_run.isoformat() if next_run is not None else None,
+            )
+        return self.update_job(job_id, status="active")
 
     def next_run(self, job_id: str) -> datetime | None:
         scheduled = self._scheduler.get_job(job_id)
@@ -543,3 +644,8 @@ class Scheduler:
                 continue
             if job.type in {"absolute", "cron"}:
                 self.schedule_job(job, persist=False)
+
+    @staticmethod
+    def _next_job_id() -> str:
+        stamp = _utc_now().strftime("%Y_%m_%d_%H%M%S")
+        return f"job_{stamp}_{uuid.uuid4().hex[:6]}"

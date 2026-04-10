@@ -561,6 +561,7 @@ class Session:
         bus: Any = None,
         agent_name: str = "kai",
         signal_consumer: SignalConsumer | None = None,
+        scheduler: Any = None,
     ) -> AgentRunner:
         """Attach the in-process agent runtime to this session."""
         self.agent_name = agent_name
@@ -571,6 +572,8 @@ class Session:
             bus,
             self.sub_agent_registry if bus is not None else None,
             signal_consumer=self.signal_consumer,
+            scheduler=scheduler,
+            session=self,
         )
         self.agent_runner = AgentRunner(
             tools=tools,
