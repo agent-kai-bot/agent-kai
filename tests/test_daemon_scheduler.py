@@ -7,7 +7,13 @@ import unittest
 from datetime import timedelta
 from pathlib import Path
 
-from daemon.scheduler import ScheduledJob, Scheduler, _utc_now, matches_structured_filter
+from daemon.scheduler import (
+    DaemonEventBus,
+    ScheduledJob,
+    Scheduler,
+    _utc_now,
+    matches_structured_filter,
+)
 
 
 class SchedulerTests(unittest.IsolatedAsyncioTestCase):
@@ -16,101 +22,162 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
     async def test_absolute_jobs_dispatch_through_callback(self):
         fired: list[tuple[str, str]] = []
         created_at = _utc_now().replace(microsecond=0).isoformat()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            async def dispatch(job, fired_at):
+                fired.append((job.id, fired_at.isoformat()))
 
-        async def dispatch(job, fired_at):
-            fired.append((job.id, fired_at.isoformat()))
-
-        scheduler = Scheduler(dispatch_callback=dispatch)
-        await scheduler.start()
-        try:
-            when = (_utc_now() + timedelta(minutes=1)).replace(microsecond=0)
-            job = {
-                "id": "job-absolute",
-                "type": "absolute",
-                "spec": {"at": when.isoformat()},
-                "prompt": "Check BTC",
-                "owner_session": "terminal",
-                "created_at": created_at,
-                "created_by": "user",
-            }
-
-            next_run = scheduler.schedule_job(job)
-            self.assertEqual(next_run, when)
-
-            await scheduler._fire_scheduled_job(job["id"])
-
-            self.assertEqual([item[0] for item in fired], ["job-absolute"])
-            scheduled = scheduler.get_job("job-absolute")
-            self.assertIsNotNone(scheduled)
-            self.assertEqual(scheduled.id, "job-absolute")
-            self.assertEqual(scheduled.prompt, "Check BTC")
-        finally:
-            await scheduler.shutdown()
-
-    async def test_cron_jobs_validate_and_register_next_run(self):
-        scheduler = Scheduler(dispatch_callback=lambda *_args: None)
-        await scheduler.start()
-        try:
-            created_at = _utc_now().replace(microsecond=0).isoformat()
-            next_run = scheduler.schedule_job(
-                {
-                    "id": "job-cron",
-                    "type": "cron",
-                    "spec": {"cron": "*/5 * * * *", "tz": "UTC"},
-                    "prompt": "Recurring check",
-                    "owner_session": "terminal",
-                    "created_at": created_at,
-                    "created_by": "agent",
-                }
+            scheduler = Scheduler(
+                dispatch_callback=dispatch,
+                jobs_path=Path(tmpdir) / "scheduler" / "jobs.json",
             )
-
-            self.assertIsNotNone(next_run)
-            self.assertIsNotNone(scheduler.next_run("job-cron"))
-
-            with self.assertRaisesRegex(ValueError, "valid cron expression"):
-                scheduler.schedule_job(
-                    {
-                        "id": "job-bad-cron",
-                        "type": "cron",
-                        "spec": {"cron": "not a cron"},
-                        "prompt": "Bad recurring check",
-                        "owner_session": "terminal",
-                        "created_at": created_at,
-                        "created_by": "agent",
-                    }
-                )
-        finally:
-            await scheduler.shutdown()
-
-    async def test_pause_resume_and_remove_proxy_to_apscheduler(self):
-        scheduler = Scheduler(dispatch_callback=lambda *_args: None)
-        await scheduler.start()
-        try:
-            when = (_utc_now() + timedelta(minutes=1)).replace(microsecond=0)
-            created_at = _utc_now().replace(microsecond=0).isoformat()
-            scheduler.schedule_job(
-                {
-                    "id": "job-ops",
+            await scheduler.start()
+            try:
+                when = (_utc_now() + timedelta(minutes=1)).replace(microsecond=0)
+                job = {
+                    "id": "job-absolute",
                     "type": "absolute",
                     "spec": {"at": when.isoformat()},
-                    "prompt": "Ops check",
+                    "prompt": "Check BTC",
                     "owner_session": "terminal",
                     "created_at": created_at,
                     "created_by": "user",
                 }
+
+                next_run = scheduler.schedule_job(job, persist=False)
+                self.assertEqual(next_run, when)
+
+                await scheduler._fire_scheduled_job(job["id"])
+
+                self.assertEqual([item[0] for item in fired], ["job-absolute"])
+                scheduled = scheduler.get_job("job-absolute")
+                self.assertIsNotNone(scheduled)
+                self.assertEqual(scheduled.id, "job-absolute")
+                self.assertEqual(scheduled.prompt, "Check BTC")
+            finally:
+                await scheduler.shutdown()
+
+    async def test_cron_jobs_validate_and_register_next_run(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scheduler = Scheduler(
+                dispatch_callback=lambda *_args: None,
+                jobs_path=Path(tmpdir) / "scheduler" / "jobs.json",
             )
+            await scheduler.start()
+            try:
+                created_at = _utc_now().replace(microsecond=0).isoformat()
+                next_run = scheduler.schedule_job(
+                    {
+                        "id": "job-cron",
+                        "type": "cron",
+                        "spec": {"cron": "*/5 * * * *", "tz": "UTC"},
+                        "prompt": "Recurring check",
+                        "owner_session": "terminal",
+                        "created_at": created_at,
+                        "created_by": "agent",
+                    },
+                    persist=False,
+                )
 
-            scheduler.pause_job("job-ops")
-            self.assertIsNone(scheduler.next_run("job-ops"))
+                self.assertIsNotNone(next_run)
+                self.assertIsNotNone(scheduler.next_run("job-cron"))
 
-            scheduler.resume_job("job-ops")
-            self.assertIsNotNone(scheduler.next_run("job-ops"))
+                with self.assertRaisesRegex(ValueError, "valid cron expression"):
+                    scheduler.schedule_job(
+                        {
+                            "id": "job-bad-cron",
+                            "type": "cron",
+                            "spec": {"cron": "not a cron"},
+                            "prompt": "Bad recurring check",
+                            "owner_session": "terminal",
+                            "created_at": created_at,
+                            "created_by": "agent",
+                        },
+                        persist=False,
+                    )
+            finally:
+                await scheduler.shutdown()
 
-            removed = scheduler.remove_job("job-ops")
-            self.assertTrue(removed)
-            self.assertIsNone(scheduler.get_job("job-ops"))
-        finally:
-            await scheduler.shutdown()
+    async def test_pause_resume_and_remove_proxy_to_apscheduler(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scheduler = Scheduler(
+                dispatch_callback=lambda *_args: None,
+                jobs_path=Path(tmpdir) / "scheduler" / "jobs.json",
+            )
+            await scheduler.start()
+            try:
+                when = (_utc_now() + timedelta(minutes=1)).replace(microsecond=0)
+                created_at = _utc_now().replace(microsecond=0).isoformat()
+                scheduler.schedule_job(
+                    {
+                        "id": "job-ops",
+                        "type": "absolute",
+                        "spec": {"at": when.isoformat()},
+                        "prompt": "Ops check",
+                        "owner_session": "terminal",
+                        "created_at": created_at,
+                        "created_by": "user",
+                    },
+                    persist=False,
+                )
+
+                scheduler.pause_job("job-ops")
+                self.assertIsNone(scheduler.next_run("job-ops"))
+
+                scheduler.resume_job("job-ops")
+                self.assertIsNotNone(scheduler.next_run("job-ops"))
+
+                removed = scheduler.remove_job("job-ops")
+                self.assertTrue(removed)
+                self.assertIsNone(scheduler.get_job("job-ops"))
+            finally:
+                await scheduler.shutdown()
+
+    async def test_event_jobs_fire_when_daemon_event_bus_matches(self):
+        fired: list[str] = []
+        created_at = _utc_now().replace(microsecond=0).isoformat()
+        event_bus = DaemonEventBus()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            async def dispatch(job, _fired_at):
+                fired.append(job.id)
+
+            scheduler = Scheduler(
+                dispatch_callback=dispatch,
+                event_bus=event_bus,
+                jobs_path=Path(tmpdir) / "scheduler" / "jobs.json",
+            )
+            await scheduler.start()
+            try:
+                scheduler.schedule_job(
+                    {
+                        "id": "job-event-match",
+                        "type": "event",
+                        "spec": {
+                            "channel": "signals",
+                            "filter": {
+                                "symbol": "BTC",
+                                "score": {"gte": 0.9},
+                            },
+                        },
+                        "prompt": "Summarize the signal",
+                        "owner_session": "terminal",
+                        "created_at": created_at,
+                        "created_by": "agent",
+                    },
+                    persist=False,
+                )
+
+                await event_bus.publish(
+                    "signals",
+                    {"symbol": "ETH", "score": 0.95},
+                )
+                await event_bus.publish(
+                    "signals",
+                    {"symbol": "BTC", "score": 0.95},
+                )
+
+                self.assertEqual(fired, ["job-event-match"])
+            finally:
+                await scheduler.shutdown()
 
     def test_event_jobs_validate_structured_filters(self):
         created_at = _utc_now().replace(microsecond=0).isoformat()

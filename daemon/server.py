@@ -14,6 +14,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent.signal_consumer import Signal, SignalConsumer
 from config import DEFAULT_AGENT, NATS_URL
 from daemon.core import (
     Session,
@@ -23,6 +24,7 @@ from daemon.core import (
     remove_indexed_session,
     serialize_messages,
 )
+from daemon.scheduler import DaemonEventBus, Scheduler
 from daemon.protocol import (
     AttachEnvelope,
     ChartBarEnvelope,
@@ -80,12 +82,17 @@ class DaemonServer:
         agent_name: str = DEFAULT_AGENT,
         nats_url: str = NATS_URL,
         bus_factory: Callable[[str, str], Any] | None = None,
+        scheduler_factory: Callable[..., Scheduler] | None = None,
     ) -> None:
         self.agent_name = agent_name
         self.nats_url = nats_url
         self.bus_factory = bus_factory or self._default_bus_factory
+        self.scheduler_factory = scheduler_factory or Scheduler
         self.bus: Any | None = None
         self.sessions: dict[str, ManagedSession] = {}
+        self.event_bus = DaemonEventBus()
+        self.signal_consumer = SignalConsumer()
+        self.scheduler: Scheduler | None = None
         self.log = logging.getLogger(__name__)
 
     @staticmethod
@@ -94,25 +101,37 @@ class DaemonServer:
 
     async def startup(self) -> None:
         """Connect shared resources used by daemon-backed sessions."""
+        self.signal_consumer.on_signal = self._handle_signal
         if self.bus_factory is None:
             self.bus = None
-            return
+        else:
+            try:
+                bus = self.bus_factory(self.nats_url, self.agent_name)
+                await bus.connect()
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("daemon bus connect failed: %s", exc)
+                self.bus = None
+            else:
+                self.bus = bus
+                with suppress(Exception):
+                    await self.signal_consumer.subscribe(bus)
 
-        try:
-            bus = self.bus_factory(self.nats_url, self.agent_name)
-            await bus.connect()
-        except Exception as exc:  # noqa: BLE001
-            self.log.warning("daemon bus connect failed: %s", exc)
-            self.bus = None
-            return
-
-        self.bus = bus
+        self.scheduler = self.scheduler_factory(
+            dispatch_callback=self._handle_scheduled_job_trigger,
+            event_bus=self.event_bus,
+        )
+        await self.scheduler.start()
 
     async def shutdown(self) -> None:
         """Stop all managed runtime resources."""
         for managed in self.sessions.values():
             with suppress(Exception):
                 await managed.session.sub_agent_registry.stop_all()
+
+        if self.scheduler is not None:
+            with suppress(Exception):
+                await self.scheduler.shutdown()
+            self.scheduler = None
 
         if self.bus is not None:
             with suppress(Exception):
@@ -136,7 +155,11 @@ class DaemonServer:
             raise KeyError(f"session '{name}' does not exist")
 
         session.load()
-        session.attach_runtime(bus=self.bus, agent_name=self.agent_name)
+        session.attach_runtime(
+            bus=self.bus,
+            agent_name=self.agent_name,
+            signal_consumer=self.signal_consumer,
+        )
         session.touch_index()
 
         managed = ManagedSession(session=session)
@@ -156,6 +179,25 @@ class DaemonServer:
                 managed.session.set_activity_status("idle")
                 with suppress(Exception):
                     managed.session.save()
+
+    async def publish_daemon_event(self, channel: str, payload: dict[str, Any]) -> None:
+        """Publish one daemon-scoped event to scheduler subscribers."""
+        await self.event_bus.publish(channel, payload)
+
+    async def _handle_scheduled_job_trigger(self, job, fired_at) -> None:
+        """Placeholder until Phase 5 wires scheduler dispatch into sessions."""
+        self.log.info("scheduled job fired job_id=%s at %s", job.id, fired_at.isoformat())
+
+    def _handle_signal(self, signal: Signal) -> None:
+        """Fan out shared signal events to live sessions and the daemon bus."""
+        payload = signal.to_dict()
+        for managed in self.sessions.values():
+            managed.session.publish_event("signal.received", {"signal": payload})
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self.publish_daemon_event("signals", payload))
 
     def describe_session(self, name: str) -> dict[str, Any]:
         """Return one session summary suitable for REST and slash listings."""
@@ -376,12 +418,14 @@ def create_app(
     agent_name: str = DEFAULT_AGENT,
     nats_url: str = NATS_URL,
     bus_factory: Callable[[str, str], Any] | None = None,
+    scheduler_factory: Callable[..., Scheduler] | None = None,
 ) -> FastAPI:
     """Build the FastAPI app that exposes the daemon WebSocket server."""
     daemon_server = DaemonServer(
         agent_name=agent_name,
         nats_url=nats_url,
         bus_factory=bus_factory,
+        scheduler_factory=scheduler_factory,
     )
 
     @asynccontextmanager
