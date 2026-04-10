@@ -9,7 +9,6 @@ from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
-import websockets
 from langchain_core.messages import AIMessage, HumanMessage
 
 from daemon.core import DEFAULT_SESSION_NAME, SessionUIState, deserialize_messages
@@ -28,6 +27,11 @@ from daemon.protocol import (
     encode_envelope,
 )
 from daemon.server import DEFAULT_DAEMON_WS_PATH, DEFAULT_DAEMON_WS_URL
+
+try:
+    from websockets.asyncio.client import connect as websocket_connect
+except ImportError:  # pragma: no cover - compatibility with older websockets
+    from websockets import connect as websocket_connect
 
 
 @dataclass(frozen=True)
@@ -60,7 +64,7 @@ class RemoteSession:
         self.signal_consumer = None
         self.sub_agent_manager = None
         self.paths = RemoteSessionPaths()
-        self._connection_factory = connection_factory or websockets.connect
+        self._connection_factory = connection_factory or websocket_connect
         self._websocket = None
         self._connected = False
         self._stream_lock = asyncio.Lock()
@@ -216,4 +220,3 @@ class RemoteSession:
             raise RuntimeError("remote session is not connected")
         raw = await self._websocket.recv()
         return decode_server_envelope(raw)
-
