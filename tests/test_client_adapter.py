@@ -70,6 +70,42 @@ class RemoteSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attach["type"], "attach")
         self.assertEqual(attach["session"], "terminal")
 
+    async def test_connect_uses_named_session_in_attach_envelope(self):
+        websocket = _FakeWebSocket(
+            [
+                {
+                    "type": "session_attached",
+                    "session": "btc-scalper",
+                    "state": {
+                        "chart_symbol": "BTC",
+                        "chart_timeframe": "1m",
+                        "chart_source": "kai-api",
+                        "chart_layout_mode": "dashboard",
+                        "chart_color_scheme": "classic",
+                        "watchlist_symbols": ["BTC", "ETH"],
+                        "autotrade_enabled": False,
+                        "activity_status": "idle",
+                        "chat_history": [],
+                    },
+                },
+                {"type": "status", "activity": "idle", "queue": 0},
+            ]
+        )
+
+        async def factory(_url: str):
+            return websocket
+
+        session = RemoteSession(
+            "ws://127.0.0.1:8765",
+            session_name="btc-scalper",
+            connection_factory=factory,
+        )
+        await session.connect()
+
+        attach = json.loads(websocket.sent[0])
+        self.assertEqual(attach["type"], "attach")
+        self.assertEqual(attach["session"], "btc-scalper")
+
     async def test_stream_agent_events_translates_protocol_messages(self):
         websocket = _FakeWebSocket(
             [
