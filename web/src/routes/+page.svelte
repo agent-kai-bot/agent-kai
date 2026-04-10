@@ -446,9 +446,9 @@
         </div>
 
         <p class="token-hint">
-          Remote clients should use the daemon bearer token from
-          <code>workspaces/daemon-token.txt</code>. Localhost attaches can continue
-          without a token until Phase 7 enables enforcement.
+          Remote or proxied clients should use the daemon bearer token from
+          <code>workspaces/daemon-token.txt</code>. Direct localhost sessions can
+          still attach without one.
         </p>
 
         {#if attachError}

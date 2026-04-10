@@ -8,7 +8,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import quote, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, urlparse, urlunparse
 
 import aiohttp
 
@@ -66,6 +66,7 @@ class RemoteSession:
     ) -> None:
         self.remote_url = self._normalize_remote_url(remote_url)
         self.api_base_url = self._derive_api_base_url(self.remote_url)
+        self.auth_token = self._extract_auth_token(self.remote_url)
         self.name = session_name
         self.create_if_missing = create_if_missing
         self.ui_state = SessionUIState()
@@ -109,6 +110,19 @@ class RemoteSession:
                 fragment="",
             )
         )
+
+    @staticmethod
+    def _extract_auth_token(remote_url: str) -> str | None:
+        """Reuse a websocket query token for daemon REST calls."""
+        parsed = urlparse(remote_url)
+        token = parse_qs(parsed.query).get("token", [""])[0].strip()
+        return token or None
+
+    def _build_auth_headers(self) -> dict[str, str] | None:
+        """Return bearer auth headers when the remote URL carries a token."""
+        if not self.auth_token:
+            return None
+        return {"Authorization": f"Bearer {self.auth_token}"}
 
     async def connect(self) -> None:
         """Open the WS connection and attach to the target daemon session."""
@@ -261,7 +275,12 @@ class RemoteSession:
         """Issue one JSON REST request against the daemon HTTP API."""
         url = f"{self.api_base_url}{path}"
         async with aiohttp.ClientSession() as client:
-            async with client.request(method, url, json=payload) as response:
+            async with client.request(
+                method,
+                url,
+                json=payload,
+                headers=self._build_auth_headers(),
+            ) as response:
                 data = await response.json()
                 if response.status >= 400:
                     detail = data.get("detail") if isinstance(data, dict) else None

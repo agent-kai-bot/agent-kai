@@ -179,6 +179,15 @@ class RemoteSessionTests(unittest.IsolatedAsyncioTestCase):
             "/api/sessions/swing%20trader",
         )
 
+    async def test_remote_query_token_is_reused_for_rest_headers(self):
+        session = RemoteSession("ws://127.0.0.1:8765/ws?token=secret-token")
+
+        self.assertEqual(session.auth_token, "secret-token")
+        self.assertEqual(
+            session._build_auth_headers(),
+            {"Authorization": "Bearer secret-token"},
+        )
+
     async def test_translate_scheduled_job_envelopes(self):
         websocket = _FakeWebSocket(
             [

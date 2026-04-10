@@ -764,6 +764,95 @@ class DaemonServerRestTests(unittest.TestCase):
             load_chart_history.assert_called_once_with("BTC", "1h", "coinbase", 120)
 
 
+class DaemonServerAuthTests(unittest.TestCase):
+    """Validate Phase 7 token enforcement on REST and websocket paths."""
+
+    @staticmethod
+    def _make_client(
+        token_path: Path,
+        *,
+        allow_unauthenticated_local: bool = False,
+    ) -> TestClient:
+        app = create_app(
+            agent_name="kai",
+            nats_url="nats://unit-test",
+            bus_factory=_FakeBus,
+            token_path=token_path,
+            allow_unauthenticated_local=allow_unauthenticated_local,
+        )
+        return TestClient(app)
+
+    def test_rest_requires_bearer_token_when_local_bypass_is_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir) / "sessions"
+            token_path = Path(tmpdir) / "daemon-token.txt"
+            token_path.write_text("secret-token\n", encoding="utf-8")
+
+            with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+            ):
+                with self._make_client(token_path) as client:
+                    unauthorized = client.get("/api/sessions")
+                    self.assertEqual(unauthorized.status_code, 401)
+                    self.assertEqual(
+                        unauthorized.json()["detail"],
+                        "daemon bearer token required",
+                    )
+
+                    authorized = client.get(
+                        "/api/sessions",
+                        headers={"Authorization": "Bearer secret-token"},
+                    )
+                    self.assertEqual(authorized.status_code, 200)
+                    self.assertEqual(authorized.json(), {"sessions": []})
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    def test_websocket_rejects_unauthorized_client(self, attach_runtime):
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir) / "sessions"
+            token_path = Path(tmpdir) / "daemon-token.txt"
+            token_path.write_text("secret-token\n", encoding="utf-8")
+
+            with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+            ):
+                with self._make_client(token_path) as client:
+                    with client.websocket_connect("/ws") as websocket:
+                        error = websocket.receive_json()
+
+                        self.assertEqual(error["type"], "error")
+                        self.assertEqual(error["code"], "unauthorized")
+                        self.assertIn("bearer token", error["message"])
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    def test_websocket_accepts_token_query_parameter(self, attach_runtime):
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir) / "sessions"
+            token_path = Path(tmpdir) / "daemon-token.txt"
+            token_path.write_text("secret-token\n", encoding="utf-8")
+
+            with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+            ):
+                with self._make_client(token_path) as client:
+                    with client.websocket_connect("/ws?token=secret-token") as websocket:
+                        websocket.send_json(
+                            {
+                                "type": "attach",
+                                "session": "terminal",
+                                "create_if_missing": True,
+                            }
+                        )
+
+                        attached = websocket.receive_json()
+                        self.assertEqual(attached["type"], "session_attached")
+                        self.assertEqual(attached["session"], "terminal")
+
+
 class DaemonServerWebAssetTests(unittest.TestCase):
     """Validate the Phase 6 static web asset mounting."""
 

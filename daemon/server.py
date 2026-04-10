@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import secrets
 import shlex
 import shutil
 import time
@@ -15,12 +16,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent.signal_consumer import Signal, SignalConsumer
 from config import DEFAULT_AGENT, NATS_URL
+from daemon.auth import DAEMON_TOKEN_PATH, ensure_daemon_token, is_local_client_host, parse_bearer_token
 from daemon.core import (
     Session,
     SessionEvent,
@@ -229,16 +231,22 @@ class DaemonServer:
         nats_url: str = NATS_URL,
         bus_factory: Callable[[str, str], Any] | None = None,
         scheduler_factory: Callable[..., Scheduler] | None = None,
+        token_path: str | Path | None = None,
+        allow_unauthenticated_local: bool = True,
     ) -> None:
         self.agent_name = agent_name
         self.nats_url = nats_url
         self.bus_factory = bus_factory or self._default_bus_factory
         self.scheduler_factory = scheduler_factory or Scheduler
+        self.token_path = Path(token_path) if token_path is not None else DAEMON_TOKEN_PATH
+        self.allow_unauthenticated_local = allow_unauthenticated_local
         self.bus: Any | None = None
         self.sessions: dict[str, ManagedSession] = {}
         self.event_bus = DaemonEventBus()
         self.signal_consumer = SignalConsumer()
         self.scheduler: Scheduler | None = None
+        self.daemon_token = ""
+        self.started_at_monotonic: float | None = None
         self.log = logging.getLogger(__name__)
 
     @staticmethod
@@ -247,6 +255,8 @@ class DaemonServer:
 
     async def startup(self) -> None:
         """Connect shared resources used by daemon-backed sessions."""
+        self.daemon_token = ensure_daemon_token(self.token_path)
+        self.started_at_monotonic = time.monotonic()
         self.signal_consumer.on_signal = self._handle_signal
         if self.bus_factory is None:
             self.bus = None
@@ -286,6 +296,31 @@ class DaemonServer:
             with suppress(Exception):
                 await self.bus.disconnect()
             self.bus = None
+
+    def _is_authorized(self, *, token: str | None, client_host: str | None) -> bool:
+        if token and self.daemon_token and secrets.compare_digest(token, self.daemon_token):
+            return True
+        return self.allow_unauthenticated_local and is_local_client_host(client_host)
+
+    def require_http_auth(self, request: Request) -> None:
+        """Reject unauthorized REST requests."""
+        client_host = request.client.host if request.client is not None else None
+        token = parse_bearer_token(request.headers.get("authorization"))
+        if self._is_authorized(token=token, client_host=client_host):
+            return
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="daemon bearer token required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    def authorize_websocket(self, websocket: WebSocket) -> bool:
+        """Validate websocket auth before the attach handshake."""
+        client_host = websocket.client.host if websocket.client is not None else None
+        token = parse_bearer_token(websocket.headers.get("authorization"))
+        if token is None:
+            token = websocket.query_params.get("token")
+        return self._is_authorized(token=token, client_host=client_host)
 
     async def get_or_create_session(
         self,
@@ -840,6 +875,8 @@ def create_app(
     bus_factory: Callable[[str, str], Any] | None = None,
     scheduler_factory: Callable[..., Scheduler] | None = None,
     web_build_dir: str | Path | None = None,
+    token_path: str | Path | None = None,
+    allow_unauthenticated_local: bool = True,
 ) -> FastAPI:
     """Build the FastAPI app that exposes the daemon WebSocket server."""
     daemon_server = DaemonServer(
@@ -847,6 +884,8 @@ def create_app(
         nats_url=nats_url,
         bus_factory=bus_factory,
         scheduler_factory=scheduler_factory,
+        token_path=token_path,
+        allow_unauthenticated_local=allow_unauthenticated_local,
     )
 
     @asynccontextmanager
@@ -862,7 +901,8 @@ def create_app(
     build_dir = Path(web_build_dir) if web_build_dir is not None else DEFAULT_WEB_BUILD_DIR
 
     @app.get("/api/health")
-    async def health_endpoint() -> dict[str, Any]:
+    async def health_endpoint(request: Request) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
         return {
             "status": "ok",
             "agent_name": daemon_server.agent_name,
@@ -871,11 +911,13 @@ def create_app(
         }
 
     @app.get("/api/sessions")
-    async def list_sessions_endpoint() -> dict[str, Any]:
+    async def list_sessions_endpoint(request: Request) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
         return {"sessions": daemon_server.list_sessions()}
 
     @app.get("/api/market/watchlist")
-    async def watchlist_endpoint(symbols: str = "") -> dict[str, Any]:
+    async def watchlist_endpoint(request: Request, symbols: str = "") -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
         requested = []
         seen: set[str] = set()
         for raw_symbol in symbols.split(","):
@@ -896,11 +938,13 @@ def create_app(
 
     @app.get("/api/market/ohlcv")
     async def market_ohlcv_endpoint(
+        request: Request,
         symbol: str,
         interval: str = "1m",
         source: str = "kai-api",
         limit: int = 300,
     ) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
         try:
             bars = await asyncio.to_thread(
                 _load_chart_history,
@@ -922,7 +966,8 @@ def create_app(
         return {"bars": bars}
 
     @app.get("/api/portfolio")
-    async def portfolio_endpoint() -> dict[str, Any]:
+    async def portfolio_endpoint(request: Request) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
         try:
             snapshot = await asyncio.to_thread(_load_portfolio_snapshot)
         except Exception as exc:  # noqa: BLE001
@@ -933,7 +978,8 @@ def create_app(
         return snapshot
 
     @app.post("/api/sessions", status_code=status.HTTP_201_CREATED)
-    async def create_session_endpoint(payload: SessionCreateRequest) -> dict[str, Any]:
+    async def create_session_endpoint(request: Request, payload: SessionCreateRequest) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
         try:
             session_info = await daemon_server.create_session(payload.name)
         except FileExistsError as exc:
@@ -949,7 +995,8 @@ def create_app(
         return {"session": session_info}
 
     @app.delete("/api/sessions/{session_name}")
-    async def delete_session_endpoint(session_name: str) -> dict[str, Any]:
+    async def delete_session_endpoint(request: Request, session_name: str) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
         try:
             return await daemon_server.delete_session(session_name)
         except KeyError as exc:
@@ -966,6 +1013,11 @@ def create_app(
     @app.websocket(DEFAULT_DAEMON_WS_PATH)
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.accept()
+
+        if not daemon_server.authorize_websocket(websocket):
+            await _send_error(websocket, "unauthorized", "daemon bearer token required")
+            await websocket.close(code=1008)
+            return
 
         try:
             first_message = await _receive_client_envelope(websocket)
