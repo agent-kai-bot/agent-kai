@@ -1,5 +1,6 @@
 """LangChain agent core — AgentRunner wrapping AgentExecutor with fallback."""
 
+from contextlib import contextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -549,6 +550,25 @@ class AgentRunner:
             "provider": ep.get("provider") if ep else None,
             "fallback_count": len(self.fallback_executors),
         }
+
+    @contextmanager
+    def override_max_iterations(self, max_iterations: int | None):
+        """Temporarily override the iteration budget for one run."""
+        if max_iterations is None:
+            yield
+            return
+
+        executors = [self.executor, *self.fallback_executors]
+        originals = [getattr(executor, "max_iterations", None) for executor in executors]
+        for executor in executors:
+            if hasattr(executor, "max_iterations"):
+                executor.max_iterations = max_iterations
+        try:
+            yield
+        finally:
+            for executor, original in zip(executors, originals):
+                if original is not None:
+                    executor.max_iterations = original
 
     async def run(self, user_input: str) -> AsyncIterator[dict]:
         """Stream agent events. Falls back to secondary endpoint on error."""

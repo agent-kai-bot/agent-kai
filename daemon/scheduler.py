@@ -292,6 +292,7 @@ class Scheduler:
         jobs_path: Path = SCHEDULER_JOBS_PATH,
         event_bus: DaemonEventBus | None = None,
         event_callback: SchedulerEventCallback | None = None,
+        session_job_limit: int = 50,
     ) -> None:
         self.dispatch_callback = dispatch_callback
         self.timezone_name = timezone_name
@@ -300,6 +301,7 @@ class Scheduler:
         self.jobs_path = jobs_path
         self.event_bus = event_bus
         self.event_callback = event_callback
+        self.session_job_limit = session_job_limit
         self._jobs: dict[str, ScheduledJob] = {}
         self._started = False
         self._event_callback: EventCallback | None = None
@@ -337,6 +339,13 @@ class Scheduler:
             return jobs
         return [job for job in jobs if job.owner_session == session_name]
 
+    def active_job_count(self, session_name: str) -> int:
+        return sum(
+            1
+            for job in self._jobs.values()
+            if job.owner_session == session_name and job.status == "active"
+        )
+
     def get_job(self, job_id: str) -> ScheduledJob | None:
         return self._jobs.get(job_id)
 
@@ -351,6 +360,7 @@ class Scheduler:
         concurrency: JobConcurrency = "queue",
         tool_budget: int | None = None,
     ) -> ScheduledJob:
+        self._enforce_session_job_limit(owner_session)
         job = ScheduledJob.model_validate(
             {
                 "id": self._next_job_id(),
@@ -381,6 +391,7 @@ class Scheduler:
         tool_budget: int | None = None,
         timezone_name: str | None = None,
     ) -> ScheduledJob:
+        self._enforce_session_job_limit(owner_session)
         job = ScheduledJob.model_validate(
             {
                 "id": self._next_job_id(),
@@ -410,6 +421,7 @@ class Scheduler:
         concurrency: JobConcurrency = "queue",
         tool_budget: int | None = None,
     ) -> ScheduledJob:
+        self._enforce_session_job_limit(owner_session)
         spec = {
             "channel": condition.get("channel"),
             "filter": condition.get("filter"),
@@ -488,6 +500,16 @@ class Scheduler:
         updated = self.update_job(job_id, status="cancelled", next_run=None)
         self._emit_event("cancelled", updated)
         return updated
+
+    def pause_all_jobs(self, session_name: str | None = None) -> list[ScheduledJob]:
+        paused: list[ScheduledJob] = []
+        for job in list(self._jobs.values()):
+            if session_name is not None and job.owner_session != session_name:
+                continue
+            if job.status != "active":
+                continue
+            paused.append(self.pause_job(job.id))
+        return paused
 
     def pause_job(self, job_id: str) -> ScheduledJob:
         job = self._jobs[job_id]
@@ -671,6 +693,12 @@ class Scheduler:
     def _next_job_id() -> str:
         stamp = _utc_now().strftime("%Y_%m_%d_%H%M%S")
         return f"job_{stamp}_{uuid.uuid4().hex[:6]}"
+
+    def _enforce_session_job_limit(self, owner_session: str) -> None:
+        if self.active_job_count(owner_session) >= self.session_job_limit:
+            raise ValueError(
+                f"session '{owner_session}' already has {self.session_job_limit} active scheduled jobs"
+            )
 
     def _emit_event(self, event_type: str, job: ScheduledJob, **payload: Any) -> None:
         if self.event_callback is None:

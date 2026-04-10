@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -136,6 +137,35 @@ class SessionEventBusTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(events[0]["type"], "token")
         self.assertEqual(token_event.payload["value"], "hello")
+
+    async def test_stream_agent_events_applies_tool_budget_override(self):
+        session = Session("alpha")
+        overrides: list[int | None] = []
+
+        @contextmanager
+        def override_max_iterations(limit):
+            overrides.append(limit)
+            yield
+
+        async def fake_run(_user_input):
+            yield {"type": "final", "data": "done"}
+
+        session.agent_runner = mock.Mock()
+        session.agent_runner.run = fake_run
+        session.agent_runner.override_max_iterations = override_max_iterations
+
+        events = [
+            event
+            async for event in session.stream_agent_events(
+                "ping",
+                source="scheduler",
+                job_id="job-1",
+                tool_budget=3,
+            )
+        ]
+
+        self.assertEqual(overrides, [3])
+        self.assertEqual(events[0]["type"], "final")
 
 
 class SessionPersistenceTests(unittest.TestCase):

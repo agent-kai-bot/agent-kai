@@ -20,6 +20,13 @@ from daemon.protocol import (
     ChartBarEnvelope,
     ErrorEnvelope,
     FinalEnvelope,
+    ScheduledJobCancelledEnvelope,
+    ScheduledJobCompletedEnvelope,
+    ScheduledJobCreatedEnvelope,
+    ScheduledJobFailedEnvelope,
+    ScheduledJobPausedEnvelope,
+    ScheduledJobResumedEnvelope,
+    ScheduledJobTriggeredEnvelope,
     SessionAttachedEnvelope,
     SignalEnvelope,
     StatusEnvelope,
@@ -286,6 +293,18 @@ class RemoteSession:
             self.chat_history.append(AIMessage(content=envelope.text))
             self.agent_runner.chat_history = self.chat_history
             return {"type": "final", "data": envelope.text}
+
+        if isinstance(
+            envelope,
+            ScheduledJobCreatedEnvelope
+            | ScheduledJobTriggeredEnvelope
+            | ScheduledJobCompletedEnvelope
+            | ScheduledJobFailedEnvelope
+            | ScheduledJobCancelledEnvelope
+            | ScheduledJobPausedEnvelope
+            | ScheduledJobResumedEnvelope,
+        ):
+            return {"type": envelope.type, "data": encode_envelope(envelope)}
 
         if isinstance(envelope, ErrorEnvelope):
             return {"type": "error", "data": envelope.message}

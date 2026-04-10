@@ -282,6 +282,35 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([job.id for job in loaded], ["job-persisted"])
             self.assertEqual(second.get_job("job-persisted").prompt, "Reload me")
 
+    async def test_session_job_limit_rejects_extra_active_jobs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scheduler = Scheduler(
+                dispatch_callback=lambda *_args: None,
+                jobs_path=Path(tmpdir) / "scheduler" / "jobs.json",
+                session_job_limit=1,
+            )
+            await scheduler.start()
+            try:
+                scheduler.create_absolute_job(
+                    when="2026-04-10T01:00:00+00:00",
+                    prompt="First job",
+                    owner_session="alpha",
+                    created_by="user",
+                )
+
+                with self.assertRaisesRegex(ValueError, "already has 1 active"):
+                    scheduler.create_event_job(
+                        condition={
+                            "channel": "signals",
+                            "filter": {"symbol": "BTC"},
+                        },
+                        prompt="Second job",
+                        owner_session="alpha",
+                        created_by="user",
+                    )
+            finally:
+                await scheduler.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

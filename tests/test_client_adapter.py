@@ -179,6 +179,40 @@ class RemoteSessionTests(unittest.IsolatedAsyncioTestCase):
             "/api/sessions/swing%20trader",
         )
 
+    async def test_translate_scheduled_job_envelopes(self):
+        websocket = _FakeWebSocket(
+            [
+                {
+                    "type": "session_attached",
+                    "session": "terminal",
+                    "state": {
+                        "chart_symbol": "BTC",
+                        "chart_timeframe": "1m",
+                        "chart_source": "kai-api",
+                        "chart_layout_mode": "dashboard",
+                        "chart_color_scheme": "classic",
+                        "watchlist_symbols": ["BTC", "ETH", "SOL"],
+                        "autotrade_enabled": False,
+                        "activity_status": "idle",
+                        "chat_history": [],
+                    },
+                },
+                {"type": "status", "activity": "idle", "queue": 0},
+                {"type": "scheduled_job_created", "job": {"id": "job-1", "type": "absolute"}},
+            ]
+        )
+
+        async def factory(_url: str):
+            return websocket
+
+        session = RemoteSession("ws://127.0.0.1:8765", connection_factory=factory)
+        await session.connect()
+
+        event = await session.next_event()
+
+        self.assertEqual(event["type"], "scheduled_job_created")
+        self.assertEqual(event["data"]["job"]["id"], "job-1")
+
 
 if __name__ == "__main__":
     unittest.main()

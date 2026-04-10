@@ -11,7 +11,7 @@ import fcntl
 import json
 import os
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -511,6 +511,8 @@ class Session:
         self.signal_consumer: Any = None
         self.event_bus = SessionEventBus(self.name)
         self.agent_name: str | None = None
+        self.current_source: str = "user"
+        self.current_job_id: str | None = None
 
         self.sub_agent_pool = SessionSubAgentPool(
             session_name=self.name,
@@ -676,6 +678,7 @@ class Session:
         *,
         source: str = "user",
         job_id: str | None = None,
+        tool_budget: int | None = None,
     ):
         """Stream agent events through the session bus."""
         if self.agent_runner is None:
@@ -689,12 +692,27 @@ class Session:
             "input.received",
             {"text": user_input, "source": source, "job_id": job_id},
         )
-        async for event in self.agent_runner.run(user_input):
-            etype = event.get("type", "unknown")
-            data = event.get("data")
-            payload = data if isinstance(data, dict) else {"value": data}
-            self.publish_event(f"agent.{etype}", payload)
-            yield event
+        previous_source = self.current_source
+        previous_job_id = self.current_job_id
+        self.current_source = source
+        self.current_job_id = job_id
+        budget_override = getattr(self.agent_runner, "override_max_iterations", None)
+        budget_context = (
+            budget_override(tool_budget)
+            if tool_budget is not None and callable(budget_override)
+            else nullcontext()
+        )
+        try:
+            with budget_context:
+                async for event in self.agent_runner.run(user_input):
+                    etype = event.get("type", "unknown")
+                    data = event.get("data")
+                    payload = data if isinstance(data, dict) else {"value": data}
+                    self.publish_event(f"agent.{etype}", payload)
+                    yield event
+        finally:
+            self.current_source = previous_source
+            self.current_job_id = previous_job_id
 
     def __repr__(self) -> str:
         return (
