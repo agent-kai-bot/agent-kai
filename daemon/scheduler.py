@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import fcntl
 import inspect
+import json
 import logging
+import os
 import re
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, Literal
 from zoneinfo import ZoneInfo
 
@@ -17,11 +23,15 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from config import WORKSPACES_DIR
+
 NonEmptyString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 JobType = Literal["absolute", "cron", "event"]
 JobStatus = Literal["active", "paused", "completed", "failed", "cancelled"]
 JobConcurrency = Literal["skip", "queue"]
 DispatchCallback = Callable[["ScheduledJob", datetime], Awaitable[None] | None]
+SCHEDULER_ROOT_DIR = Path(WORKSPACES_DIR) / "scheduler"
+SCHEDULER_JOBS_PATH = SCHEDULER_ROOT_DIR / "jobs.json"
 
 STRUCTURED_FILTER_SCHEMA = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -83,6 +93,50 @@ def _parse_datetime(value: str) -> datetime:
 
 def _coerce_timezone(value: str | None) -> ZoneInfo:
     return ZoneInfo(value or "UTC")
+
+
+@contextmanager
+def _json_file_lock(path: Path):
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "w", encoding="utf-8")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield handle
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+
+
+def _read_json_dict(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    if not raw.strip():
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_json_dict_unlocked(path: Path, payload: dict[str, Any]) -> None:
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.stem}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
 
 
 def validate_structured_filter(filter_spec: dict[str, Any]) -> dict[str, Any]:
@@ -199,11 +253,13 @@ class Scheduler:
         dispatch_callback: DispatchCallback,
         timezone_name: str = "UTC",
         apscheduler_factory: Callable[..., AsyncIOScheduler] | None = None,
+        jobs_path: Path = SCHEDULER_JOBS_PATH,
     ) -> None:
         self.dispatch_callback = dispatch_callback
         self.timezone_name = timezone_name
         self._apscheduler_factory = apscheduler_factory or AsyncIOScheduler
         self._scheduler = self._apscheduler_factory(timezone=_coerce_timezone(timezone_name))
+        self.jobs_path = jobs_path
         self._jobs: dict[str, ScheduledJob] = {}
         self._started = False
         self.log = logging.getLogger(__name__)
@@ -215,7 +271,9 @@ class Scheduler:
     async def start(self) -> None:
         if self._started:
             return
+        self.load_jobs()
         self._scheduler.start()
+        self._register_loaded_jobs()
         self._started = True
 
     async def shutdown(self) -> None:
@@ -230,29 +288,73 @@ class Scheduler:
     def get_job(self, job_id: str) -> ScheduledJob | None:
         return self._jobs.get(job_id)
 
-    def schedule_job(self, job: ScheduledJob | dict[str, Any]) -> datetime | None:
+    def load_jobs(self) -> list[ScheduledJob]:
+        payload = _read_json_dict(self.jobs_path)
+        raw_jobs = payload.get("jobs")
+        jobs: list[ScheduledJob] = []
+        if not isinstance(raw_jobs, dict):
+            self._jobs = {}
+            return jobs
+        loaded: dict[str, ScheduledJob] = {}
+        for job_id, raw_job in raw_jobs.items():
+            if not isinstance(job_id, str) or not isinstance(raw_job, dict):
+                continue
+            try:
+                job = ScheduledJob.model_validate(raw_job)
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("dropping invalid persisted job %s: %s", job_id, exc)
+                continue
+            loaded[job.id] = job
+            jobs.append(job)
+        self._jobs = loaded
+        return jobs
+
+    def schedule_job(
+        self,
+        job: ScheduledJob | dict[str, Any],
+        *,
+        persist: bool = True,
+    ) -> datetime | None:
         scheduled_job = job if isinstance(job, ScheduledJob) else ScheduledJob.model_validate(job)
         job_type = scheduled_job.type
         if job_type == "absolute":
-            return self._schedule_absolute(scheduled_job)
-        if job_type == "cron":
-            return self._schedule_cron(scheduled_job)
-        self._jobs[scheduled_job.id] = scheduled_job
-        return None
+            next_run = self._schedule_absolute(scheduled_job)
+        elif job_type == "cron":
+            next_run = self._schedule_cron(scheduled_job)
+        else:
+            self._jobs[scheduled_job.id] = scheduled_job
+            next_run = None
+        if persist:
+            self._persist_jobs()
+        return next_run
 
     def remove_job(self, job_id: str) -> bool:
         existed = self._jobs.pop(job_id, None) is not None
         try:
             self._scheduler.remove_job(job_id)
         except Exception:  # noqa: BLE001
+            self._persist_jobs()
             return existed
+        self._persist_jobs()
         return True
 
     def pause_job(self, job_id: str) -> None:
         self._scheduler.pause_job(job_id)
+        job = self._jobs[job_id]
+        self._jobs[job_id] = job.model_copy(update={"status": "paused", "next_run": None})
+        self._persist_jobs()
 
     def resume_job(self, job_id: str) -> None:
         self._scheduler.resume_job(job_id)
+        next_run = self.next_run(job_id)
+        job = self._jobs[job_id]
+        self._jobs[job_id] = job.model_copy(
+            update={
+                "status": "active",
+                "next_run": next_run.isoformat() if next_run is not None else None,
+            }
+        )
+        self._persist_jobs()
 
     def next_run(self, job_id: str) -> datetime | None:
         scheduled = self._scheduler.get_job(job_id)
@@ -277,7 +379,7 @@ class Scheduler:
 
     def _schedule_absolute(self, job: ScheduledJob) -> datetime:
         when = _parse_datetime(job.spec.get("at", ""))
-        self._jobs[job.id] = job
+        self._jobs[job.id] = job.model_copy(update={"next_run": when.isoformat(), "status": "active"})
         self._scheduler.add_job(
             self._fire_scheduled_job,
             trigger=DateTrigger(run_date=when),
@@ -292,7 +394,7 @@ class Scheduler:
         tz_name = job.spec.get("tz")
         timezone_info = _coerce_timezone(tz_name if isinstance(tz_name, str) else None)
         trigger = CronTrigger.from_crontab(str(cron), timezone=timezone_info)
-        self._jobs[job.id] = job
+        self._jobs[job.id] = job.model_copy(update={"status": "active"})
         self._scheduler.add_job(
             self._fire_scheduled_job,
             trigger=trigger,
@@ -303,4 +405,30 @@ class Scheduler:
         next_run = self.next_run(job.id)
         if next_run is None:
             raise RuntimeError(f"cron job '{job.id}' did not produce a next run")
+        self._jobs[job.id] = self._jobs[job.id].model_copy(update={"next_run": next_run.isoformat()})
         return next_run
+
+    def _persist_jobs(self) -> None:
+        self.jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        with _json_file_lock(self.jobs_path):
+            payload = _read_json_dict(self.jobs_path)
+            existing = payload.get("jobs")
+            jobs_payload = existing if isinstance(existing, dict) else {}
+            current_jobs = {
+                job_id: job.model_dump(mode="json")
+                for job_id, job in self._jobs.items()
+            }
+            jobs_payload.update(current_jobs)
+            for job_id in list(jobs_payload):
+                if job_id not in current_jobs:
+                    jobs_payload.pop(job_id, None)
+            payload["version"] = 1
+            payload["jobs"] = jobs_payload
+            _write_json_dict_unlocked(self.jobs_path, payload)
+
+    def _register_loaded_jobs(self) -> None:
+        for job in list(self._jobs.values()):
+            if job.status != "active":
+                continue
+            if job.type in {"absolute", "cron"}:
+                self.schedule_job(job, persist=False)
