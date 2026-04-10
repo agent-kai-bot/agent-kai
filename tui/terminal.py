@@ -151,6 +151,7 @@ class TradingTerminal(App):
         self._kai_api_task = None     # asyncio.Task running the WS consumer
         self._kai_api_refresh_task = None  # asyncio.Task running the periodic REST refresh
         self._kai_api_last_refresh: float = 0.0  # epoch timestamp of last successful REST refetch
+        self._watchlist_refresh_task = None  # asyncio.Task keeping the watchlist prices fresh
         # Last text the auto-copy-on-mouseup handler pushed to the
         # OS clipboard. Used to suppress duplicate OSC 52 emissions
         # when TextSelected fires repeatedly during a single drag.
@@ -351,15 +352,70 @@ class TradingTerminal(App):
             # endpoint), local hits the local data_api, coinbase uses
             # the existing fetch_latest_price client.
             watchlist = self.query_one("#watchlist-panel", WatchlistPanel)
-            await asyncio.to_thread(self._seed_watchlist_prices, watchlist, TRACKED_SYMBOLS)
+            await asyncio.to_thread(
+                self._seed_watchlist_prices, watchlist, list(watchlist.tracked_symbols)
+            )
 
             # Load chart
             await self._load_chart(self._chart_symbol, self.TIMEFRAMES[self._current_tf_idx])
 
             # Load positions
             await self._refresh_positions()
+
+            # Keep the watchlist fresh with a periodic refresh loop.
+            # NATS market.*.price messages ARE still routed to the
+            # panel when they arrive, but nothing currently publishes
+            # to that subject in the default deploy — so without the
+            # loop the prices freeze at their seeded values.
+            if self._watchlist_refresh_task is None or self._watchlist_refresh_task.done():
+                self._watchlist_refresh_task = asyncio.create_task(
+                    self._run_watchlist_refresh()
+                )
         except Exception as e:
             self._log_error("init error", e)
+
+    # How often to re-fetch watchlist prices. Watchlists don't need
+    # sub-second updates but a minute of staleness on a fast market
+    # feels bad, so 15 seconds is the compromise. Cheap: one tiny
+    # OHLCV call per symbol.
+    WATCHLIST_REFRESH_INTERVAL_S = 15.0
+
+    async def _run_watchlist_refresh(self) -> None:
+        """Background loop that keeps the watchlist prices fresh.
+
+        Re-runs ``_seed_watchlist_prices`` every
+        ``WATCHLIST_REFRESH_INTERVAL_S`` seconds against whatever
+        symbols are currently in the panel. That way /watch add
+        and /watch remove take effect on the next tick without
+        needing any bookkeeping outside the panel itself.
+
+        Cancels cleanly on ``asyncio.CancelledError`` when the TUI
+        tears down. Failures are logged per-symbol by the seed
+        function itself so we only have to guard the loop-level
+        exception here.
+        """
+        # Initial sleep so we don't re-seed immediately on top of
+        # the bootstrap that _load_initial_data just ran.
+        try:
+            await asyncio.sleep(self.WATCHLIST_REFRESH_INTERVAL_S)
+        except asyncio.CancelledError:
+            raise
+
+        while True:
+            try:
+                watchlist = self.query_one("#watchlist-panel", WatchlistPanel)
+                symbols = list(watchlist.tracked_symbols)
+                await asyncio.to_thread(
+                    self._seed_watchlist_prices, watchlist, symbols
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.logger.warning("watchlist refresh loop failed: %s", exc)
+            try:
+                await asyncio.sleep(self.WATCHLIST_REFRESH_INTERVAL_S)
+            except asyncio.CancelledError:
+                raise
 
     def _seed_watchlist_prices(self, watchlist, symbols: list[str]) -> None:
         """Synchronously fetch latest prices for the watchlist via the
