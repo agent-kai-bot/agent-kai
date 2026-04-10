@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from textual import events
 from textual.app import App, ComposeResult
 from textual.widgets import DataTable, Input, RichLog, Static
 
@@ -1169,6 +1170,54 @@ class TradingTerminal(App):
         tf = self.TIMEFRAMES[self._current_tf_idx]
         self.run_worker(self._load_chart(symbol, tf), thread=False)
         self._chat_msg(f"[dim]Chart: {symbol} {tf}[/]")
+
+    def _focus_input_with_text(self, text: str = "") -> bool:
+        """Focus the main input widget and optionally insert text."""
+
+        try:
+            input_widget = self.query_one("#input-area", Input)
+        except Exception:
+            return False
+
+        if getattr(input_widget, "disabled", False):
+            return False
+
+        if not getattr(input_widget, "has_focus", False):
+            try:
+                input_widget.focus()
+            except Exception:
+                pass
+
+        if text:
+            try:
+                input_widget.insert_text_at_cursor(text)
+            except Exception:
+                current_value = getattr(input_widget, "value", "")
+                input_widget.value = f"{current_value}{text}"
+                try:
+                    input_widget.cursor_position = len(input_widget.value)
+                except Exception:
+                    pass
+
+        return True
+
+    def on_key(self, event: events.Key) -> None:
+        """Route slash presses to the main input from anywhere in the app."""
+
+        if event.character != "/":
+            return
+
+        try:
+            input_widget = self.query_one("#input-area", Input)
+        except Exception:
+            return
+
+        if getattr(input_widget, "has_focus", False):
+            return
+
+        if self._focus_input_with_text("/"):
+            event.stop()
+            event.prevent_default()
 
     async def on_input_submitted(self, event: Input.Submitted):
         # Multi-line paste handling: if the input has a buffered
