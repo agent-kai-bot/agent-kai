@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import type { ChatHistoryEntry } from "$lib/daemon/types";
   import { renderMarkdown } from "$lib/markdown";
 
@@ -15,6 +16,21 @@
     mobileCollapsible?: boolean;
     initiallyOpen?: boolean;
   } = $props();
+
+  let chatLogEl: HTMLDivElement | undefined = $state();
+
+  // Auto-scroll to bottom when messages change or streaming text grows
+  $effect(() => {
+    // Touch the reactive deps so the effect re-runs
+    void messages.length;
+    void streamingReply;
+    // Wait for DOM update, then scroll
+    tick().then(() => {
+      if (chatLogEl) {
+        chatLogEl.scrollTop = chatLogEl.scrollHeight;
+      }
+    });
+  });
 
   function label(role: string): string {
     if (role === "human") {
@@ -34,7 +50,7 @@
   title="Chat"
   subtitle={`${messages.length} messages`}
 >
-  <div class="chat-log">
+  <div class="chat-log" bind:this={chatLogEl}>
     {#if messages.length || streamingReply}
       {#each messages as message, index (message.role + message.content + index)}
         <article class={`message ${message.role}`}>
@@ -61,6 +77,7 @@
     display: grid;
     gap: 0.75rem;
     min-height: 0;
+    overflow-y: auto;
     padding-right: 0.2rem;
   }
 
