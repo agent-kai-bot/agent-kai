@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from fastapi.testclient import TestClient
 
-from daemon.server import create_app
+from daemon.server import DaemonServer, create_app
 
 
 class _FakeBus:
@@ -164,6 +166,41 @@ class DaemonServerTests(unittest.TestCase):
                 self.assertEqual(error["type"], "error")
                 self.assertEqual(error["code"], "bad_request")
                 self.assertIn("attach envelope", error["message"])
+
+
+class DaemonServerIndexTests(unittest.IsolatedAsyncioTestCase):
+    """Validate Phase 3 session lookup through the persisted index."""
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    async def test_indexed_session_can_reopen_without_state_file(self, attach_runtime):
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+            ):
+                server = DaemonServer(
+                    agent_name="kai",
+                    nats_url="nats://unit-test",
+                    bus_factory=None,
+                )
+
+                managed = await server.get_or_create_session(
+                    "swing-trader",
+                    create_if_missing=True,
+                )
+                self.assertTrue((base_dir / "index.json").exists())
+                self.assertFalse(managed.session.paths.state_path.exists())
+
+                server.sessions.clear()
+                reopened = await server.get_or_create_session(
+                    "swing-trader",
+                    create_if_missing=False,
+                )
+
+                self.assertEqual(reopened.session.name, "swing-trader")
+                self.assertFalse(reopened.session.paths.state_path.exists())
 
 
 if __name__ == "__main__":

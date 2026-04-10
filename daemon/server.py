@@ -13,7 +13,7 @@ from typing import Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from config import DEFAULT_AGENT, NATS_URL
-from daemon.core import Session, SessionEvent, serialize_messages
+from daemon.core import Session, SessionEvent, get_indexed_session, serialize_messages
 from daemon.protocol import (
     AttachEnvelope,
     ChartBarEnvelope,
@@ -114,11 +114,13 @@ class DaemonServer:
 
         session = Session(name)
         state_exists = session.paths.state_path.exists()
-        if not create_if_missing and not state_exists:
+        indexed_entry = get_indexed_session(name)
+        if not create_if_missing and not (state_exists or indexed_entry):
             raise KeyError(f"session '{name}' does not exist")
 
         session.load()
         session.attach_runtime(bus=self.bus, agent_name=self.agent_name)
+        session.touch_index()
 
         managed = ManagedSession(session=session)
         self.sessions[session.name] = managed

@@ -177,6 +177,8 @@ async def main(argv: list[str] | None = None):
     session = Session(
         _resolve_terminal_session_name(args) if args.terminal else args.name
     )
+    if args.terminal:
+        session.touch_index()
     agent_runner = session.attach_runtime(bus=bus, agent_name=args.name)
     sub_agent_manager = session.sub_agent_manager if bus else None
 
