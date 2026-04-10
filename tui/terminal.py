@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +22,13 @@ from agent.signal_consumer import SignalConsumer
 from agent.skills_store import SkillStore
 from agent_logger import get_logger
 from config import get_skills_dir
-from daemon.core import Session, deserialize_messages
+from daemon.core import (
+    Session,
+    deserialize_messages,
+    get_indexed_session,
+    list_indexed_sessions,
+    remove_indexed_session,
+)
 from tui.panels.alerts import AlertsPanel
 from tui.chart_modes import (
     CHART_LAYOUT_MODES,
@@ -409,7 +416,7 @@ class TradingTerminal(App):
         chat.append_message("[bold dim]Welcome to KAI. Type a message or use slash commands.[/]")
         chat.append_message(
             "[dim]/buy /sell /analyze /scan /risk /chart /watch /learn /remember "
-            "/react /autotrade /model /think /queue /status /debug "
+            "/react /autotrade /model /think /sessions /session /queue /status /debug "
             "/login codex /exit /reset[/]"
         )
         chat.append_message(
@@ -1845,6 +1852,18 @@ class TradingTerminal(App):
             # /queue clear            — drop everything in the queue
             return self._handle_queue_command(parts)
 
+        elif cmd == "/sessions":
+            # /sessions               — list known sessions and their
+            #                           last activity
+            return await self._handle_sessions_command(parts)
+
+        elif cmd == "/session":
+            # /session                — show current session
+            # /session NAME           — switch to NAME
+            # /session switch NAME    — switch to NAME
+            # /session kill NAME      — delete NAME
+            return await self._handle_session_command(parts)
+
         elif cmd == "/status":
             # /status                 — dump every background task state
             #                           in one chat message for debugging
@@ -1898,6 +1917,164 @@ class TradingTerminal(App):
             return True
 
         return False
+
+    async def _handle_sessions_command(self, parts: list[str]) -> bool:
+        """List the known sessions for the current runtime mode."""
+        del parts  # command currently takes no sub-arguments
+        try:
+            sessions = await self._list_known_sessions()
+        except Exception as exc:
+            self._chat_msg(f"[red]Session list failed: {exc}[/]")
+            return True
+
+        if not sessions:
+            self._chat_msg("[dim]No saved sessions[/]")
+            return True
+
+        self._chat_msg("[bold cyan]Sessions:[/]")
+        for session_info in sessions:
+            self._chat_msg(self._format_session_summary(session_info))
+        self._chat_msg(
+            "[dim]Use /session NAME, /session switch NAME, or /session kill NAME[/]"
+        )
+        return True
+
+    async def _handle_session_command(self, parts: list[str]) -> bool:
+        """Show, switch, or delete sessions from the terminal."""
+        sub = parts[1].lower() if len(parts) > 1 else "current"
+
+        if sub in ("", "current", "show", "status"):
+            self._chat_msg(f"[dim]Current session: {self.session.name}[/]")
+            return True
+
+        if sub == "kill":
+            if len(parts) < 3:
+                self._chat_msg("[red]Usage: /session kill NAME[/]")
+                return True
+            return await self._delete_named_session(parts[2])
+
+        if sub in ("switch", "attach", "use"):
+            if len(parts) < 3:
+                self._chat_msg("[red]Usage: /session switch NAME[/]")
+                return True
+            return self._request_session_switch(parts[2])
+
+        return self._request_session_switch(parts[1])
+
+    async def _list_known_sessions(self) -> list[dict[str, Any]]:
+        """Load session summaries from either the daemon or local index."""
+        if getattr(self.session, "is_remote", False):
+            return await self.session.list_sessions()
+
+        self.session.touch_index()
+        sessions: list[dict[str, Any]] = []
+        for entry in list_indexed_sessions():
+            sessions.append(
+                {
+                    "name": entry.name,
+                    "created_at": entry.created_at,
+                    "last_activity": entry.last_activity,
+                    "state_path": entry.state_path,
+                    "activity_status": (
+                        self._activity_status if entry.name == self.session.name else "idle"
+                    ),
+                    "queued_inputs": len(self._input_queue) if entry.name == self.session.name else 0,
+                }
+            )
+        return sessions
+
+    def _format_session_summary(self, session_info: dict[str, Any]) -> str:
+        """Format one session summary line for inline chat rendering."""
+        name = str(session_info.get("name") or "")
+        marker = "[bold green]*[/]" if name == self.session.name else "[dim]-[/]"
+        activity = str(session_info.get("activity_status") or "idle")
+        queued_inputs = int(session_info.get("queued_inputs") or 0)
+        last_activity = str(session_info.get("last_activity") or "unknown")
+        return (
+            f"{marker} [bold]{name}[/] [dim]| activity: {activity} "
+            f"| queue: {queued_inputs} | last: {last_activity}[/]"
+        )
+
+    def _request_session_switch(self, target_name: str) -> bool:
+        """Exit the current terminal so main.py can relaunch the next session."""
+        if self._agent_working:
+            self._chat_msg(
+                "[red]Wait for the current turn to finish before switching sessions[/]"
+            )
+            return True
+        if self._input_queue:
+            self._chat_msg(
+                "[red]Clear the queued inputs before switching sessions[/]"
+            )
+            return True
+
+        try:
+            normalized = Session(target_name).name
+        except (TypeError, ValueError) as exc:
+            self._chat_msg(f"[red]{exc}[/]")
+            return True
+
+        if normalized == self.session.name:
+            self._chat_msg(f"[dim]Already on session {normalized}[/]")
+            return True
+
+        self._save_chat_history()
+        self.exit({"action": "switch_session", "session": normalized})
+        return True
+
+    async def _delete_named_session(self, target_name: str) -> bool:
+        """Delete a named session from either the daemon or local storage."""
+        try:
+            normalized = Session(target_name).name
+        except (TypeError, ValueError) as exc:
+            self._chat_msg(f"[red]{exc}[/]")
+            return True
+
+        if normalized == self.session.name:
+            self._chat_msg(
+                "[red]Switch to another session before deleting the current one[/]"
+            )
+            return True
+
+        try:
+            if getattr(self.session, "is_remote", False):
+                await self.session.delete_session(normalized)
+            else:
+                if not self._delete_local_session(normalized):
+                    self._chat_msg(f"[red]Unknown session '{normalized}'[/]")
+                    return True
+        except Exception as exc:
+            self._chat_msg(f"[red]Session delete failed: {exc}[/]")
+            return True
+
+        self._chat_msg(f"[dim]Deleted session {normalized}[/]")
+        return True
+
+    @staticmethod
+    def _delete_local_session(name: str) -> bool:
+        """Remove a standalone session from disk and the local index."""
+        session = Session(name)
+        existed = (
+            session.paths.state_path.exists()
+            or session.paths.root_dir.exists()
+            or get_indexed_session(name) is not None
+        )
+        if not existed:
+            return False
+
+        for path in (
+            session.paths.state_path,
+            session.paths.state_path.with_suffix(session.paths.state_path.suffix + ".lock"),
+        ):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+        if session.paths.root_dir.exists():
+            shutil.rmtree(session.paths.root_dir, ignore_errors=True)
+        remove_indexed_session(name)
+        return True
 
     async def _handle_remember_command(self, parts: list[str]) -> bool:
         """Ask kai to summarize the recent discussion and save it.
