@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import inspect
 import json
@@ -32,6 +33,7 @@ JobStatus = Literal["active", "paused", "completed", "failed", "cancelled"]
 JobConcurrency = Literal["skip", "queue"]
 DispatchCallback = Callable[["ScheduledJob", datetime], Awaitable[None] | None]
 EventCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
+SchedulerEventCallback = Callable[..., Awaitable[None] | None]
 SCHEDULER_ROOT_DIR = Path(WORKSPACES_DIR) / "scheduler"
 SCHEDULER_JOBS_PATH = SCHEDULER_ROOT_DIR / "jobs.json"
 
@@ -289,6 +291,7 @@ class Scheduler:
         apscheduler_factory: Callable[..., AsyncIOScheduler] | None = None,
         jobs_path: Path = SCHEDULER_JOBS_PATH,
         event_bus: DaemonEventBus | None = None,
+        event_callback: SchedulerEventCallback | None = None,
     ) -> None:
         self.dispatch_callback = dispatch_callback
         self.timezone_name = timezone_name
@@ -296,6 +299,7 @@ class Scheduler:
         self._scheduler = self._apscheduler_factory(timezone=_coerce_timezone(timezone_name))
         self.jobs_path = jobs_path
         self.event_bus = event_bus
+        self.event_callback = event_callback
         self._jobs: dict[str, ScheduledJob] = {}
         self._started = False
         self._event_callback: EventCallback | None = None
@@ -362,6 +366,7 @@ class Scheduler:
             }
         )
         self.schedule_job(job)
+        self._emit_event("created", self._jobs[job.id])
         return self._jobs[job.id]
 
     def create_recurring_job(
@@ -391,6 +396,7 @@ class Scheduler:
             }
         )
         self.schedule_job(job)
+        self._emit_event("created", self._jobs[job.id])
         return self._jobs[job.id]
 
     def create_event_job(
@@ -423,6 +429,7 @@ class Scheduler:
             }
         )
         self.schedule_job(job)
+        self._emit_event("created", self._jobs[job.id])
         return self._jobs[job.id]
 
     def load_jobs(self) -> list[ScheduledJob]:
@@ -478,25 +485,32 @@ class Scheduler:
     def cancel_job(self, job_id: str) -> ScheduledJob:
         with suppress(Exception):
             self._scheduler.remove_job(job_id)
-        return self.update_job(job_id, status="cancelled", next_run=None)
+        updated = self.update_job(job_id, status="cancelled", next_run=None)
+        self._emit_event("cancelled", updated)
+        return updated
 
     def pause_job(self, job_id: str) -> ScheduledJob:
         job = self._jobs[job_id]
         if job.type in {"absolute", "cron"}:
             self._scheduler.pause_job(job_id)
-        return self.update_job(job_id, status="paused", next_run=None)
+        updated = self.update_job(job_id, status="paused", next_run=None)
+        self._emit_event("paused", updated)
+        return updated
 
     def resume_job(self, job_id: str) -> ScheduledJob:
         job = self._jobs[job_id]
         if job.type in {"absolute", "cron"}:
             self._scheduler.resume_job(job_id)
             next_run = self.next_run(job_id)
-            return self.update_job(
+            updated = self.update_job(
                 job_id,
                 status="active",
                 next_run=next_run.isoformat() if next_run is not None else None,
             )
-        return self.update_job(job_id, status="active")
+        else:
+            updated = self.update_job(job_id, status="active")
+        self._emit_event("resumed", updated)
+        return updated
 
     def next_run(self, job_id: str) -> datetime | None:
         scheduled = self._scheduler.get_job(job_id)
@@ -550,7 +564,7 @@ class Scheduler:
             next_run_iso = None
             with suppress(Exception):
                 self._scheduler.remove_job(job_id)
-        return self.update_job(
+        updated = self.update_job(
             job_id,
             last_run=fired_at.isoformat(),
             last_result_preview=_truncate_preview(result_preview),
@@ -558,6 +572,8 @@ class Scheduler:
             run_count=run_count,
             status=status,
         )
+        self._emit_event("completed", updated, result_preview=updated.last_result_preview)
+        return updated
 
     def record_failure(
         self,
@@ -570,13 +586,19 @@ class Scheduler:
         if job.type == "absolute":
             with suppress(Exception):
                 self._scheduler.remove_job(job_id)
-        return self.update_job(
+        updated = self.update_job(
             job_id,
             last_run=fired_at.isoformat(),
             last_result_preview=_truncate_preview(error),
             next_run=None if job.type in {"absolute", "event"} else job.next_run,
             status="failed",
         )
+        self._emit_event("failed", updated, error=error)
+        return updated
+
+    def notify_triggered(self, job_id: str, *, fired_at: datetime) -> None:
+        job = self._jobs[job_id]
+        self._emit_event("triggered", job, fired_at=fired_at.isoformat())
 
     async def _fire_scheduled_job(self, job_id: str) -> None:
         job = self._jobs[job_id]
@@ -649,3 +671,14 @@ class Scheduler:
     def _next_job_id() -> str:
         stamp = _utc_now().strftime("%Y_%m_%d_%H%M%S")
         return f"job_{stamp}_{uuid.uuid4().hex[:6]}"
+
+    def _emit_event(self, event_type: str, job: ScheduledJob, **payload: Any) -> None:
+        if self.event_callback is None:
+            return
+        maybe_awaitable = self.event_callback(event_type, job=job, **payload)
+        if inspect.isawaitable(maybe_awaitable):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            loop.create_task(maybe_awaitable)

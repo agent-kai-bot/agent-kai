@@ -161,6 +161,44 @@ class ErrorEnvelope(ProtocolModel):
     message: str
 
 
+class ScheduledJobCreatedEnvelope(ProtocolModel):
+    type: Literal["scheduled_job_created"]
+    job: Any
+
+
+class ScheduledJobTriggeredEnvelope(ProtocolModel):
+    type: Literal["scheduled_job_triggered"]
+    job_id: NonEmptyString
+    fired_at: NonEmptyString
+
+
+class ScheduledJobCompletedEnvelope(ProtocolModel):
+    type: Literal["scheduled_job_completed"]
+    job_id: NonEmptyString
+    result_preview: str | None = None
+
+
+class ScheduledJobFailedEnvelope(ProtocolModel):
+    type: Literal["scheduled_job_failed"]
+    job_id: NonEmptyString
+    error: str
+
+
+class ScheduledJobCancelledEnvelope(ProtocolModel):
+    type: Literal["scheduled_job_cancelled"]
+    job_id: NonEmptyString
+
+
+class ScheduledJobPausedEnvelope(ProtocolModel):
+    type: Literal["scheduled_job_paused"]
+    job_id: NonEmptyString
+
+
+class ScheduledJobResumedEnvelope(ProtocolModel):
+    type: Literal["scheduled_job_resumed"]
+    job_id: NonEmptyString
+
+
 ServerEnvelope = Annotated[
     SessionAttachedEnvelope
     | TokenEnvelope
@@ -170,6 +208,13 @@ ServerEnvelope = Annotated[
     | StatusEnvelope
     | SignalEnvelope
     | ChartBarEnvelope
+    | ScheduledJobCreatedEnvelope
+    | ScheduledJobTriggeredEnvelope
+    | ScheduledJobCompletedEnvelope
+    | ScheduledJobFailedEnvelope
+    | ScheduledJobCancelledEnvelope
+    | ScheduledJobPausedEnvelope
+    | ScheduledJobResumedEnvelope
     | ErrorEnvelope,
     Field(discriminator="type"),
 ]
@@ -215,4 +260,3 @@ def decode_server_envelope(
 def encode_envelope(envelope: BaseModel) -> dict[str, Any]:
     """Convert an envelope model into a JSON-ready dict."""
     return envelope.model_dump(mode="json", exclude_none=True)
-

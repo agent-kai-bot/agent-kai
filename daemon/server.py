@@ -34,6 +34,13 @@ from daemon.protocol import (
     HeartbeatEnvelope,
     InputEnvelope,
     InterruptEnvelope,
+    ScheduledJobCancelledEnvelope,
+    ScheduledJobCompletedEnvelope,
+    ScheduledJobCreatedEnvelope,
+    ScheduledJobFailedEnvelope,
+    ScheduledJobPausedEnvelope,
+    ScheduledJobResumedEnvelope,
+    ScheduledJobTriggeredEnvelope,
     SessionAttachedEnvelope,
     SessionStateSnapshot,
     SignalEnvelope,
@@ -127,6 +134,7 @@ class DaemonServer:
         self.scheduler = self.scheduler_factory(
             dispatch_callback=self._handle_scheduled_job_trigger,
             event_bus=self.event_bus,
+            event_callback=self._handle_scheduler_event,
         )
         await self.scheduler.start()
 
@@ -214,6 +222,7 @@ class DaemonServer:
         """Dispatch one scheduled job into its owner session."""
         if self.scheduler is None:
             return
+        self.scheduler.notify_triggered(job.id, fired_at=fired_at)
 
         try:
             managed = await self.get_or_create_session(
@@ -247,6 +256,42 @@ class DaemonServer:
             fired_at=fired_at,
             result_preview=outcome.final_text,
         )
+
+    def _handle_scheduler_event(self, event_type: str, *, job, **payload: Any) -> None:
+        """Publish scheduler lifecycle events onto the owner session bus."""
+        managed = self.sessions.get(job.owner_session)
+        if managed is None:
+            return
+
+        topic_map = {
+            "created": "scheduled_job.created",
+            "triggered": "scheduled_job.triggered",
+            "completed": "scheduled_job.completed",
+            "failed": "scheduled_job.failed",
+            "cancelled": "scheduled_job.cancelled",
+            "paused": "scheduled_job.paused",
+            "resumed": "scheduled_job.resumed",
+        }
+        topic = topic_map.get(event_type)
+        if not topic:
+            return
+
+        event_payload: dict[str, Any]
+        if event_type == "created":
+            event_payload = {"job": job.model_dump(mode="json")}
+        elif event_type == "triggered":
+            event_payload = {"job_id": job.id, "fired_at": payload.get("fired_at")}
+        elif event_type == "completed":
+            event_payload = {
+                "job_id": job.id,
+                "result_preview": payload.get("result_preview"),
+            }
+        elif event_type == "failed":
+            event_payload = {"job_id": job.id, "error": payload.get("error") or "job failed"}
+        else:
+            event_payload = {"job_id": job.id}
+
+        managed.session.publish_event(topic, event_payload)
 
     def _handle_signal(self, signal: Signal) -> None:
         """Fan out shared signal events to live sessions and the daemon bus."""
@@ -434,6 +479,51 @@ class DaemonServer:
                 symbol=symbol,
                 tf=timeframe,
                 bar=payload.get("bar"),
+            )
+
+        if topic == "scheduled_job.created":
+            return ScheduledJobCreatedEnvelope(
+                type="scheduled_job_created",
+                job=payload.get("job"),
+            )
+
+        if topic == "scheduled_job.triggered":
+            return ScheduledJobTriggeredEnvelope(
+                type="scheduled_job_triggered",
+                job_id=str(payload.get("job_id") or ""),
+                fired_at=str(payload.get("fired_at") or ""),
+            )
+
+        if topic == "scheduled_job.completed":
+            return ScheduledJobCompletedEnvelope(
+                type="scheduled_job_completed",
+                job_id=str(payload.get("job_id") or ""),
+                result_preview=payload.get("result_preview"),
+            )
+
+        if topic == "scheduled_job.failed":
+            return ScheduledJobFailedEnvelope(
+                type="scheduled_job_failed",
+                job_id=str(payload.get("job_id") or ""),
+                error=str(payload.get("error") or "job failed"),
+            )
+
+        if topic == "scheduled_job.cancelled":
+            return ScheduledJobCancelledEnvelope(
+                type="scheduled_job_cancelled",
+                job_id=str(payload.get("job_id") or ""),
+            )
+
+        if topic == "scheduled_job.paused":
+            return ScheduledJobPausedEnvelope(
+                type="scheduled_job_paused",
+                job_id=str(payload.get("job_id") or ""),
+            )
+
+        if topic == "scheduled_job.resumed":
+            return ScheduledJobResumedEnvelope(
+                type="scheduled_job_resumed",
+                job_id=str(payload.get("job_id") or ""),
             )
 
         return None

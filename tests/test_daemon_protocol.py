@@ -6,6 +6,8 @@ import unittest
 
 from daemon.protocol import (
     ChartBarEnvelope,
+    ScheduledJobCreatedEnvelope,
+    ScheduledJobTriggeredEnvelope,
     SessionAttachedEnvelope,
     SessionStateSnapshot,
     StatusEnvelope,
@@ -96,6 +98,30 @@ class ServerEnvelopeTests(unittest.TestCase):
         self.assertEqual(chart_bar.symbol, "BTC-USD")
         self.assertEqual(status.type, "status")
         self.assertEqual(status.queue, 2)
+
+    def test_scheduled_job_envelopes_round_trip(self):
+        created = decode_server_envelope(
+            encode_envelope(
+                ScheduledJobCreatedEnvelope(
+                    type="scheduled_job_created",
+                    job={"id": "job-1", "status": "active"},
+                )
+            )
+        )
+        triggered = decode_server_envelope(
+            encode_envelope(
+                ScheduledJobTriggeredEnvelope(
+                    type="scheduled_job_triggered",
+                    job_id="job-1",
+                    fired_at="2026-04-10T00:00:00Z",
+                )
+            )
+        )
+
+        self.assertEqual(created.type, "scheduled_job_created")
+        self.assertEqual(created.job["id"], "job-1")
+        self.assertEqual(triggered.type, "scheduled_job_triggered")
+        self.assertEqual(triggered.job_id, "job-1")
 
 
 if __name__ == "__main__":

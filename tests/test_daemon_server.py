@@ -160,6 +160,50 @@ class DaemonServerTests(unittest.TestCase):
                 self.assertEqual(chart_bar["symbol"], "BTC-USD")
                 self.assertEqual(chart_bar["tf"], "1h")
 
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    def test_scheduled_job_events_are_forwarded(self, attach_runtime):
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with self._make_client() as client:
+            with client.websocket_connect("/ws") as websocket:
+                websocket.send_json(
+                    {
+                        "type": "attach",
+                        "session": "terminal",
+                        "create_if_missing": True,
+                    }
+                )
+                websocket.receive_json()
+                websocket.receive_json()
+
+                session = client.app.state.daemon_server.sessions["terminal"].session
+                session.publish_event(
+                    "scheduled_job.created",
+                    {
+                        "job": {
+                            "id": "job-1",
+                            "status": "active",
+                            "owner_session": "terminal",
+                        }
+                    },
+                )
+                session.publish_event(
+                    "scheduled_job.completed",
+                    {
+                        "job_id": "job-1",
+                        "result_preview": "done",
+                    },
+                )
+
+                created = websocket.receive_json()
+                completed = websocket.receive_json()
+
+                self.assertEqual(created["type"], "scheduled_job_created")
+                self.assertEqual(created["job"]["id"], "job-1")
+                self.assertEqual(completed["type"], "scheduled_job_completed")
+                self.assertEqual(completed["job_id"], "job-1")
+                self.assertEqual(completed["result_preview"], "done")
+
     def test_websocket_requires_attach_as_first_message(self):
         with self._make_client() as client:
             with client.websocket_connect("/ws") as websocket:
