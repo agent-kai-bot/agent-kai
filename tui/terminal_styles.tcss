@@ -7,6 +7,7 @@ Screen {
 
 /* Chart workspace modes. The default dashboard keeps every panel
  * visible. Inspect makes the chart dominant without hiding the rails.
+ * Zen keeps the inspect feel but gives chat more breathing room.
  * Focus is the near-fullscreen chart view. Chat keeps the chart
  * present but lets the conversation dominate the center column. */
 
@@ -18,6 +19,11 @@ Screen.chart-mode-dashboard {
 Screen.chart-mode-inspect {
     grid-columns: 0.9fr 5.4fr 1.1fr;
     grid-rows: auto 5fr 1.1fr;
+}
+
+Screen.chart-mode-zen {
+    grid-columns: 0.95fr 4.7fr 1.1fr;
+    grid-rows: auto 4fr 1.7fr;
 }
 
 Screen.chart-mode-chat {

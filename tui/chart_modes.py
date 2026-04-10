@@ -31,6 +31,11 @@ CHART_LAYOUT_MODES: dict[str, ChartLayoutMode] = {
         screen_class="chart-mode-inspect",
         description="Chart-dominant layout with narrow side rails and a reduced chat row.",
     ),
+    "zen": ChartLayoutMode(
+        name="zen",
+        screen_class="chart-mode-zen",
+        description="Calm chart-first layout with narrow side rails and a larger chat area.",
+    ),
     "focus": ChartLayoutMode(
         name="focus",
         screen_class="chart-mode-focus",
@@ -49,6 +54,7 @@ CHART_LAYOUT_ALIASES: dict[str, str] = {
     "full": "dashboard",
     "detail": "inspect",
     "analysis": "inspect",
+    "calm": "zen",
     "half": "chat",
     "halfsize": "chat",
     "small": "chat",
