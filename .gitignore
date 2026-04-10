@@ -6,6 +6,10 @@ logs/
 eval_results.json
 eval_results/
 .claude/
+web/node_modules/
+web/.svelte-kit/
+web/build/
+web/.vite/
 
 # Secrets / credentials — never commit
 AGENT-KAI-API-KEY.txt

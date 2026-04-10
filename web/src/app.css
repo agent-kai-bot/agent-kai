@@ -1,0 +1,110 @@
+:root {
+  color-scheme: dark;
+  --bg: #07121f;
+  --bg-alt: #0d1e2e;
+  --panel: rgba(10, 25, 41, 0.84);
+  --panel-border: rgba(145, 181, 221, 0.18);
+  --text: #f2f6fb;
+  --muted: #a3b8d0;
+  --accent: #4dd3a8;
+  --accent-strong: #f3c46a;
+  --shadow: rgba(0, 0, 0, 0.35);
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  background:
+    radial-gradient(circle at top, rgba(77, 211, 168, 0.12), transparent 32%),
+    linear-gradient(180deg, #08111b 0%, #0b1d2d 100%);
+}
+
+html,
+body {
+  min-height: 100%;
+  margin: 0;
+  background: transparent;
+  color: var(--text);
+}
+
+body {
+  min-height: 100vh;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.landing-shell {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 2rem;
+}
+
+.landing-card {
+  width: min(100%, 48rem);
+  border: 1px solid var(--panel-border);
+  border-radius: 1.5rem;
+  background: linear-gradient(180deg, rgba(12, 29, 46, 0.92), rgba(8, 20, 33, 0.92));
+  box-shadow: 0 1.5rem 4rem var(--shadow);
+  padding: 2rem;
+  backdrop-filter: blur(14px);
+}
+
+.eyebrow {
+  margin: 0 0 0.75rem;
+  color: var(--accent);
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.landing-card h1 {
+  margin: 0;
+  font-size: clamp(2rem, 5vw, 3.5rem);
+  line-height: 0.95;
+}
+
+.summary {
+  margin: 1rem 0 1.5rem;
+  max-width: 38rem;
+  color: var(--muted);
+  font-size: 1.05rem;
+  line-height: 1.6;
+}
+
+.checklist {
+  display: grid;
+  gap: 1rem;
+  margin: 0;
+}
+
+.checklist div {
+  border: 1px solid rgba(145, 181, 221, 0.14);
+  border-radius: 1rem;
+  background: rgba(5, 17, 28, 0.42);
+  padding: 1rem 1.1rem;
+}
+
+.checklist dt {
+  margin: 0 0 0.35rem;
+  color: var(--accent-strong);
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.checklist dd {
+  margin: 0;
+  color: var(--text);
+  line-height: 1.5;
+}
+
+@media (max-width: 700px) {
+  .landing-shell {
+    padding: 1rem;
+  }
+
+  .landing-card {
+    padding: 1.5rem;
+  }
+}
