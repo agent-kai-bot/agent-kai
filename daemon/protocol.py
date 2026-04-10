@@ -62,7 +62,7 @@ class InterruptEnvelope(ProtocolModel):
 
 class SubscribeEnvelope(ProtocolModel):
     type: Literal["subscribe"]
-    channel: Literal["chart", "signals"]
+    channel: Literal["chart", "signals", "nats"]
     symbol: str | None = None
     tf: str | None = None
 
@@ -75,7 +75,7 @@ class SubscribeEnvelope(ProtocolModel):
 
 class UnsubscribeEnvelope(ProtocolModel):
     type: Literal["unsubscribe"]
-    channel: Literal["chart", "signals"]
+    channel: Literal["chart", "signals", "nats"]
     symbol: str | None = None
     tf: str | None = None
 
@@ -155,6 +155,13 @@ class ChartBarEnvelope(ProtocolModel):
     bar: Any
 
 
+class NatsEventEnvelope(ProtocolModel):
+    type: Literal["nats_event"]
+    direction: NonEmptyString
+    subject: NonEmptyString
+    payload: Any
+
+
 class ErrorEnvelope(ProtocolModel):
     type: Literal["error"]
     code: NonEmptyString
@@ -208,6 +215,7 @@ ServerEnvelope = Annotated[
     | StatusEnvelope
     | SignalEnvelope
     | ChartBarEnvelope
+    | NatsEventEnvelope
     | ScheduledJobCreatedEnvelope
     | ScheduledJobTriggeredEnvelope
     | ScheduledJobCompletedEnvelope

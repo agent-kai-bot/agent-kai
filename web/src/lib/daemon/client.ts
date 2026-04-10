@@ -1,8 +1,10 @@
 import type {
+  PortfolioSnapshot,
   ServerEnvelope,
   SessionAttachedEnvelope,
   SessionSummary,
   StatusEnvelope,
+  WatchlistQuote,
 } from "$lib/daemon/types";
 
 export const DEFAULT_HTTP_BASE_URL = "http://127.0.0.1:8765";
@@ -25,6 +27,8 @@ export type AttachOptions = {
   token?: string;
   createIfMissing?: boolean;
 };
+
+type JsonRecord = Record<string, unknown>;
 
 export function deriveHttpBaseUrl(): string {
   if (typeof window === "undefined") {
@@ -64,6 +68,20 @@ function parseEnvelope(raw: string): ServerEnvelope {
     throw new Error("daemon sent an invalid envelope");
   }
   return parsed as ServerEnvelope;
+}
+
+function dedupeSymbols(symbols: string[]): string[] {
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const rawSymbol of symbols) {
+    const symbol = rawSymbol.trim().toUpperCase();
+    if (!symbol || seen.has(symbol)) {
+      continue;
+    }
+    seen.add(symbol);
+    normalized.push(symbol);
+  }
+  return normalized;
 }
 
 export class DaemonConnection {
@@ -106,7 +124,7 @@ export class DaemonConnection {
     );
   }
 
-  subscribe(channel: "chart" | "signals", symbol?: string, tf?: string): void {
+  subscribe(channel: "chart" | "signals" | "nats", symbol?: string, tf?: string): void {
     this.socket.send(
       JSON.stringify({
         type: "subscribe",
@@ -148,15 +166,46 @@ export class DaemonClient {
       options?.webSocketFactory ?? ((url: string) => new WebSocket(url));
   }
 
-  async listSessions(token = ""): Promise<SessionSummary[]> {
-    const response = await this.fetchImpl(`${this.baseHttpUrl}/api/sessions`, {
+  private async requestJson(path: string, token = ""): Promise<JsonRecord> {
+    const response = await this.fetchImpl(`${this.baseHttpUrl}${path}`, {
       headers: buildAuthHeaders(token),
     });
     if (!response.ok) {
-      throw new Error(`session list failed (${response.status})`);
+      throw new Error(`${path} failed (${response.status})`);
     }
-    const payload = (await response.json()) as { sessions?: SessionSummary[] };
+    const payload = (await response.json()) as unknown;
+    return payload && typeof payload === "object" ? (payload as JsonRecord) : {};
+  }
+
+  async listSessions(token = ""): Promise<SessionSummary[]> {
+    const payload = (await this.requestJson("/api/sessions", token)) as {
+      sessions?: SessionSummary[];
+    };
     return Array.isArray(payload.sessions) ? payload.sessions : [];
+  }
+
+  async fetchWatchlistQuotes(
+    symbols: string[],
+    token = "",
+  ): Promise<WatchlistQuote[]> {
+    const normalized = dedupeSymbols(symbols);
+    if (!normalized.length) {
+      return [];
+    }
+    const params = new URLSearchParams({ symbols: normalized.join(",") });
+    const payload = (await this.requestJson(
+      `/api/market/watchlist?${params.toString()}`,
+      token,
+    )) as { quotes?: WatchlistQuote[] };
+    return Array.isArray(payload.quotes) ? payload.quotes : [];
+  }
+
+  async fetchPortfolio(token = ""): Promise<PortfolioSnapshot> {
+    const payload = (await this.requestJson("/api/portfolio", token)) as Partial<PortfolioSnapshot>;
+    return {
+      positions: Array.isArray(payload.positions) ? payload.positions : [],
+      pnl: payload.pnl && typeof payload.pnl === "object" ? payload.pnl : {},
+    };
   }
 
   async attach(options: AttachOptions): Promise<DaemonConnection> {

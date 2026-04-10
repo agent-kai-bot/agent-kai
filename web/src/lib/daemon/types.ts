@@ -24,6 +24,34 @@ export type SessionSummary = {
   state_path?: string;
 };
 
+export type WatchlistQuote = {
+  symbol: string;
+  price?: number;
+  volume_24h?: number;
+  price_change_24h_pct?: number;
+  error?: string;
+};
+
+export type PositionRow = {
+  symbol: string;
+  side: string;
+  quantity: number;
+  entry_price: number;
+  current_price: number;
+  unrealized_pnl: number;
+  pnl_pct: number;
+};
+
+export type PortfolioSnapshot = {
+  positions: PositionRow[];
+  pnl: {
+    total_value?: number;
+    total_pnl?: number;
+    total_pnl_pct?: number;
+    [key: string]: number | string | undefined;
+  };
+};
+
 export type SessionAttachedEnvelope = {
   type: "session_attached";
   session: string;
@@ -77,6 +105,13 @@ export type ChartBarEnvelope = {
   bar: Record<string, unknown>;
 };
 
+export type NatsEventEnvelope = {
+  type: "nats_event";
+  direction: string;
+  subject: string;
+  payload: Record<string, unknown>;
+};
+
 export type ScheduledJobEnvelope =
   | { type: "scheduled_job_created"; job: Record<string, unknown> }
   | { type: "scheduled_job_triggered"; job_id: string; fired_at: string }
@@ -96,6 +131,7 @@ export type ServerEnvelope =
   | ToolEndEnvelope
   | SignalEnvelope
   | ChartBarEnvelope
+  | NatsEventEnvelope
   | ScheduledJobEnvelope;
 
 export function isServerEnvelope(value: unknown): value is ServerEnvelope {

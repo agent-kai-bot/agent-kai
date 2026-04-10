@@ -64,6 +64,44 @@ describe("daemon client helpers", () => {
     writeStoredToken("");
     expect(readStoredToken()).toBe("");
   });
+
+  it("loads sidebar snapshots through the daemon REST API", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ quotes: [{ symbol: "BTC", price: 100_000 }] })),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            positions: [{ symbol: "BTC", side: "long", quantity: 1, entry_price: 90_000, current_price: 100_000, unrealized_pnl: 10_000, pnl_pct: 11.1 }],
+            pnl: { total_value: 110_000 },
+          }),
+        ),
+      );
+
+    const client = new DaemonClient({
+      baseHttpUrl: "http://127.0.0.1:8765",
+      fetchImpl,
+      webSocketFactory: vi.fn() as never,
+    });
+
+    const quotes = await client.fetchWatchlistQuotes(["BTC", "btc"], "secret");
+    const portfolio = await client.fetchPortfolio("secret");
+
+    expect(quotes).toEqual([{ symbol: "BTC", price: 100_000 }]);
+    expect(portfolio.positions).toHaveLength(1);
+    expect(fetchImpl).toHaveBeenNthCalledWith(
+      1,
+      "http://127.0.0.1:8765/api/market/watchlist?symbols=BTC",
+      { headers: { Authorization: "Bearer secret" } },
+    );
+    expect(fetchImpl).toHaveBeenNthCalledWith(
+      2,
+      "http://127.0.0.1:8765/api/portfolio",
+      { headers: { Authorization: "Bearer secret" } },
+    );
+  });
 });
 
 describe("daemon attach handshake", () => {

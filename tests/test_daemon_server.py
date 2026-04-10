@@ -164,6 +164,36 @@ class DaemonServerTests(unittest.TestCase):
                 self.assertEqual(chart_bar["tf"], "1h")
 
     @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    def test_subscribed_nats_events_are_forwarded(self, attach_runtime):
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with self._make_client() as client:
+            with client.websocket_connect("/ws") as websocket:
+                websocket.send_json(
+                    {
+                        "type": "attach",
+                        "session": "terminal",
+                        "create_if_missing": True,
+                    }
+                )
+                websocket.receive_json()
+                websocket.receive_json()
+
+                websocket.send_json({"type": "subscribe", "channel": "nats"})
+
+                client.app.state.daemon_server._handle_nats_message(
+                    "pub",
+                    "agent.broadcast",
+                    {"message": "hello"},
+                )
+
+                nats_event = websocket.receive_json()
+                self.assertEqual(nats_event["type"], "nats_event")
+                self.assertEqual(nats_event["direction"], "pub")
+                self.assertEqual(nats_event["subject"], "agent.broadcast")
+                self.assertEqual(nats_event["payload"]["message"], "hello")
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
     def test_scheduled_job_events_are_forwarded(self, attach_runtime):
         attach_runtime.side_effect = _fake_attach_runtime
 
@@ -661,6 +691,57 @@ class DaemonServerRestTests(unittest.TestCase):
                     missing = client.delete("/api/sessions/missing")
                     self.assertEqual(missing.status_code, 404)
                     self.assertIn("does not exist", missing.json()["detail"])
+
+    @mock.patch("daemon.server._fetch_watchlist_quote")
+    def test_rest_watchlist_quotes_and_portfolio_snapshot(self, fetch_watchlist_quote):
+        fetch_watchlist_quote.side_effect = [
+            {
+                "symbol": "BTC",
+                "price": 101_000.0,
+                "volume_24h": 1234.5,
+                "price_change_24h_pct": 2.5,
+            },
+            {
+                "symbol": "ETH",
+                "price": 5_200.0,
+                "volume_24h": 4321.0,
+                "price_change_24h_pct": -1.2,
+            },
+        ]
+
+        with mock.patch(
+            "daemon.server._load_portfolio_snapshot",
+            return_value={
+                "positions": [
+                    {
+                        "symbol": "BTC",
+                        "side": "long",
+                        "quantity": 0.25,
+                        "entry_price": 95_000.0,
+                        "current_price": 101_000.0,
+                        "unrealized_pnl": 1_500.0,
+                        "pnl_pct": 6.3,
+                    }
+                ],
+                "pnl": {
+                    "total_value": 105_000.0,
+                    "total_pnl": 5_000.0,
+                    "total_pnl_pct": 5.0,
+                },
+            },
+        ):
+            with self._make_client() as client:
+                watchlist = client.get("/api/market/watchlist?symbols=BTC,ETH")
+                self.assertEqual(watchlist.status_code, 200)
+                quotes = watchlist.json()["quotes"]
+                self.assertEqual([item["symbol"] for item in quotes], ["BTC", "ETH"])
+                self.assertEqual(quotes[0]["price"], 101_000.0)
+
+                portfolio = client.get("/api/portfolio")
+                self.assertEqual(portfolio.status_code, 200)
+                payload = portfolio.json()
+                self.assertEqual(payload["positions"][0]["symbol"], "BTC")
+                self.assertEqual(payload["pnl"]["total_value"], 105_000.0)
 
 
 class DaemonServerWebAssetTests(unittest.TestCase):
