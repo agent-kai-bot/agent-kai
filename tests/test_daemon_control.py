@@ -10,8 +10,11 @@ from unittest import mock
 from daemon.control import (
     build_daemon_command,
     clear_daemon_pid,
+    get_daemon_status,
     read_daemon_pid,
+    read_log_tail,
     start_local_daemon,
+    stop_local_daemon,
 )
 
 
@@ -103,3 +106,40 @@ class DaemonControlTests(unittest.TestCase):
 
             clear_daemon_pid(pid_path)
             self.assertIsNone(read_daemon_pid(pid_path))
+
+    @mock.patch("daemon.control.pid_is_running", return_value=True)
+    @mock.patch("daemon.control.daemon_healthcheck")
+    def test_get_daemon_status_reports_managed_process(self, healthcheck, _pid_is_running):
+        healthcheck.return_value = {"status": "ok"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pid_path = Path(tmpdir) / "kaid.pid"
+            pid_path.write_text("2468\n", encoding="utf-8")
+
+            status = get_daemon_status(pid_path=pid_path)
+
+            self.assertTrue(status.running)
+            self.assertTrue(status.healthy)
+            self.assertTrue(status.managed)
+            self.assertEqual(status.pid, 2468)
+
+    @mock.patch("daemon.control.pid_is_running", return_value=False)
+    def test_stop_local_daemon_clears_stale_pid_file(self, _pid_is_running):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pid_path = Path(tmpdir) / "kaid.pid"
+            pid_path.write_text("2468\n", encoding="utf-8")
+
+            result = stop_local_daemon(pid_path=pid_path)
+
+            self.assertTrue(result.already_stopped)
+            self.assertIn("stale pid file", result.detail)
+            self.assertIsNone(read_daemon_pid(pid_path))
+
+    def test_read_log_tail_returns_last_lines(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "kaid.log"
+            log_path.write_text("one\ntwo\nthree\n", encoding="utf-8")
+
+            tail = read_log_tail(log_path=log_path, lines=2)
+
+            self.assertEqual(tail, "two\nthree\n")
