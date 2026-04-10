@@ -6,6 +6,7 @@ import asyncio
 import sys
 
 from config import DEFAULT_AGENT, NATS_URL
+from daemon.control import ensure_local_daemon_started
 from daemon.core import Session
 from nats_bus.bus import NatsBus
 from tui.app import AgentTUI
@@ -156,6 +157,21 @@ async def _run_remote_terminal(args: argparse.Namespace) -> None:
         session_name = next_session.strip()
 
 
+async def _ensure_local_daemon(args: argparse.Namespace) -> str | None:
+    """Start the local daemon on demand and return its websocket URL."""
+    try:
+        return await asyncio.to_thread(
+            ensure_local_daemon_started,
+            agent_name=args.name,
+            nats_url=args.nats_url,
+            log_level=args.log_level,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Warning: Could not auto-start the local daemon: {exc}")
+        print("Falling back to --standalone.\n")
+        return None
+
+
 async def _run_local_terminal(args: argparse.Namespace, bus) -> None:
     """Launch the in-process terminal and recreate it when switching sessions."""
     from tui.terminal import TradingTerminal
@@ -181,6 +197,28 @@ async def _run_local_terminal(args: argparse.Namespace, bus) -> None:
         session_name = next_session.strip()
 
 
+async def _run_terminal_mode(args: argparse.Namespace) -> None:
+    """Run terminal mode through the daemon by default, with standalone fallback."""
+    if args.remote:
+        await _run_remote_terminal(args)
+        return
+
+    if not args.standalone:
+        remote_url = await _ensure_local_daemon(args)
+        if remote_url:
+            remote_args = argparse.Namespace(**vars(args))
+            remote_args.remote = remote_url
+            await _run_remote_terminal(remote_args)
+            return
+
+    bus = await _connect_bus(args)
+    try:
+        await _run_local_terminal(args, bus)
+    finally:
+        if bus:
+            await bus.disconnect()
+
+
 async def main(argv: list[str] | None = None):
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -201,17 +239,15 @@ async def main(argv: list[str] | None = None):
         await _run_daemon(args)
         return
 
-    if args.terminal and args.remote:
-        await _run_remote_terminal(args)
+    if args.terminal:
+        await _run_terminal_mode(args)
         return
 
     # Connect to NATS
     bus = await _connect_bus(args)
 
     try:
-        if args.terminal:
-            await _run_local_terminal(args, bus)
-        elif args.no_tui:
+        if args.no_tui:
             session = Session(args.name)
             agent_runner = session.attach_runtime(bus=bus, agent_name=args.name)
             if not bus:

@@ -9,6 +9,7 @@ from main import (
     _resolve_terminal_session_name,
     _run_local_terminal,
     _run_remote_terminal,
+    _run_terminal_mode,
     build_parser,
     validate_args,
 )
@@ -202,6 +203,105 @@ class MainTerminalLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             all(session.sub_agent_manager.stopped for session in _FakeLocalSession.instances)
         )
+
+
+class MainTerminalModeTests(unittest.IsolatedAsyncioTestCase):
+    """Validate the Phase 4 daemon-default terminal routing."""
+
+    async def test_terminal_mode_prefers_daemon_when_available(self):
+        parser = build_parser()
+        args = parser.parse_args(["--terminal", "--session", "alpha"])
+
+        with mock.patch(
+            "main._ensure_local_daemon",
+            mock.AsyncMock(return_value="ws://127.0.0.1:8765/ws"),
+        ) as ensure_daemon, mock.patch(
+            "main._run_remote_terminal",
+            mock.AsyncMock(),
+        ) as run_remote, mock.patch(
+            "main._connect_bus",
+            mock.AsyncMock(),
+        ) as connect_bus, mock.patch(
+            "main._run_local_terminal",
+            mock.AsyncMock(),
+        ) as run_local:
+            await _run_terminal_mode(args)
+
+        ensure_daemon.assert_awaited_once_with(args)
+        connect_bus.assert_not_awaited()
+        run_local.assert_not_awaited()
+        run_remote.assert_awaited_once()
+        remote_args = run_remote.await_args.args[0]
+        self.assertEqual(remote_args.remote, "ws://127.0.0.1:8765/ws")
+        self.assertEqual(remote_args.session, "alpha")
+
+    async def test_terminal_mode_falls_back_to_standalone_when_daemon_fails(self):
+        parser = build_parser()
+        args = parser.parse_args(["--terminal", "--session", "alpha"])
+        bus = mock.Mock()
+        bus.disconnect = mock.AsyncMock()
+
+        with mock.patch(
+            "main._ensure_local_daemon",
+            mock.AsyncMock(return_value=None),
+        ) as ensure_daemon, mock.patch(
+            "main._run_remote_terminal",
+            mock.AsyncMock(),
+        ) as run_remote, mock.patch(
+            "main._connect_bus",
+            mock.AsyncMock(return_value=bus),
+        ) as connect_bus, mock.patch(
+            "main._run_local_terminal",
+            mock.AsyncMock(),
+        ) as run_local:
+            await _run_terminal_mode(args)
+
+        ensure_daemon.assert_awaited_once_with(args)
+        connect_bus.assert_awaited_once_with(args)
+        run_local.assert_awaited_once_with(args, bus)
+        bus.disconnect.assert_awaited_once_with()
+        run_remote.assert_not_awaited()
+
+    async def test_terminal_mode_respects_explicit_standalone(self):
+        parser = build_parser()
+        args = parser.parse_args(["--terminal", "--standalone"])
+        bus = mock.Mock()
+        bus.disconnect = mock.AsyncMock()
+
+        with mock.patch("main._ensure_local_daemon", mock.AsyncMock()) as ensure_daemon, mock.patch(
+            "main._run_remote_terminal",
+            mock.AsyncMock(),
+        ) as run_remote, mock.patch(
+            "main._connect_bus",
+            mock.AsyncMock(return_value=bus),
+        ) as connect_bus, mock.patch(
+            "main._run_local_terminal",
+            mock.AsyncMock(),
+        ) as run_local:
+            await _run_terminal_mode(args)
+
+        ensure_daemon.assert_not_awaited()
+        connect_bus.assert_awaited_once_with(args)
+        run_local.assert_awaited_once_with(args, bus)
+        bus.disconnect.assert_awaited_once_with()
+        run_remote.assert_not_awaited()
+
+    async def test_terminal_mode_keeps_explicit_remote_flow(self):
+        parser = build_parser()
+        args = parser.parse_args(["--terminal", "--remote", "ws://example.com/ws"])
+
+        with mock.patch("main._ensure_local_daemon", mock.AsyncMock()) as ensure_daemon, mock.patch(
+            "main._run_remote_terminal",
+            mock.AsyncMock(),
+        ) as run_remote, mock.patch(
+            "main._connect_bus",
+            mock.AsyncMock(),
+        ) as connect_bus:
+            await _run_terminal_mode(args)
+
+        ensure_daemon.assert_not_awaited()
+        connect_bus.assert_not_awaited()
+        run_remote.assert_awaited_once_with(args)
 
 
 if __name__ == "__main__":
