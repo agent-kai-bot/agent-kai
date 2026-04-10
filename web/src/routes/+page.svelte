@@ -2,6 +2,12 @@
   import { onDestroy, onMount } from "svelte";
 
   import {
+    filterPaletteItems,
+    resolvePaletteQuery,
+    splitSlashInput,
+    type CommandPaletteItem,
+  } from "$lib/command-palette";
+  import {
     DaemonClient,
     DEFAULT_SESSION_NAME,
   } from "$lib/daemon/client";
@@ -17,6 +23,7 @@
   } from "$lib/daemon/types";
   import ChartPanel from "$lib/components/ChartPanel.svelte";
   import ChatPanel from "$lib/components/ChatPanel.svelte";
+  import CommandPalette from "$lib/components/CommandPalette.svelte";
   import EventPanel, { type EventRow } from "$lib/components/EventPanel.svelte";
   import PositionsPanel from "$lib/components/PositionsPanel.svelte";
   import WatchlistPanel from "$lib/components/WatchlistPanel.svelte";
@@ -46,6 +53,9 @@
   let natsEvents: EventRow[] = [];
   let schedulerEvents: EventRow[] = [];
   let inputDraft = "";
+  let paletteOpen = false;
+  let paletteQuery = "";
+  let paletteItems: CommandPaletteItem[] = filterPaletteItems("");
   let pollingHandle: number | null = null;
   let daemonConnection: Awaited<ReturnType<DaemonClient["attach"]>> | null = null;
 
@@ -66,6 +76,22 @@
       window.clearInterval(pollingHandle);
       pollingHandle = null;
     }
+  }
+
+  function updatePaletteItems(): void {
+    paletteItems = filterPaletteItems(paletteQuery);
+  }
+
+  function openPalette(): void {
+    paletteOpen = true;
+    paletteQuery = "";
+    updatePaletteItems();
+  }
+
+  function closePalette(): void {
+    paletteOpen = false;
+    paletteQuery = "";
+    updatePaletteItems();
   }
 
   async function refreshChartData(): Promise<void> {
@@ -295,10 +321,46 @@
     daemonConnection.sendInput(text);
   }
 
+  function executePaletteCommand(raw: string): void {
+    if (!daemonConnection) {
+      return;
+    }
+    const split = splitSlashInput(resolvePaletteQuery(raw, paletteItems));
+    if (!split.command) {
+      return;
+    }
+    chatMessages = [
+      ...chatMessages,
+      {
+        role: "human",
+        content: `${split.command}${split.args ? ` ${split.args}` : ""}`,
+      },
+    ];
+    streamingReply = "";
+    daemonConnection.sendSlash(split.command, split.args);
+    closePalette();
+  }
+
   onMount(() => {
     token = readStoredToken();
     tokenRequired = !localhostHosts.has(window.location.hostname);
     void refreshSessions();
+    const onKeydown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        void openPalette();
+      } else if (paletteOpen && event.key === "Escape") {
+        event.preventDefault();
+        closePalette();
+      } else if (paletteOpen && event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        executePaletteCommand(paletteQuery);
+      }
+    };
+    window.addEventListener("keydown", onKeydown);
+    return () => {
+      window.removeEventListener("keydown", onKeydown);
+    };
   });
 
   onDestroy(() => {
@@ -332,6 +394,11 @@
       {#if activeSession}
         <strong>{activeSession}</strong>
       {/if}
+    </div>
+
+    <div class="shortcut-hint">
+      <span>Ctrl+K</span>
+      <p>Open the slash command palette and execute daemon-side commands without leaving the dashboard.</p>
     </div>
 
     <div class="connect-grid">
@@ -493,3 +560,16 @@
     {/if}
   </div>
 </section>
+
+<CommandPalette
+  activeSession={activeSession}
+  items={paletteItems}
+  onClose={closePalette}
+  onQueryChange={(value) => {
+    paletteQuery = value;
+    updatePaletteItems();
+  }}
+  onSelect={executePaletteCommand}
+  open={paletteOpen}
+  query={paletteQuery}
+/>
