@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from collections.abc import Callable
@@ -15,6 +14,28 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from config import DEFAULT_AGENT, NATS_URL
 from daemon.core import Session, SessionEvent, serialize_messages
+from daemon.protocol import (
+    AttachEnvelope,
+    ChartBarEnvelope,
+    ClientEnvelope,
+    ErrorEnvelope,
+    FinalEnvelope,
+    HeartbeatEnvelope,
+    InputEnvelope,
+    InterruptEnvelope,
+    SessionAttachedEnvelope,
+    SessionStateSnapshot,
+    SignalEnvelope,
+    SlashEnvelope,
+    StatusEnvelope,
+    SubscribeEnvelope,
+    TokenEnvelope,
+    ToolEndEnvelope,
+    ToolStartEnvelope,
+    UnsubscribeEnvelope,
+    decode_client_envelope,
+    encode_envelope,
+)
 from nats_bus.bus import NatsBus
 
 DEFAULT_DAEMON_HOST = "127.0.0.1"
@@ -136,7 +157,7 @@ class DaemonServer:
             )
             if message is None:
                 continue
-            await websocket.send_json(message)
+            await _send_server_envelope(websocket, message)
 
     def _event_to_message(
         self,
@@ -145,24 +166,24 @@ class DaemonServer:
         event: SessionEvent,
         subscriptions: dict[str, Any],
         tool_start_times: dict[str, float],
-    ) -> dict[str, Any] | None:
+    ):
         """Map one internal session event to a WS envelope."""
         topic = event.topic
         payload = event.payload
 
         if topic == "agent.token":
             text = payload.get("value")
-            return {"type": "token", "text": text or ""}
+            return TokenEnvelope(type="token", text=text or "")
 
         if topic == "agent.tool_start":
             tool = str(payload.get("tool") or "")
             if tool:
                 tool_start_times[tool] = time.monotonic()
-            return {
-                "type": "tool_start",
-                "tool": tool,
-                "args": payload.get("input"),
-            }
+            return ToolStartEnvelope(
+                type="tool_start",
+                tool=tool,
+                args=payload.get("input"),
+            )
 
         if topic == "agent.tool_end":
             tool = str(payload.get("tool") or "")
@@ -170,49 +191,49 @@ class DaemonServer:
             elapsed_ms = None
             if started_at is not None:
                 elapsed_ms = int((time.monotonic() - started_at) * 1000)
-            return {
-                "type": "tool_end",
-                "tool": tool,
-                "elapsed_ms": elapsed_ms,
-                "ok": True,
-            }
+            return ToolEndEnvelope(
+                type="tool_end",
+                tool=tool,
+                elapsed_ms=elapsed_ms,
+                ok=True,
+            )
 
         if topic == "agent.final":
-            return {"type": "final", "text": payload.get("value") or ""}
+            return FinalEnvelope(type="final", text=payload.get("value") or "")
 
         if topic == "agent.status":
-            return {
-                "type": "status",
-                "activity": payload.get("value") or "idle",
-                "queue": len(session.input_queue),
-            }
+            return StatusEnvelope(
+                type="status",
+                activity=payload.get("value") or "idle",
+                queue=len(session.input_queue),
+            )
 
         if topic == "agent.error":
-            return {
-                "type": "error",
-                "code": "agent_error",
-                "message": payload.get("value") or "agent stream failed",
-            }
+            return ErrorEnvelope(
+                type="error",
+                code="agent_error",
+                message=payload.get("value") or "agent stream failed",
+            )
 
         if topic == "status.updated":
-            return {
-                "type": "status",
-                "activity": payload.get("status") or "idle",
-                "queue": len(session.input_queue),
-            }
+            return StatusEnvelope(
+                type="status",
+                activity=payload.get("status") or "idle",
+                queue=len(session.input_queue),
+            )
 
         if topic == "input.queued" or topic == "input.dequeued":
-            return {
-                "type": "status",
-                "activity": session.activity_status,
-                "queue": payload.get("depth", len(session.input_queue)),
-            }
+            return StatusEnvelope(
+                type="status",
+                activity=session.activity_status,
+                queue=payload.get("depth", len(session.input_queue)),
+            )
 
         if topic == "signal.received":
             if not subscriptions.get("signals"):
                 return None
             signal = payload.get("signal")
-            return {"type": "signal", "signal": signal or payload}
+            return SignalEnvelope(type="signal", signal=signal or payload)
 
         if topic == "chart.bar":
             chart_subs = subscriptions.get("chart", set())
@@ -222,49 +243,47 @@ class DaemonServer:
                 return None
             if not chart_subs:
                 return None
-            return {
-                "type": "chart_bar",
-                "symbol": symbol,
-                "tf": timeframe,
-                "bar": payload.get("bar"),
-            }
+            return ChartBarEnvelope(
+                type="chart_bar",
+                symbol=symbol,
+                tf=timeframe,
+                bar=payload.get("bar"),
+            )
 
         return None
 
     @staticmethod
-    def session_snapshot(session: Session) -> dict[str, Any]:
+    def session_snapshot(session: Session) -> SessionStateSnapshot:
         """Serialize the attach-time state snapshot for one session."""
-        return {
-            "chart_symbol": session.ui_state.chart_symbol,
-            "chart_timeframe": session.ui_state.chart_timeframe,
-            "chart_source": session.ui_state.chart_source,
-            "chart_layout_mode": session.ui_state.chart_layout_mode,
-            "chart_color_scheme": session.ui_state.chart_color_scheme,
-            "watchlist_symbols": list(session.ui_state.watchlist_symbols),
-            "autotrade_enabled": bool(session.ui_state.autotrade_enabled),
-            "activity_status": session.ui_state.activity_status,
-            "chat_history": serialize_messages(session.chat_history),
-        }
+        return SessionStateSnapshot(
+            chart_symbol=session.ui_state.chart_symbol,
+            chart_timeframe=session.ui_state.chart_timeframe,
+            chart_source=session.ui_state.chart_source,
+            chart_layout_mode=session.ui_state.chart_layout_mode,
+            chart_color_scheme=session.ui_state.chart_color_scheme,
+            watchlist_symbols=list(session.ui_state.watchlist_symbols),
+            autotrade_enabled=bool(session.ui_state.autotrade_enabled),
+            activity_status=session.ui_state.activity_status,
+            chat_history=serialize_messages(session.chat_history),
+        )
 
 
-async def _receive_json(websocket: WebSocket) -> dict[str, Any]:
-    raw = await websocket.receive_text()
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError("invalid JSON payload") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("message payload must be a JSON object")
-    return payload
+async def _receive_client_envelope(websocket: WebSocket) -> ClientEnvelope:
+    return decode_client_envelope(await websocket.receive_text())
+
+
+async def _send_server_envelope(websocket: WebSocket, envelope) -> None:
+    await websocket.send_json(encode_envelope(envelope))
 
 
 async def _send_error(websocket: WebSocket, code: str, message: str) -> None:
-    await websocket.send_json(
-        {
-            "type": "error",
-            "code": code,
-            "message": message,
-        }
+    await _send_server_envelope(
+        websocket,
+        ErrorEnvelope(
+            type="error",
+            code=code,
+            message=message,
+        ),
     )
 
 
@@ -297,13 +316,13 @@ def create_app(
         await websocket.accept()
 
         try:
-            first_message = await _receive_json(websocket)
+            first_message = await _receive_client_envelope(websocket)
         except ValueError as exc:
             await _send_error(websocket, "bad_request", str(exc))
             await websocket.close(code=1003)
             return
 
-        if first_message.get("type") != "attach":
+        if not isinstance(first_message, AttachEnvelope):
             await _send_error(
                 websocket,
                 "bad_request",
@@ -312,12 +331,10 @@ def create_app(
             await websocket.close(code=1008)
             return
 
-        session_name = str(first_message.get("session") or "").strip()
-        create_if_missing = bool(first_message.get("create_if_missing"))
         try:
             managed = await daemon_server.get_or_create_session(
-                session_name,
-                create_if_missing=create_if_missing,
+                first_message.session,
+                create_if_missing=first_message.create_if_missing,
             )
         except (KeyError, TypeError, ValueError) as exc:
             await _send_error(websocket, "attach_failed", str(exc))
@@ -336,62 +353,46 @@ def create_app(
             )
         )
 
-        await websocket.send_json(
-            {
-                "type": "session_attached",
-                "session": session.name,
-                "state": daemon_server.session_snapshot(session),
-            }
+        await _send_server_envelope(
+            websocket,
+            SessionAttachedEnvelope(
+                type="session_attached",
+                session=session.name,
+                state=daemon_server.session_snapshot(session),
+            ),
         )
-        await websocket.send_json(
-            {
-                "type": "status",
-                "activity": session.activity_status,
-                "queue": len(session.input_queue),
-            }
+        await _send_server_envelope(
+            websocket,
+            StatusEnvelope(
+                type="status",
+                activity=session.activity_status,
+                queue=len(session.input_queue),
+            ),
         )
 
         try:
             while True:
                 try:
-                    payload = await _receive_json(websocket)
+                    payload = await _receive_client_envelope(websocket)
                 except ValueError as exc:
                     await _send_error(websocket, "bad_request", str(exc))
                     continue
 
-                message_type = payload.get("type")
-                if message_type == "input":
-                    text = payload.get("text")
-                    if not isinstance(text, str) or not text.strip():
-                        await _send_error(
-                            websocket,
-                            "bad_request",
-                            "input envelope requires non-empty text",
-                        )
-                        continue
-                    await daemon_server.run_input(managed, text)
+                if isinstance(payload, InputEnvelope):
+                    await daemon_server.run_input(managed, payload.text)
                     continue
 
-                if message_type == "slash":
-                    command = payload.get("command")
-                    args = payload.get("args")
-                    if not isinstance(command, str) or not command.strip():
-                        await _send_error(
-                            websocket,
-                            "bad_request",
-                            "slash envelope requires a command string",
-                        )
-                        continue
-                    parts = [command.strip()]
-                    if isinstance(args, str) and args.strip():
-                        parts.append(args.strip())
+                if isinstance(payload, SlashEnvelope):
+                    parts = [payload.command.strip()]
+                    if payload.args.strip():
+                        parts.append(payload.args.strip())
                     await daemon_server.run_input(managed, " ".join(parts))
                     continue
 
-                if message_type == "heartbeat":
+                if isinstance(payload, HeartbeatEnvelope):
                     continue
 
-                if message_type == "interrupt":
+                if isinstance(payload, InterruptEnvelope):
                     await _send_error(
                         websocket,
                         "unsupported",
@@ -399,31 +400,24 @@ def create_app(
                     )
                     continue
 
-                if message_type == "subscribe":
-                    channel = payload.get("channel")
-                    if channel == "signals":
+                if isinstance(payload, SubscribeEnvelope):
+                    if payload.channel == "signals":
                         subscriptions["signals"] = True
-                    elif channel == "chart":
-                        symbol = payload.get("symbol")
-                        timeframe = payload.get("tf")
-                        if isinstance(symbol, str) and isinstance(timeframe, str):
-                            subscriptions["chart"].add((symbol, timeframe))
+                    elif payload.channel == "chart":
+                        subscriptions["chart"].add((payload.symbol, payload.tf))
                     continue
 
-                if message_type == "unsubscribe":
-                    channel = payload.get("channel")
-                    if channel == "signals":
+                if isinstance(payload, UnsubscribeEnvelope):
+                    if payload.channel == "signals":
                         subscriptions["signals"] = False
-                    elif channel == "chart":
-                        symbol = payload.get("symbol")
-                        timeframe = payload.get("tf")
-                        subscriptions["chart"].discard((symbol, timeframe))
+                    elif payload.channel == "chart":
+                        subscriptions["chart"].discard((payload.symbol, payload.tf))
                     continue
 
                 await _send_error(
                     websocket,
                     "bad_request",
-                    f"unsupported message type: {message_type!r}",
+                    f"unsupported message type: {type(payload).__name__}",
                 )
         except WebSocketDisconnect:
             pass
@@ -437,4 +431,3 @@ def create_app(
 
 
 app = create_app()
-
