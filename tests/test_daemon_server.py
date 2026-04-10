@@ -53,7 +53,9 @@ def _fake_attach_runtime(
     bus=None,
     agent_name="kai",
     signal_consumer=None,
+    scheduler=None,
 ):
+    del bus, signal_consumer, scheduler
     runner = _FakeRunner()
     session.agent_runner = runner
     session.agent_name = agent_name

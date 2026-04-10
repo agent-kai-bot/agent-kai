@@ -90,6 +90,8 @@ class SessionTests(unittest.TestCase):
             bus,
             session.sub_agent_registry,
             signal_consumer=signal_consumer,
+            scheduler=None,
+            session=session,
         )
         agent_runner_cls.assert_called_once_with(
             tools=["tool-a", "tool-b"],
