@@ -20,6 +20,12 @@ from agent.skills_store import SkillStore
 from agent_logger import get_logger
 from config import get_skills_dir
 from tui.panels.alerts import AlertsPanel
+from tui.chart_modes import (
+    CHART_LAYOUT_MODES,
+    chart_layout_choices,
+    cycle_chart_layout_mode,
+    normalize_chart_layout_mode,
+)
 from tui.panels.agent_chat import ChatPanel
 from tui.panels.chart import ChartPanel
 from tui.panels.history_input import HistoryInput
@@ -40,6 +46,7 @@ TRACKED_SYMBOLS = ["BTC", "ETH", "SOL"]
 # realistic interactive use; the user can always /queue clear and
 # retry if they hit the cap.
 MAX_INPUT_QUEUE = 10
+CHART_HISTORY_LIMIT = 500
 
 
 def _kai_api_headers() -> dict:
@@ -114,12 +121,17 @@ class TradingTerminal(App):
         ("ctrl+l", "clear_chat", "Clear chat"),
         ("ctrl+t", "cycle_timeframe", "Timeframe"),
         ("ctrl+s", "cycle_symbol", "Symbol"),
+        ("ctrl+g", "cycle_chart_layout_mode", "Chart Mode"),
+        ("alt+left", "chart_pan_left", "Pan Left"),
+        ("alt+right", "chart_pan_right", "Pan Right"),
+        ("alt+up", "chart_zoom_in", "Zoom In"),
+        ("alt+down", "chart_zoom_out", "Zoom Out"),
         ("ctrl+w", "toggle_watchlist_add", "Add symbol"),
         ("ctrl+y", "copy_last_response", "Copy last reply"),
         ("ctrl+shift+c", "copy_selection", "Copy selection"),
     ]
 
-    TIMEFRAMES = ["1m", "5m", "15m", "1h"]
+    TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "6h", "1d"]
 
     def __init__(self, agent_runner, bus=None, signal_consumer: SignalConsumer | None = None):
         super().__init__()
@@ -220,12 +232,12 @@ class TradingTerminal(App):
         self._saved_color_scheme = state.get("chart_color_scheme", "classic")
         self._chart_source = state.get("chart_source", "kai-api")
         self._autotrade_enabled = bool(state.get("autotrade_enabled", False))
-        # Chart-vs-chat row sizing mode. "full" is the default 3fr/2fr
-        # layout (chart 60% / chat 40%); "half" flips the ratio to
-        # 1fr/4fr so the chart shrinks and the chat dominates. Toggled
-        # at runtime via /chart half | /chart full and re-applied in
-        # on_mount via _apply_chart_size_mode.
-        self._chart_size_mode: str = state.get("chart_size_mode", "full")
+        # ``chart_size_mode`` is the legacy key from the older
+        # full/half implementation. Keep reading it as a migration
+        # path so existing state files land on a sensible modern
+        # workspace mode.
+        persisted_layout = state.get("chart_layout_mode") or state.get("chart_size_mode")
+        self._chart_layout_mode = normalize_chart_layout_mode(persisted_layout)
         # Persisted watchlist symbol list. /watch add and /watch remove
         # mutate the panel's tracked_symbols and immediately save back
         # via _persist_watchlist_symbols. Falls back to TRACKED_SYMBOLS
@@ -244,7 +256,8 @@ class TradingTerminal(App):
     def compose(self) -> ComposeResult:
         yield Static(
             "KAI Trading Terminal (agent-k.ai)  "
-            "[ctrl+s: symbol] [ctrl+t: timeframe] [ctrl+w: add symbol] "
+            "[ctrl+s: symbol] [ctrl+t: timeframe] [ctrl+g: mode] "
+            "[alt+arrows: pan/zoom] [ctrl+w: add symbol] "
             "[click a watchlist row to chart it]",
             id="header",
         )
@@ -327,19 +340,21 @@ class TradingTerminal(App):
                     self._saved_color_scheme,
                     chart.color_scheme,
                 )
+            chart.set_source(self._chart_source)
+            chart.set_layout_mode(self._chart_layout_mode)
         except Exception as exc:
             self.logger.warning("chart color scheme restore failed: %s", exc)
 
-        # Restore the persisted chart-vs-chat row sizing. Has to run
+        # Restore the persisted chart workspace mode. Has to run
         # after the screen is fully mounted (the styles object only
         # exists once Textual has built the layout) but before the
         # user starts typing — on_mount is the right window. If the
-        # restore fails for any reason, the default 3fr/2fr layout
+        # restore fails for any reason, the default dashboard layout
         # from terminal_styles.tcss is what gets shown.
         try:
-            self._apply_chart_size_mode(self._chart_size_mode)
+            self._apply_chart_layout_mode(self._chart_layout_mode)
         except Exception as exc:
-            self.logger.warning("chart size restore failed: %s", exc)
+            self.logger.warning("chart layout restore failed: %s", exc)
 
         # Initial status bar render and the periodic refresh task.
         # The refresh task runs every STATUS_BAR_REFRESH_INTERVAL_S
@@ -365,7 +380,11 @@ class TradingTerminal(App):
             "/react /autotrade /model /think /queue /status /debug "
             "/login codex /exit /reset[/]"
         )
-        chat.append_message("[dim]Mouse-drag any panel to copy. Ctrl+Y = last reply. Ctrl+Shift+C = current selection.[/]")
+        chat.append_message(
+            "[dim]Mouse-drag any panel to copy. Ctrl+Y = last reply. "
+            "Ctrl+Shift+C = current selection. Ctrl+G cycles chart modes. "
+            "Alt+Left/Right pans. Alt+Up/Down zooms.[/]"
+        )
 
         # Restore the previous session's chat history if any. We do
         # this AFTER the welcome banner so the visual order is
@@ -600,7 +619,7 @@ class TradingTerminal(App):
     async def _load_chart_from_kai_api(self, symbol: str, interval: str) -> None:
         """Hand off to the kai-api WebSocket feed lifecycle.
 
-        REST historical bootstrap (up to 200 bars) seeds the chart,
+        REST historical bootstrap (up to ``CHART_HISTORY_LIMIT`` bars) seeds the chart,
         then a live WebSocket subscription on the same channel keeps
         it updated as new candles tick. See ``_start_kai_api_feed``
         for the full sequence.
@@ -611,7 +630,7 @@ class TradingTerminal(App):
         """Start (or restart) the cloud agent-k.ai chart feed.
 
         1) Stop any existing kai-api WS task and Coinbase feed
-        2) Fetch historical bars via REST (200 bars, oldest → newest)
+        2) Fetch historical bars via REST (deep history, oldest → newest)
         3) Seed the chart panel with the historical window
         4) Spin up a KaiApiCandleStream consumer task that listens for
            live ``event`` frames and overwrites / appends bars on the
@@ -633,7 +652,9 @@ class TradingTerminal(App):
 
         # 1) Historical bootstrap (off the event loop)
         try:
-            hist = await asyncio.to_thread(fetch_candles, sym_upper, interval, 200)
+            hist = await asyncio.to_thread(
+                fetch_candles, sym_upper, interval, CHART_HISTORY_LIMIT
+            )
         except RuntimeError as e:
             self._nats_log(
                 f"[red]kai-api requires an API key — drop AGENT-KAI-API-KEY.txt "
@@ -647,6 +668,8 @@ class TradingTerminal(App):
         # Populate the chart with the historical window
         try:
             chart = self.query_one("#chart-panel", ChartPanel)
+            chart.set_source(self._chart_source)
+            chart.set_layout_mode(self._chart_layout_mode)
             chart.set_data(sym_upper, interval, hist)
         except Exception as e:
             self._log_error("chart set_data failed (kai-api path)", e)
@@ -838,11 +861,13 @@ class TradingTerminal(App):
         while True:
             try:
                 hist = await asyncio.to_thread(
-                    fetch_candles, symbol, interval, 200
+                    fetch_candles, symbol, interval, CHART_HISTORY_LIMIT
                 )
                 if hist:
                     try:
                         chart = self.query_one("#chart-panel", ChartPanel)
+                        chart.set_source(self._chart_source)
+                        chart.set_layout_mode(self._chart_layout_mode)
                         chart.set_data(symbol, interval, hist)
                         self._kai_api_last_refresh = time.time()
                         refresh_count += 1
@@ -909,7 +934,7 @@ class TradingTerminal(App):
         """Persist chart symbol/timeframe/source/scheme to state.json.
 
         Loads the existing state first and merges the chart fields on
-        top, so other state keys (autotrade_enabled, chart_size_mode,
+        top, so other state keys (autotrade_enabled, chart_layout_mode,
         anything added later) survive every chart save. Previously
         this built a fresh dict from scratch and silently clobbered
         autotrade_enabled every time the user changed the chart
@@ -924,61 +949,59 @@ class TradingTerminal(App):
         state["chart_timeframe"] = interval
         state["chart_color_scheme"] = current_scheme
         state["chart_source"] = self._chart_source
+        state["chart_layout_mode"] = self._chart_layout_mode
         _save_terminal_state(state)
 
-    def _set_chart_size_mode(self, mode: str) -> None:
-        """Toggle the chart-vs-chat row sizing mode + persist.
+    def _set_chart_layout_mode(self, mode: str) -> None:
+        """Set the chart workspace layout mode and persist it."""
 
-        ``mode`` is one of "full" / "half". Applies the corresponding
-        CSS class to the Screen so Textual recomputes the grid_rows
-        in place, then persists to state.json (load-then-merge so
-        other state fields survive).
-
-        Idempotent — calling with the current mode is a no-op visual
-        but still re-saves state, which is fine.
-        """
-        if mode not in ("full", "half"):
-            mode = "full"
-        self._chart_size_mode = mode
-        self._apply_chart_size_mode(mode)
-        # Persist via load-then-merge to avoid clobbering other state.
+        normalized = normalize_chart_layout_mode(mode)
+        self._chart_layout_mode = normalized
+        self._apply_chart_layout_mode(normalized)
+        try:
+            chart = self.query_one("#chart-panel", ChartPanel)
+            chart.set_layout_mode(normalized)
+        except Exception:
+            pass
         try:
             state = _load_terminal_state()
-            state["chart_size_mode"] = mode
+            state["chart_layout_mode"] = normalized
             _save_terminal_state(state)
         except Exception as exc:
-            self.logger.warning("persist chart_size_mode failed: %s", exc)
+            self.logger.warning("persist chart_layout_mode failed: %s", exc)
 
-    def _apply_chart_size_mode(self, mode: str) -> None:
-        """Apply the chart row sizing mode by toggling Screen CSS classes.
+    def _apply_chart_layout_mode(self, mode: str) -> None:
+        """Apply a chart workspace layout by toggling the screen CSS class."""
 
-        The CSS rules for ``Screen.chart-full`` and ``Screen.chart-half``
-        are defined in tui/terminal_styles.tcss. Toggling the class
-        triggers Textual to recompute the grid_rows in place, with
-        no need to mutate ``self.screen.styles.grid_rows`` directly
-        (which has reactive-property quirks across Textual versions).
-
-        Both classes are removed first so a switch from one to the
-        other doesn't leave both classes attached.
-        """
+        normalized = normalize_chart_layout_mode(mode)
         try:
             screen = self.screen
         except Exception:
-            # Pre-mount or post-unmount — there's no screen yet/anymore
-            # to mutate. Will be re-applied in on_mount.
             return
-        for cls in ("chart-half", "chart-full"):
+        for layout in CHART_LAYOUT_MODES.values():
             try:
-                screen.remove_class(cls)
+                screen.remove_class(layout.screen_class)
             except Exception:
                 pass
-        target_class = "chart-half" if mode == "half" else "chart-full"
+        target_class = CHART_LAYOUT_MODES[normalized].screen_class
         try:
             screen.add_class(target_class)
         except Exception as exc:
             self.logger.warning(
-                "chart size mode %r class apply failed: %s", mode, exc
+                "chart layout mode %r class apply failed: %s", normalized, exc
             )
+
+    def _format_chart_view_summary(self, state: dict[str, Any]) -> str:
+        """Render a short chart viewport summary for chat or status."""
+
+        live_state = "live" if state.get("right_offset", 0) == 0 else f"offset {state['right_offset']}"
+        return (
+            f"mode={state.get('layout_mode')} "
+            f"zoom={state.get('zoom')} "
+            f"bars={state.get('visible_bars')}/{state.get('total_bars')} "
+            f"volume={'on' if state.get('show_volume') else 'off'} "
+            f"{live_state}"
+        )
 
     # ── Coinbase feed lifecycle ───────────────────────────────
 
@@ -1009,7 +1032,7 @@ class TradingTerminal(App):
         # 1) Historical bootstrap via REST (off the event loop)
         try:
             hist = await asyncio.to_thread(
-                fetch_candles, product_id, interval, 120
+                fetch_candles, product_id, interval, min(CHART_HISTORY_LIMIT, 300)
             )
         except Exception as e:
             self._log_error(f"Coinbase historical fetch failed ({product_id} {interval})", e)
@@ -1018,6 +1041,8 @@ class TradingTerminal(App):
         # Populate the chart with the historical window
         try:
             chart = self.query_one("#chart-panel", ChartPanel)
+            chart.set_source(self._chart_source)
+            chart.set_layout_mode(self._chart_layout_mode)
             chart.set_data(product_id, interval, hist)
         except Exception as e:
             self._log_error("chart set_data failed (coinbase path)", e)
@@ -1098,8 +1123,10 @@ class TradingTerminal(App):
                 await asyncio.sleep(15)
                 try:
                     bars = await asyncio.to_thread(
-                        fetch_candles, product_id, interval, 120
+                        fetch_candles, product_id, interval, min(CHART_HISTORY_LIMIT, 300)
                     )
+                    chart.set_source(self._chart_source)
+                    chart.set_layout_mode(self._chart_layout_mode)
                     chart.set_data(product_id, interval, bars)
                 except asyncio.CancelledError:
                     raise
@@ -1419,12 +1446,16 @@ class TradingTerminal(App):
             # /chart BTC 1h          — change symbol + timeframe
             # /chart symbol BTC-USD  — change just the symbol (keep tf + source)
             # /chart source coinbase — switch data source to coinbase
-            # /chart source local    — switch data source back to local data_api
             # /chart source          — show current source
             # /chart color classic   — switch color scheme
             # /chart color           — list available schemes
             # /chart on              — show chart panel
             # /chart off             — hide chart panel
+            # /chart mode focus      — switch workspace layout mode
+            # /chart zoom in|out      — viewport zoom controls
+            # /chart left|right N     — viewport pan controls
+            # /chart latest           — jump back to the live edge
+            # /chart volume on|off    — toggle the volume pane
             sub = parts[1].lower() if len(parts) > 1 else ""
 
             if sub == "color":
@@ -1455,29 +1486,89 @@ class TradingTerminal(App):
                 self._chat_msg("[dim]Chart visible[/]")
                 return True
 
-            # Chart-vs-chat row sizing. Mutates the screen's grid_rows
-            # at runtime — Textual recomputes the layout in place. The
-            # choice is persisted to workspaces/terminal/state.json so
-            # it survives restart, and re-applied in on_mount.
-            if sub in ("half", "halfsize", "small"):
-                self._set_chart_size_mode("half")
-                self._chat_msg(
-                    "[dim]Chart shrunk — chat is now the dominant panel. "
-                    "Restore with /chart full[/]"
-                )
-                return True
-
             if sub in ("full", "fullsize", "default"):
-                self._set_chart_size_mode("full")
-                self._chat_msg("[dim]Chart restored to full size[/]")
+                self._set_chart_layout_mode("dashboard")
+                self._chat_msg("[dim]Chart layout: dashboard[/]")
                 return True
 
-            if sub == "size":
-                # /chart size — show the current size mode
-                mode = getattr(self, "_chart_size_mode", "full")
+            if sub in ("half", "halfsize", "small"):
+                self._set_chart_layout_mode("chat")
+                self._chat_msg("[dim]Chart layout: chat[/]")
+                return True
+
+            if sub == "mode":
+                if len(parts) < 3:
+                    choices = ", ".join(chart_layout_choices())
+                    self._chat_msg(
+                        f"[dim]Chart mode: {self._chart_layout_mode} "
+                        f"(available: {choices})[/]"
+                    )
+                    return True
+                target_mode = normalize_chart_layout_mode(parts[2])
+                self._set_chart_layout_mode(target_mode)
+                description = CHART_LAYOUT_MODES[target_mode].description
                 self._chat_msg(
-                    f"[dim]Chart size: {mode} (available: full, half)[/]"
+                    f"[bold cyan]Chart mode:[/] {target_mode} [dim]- {description}[/]"
                 )
+                return True
+
+            if sub == "view":
+                chart = self.query_one("#chart-panel", ChartPanel)
+                summary = self._format_chart_view_summary(chart.get_view_state())
+                self._chat_msg(f"[dim]{summary}[/]")
+                return True
+
+            if sub == "zoom":
+                chart = self.query_one("#chart-panel", ChartPanel)
+                direction = parts[2].lower() if len(parts) > 2 else ""
+                if direction in ("in", "+"):
+                    summary = self._format_chart_view_summary(chart.zoom_in())
+                    self._chat_msg(f"[dim]{summary}[/]")
+                    return True
+                if direction in ("out", "-"):
+                    summary = self._format_chart_view_summary(chart.zoom_out())
+                    self._chat_msg(f"[dim]{summary}[/]")
+                    return True
+                if direction in ("reset", "latest", "live"):
+                    summary = self._format_chart_view_summary(chart.reset_view())
+                    self._chat_msg(f"[dim]{summary}[/]")
+                    return True
+                summary = self._format_chart_view_summary(chart.get_view_state())
+                self._chat_msg(
+                    f"[dim]{summary} | usage: /chart zoom in|out|reset[/]"
+                )
+                return True
+
+            if sub in ("left", "back"):
+                chart = self.query_one("#chart-panel", ChartPanel)
+                steps = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 6
+                summary = self._format_chart_view_summary(chart.pan_left(steps))
+                self._chat_msg(f"[dim]{summary}[/]")
+                return True
+
+            if sub in ("right", "forward"):
+                chart = self.query_one("#chart-panel", ChartPanel)
+                steps = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 6
+                summary = self._format_chart_view_summary(chart.pan_right(steps))
+                self._chat_msg(f"[dim]{summary}[/]")
+                return True
+
+            if sub in ("latest", "live", "reset"):
+                chart = self.query_one("#chart-panel", ChartPanel)
+                summary = self._format_chart_view_summary(chart.pan_to_latest())
+                self._chat_msg(f"[dim]{summary}[/]")
+                return True
+
+            if sub == "volume":
+                chart = self.query_one("#chart-panel", ChartPanel)
+                arg = parts[2].lower() if len(parts) > 2 else ""
+                if arg in ("on", "show"):
+                    summary = self._format_chart_view_summary(chart.toggle_volume(True))
+                elif arg in ("off", "hide"):
+                    summary = self._format_chart_view_summary(chart.toggle_volume(False))
+                else:
+                    summary = self._format_chart_view_summary(chart.toggle_volume())
+                self._chat_msg(f"[dim]{summary}[/]")
                 return True
 
             if sub == "source":
@@ -1988,12 +2079,15 @@ class TradingTerminal(App):
         # Activity + chart
         try:
             tf = self.TIMEFRAMES[self._current_tf_idx]
+            chart = self.query_one("#chart-panel", ChartPanel)
+            view_summary = self._format_chart_view_summary(chart.get_view_state())
             self._chat_msg(
                 f"[dim]activity:[/] {self._activity_status}    "
                 f"[dim]chart:[/] {self._chart_symbol}/{tf} "
                 f"([cyan]{self._chart_source}[/], "
-                f"size={getattr(self, '_chart_size_mode', 'full')})"
+                f"mode={getattr(self, '_chart_layout_mode', 'dashboard')})"
             )
+            self._chat_msg(f"[dim]chart view:[/] {view_summary}")
         except Exception:
             pass
 
@@ -3307,6 +3401,37 @@ class TradingTerminal(App):
         tf = self.TIMEFRAMES[self._current_tf_idx]
         self.run_worker(self._load_chart(self._chart_symbol, tf), thread=False)
         self._chat_msg(f"[dim]Chart: {self._chart_symbol} {tf}[/]")
+
+    def action_cycle_chart_layout_mode(self):
+        """Cycle the chart workspace mode."""
+
+        next_mode = cycle_chart_layout_mode(self._chart_layout_mode)
+        self._set_chart_layout_mode(next_mode)
+        self._chat_msg(f"[dim]Chart mode: {next_mode}[/]")
+
+    def action_chart_pan_left(self):
+        """Pan the chart toward older history."""
+
+        chart = self.query_one("#chart-panel", ChartPanel)
+        chart.pan_left()
+
+    def action_chart_pan_right(self):
+        """Pan the chart toward the live edge."""
+
+        chart = self.query_one("#chart-panel", ChartPanel)
+        chart.pan_right()
+
+    def action_chart_zoom_in(self):
+        """Zoom the chart in."""
+
+        chart = self.query_one("#chart-panel", ChartPanel)
+        chart.zoom_in()
+
+    def action_chart_zoom_out(self):
+        """Zoom the chart out."""
+
+        chart = self.query_one("#chart-panel", ChartPanel)
+        chart.zoom_out()
 
     def action_cycle_symbol(self):
         """Cycle the chart through the current watchlist.
