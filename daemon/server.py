@@ -177,6 +177,24 @@ def _load_portfolio_snapshot() -> dict[str, Any]:
     }
 
 
+def _load_chart_history(
+    symbol: str,
+    interval: str,
+    source: str,
+    limit: int = 300,
+) -> list[dict[str, Any]]:
+    normalized_source = source.strip().lower() or "kai-api"
+    if normalized_source == "kai-api":
+        from agent.data_sources.kai_api import fetch_candles
+
+        return fetch_candles(symbol.upper(), interval, limit)
+    if normalized_source == "coinbase":
+        from agent.data_sources.coinbase import fetch_candles
+
+        return fetch_candles(symbol.upper(), interval, min(limit, 300))
+    raise ValueError(f"unsupported chart source '{source}'")
+
+
 @dataclass
 class ManagedSession:
     """Server-owned session plus per-session coordination state."""
@@ -875,6 +893,33 @@ def create_app(
                 quote = {"symbol": symbol, "error": str(exc)}
             quotes.append(quote)
         return {"quotes": quotes}
+
+    @app.get("/api/market/ohlcv")
+    async def market_ohlcv_endpoint(
+        symbol: str,
+        interval: str = "1m",
+        source: str = "kai-api",
+        limit: int = 300,
+    ) -> dict[str, Any]:
+        try:
+            bars = await asyncio.to_thread(
+                _load_chart_history,
+                symbol,
+                interval,
+                source,
+                limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        return {"bars": bars}
 
     @app.get("/api/portfolio")
     async def portfolio_endpoint() -> dict[str, Any]:

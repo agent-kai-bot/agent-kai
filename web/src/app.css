@@ -264,27 +264,6 @@ body {
   grid-template-rows: minmax(16rem, 20rem) minmax(0, 1fr) auto;
 }
 
-.chart-placeholder {
-  display: grid;
-  place-items: center;
-  gap: 0.8rem;
-  min-height: 16rem;
-  border: 1px dashed rgba(145, 181, 221, 0.18);
-  border-radius: 1rem;
-  background:
-    radial-gradient(circle at top, rgba(77, 211, 168, 0.12), transparent 40%),
-    linear-gradient(180deg, rgba(7, 19, 31, 0.95), rgba(5, 14, 24, 0.95));
-  text-align: center;
-  padding: 1.25rem;
-}
-
-.chart-placeholder p {
-  margin: 0;
-  color: var(--muted);
-  max-width: 22rem;
-  line-height: 1.6;
-}
-
 .chat-input {
   display: grid;
   gap: 0.75rem;

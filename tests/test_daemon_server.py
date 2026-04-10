@@ -743,6 +743,26 @@ class DaemonServerRestTests(unittest.TestCase):
                 self.assertEqual(payload["positions"][0]["symbol"], "BTC")
                 self.assertEqual(payload["pnl"]["total_value"], 105_000.0)
 
+    @mock.patch(
+        "daemon.server._load_chart_history",
+        return_value=[{"ts": "2026-04-10T00:00:00Z", "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 42}],
+    )
+    def test_rest_chart_history_snapshot(self, load_chart_history):
+        with self._make_client() as client:
+            response = client.get(
+                "/api/market/ohlcv",
+                params={
+                    "symbol": "BTC",
+                    "interval": "1h",
+                    "source": "coinbase",
+                    "limit": 120,
+                },
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["bars"][0]["close"], 1.5)
+            load_chart_history.assert_called_once_with("BTC", "1h", "coinbase", 120)
+
 
 class DaemonServerWebAssetTests(unittest.TestCase):
     """Validate the Phase 6 static web asset mounting."""

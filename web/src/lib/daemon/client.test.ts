@@ -78,6 +78,22 @@ describe("daemon client helpers", () => {
             pnl: { total_value: 110_000 },
           }),
         ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            bars: [
+              {
+                ts: "2026-04-10T00:00:00Z",
+                open: 1,
+                high: 2,
+                low: 0.5,
+                close: 1.5,
+                volume: 42,
+              },
+            ],
+          }),
+        ),
       );
 
     const client = new DaemonClient({
@@ -88,9 +104,16 @@ describe("daemon client helpers", () => {
 
     const quotes = await client.fetchWatchlistQuotes(["BTC", "btc"], "secret");
     const portfolio = await client.fetchPortfolio("secret");
+    const bars = await client.fetchChartHistory({
+      symbol: "BTC",
+      interval: "1h",
+      source: "coinbase",
+      token: "secret",
+    });
 
     expect(quotes).toEqual([{ symbol: "BTC", price: 100_000 }]);
     expect(portfolio.positions).toHaveLength(1);
+    expect(bars[0]?.close).toBe(1.5);
     expect(fetchImpl).toHaveBeenNthCalledWith(
       1,
       "http://127.0.0.1:8765/api/market/watchlist?symbols=BTC",
@@ -99,6 +122,11 @@ describe("daemon client helpers", () => {
     expect(fetchImpl).toHaveBeenNthCalledWith(
       2,
       "http://127.0.0.1:8765/api/portfolio",
+      { headers: { Authorization: "Bearer secret" } },
+    );
+    expect(fetchImpl).toHaveBeenNthCalledWith(
+      3,
+      "http://127.0.0.1:8765/api/market/ohlcv?symbol=BTC&interval=1h&source=coinbase&limit=300",
       { headers: { Authorization: "Bearer secret" } },
     );
   });

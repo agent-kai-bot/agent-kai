@@ -24,6 +24,15 @@ export type SessionSummary = {
   state_path?: string;
 };
 
+export type CandleBar = {
+  ts: string | number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume?: number;
+};
+
 export type WatchlistQuote = {
   symbol: string;
   price?: number;
@@ -102,7 +111,7 @@ export type ChartBarEnvelope = {
   type: "chart_bar";
   symbol: string;
   tf: string;
-  bar: Record<string, unknown>;
+  bar: CandleBar;
 };
 
 export type NatsEventEnvelope = {

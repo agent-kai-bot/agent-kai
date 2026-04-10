@@ -7,6 +7,7 @@
   } from "$lib/daemon/client";
   import { readStoredToken, writeStoredToken } from "$lib/daemon/storage";
   import type {
+    CandleBar,
     ChatHistoryEntry,
     PortfolioSnapshot,
     ScheduledJobEnvelope,
@@ -14,9 +15,9 @@
     SessionSummary,
     WatchlistQuote,
   } from "$lib/daemon/types";
+  import ChartPanel from "$lib/components/ChartPanel.svelte";
   import ChatPanel from "$lib/components/ChatPanel.svelte";
   import EventPanel, { type EventRow } from "$lib/components/EventPanel.svelte";
-  import Panel from "$lib/components/Panel.svelte";
   import PositionsPanel from "$lib/components/PositionsPanel.svelte";
   import WatchlistPanel from "$lib/components/WatchlistPanel.svelte";
 
@@ -39,6 +40,8 @@
   let streamingReply = "";
   let watchlistQuotes: WatchlistQuote[] = [];
   let portfolio: PortfolioSnapshot = { positions: [], pnl: {} };
+  let chartBars: CandleBar[] = [];
+  let chartStatus = "waiting for a session";
   let alerts: EventRow[] = [];
   let natsEvents: EventRow[] = [];
   let schedulerEvents: EventRow[] = [];
@@ -65,12 +68,34 @@
     }
   }
 
+  async function refreshChartData(): Promise<void> {
+    if (!daemonConnection) {
+      chartBars = [];
+      chartStatus = "waiting for a session";
+      return;
+    }
+    const snapshot = daemonConnection.snapshot;
+    try {
+      chartBars = await client.fetchChartHistory({
+        symbol: snapshot.chart_symbol,
+        interval: snapshot.chart_timeframe,
+        source: snapshot.chart_source,
+        token,
+      });
+      chartStatus = `${chartBars.length} bars refreshed from ${snapshot.chart_source}`;
+    } catch (error) {
+      chartStatus = error instanceof Error ? error.message : String(error);
+    }
+  }
+
   async function refreshSidebarData(): Promise<void> {
     if (!daemonConnection) {
       return;
     }
-    watchlistQuotes = await client.fetchWatchlistQuotes(watchlist, token);
-    portfolio = await client.fetchPortfolio(token);
+    [watchlistQuotes, portfolio] = await Promise.all([
+      client.fetchWatchlistQuotes(watchlist, token),
+      client.fetchPortfolio(token),
+    ]);
   }
 
   function startPolling(): void {
@@ -79,7 +104,7 @@
       return;
     }
     pollingHandle = window.setInterval(() => {
-      void refreshSidebarData();
+      void Promise.all([refreshSidebarData(), refreshChartData()]);
     }, 15_000);
   }
 
@@ -215,7 +240,7 @@
       connectionStatus = `attached to session ${activeSession}`;
       applySnapshot();
       await refreshSessions();
-      await refreshSidebarData();
+      await Promise.all([refreshSidebarData(), refreshChartData()]);
       startPolling();
     } catch (error) {
       attachError = error instanceof Error ? error.message : String(error);
@@ -236,6 +261,8 @@
     watchlist = [];
     watchlistQuotes = [];
     portfolio = { positions: [], pnl: {} };
+    chartBars = [];
+    chartStatus = "waiting for a session";
     alerts = [];
     natsEvents = [];
     schedulerEvents = [];
@@ -396,12 +423,13 @@
         </div>
 
         <div class="dashboard-column center">
-          <Panel eyebrow="Visualization" title="Chart" subtitle={snapshotSummary}>
-            <div class="chart-placeholder">
-              <strong>{daemonConnection.snapshot.chart_symbol} {daemonConnection.snapshot.chart_timeframe}</strong>
-              <p>{daemonConnection.snapshot.chart_source} source attached. Lightweight Charts lands in `P6.5`.</p>
-            </div>
-          </Panel>
+          <ChartPanel
+            bars={chartBars}
+            source={daemonConnection.snapshot.chart_source}
+            status={chartStatus}
+            symbol={daemonConnection.snapshot.chart_symbol}
+            timeframe={daemonConnection.snapshot.chart_timeframe}
+          />
 
           <ChatPanel messages={chatMessages} {streamingReply} />
 
