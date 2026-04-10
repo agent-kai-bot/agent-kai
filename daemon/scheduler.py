@@ -30,6 +30,7 @@ JobType = Literal["absolute", "cron", "event"]
 JobStatus = Literal["active", "paused", "completed", "failed", "cancelled"]
 JobConcurrency = Literal["skip", "queue"]
 DispatchCallback = Callable[["ScheduledJob", datetime], Awaitable[None] | None]
+EventCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 SCHEDULER_ROOT_DIR = Path(WORKSPACES_DIR) / "scheduler"
 SCHEDULER_JOBS_PATH = SCHEDULER_ROOT_DIR / "jobs.json"
 
@@ -244,6 +245,27 @@ class ScheduledJob(BaseModel):
         return self
 
 
+class DaemonEventBus:
+    """Small async pub/sub bus for daemon-scoped events."""
+
+    def __init__(self) -> None:
+        self._subscribers: list[EventCallback] = []
+
+    def subscribe(self, callback: EventCallback) -> EventCallback:
+        self._subscribers.append(callback)
+        return callback
+
+    def unsubscribe(self, callback: EventCallback) -> None:
+        if callback in self._subscribers:
+            self._subscribers.remove(callback)
+
+    async def publish(self, channel: str, payload: dict[str, Any]) -> None:
+        for callback in list(self._subscribers):
+            maybe_awaitable = callback(channel, dict(payload))
+            if inspect.isawaitable(maybe_awaitable):
+                await maybe_awaitable
+
+
 class Scheduler:
     """Thin wrapper around APScheduler for daemon-managed jobs."""
 
@@ -254,14 +276,17 @@ class Scheduler:
         timezone_name: str = "UTC",
         apscheduler_factory: Callable[..., AsyncIOScheduler] | None = None,
         jobs_path: Path = SCHEDULER_JOBS_PATH,
+        event_bus: DaemonEventBus | None = None,
     ) -> None:
         self.dispatch_callback = dispatch_callback
         self.timezone_name = timezone_name
         self._apscheduler_factory = apscheduler_factory or AsyncIOScheduler
         self._scheduler = self._apscheduler_factory(timezone=_coerce_timezone(timezone_name))
         self.jobs_path = jobs_path
+        self.event_bus = event_bus
         self._jobs: dict[str, ScheduledJob] = {}
         self._started = False
+        self._event_callback: EventCallback | None = None
         self.log = logging.getLogger(__name__)
 
     @property
@@ -274,11 +299,16 @@ class Scheduler:
         self.load_jobs()
         self._scheduler.start()
         self._register_loaded_jobs()
+        if self.event_bus is not None and self._event_callback is None:
+            self._event_callback = self.event_bus.subscribe(self.handle_event)
         self._started = True
 
     async def shutdown(self) -> None:
         if not self._started:
             return
+        if self.event_bus is not None and self._event_callback is not None:
+            self.event_bus.unsubscribe(self._event_callback)
+            self._event_callback = None
         self._scheduler.shutdown(wait=False)
         self._started = False
 
@@ -365,6 +395,20 @@ class Scheduler:
     async def fire_event_job(self, job_id: str, payload: dict[str, Any]) -> None:
         job = self._jobs[job_id]
         await self._dispatch(job, fired_at=_utc_now(), payload=payload)
+
+    async def handle_event(self, channel: str, payload: dict[str, Any]) -> None:
+        for job in list(self._jobs.values()):
+            if job.type != "event" or job.status != "active":
+                continue
+            job_channel = str(job.spec.get("channel") or "")
+            if job_channel != channel:
+                continue
+            filter_spec = job.spec.get("filter")
+            if not isinstance(filter_spec, dict):
+                continue
+            if not matches_structured_filter(payload, filter_spec):
+                continue
+            await self.fire_event_job(job.id, payload)
 
     async def _fire_scheduled_job(self, job_id: str) -> None:
         job = self._jobs[job_id]

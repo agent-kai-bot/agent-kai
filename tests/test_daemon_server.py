@@ -10,6 +10,7 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from daemon.server import DaemonServer, create_app
+from daemon.scheduler import Scheduler
 
 
 class _FakeBus:
@@ -201,6 +202,56 @@ class DaemonServerIndexTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(reopened.session.name, "swing-trader")
                 self.assertFalse(reopened.session.paths.state_path.exists())
+
+    async def test_daemon_event_bus_triggers_matching_scheduler_jobs(self):
+        fired: list[str] = []
+        tmpdir = tempfile.TemporaryDirectory()
+
+        def scheduler_factory(*, dispatch_callback, event_bus, **_kwargs):
+            del dispatch_callback
+
+            async def capture(job, _fired_at):
+                fired.append(job.id)
+
+            return Scheduler(
+                dispatch_callback=capture,
+                event_bus=event_bus,
+                jobs_path=Path(tmpdir.name) / "scheduler" / "jobs.json",
+            )
+
+        server = DaemonServer(
+            agent_name="kai",
+            nats_url="nats://unit-test",
+            bus_factory=_FakeBus,
+            scheduler_factory=scheduler_factory,
+        )
+
+        await server.startup()
+        try:
+            self.assertIsNotNone(server.scheduler)
+            server.scheduler.schedule_job(
+                {
+                    "id": "job-signal",
+                    "type": "event",
+                    "spec": {
+                        "channel": "signals",
+                        "filter": {"symbol": "BTC", "score": {"gt": 0.9}},
+                    },
+                    "prompt": "Summarize the signal",
+                    "owner_session": "terminal",
+                    "created_at": "2026-04-10T00:00:00+00:00",
+                    "created_by": "agent",
+                },
+                persist=False,
+            )
+
+            await server.publish_daemon_event("signals", {"symbol": "ETH", "score": 0.95})
+            await server.publish_daemon_event("signals", {"symbol": "BTC", "score": 0.95})
+
+            self.assertEqual(fired, ["job-signal"])
+        finally:
+            await server.shutdown()
+            tmpdir.cleanup()
 
 
 class DaemonServerRestTests(unittest.TestCase):
