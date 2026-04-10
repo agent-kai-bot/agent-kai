@@ -41,6 +41,10 @@ export AGENT_KAI_API_KEY="kai-..."
 python main.py --terminal
 ```
 
+`--terminal` now auto-starts the local daemon if it is not already
+running, then attaches to the default session. Use
+`python main.py --terminal --standalone` to force the old in-process path.
+
 Then type `/analyze BTC` and watch the analyst sub-agent spin up.
 
 ## Documentation
@@ -75,11 +79,42 @@ See [docs/getting-started.md](docs/getting-started.md) for the complete walkthro
 
 ## Run modes
 
+`--terminal` is now daemon-first. Use `--standalone` only when you
+explicitly want the old single-process path for debugging or regression
+checks.
+
 ```bash
-python main.py --terminal              # Full trading terminal (recommended)
-python main.py                         # Plain agent TUI without trading panels
-python main.py --no-tui                # Headless — NATS only, for daemonized deployment
-python main.py --log-level DEBUG       # Override log level
+python main.py --terminal                         # Auto-start local daemon and attach
+python main.py --terminal --session btc-scalper  # Same, named daemon session
+python main.py --terminal --remote ws://HOST:8765/ws  # Attach to an existing daemon
+python main.py --terminal --standalone           # Old in-process terminal path
+python main.py --daemon                          # Foreground daemon (debug/systemd)
+python main.py                                   # Plain agent TUI without trading panels
+python main.py --no-tui                          # Headless — NATS only
+python main.py --log-level DEBUG                 # Override log level
+
+bin/kaictl start              # Start the local daemon in the background
+bin/kaictl status             # Show daemon status
+bin/kaictl logs -n 200        # Show the latest daemon logs
+bin/kaictl stop               # Stop the kaictl-managed daemon
+```
+
+When `kaictl` or terminal auto-spawn starts the daemon, stdout/stderr land
+in `logs/kaid.log`.
+
+## systemd user service
+
+The repo ships a user-service template at `deploy/kaid.service`. It assumes
+the checkout lives at `~/git/claude-local-ai-agent`; edit the path if yours
+differs, then install it with:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/kaid.service ~/.config/systemd/user/kaid.service
+systemctl --user daemon-reload
+systemctl --user enable --now kaid
+systemctl --user status kaid
+journalctl --user -u kaid -f
 ```
 
 ## Tests
