@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
+import aiohttp
 import uvicorn
 
 from daemon.server import create_app
@@ -171,6 +174,81 @@ class DaemonRemoteIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await second.close()
             server.should_exit = True
             await asyncio.wait_for(server_task, timeout=5)
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    async def test_live_web_and_auth_smoke_flow(self, attach_runtime):
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        port = _reserve_port()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            build_dir = base_dir / "web-build"
+            build_dir.mkdir(parents=True)
+            (build_dir / "index.html").write_text(
+                "<!doctype html><html><body>smoke shell</body></html>",
+                encoding="utf-8",
+            )
+            token_path = base_dir / "daemon-token.txt"
+            token_path.write_text("secret-token\n", encoding="utf-8")
+
+            with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir / "sessions"), mock.patch(
+                "daemon.core.SESSION_INDEX_PATH", base_dir / "sessions" / "index.json"
+            ):
+                app = create_app(
+                    agent_name="kai",
+                    nats_url="nats://unit-test",
+                    bus_factory=_FakeBus,
+                    web_build_dir=build_dir,
+                    token_path=token_path,
+                    allow_unauthenticated_local=False,
+                )
+                config = uvicorn.Config(app=app, host="127.0.0.1", port=port, log_level="warning")
+                server = uvicorn.Server(config)
+                server_task = asyncio.create_task(server.serve())
+                session = RemoteSession(
+                    f"ws://127.0.0.1:{port}/ws?token=secret-token",
+                    session_name="smoke",
+                )
+
+                try:
+                    for _ in range(100):
+                        if server.started:
+                            break
+                        await asyncio.sleep(0.02)
+                    else:
+                        self.fail("uvicorn server did not start in time")
+
+                    async with aiohttp.ClientSession() as client:
+                        root = await client.get(f"http://127.0.0.1:{port}/")
+                        self.assertEqual(root.status, 200)
+                        self.assertIn("smoke shell", await root.text())
+
+                        deep_link = await client.get(f"http://127.0.0.1:{port}/session/smoke")
+                        self.assertEqual(deep_link.status, 200)
+                        self.assertIn("smoke shell", await deep_link.text())
+
+                        unauthorized = await client.get(f"http://127.0.0.1:{port}/api/health")
+                        self.assertEqual(unauthorized.status, 401)
+
+                        headers = {"Authorization": "Bearer secret-token"}
+                        health = await client.get(
+                            f"http://127.0.0.1:{port}/api/health",
+                            headers=headers,
+                        )
+                        self.assertEqual(health.status, 200)
+                        health_payload = await health.json()
+                        self.assertEqual(health_payload["status"], "ok")
+
+                    events = [event async for event in session.stream_agent_events("smoke test")]
+                    self.assertEqual(events[1]["data"], "live:smoke test")
+                    self.assertEqual(events[4]["data"], "done:smoke test")
+
+                    sessions = await session.list_sessions()
+                    self.assertEqual([entry["name"] for entry in sessions], ["smoke"])
+                finally:
+                    await session.close()
+                    server.should_exit = True
+                    await asyncio.wait_for(server_task, timeout=5)
 
 
 if __name__ == "__main__":
