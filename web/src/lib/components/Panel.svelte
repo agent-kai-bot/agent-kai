@@ -153,6 +153,8 @@
       align-items: center;
       justify-content: center;
       flex-shrink: 0;
+      min-height: 2.75rem;
+      padding: 0.65rem 0.95rem;
     }
 
     .panel-frame.mobile-collapsible.is-collapsed {
