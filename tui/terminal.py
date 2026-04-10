@@ -21,6 +21,7 @@ from agent.signal_consumer import SignalConsumer
 from agent.skills_store import SkillStore
 from agent_logger import get_logger
 from config import get_skills_dir
+from daemon.core import Session, deserialize_messages
 from tui.panels.alerts import AlertsPanel
 from tui.chart_modes import (
     CHART_LAYOUT_MODES,
@@ -83,6 +84,7 @@ def _normalize_kai_bar(arr: list) -> dict:
 # restart. Lives under workspaces/terminal/ to match the pattern the
 # paper trading engine uses (workspaces/trader/portfolio.json).
 TERMINAL_STATE_PATH = Path(__file__).resolve().parent.parent / "workspaces" / "terminal" / "state.json"
+LEGACY_CHAT_HISTORY_PATH = Path("workspaces/terminal/chat_history.json")
 
 
 def _load_terminal_state() -> dict:
@@ -135,9 +137,24 @@ class TradingTerminal(App):
 
     TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "6h", "1d"]
 
-    def __init__(self, agent_runner, bus=None, signal_consumer: SignalConsumer | None = None):
+    def __init__(
+        self,
+        agent_runner=None,
+        bus=None,
+        signal_consumer: SignalConsumer | None = None,
+        session: Session | None = None,
+    ):
         super().__init__()
-        self.agent_runner = agent_runner
+        self.session = session or Session("terminal")
+        if self.session.agent_runner is None:
+            if agent_runner is None:
+                raise ValueError(
+                    "TradingTerminal requires a Session with an attached runtime"
+                )
+            self.session.agent_runner = agent_runner
+            self.session.chat_history = agent_runner.chat_history
+        self.agent_runner = self.session.agent_runner
+        self.agent_runner.chat_history = self.session.chat_history
         self.bus = bus
         self._agent_working = False
         # File logger so chart / signal / feed errors land in
@@ -150,7 +167,12 @@ class TradingTerminal(App):
         # Live signal feed — receives signals from the vpn-stack
         # signal scanners via NATS and buffers them for the
         # ``get_signals`` tool + the AlertsPanel display.
-        self.signal_consumer = signal_consumer or SignalConsumer()
+        self.signal_consumer = (
+            self.session.signal_consumer
+            or signal_consumer
+            or SignalConsumer()
+        )
+        self.session.signal_consumer = self.signal_consumer
         # Chart data source — "local" (data_api) or "coinbase"
         # (direct WebSocket + REST fallback). The Coinbase feed
         # owns an async task for streaming; the local feed is
@@ -171,6 +193,7 @@ class TradingTerminal(App):
         # _refresh_status_bar pulls everything else (portfolio,
         # chart, autotrade, queue, sub-agents) live each render.
         self._activity_status: str = "idle"
+        self.session.set_activity_status("idle")
         self._status_bar_task = None  # asyncio.Task running the periodic status bar refresh
         # Per-tool-call timing toggle. When True, _process_agent
         # logs the start/end of every tool call to the NATS log
@@ -195,7 +218,7 @@ class TradingTerminal(App):
         # _drain_input_queue, mirroring how a shell stacks up
         # commands when you keep typing while the previous one
         # hasn't returned. Empty list = nothing pending.
-        self._input_queue: list[str] = []
+        self._input_queue: list[str] = self.session.input_queue
         # Path where chat_history is persisted across TUI restarts.
         # Saved after every successful turn (in _process_agent's
         # finally block) AND on app teardown via on_unmount, so
@@ -203,7 +226,7 @@ class TradingTerminal(App):
         # most recent conversation. Loaded in on_mount before the
         # welcome banner so the user sees their old session
         # immediately on relaunch.
-        self._chat_history_path = Path("workspaces/terminal/chat_history.json")
+        self._chat_history_path = LEGACY_CHAT_HISTORY_PATH
         # Widget references for the queued items, kept in lockstep
         # with _input_queue so each row's [X] click can locate and
         # drop its matching string. Same length, same order, same
@@ -225,27 +248,34 @@ class TradingTerminal(App):
         # _on_live_signal callback can no-op gracefully if it fires
         # before construction.
         self._signal_handler_runner = None
+        self._sub_agent_manager = self.session.sub_agent_manager
 
-        # Restore persisted chart state from workspaces/terminal/state.json.
-        # Falls back to the BTC + 1m defaults on first run or corrupt file.
-        state = _load_terminal_state()
-        self._chart_symbol = state.get("chart_symbol", "BTC")
-        saved_tf = state.get("chart_timeframe", "1m")
-        self._saved_color_scheme = state.get("chart_color_scheme", "classic")
-        self._chart_source = state.get("chart_source", "kai-api")
-        self._autotrade_enabled = bool(state.get("autotrade_enabled", False))
+        # Restore persisted chart + chat state through the Session
+        # layer, migrating forward from the legacy workspaces/terminal
+        # files if this session has never been saved yet.
+        self._load_session_state()
+        ui_state = self.session.ui_state
+        self._chart_symbol = getattr(ui_state, "chart_symbol", "BTC") or "BTC"
+        saved_tf = getattr(ui_state, "chart_timeframe", "1m") or "1m"
+        self._saved_color_scheme = (
+            getattr(ui_state, "chart_color_scheme", "classic") or "classic"
+        )
+        self._chart_source = getattr(ui_state, "chart_source", "kai-api") or "kai-api"
+        self._autotrade_enabled = bool(getattr(ui_state, "autotrade_enabled", False))
         # ``chart_size_mode`` is the legacy key from the older
         # full/half implementation. Keep reading it as a migration
         # path so existing state files land on a sensible modern
         # workspace mode.
-        persisted_layout = state.get("chart_layout_mode") or state.get("chart_size_mode")
+        persisted_layout = (
+            getattr(ui_state, "chart_layout_mode", None) or "dashboard"
+        )
         self._chart_layout_mode = normalize_chart_layout_mode(persisted_layout)
         # Persisted watchlist symbol list. /watch add and /watch remove
         # mutate the panel's tracked_symbols and immediately save back
         # via _persist_watchlist_symbols. Falls back to TRACKED_SYMBOLS
         # (BTC/ETH/SOL) on first run or corrupt state. Stored as
         # uppercased symbols to match the panel's normalization.
-        saved_symbols = state.get("watchlist_symbols")
+        saved_symbols = getattr(ui_state, "watchlist_symbols", None)
         if isinstance(saved_symbols, list) and saved_symbols:
             self._initial_watchlist_symbols = [s.upper() for s in saved_symbols if isinstance(s, str)]
         else:
@@ -405,7 +435,95 @@ class TradingTerminal(App):
         except Exception as exc:
             self.logger.warning("chat history restore failed: %s", exc)
 
+        if self._input_queue:
+            for position, queued_text in enumerate(self._input_queue, start=1):
+                row = QueuedInputRow(queued_text, position)
+                self._queue_widgets.append(row)
+                chat.mount(row)
+            chat.scroll_end(animate=False)
+
         self.query_one("#input-area", Input).focus()
+
+    def _load_session_state(self) -> None:
+        """Load the daemon-backed session state, falling back to legacy files."""
+        try:
+            if self.session.paths.state_path.exists():
+                self.session.load()
+            else:
+                self._migrate_legacy_state_into_session()
+        except Exception as exc:
+            self.logger.warning("session state load failed: %s", exc)
+
+    def _migrate_legacy_state_into_session(self) -> None:
+        """Hydrate the new Session layout from the legacy terminal files."""
+        migrated = False
+
+        legacy_state = _load_terminal_state()
+        if legacy_state:
+            self.session.ui_state.chart_symbol = legacy_state.get("chart_symbol", "BTC")
+            self.session.ui_state.chart_timeframe = legacy_state.get(
+                "chart_timeframe", "1m"
+            )
+            self.session.ui_state.chart_source = legacy_state.get(
+                "chart_source", "kai-api"
+            )
+            self.session.ui_state.chart_layout_mode = normalize_chart_layout_mode(
+                legacy_state.get("chart_layout_mode")
+                or legacy_state.get("chart_size_mode")
+            )
+            self.session.ui_state.chart_color_scheme = legacy_state.get(
+                "chart_color_scheme", "classic"
+            )
+            watchlist = legacy_state.get("watchlist_symbols")
+            if isinstance(watchlist, list) and watchlist:
+                self.session.ui_state.watchlist_symbols = [
+                    symbol.upper()
+                    for symbol in watchlist
+                    if isinstance(symbol, str)
+                ]
+            self.session.ui_state.autotrade_enabled = bool(
+                legacy_state.get("autotrade_enabled", False)
+            )
+            migrated = True
+
+        if LEGACY_CHAT_HISTORY_PATH.exists():
+            try:
+                raw = LEGACY_CHAT_HISTORY_PATH.read_text(encoding="utf-8")
+                entries = json.loads(raw) if raw.strip() else []
+                if isinstance(entries, list):
+                    self.session.chat_history[:] = deserialize_messages(entries)
+                    migrated = migrated or bool(entries)
+            except Exception as exc:
+                self.logger.warning("legacy chat history migration failed: %s", exc)
+
+        self.agent_runner.chat_history = self.session.chat_history
+        if migrated:
+            try:
+                self.session.save()
+            except Exception as exc:
+                self.logger.warning("session state migration save failed: %s", exc)
+
+    def _sync_session_ui_state(self, *, chart_color_scheme: str | None = None) -> None:
+        """Mirror the live terminal fields onto the attached Session."""
+        self.session.ui_state.chart_symbol = self._chart_symbol
+        self.session.ui_state.chart_timeframe = self.TIMEFRAMES[self._current_tf_idx]
+        self.session.ui_state.chart_source = self._chart_source
+        self.session.ui_state.chart_layout_mode = self._chart_layout_mode
+        self.session.ui_state.autotrade_enabled = bool(self._autotrade_enabled)
+        self.session.ui_state.activity_status = self._activity_status or "idle"
+        if chart_color_scheme is not None:
+            self.session.ui_state.chart_color_scheme = chart_color_scheme
+        try:
+            watchlist = self.query_one("#watchlist-panel", WatchlistPanel)
+        except Exception:
+            watchlist = None
+        if watchlist is not None:
+            self.session.ui_state.watchlist_symbols = list(watchlist.tracked_symbols)
+
+    def _persist_session_state(self, *, chart_color_scheme: str | None = None) -> None:
+        """Persist the current terminal state through the Session."""
+        self._sync_session_ui_state(chart_color_scheme=chart_color_scheme)
+        self.session.save()
 
     async def _load_initial_data(self):
         """Load initial prices and chart data from the active source."""
@@ -933,26 +1051,13 @@ class TradingTerminal(App):
                 raise
 
     def _save_chart_state(self, interval: str) -> None:
-        """Persist chart symbol/timeframe/source/scheme to state.json.
-
-        Loads the existing state first and merges the chart fields on
-        top, so other state keys (autotrade_enabled, chart_layout_mode,
-        anything added later) survive every chart save. Previously
-        this built a fresh dict from scratch and silently clobbered
-        autotrade_enabled every time the user changed the chart
-        symbol or color.
-        """
+        """Persist chart symbol/timeframe/source/scheme via Session."""
         try:
             current_scheme = self.query_one("#chart-panel", ChartPanel).color_scheme
         except Exception:
-            current_scheme = "default"
-        state = _load_terminal_state()
-        state["chart_symbol"] = self._chart_symbol
-        state["chart_timeframe"] = interval
-        state["chart_color_scheme"] = current_scheme
-        state["chart_source"] = self._chart_source
-        state["chart_layout_mode"] = self._chart_layout_mode
-        _save_terminal_state(state)
+            current_scheme = self.session.ui_state.chart_color_scheme
+        self.session.ui_state.chart_timeframe = interval
+        self._persist_session_state(chart_color_scheme=current_scheme)
 
     def _set_chart_layout_mode(self, mode: str) -> None:
         """Set the chart workspace layout mode and persist it."""
@@ -966,9 +1071,7 @@ class TradingTerminal(App):
         except Exception:
             pass
         try:
-            state = _load_terminal_state()
-            state["chart_layout_mode"] = normalized
-            _save_terminal_state(state)
+            self._persist_session_state()
         except Exception as exc:
             self.logger.warning("persist chart_layout_mode failed: %s", exc)
 
@@ -1295,7 +1398,7 @@ class TradingTerminal(App):
                 "[dim]Use /queue clear to flush, or /queue drop N to remove a specific item.[/]"
             )
             return
-        self._input_queue.append(text)
+        self.session.queue_input(text)
         position = len(self._input_queue)
         row = QueuedInputRow(text, position)
         self._queue_widgets.append(row)
@@ -1371,7 +1474,9 @@ class TradingTerminal(App):
             return
         if not self._input_queue:
             return
-        next_text = self._input_queue.pop(0)
+        next_text = self.session.pop_input()
+        if next_text is None:
+            return
         # Pop the matching widget and remove it from chat — the
         # "running" message below replaces it visually.
         next_row = self._queue_widgets.pop(0) if self._queue_widgets else None
@@ -1784,8 +1889,9 @@ class TradingTerminal(App):
             try:
                 if self._chat_history_path.exists():
                     self._chat_history_path.unlink()
+                self.session.save()
             except Exception as exc:
-                self.logger.warning("delete chat_history.json failed: %s", exc)
+                self.logger.warning("persist reset chat history failed: %s", exc)
             self._chat_msg("[dim]Chat history reset — fresh session.[/]")
             return True
 
@@ -1980,32 +2086,17 @@ class TradingTerminal(App):
         return True
 
     def _persist_autotrade_state(self) -> None:
-        """Save the current autotrade flag to workspaces/terminal/state.json.
-
-        Reads the existing state, updates the autotrade_enabled key,
-        writes back atomically. Failures are swallowed — autotrade
-        state is a UX convenience, not load-bearing.
-        """
+        """Save the current autotrade flag through the Session state file."""
         try:
-            state = _load_terminal_state()
-            state["autotrade_enabled"] = bool(self._autotrade_enabled)
-            _save_terminal_state(state)
+            self._persist_session_state()
         except Exception as exc:
             self.logger.warning("persist autotrade state failed: %s", exc)
 
     def _persist_watchlist_symbols(self, symbols: list[str]) -> None:
-        """Save the current watchlist symbol list to state.json.
-
-        Called from /watch add and /watch remove so the user's
-        custom watchlist survives a TUI restart. Uses load-then-
-        merge so other state fields aren't clobbered. Symbols are
-        normalized to uppercase for consistency with the panel's
-        own normalization in update_price / add_symbol.
-        """
+        """Save the current watchlist symbol list through the Session."""
         try:
-            state = _load_terminal_state()
-            state["watchlist_symbols"] = [s.upper() for s in symbols]
-            _save_terminal_state(state)
+            self.session.ui_state.watchlist_symbols = [s.upper() for s in symbols]
+            self._persist_session_state()
         except Exception as exc:
             self.logger.warning("persist watchlist symbols failed: %s", exc)
 
@@ -2615,6 +2706,10 @@ class TradingTerminal(App):
             self._agent_working = False
             self._set_status("idle")
             await self._refresh_positions()
+            try:
+                self.session.save()
+            except Exception as exc:
+                self.logger.warning("session save after sub-agent task failed: %s", exc)
             self._drain_input_queue()
 
     def _maybe_nudge_learn(self, agent_name: str) -> None:
@@ -2812,7 +2907,7 @@ class TradingTerminal(App):
         final_text: str | None = None
 
         try:
-            async for event in self.agent_runner.run(user_input):
+            async for event in self.session.stream_agent_events(user_input):
                 etype = event["type"]
                 if etype == "token":
                     accumulated += event["data"]
@@ -3158,6 +3253,7 @@ class TradingTerminal(App):
         which are pulled live each render via _refresh_status_bar.
         """
         self._activity_status = text or "idle"
+        self.session.set_activity_status(self._activity_status)
         self._refresh_status_bar()
 
     def _refresh_status_bar(self) -> None:
@@ -3294,117 +3390,40 @@ class TradingTerminal(App):
     # ── Chat history persistence ──────────────────────────────
 
     def _save_chat_history(self) -> None:
-        """Persist the agent's chat_history to disk.
-
-        Format: a JSON array of ``{"role": "human"|"ai", "content": "..."}``
-        dicts, one per LangChain message in ``agent_runner.chat_history``.
-        Tool-call IDs and other run-scoped metadata are intentionally
-        dropped — they reference per-session run_ids that won't be
-        valid after a restart anyway. The conversational thread (which
-        is what the LLM uses for context on the next turn) is preserved
-        verbatim.
-
-        Saved after every successful turn (in ``_process_agent``'s
-        finally block) AND on app teardown (``on_unmount``), so a
-        crash, kill -9, terminal close, or clean exit all preserve
-        the most recent conversation.
-
-        Failures are logged but never raised — chat persistence is a
-        convenience, not load-bearing, and a corrupt save file should
-        never block the agent from running.
-        """
+        """Persist the terminal state through the attached Session."""
         try:
-            history = list(getattr(self.agent_runner, "chat_history", []) or [])
-            if not history:
-                # Don't write an empty file — just remove any stale one
-                # so a fresh session doesn't surface yesterday's empty
-                # restore message.
-                if self._chat_history_path.exists():
-                    self._chat_history_path.unlink()
-                return
-
-            entries: list[dict] = []
-            for msg in history:
-                role = self._role_for_message(msg)
-                content = getattr(msg, "content", "")
-                if isinstance(content, list):
-                    # Some LLMs return content as a list of structured
-                    # blocks. Flatten to plain text for the on-disk
-                    # format — the LLM only needs the text on reload.
-                    parts: list[str] = []
-                    for block in content:
-                        if isinstance(block, dict):
-                            t = block.get("text") or block.get("content") or ""
-                            if isinstance(t, str):
-                                parts.append(t)
-                        elif isinstance(block, str):
-                            parts.append(block)
-                    content = "".join(parts)
-                if not isinstance(content, str):
-                    content = str(content)
-                entries.append({"role": role, "content": content})
-
-            self._chat_history_path.parent.mkdir(parents=True, exist_ok=True)
-            self._chat_history_path.write_text(
-                json.dumps(entries, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            self._persist_session_state()
         except Exception as exc:
             self.logger.warning("save chat history failed: %s", exc)
 
     def _load_chat_history(self) -> int:
-        """Restore chat_history from disk on TUI start. Returns count restored.
-
-        Reconstructs LangChain ``HumanMessage`` / ``AIMessage`` objects
-        from the saved JSON and assigns them to
-        ``agent_runner.chat_history``. Also re-mounts each message in
-        the chat panel so the user sees the previous conversation
-        immediately on relaunch.
-
-        No-op (returns 0) if the save file doesn't exist or is empty.
-        Logs and returns 0 on read errors — chat restore is a
-        convenience.
-        """
-        from langchain_core.messages import AIMessage, HumanMessage
-
-        path = self._chat_history_path
-        if not path.exists():
-            return 0
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except Exception as exc:
-            self.logger.warning("read chat history failed: %s", exc)
-            return 0
-        if not raw.strip():
-            return 0
-        try:
-            entries = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            self.logger.warning("parse chat history failed: %s", exc)
-            return 0
-        if not isinstance(entries, list):
-            return 0
-
-        restored: list = []
+        """Render the Session's chat history into the chat panel."""
         chat = self.query_one("#chat-panel", ChatPanel)
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            role = entry.get("role", "")
-            content = entry.get("content", "")
+        restored = list(getattr(self.session, "chat_history", []) or [])
+        for message in restored:
+            content = getattr(message, "content", "")
+            if isinstance(content, list):
+                parts: list[str] = []
+                for block in content:
+                    if isinstance(block, dict):
+                        text = block.get("text") or block.get("content") or ""
+                        if isinstance(text, str):
+                            parts.append(text)
+                    elif isinstance(block, str):
+                        parts.append(block)
+                content = "".join(parts)
             if not isinstance(content, str) or not content:
                 continue
+            role = self._role_for_message(message)
             if role == "human":
-                restored.append(HumanMessage(content=content))
                 chat.append_message(f"[bold green]> {content}[/]", "user-msg")
             elif role == "ai":
-                restored.append(AIMessage(content=content))
                 # Drop the rich-markup styling — we don't have the
                 # original tool_start / tool_end events to recreate
                 # the inline tool log lines. Just show the answer.
                 chat.append_message(content, "agent-msg")
 
-        self.agent_runner.chat_history = restored
+        self.agent_runner.chat_history = self.session.chat_history
         return len(restored)
 
     @staticmethod
