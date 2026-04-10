@@ -1,0 +1,18 @@
+[Unit]
+Description=Agent KAI daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+# Adjust the repo path if you keep the checkout somewhere else.
+WorkingDirectory=%h/git/claude-local-ai-agent
+ExecStart=%h/git/claude-local-ai-agent/.venv/bin/python %h/git/claude-local-ai-agent/main.py --daemon
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
