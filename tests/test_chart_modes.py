@@ -18,8 +18,10 @@ class ChartLayoutModeTests(unittest.TestCase):
         self.assertEqual(normalize_chart_layout_mode("full"), "dashboard")
         self.assertEqual(normalize_chart_layout_mode("default"), "dashboard")
         self.assertEqual(normalize_chart_layout_mode("detail"), "inspect")
+        self.assertEqual(normalize_chart_layout_mode("calm"), "zen")
         self.assertEqual(normalize_chart_layout_mode("half"), "chat")
         self.assertEqual(normalize_chart_layout_mode("FOCUS"), "focus")
+        self.assertEqual(normalize_chart_layout_mode("ZEN"), "zen")
 
     def test_normalize_chart_layout_mode_falls_back_to_dashboard(self):
         """Unknown modes should not leak into persisted state."""
@@ -32,8 +34,9 @@ class ChartLayoutModeTests(unittest.TestCase):
         """Cycling should rotate through the configured order."""
 
         choices = chart_layout_choices()
-        self.assertEqual(choices, ["dashboard", "inspect", "focus", "chat"])
+        self.assertEqual(choices, ["dashboard", "inspect", "zen", "focus", "chat"])
         self.assertEqual(cycle_chart_layout_mode("dashboard"), "inspect")
+        self.assertEqual(cycle_chart_layout_mode("inspect"), "zen")
         self.assertEqual(cycle_chart_layout_mode("chat"), "dashboard")
 
 
