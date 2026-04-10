@@ -9,6 +9,7 @@ from config import DEFAULT_AGENT, NATS_URL
 from daemon.core import Session
 from nats_bus.bus import NatsBus
 from tui.app import AgentTUI
+from tui.client_adapter import RemoteSession
 
 
 async def run_tui(bus, agent_runner):
@@ -52,15 +53,89 @@ async def run_headless(bus, agent_runner):
         pass
 
 
-async def main():
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser for local, remote, and daemon modes."""
     parser = argparse.ArgumentParser(description="Local AI Agent")
     parser.add_argument("--no-tui", action="store_true", help="Run headless (NATS only)")
     parser.add_argument("--terminal", action="store_true", help="Launch KAI trading terminal")
+    parser.add_argument("--daemon", action="store_true", help="Run the daemon foreground server")
+    parser.add_argument(
+        "--remote",
+        metavar="WS_URL",
+        help="Connect the terminal to a daemon websocket instead of the in-process runtime",
+    )
+    parser.add_argument(
+        "--standalone",
+        action="store_true",
+        help="Force the in-process runtime path for terminal mode",
+    )
     parser.add_argument("--name", default=DEFAULT_AGENT, help=f"Agent name (default: {DEFAULT_AGENT})")
     parser.add_argument("--nats-url", default=NATS_URL, help=f"NATS URL (default: {NATS_URL})")
     parser.add_argument("--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="Override log level from config")
-    args = parser.parse_args()
+    return parser
+
+
+def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Reject unsupported flag combinations before runtime setup starts."""
+    if args.daemon and args.remote:
+        parser.error("--daemon cannot be combined with --remote")
+    if args.daemon and args.standalone:
+        parser.error("--daemon cannot be combined with --standalone")
+    if args.daemon and args.terminal:
+        parser.error("--daemon cannot launch the terminal in the same process")
+    if args.remote and not args.terminal:
+        parser.error("--remote requires --terminal")
+    if args.remote and args.standalone:
+        parser.error("--remote and --standalone are mutually exclusive")
+
+
+async def _run_daemon(args: argparse.Namespace) -> None:
+    """Serve the websocket daemon in the foreground."""
+    import uvicorn
+
+    from daemon.server import DEFAULT_DAEMON_HOST, DEFAULT_DAEMON_PORT, create_app
+
+    app = create_app(agent_name=args.name, nats_url=args.nats_url)
+    config = uvicorn.Config(
+        app=app,
+        host=DEFAULT_DAEMON_HOST,
+        port=DEFAULT_DAEMON_PORT,
+        log_level=(args.log_level or "INFO").lower(),
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
+async def _connect_bus(args: argparse.Namespace):
+    """Connect to NATS when the selected runtime mode needs it."""
+    bus = NatsBus(url=args.nats_url, agent_name=args.name)
+    try:
+        await bus.connect()
+    except Exception as e:
+        print(f"Warning: Could not connect to NATS at {args.nats_url}: {e}")
+        print("Running without NATS.\n")
+        return None
+    return bus
+
+
+async def _run_remote_terminal(args: argparse.Namespace) -> None:
+    """Launch the trading terminal against a remote daemon."""
+    from tui.terminal import TradingTerminal
+
+    session = RemoteSession(args.remote, session_name="terminal")
+    await session.connect()
+    try:
+        terminal = TradingTerminal(session=session, bus=None)
+        await terminal.run_async()
+    finally:
+        await session.close()
+
+
+async def main(argv: list[str] | None = None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    validate_args(parser, args)
 
     # Apply log level override if specified
     if args.log_level:
@@ -73,14 +148,16 @@ async def main():
             if name.startswith("agent."):
                 logging.getLogger(name).setLevel(level)
 
+    if args.daemon:
+        await _run_daemon(args)
+        return
+
+    if args.terminal and args.remote:
+        await _run_remote_terminal(args)
+        return
+
     # Connect to NATS
-    bus = NatsBus(url=args.nats_url, agent_name=args.name)
-    try:
-        await bus.connect()
-    except Exception as e:
-        print(f"Warning: Could not connect to NATS at {args.nats_url}: {e}")
-        print("Running without NATS.\n")
-        bus = None
+    bus = await _connect_bus(args)
 
     session = Session("terminal" if args.terminal else args.name)
     agent_runner = session.attach_runtime(bus=bus, agent_name=args.name)
