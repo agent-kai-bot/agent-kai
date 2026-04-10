@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
 from datetime import timedelta
+from pathlib import Path
 
 from daemon.scheduler import ScheduledJob, Scheduler, _utc_now, matches_structured_filter
 
@@ -175,6 +177,43 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
         )
+
+    async def test_jobs_persist_and_reload_from_disk(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jobs_path = Path(tmpdir) / "scheduler" / "jobs.json"
+            created_at = _utc_now().replace(microsecond=0).isoformat()
+            when = (_utc_now() + timedelta(minutes=2)).replace(microsecond=0)
+
+            first = Scheduler(
+                dispatch_callback=lambda *_args: None,
+                jobs_path=jobs_path,
+            )
+            await first.start()
+            try:
+                first.schedule_job(
+                    {
+                        "id": "job-persisted",
+                        "type": "absolute",
+                        "spec": {"at": when.isoformat()},
+                        "prompt": "Reload me",
+                        "owner_session": "terminal",
+                        "created_at": created_at,
+                        "created_by": "user",
+                    }
+                )
+            finally:
+                await first.shutdown()
+
+            self.assertTrue(jobs_path.exists())
+
+            second = Scheduler(
+                dispatch_callback=lambda *_args: None,
+                jobs_path=jobs_path,
+            )
+            loaded = second.load_jobs()
+
+            self.assertEqual([job.id for job in loaded], ["job-persisted"])
+            self.assertEqual(second.get_job("job-persisted").prompt, "Reload me")
 
 
 if __name__ == "__main__":
