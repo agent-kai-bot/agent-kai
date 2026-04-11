@@ -1399,10 +1399,32 @@ class TradingTerminal(App):
         # waiting for them to come up (or use /queue clear to nuke
         # the whole queue at once).
         if self._agent_working:
+            if self._handle_busy_control_input(text):
+                return
             self._queue_item(text)
             return
 
         await self._dispatch_input(text)
+
+    def _handle_busy_control_input(self, text: str) -> bool:
+        """Handle the small set of control commands allowed while busy."""
+
+        parts = text.strip().split()
+        if not parts:
+            return False
+        if parts[0].lower() != "/auto":
+            return False
+        if len(parts) < 2 or parts[1].lower() != "off":
+            return False
+        if getattr(self.session, "is_remote", False):
+            return False
+        if not getattr(self.session, "auto_mode", False):
+            self._chat_msg("[dim]Auto mode is already off[/]")
+            return True
+        self.session.stop_auto_mode("stopped by user")
+        self._chat_msg("[dim]Auto stop requested — finishing the current step only[/]")
+        self._refresh_status_bar()
+        return True
 
     def _queue_item(self, text: str) -> None:
         """Append text to _input_queue AND mount its [X]-clickable row.
@@ -1889,6 +1911,13 @@ class TradingTerminal(App):
             # /schedule ...          — handled by the daemon in remote mode
             return await self._handle_schedule_command(parts)
 
+        elif cmd == "/auto":
+            # /auto [N]             — enable auto mode
+            # /auto readonly [N]    — enable read-only auto mode
+            # /auto off             — stop auto mode
+            # /auto status          — show current auto state
+            return await self._handle_auto_command(parts)
+
         elif cmd == "/optimizer":
             # /optimizer ...         — handled locally or forwarded to the daemon
             return await self._handle_optimizer_command(text)
@@ -2000,6 +2029,67 @@ class TradingTerminal(App):
         if getattr(self.session, "is_remote", False):
             return False
         self._chat_msg("[red]Scheduling is only available when connected to the daemon.[/]")
+        return True
+
+    async def _handle_auto_command(self, parts: list[str]) -> bool:
+        """Enable, inspect, or disable autonomous mode."""
+
+        if getattr(self.session, "is_remote", False):
+            return False
+
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        if sub == "off":
+            if not getattr(self.session, "auto_mode", False):
+                self._chat_msg("[dim]Auto mode is already off[/]")
+                return True
+            payload = self.session.stop_auto_mode("stopped by user")
+            self._chat_msg(
+                f"[dim]Auto mode stopped after {payload['iterations_used']}/"
+                f"{payload['iterations_total']} iterations[/]"
+            )
+            self._refresh_status_bar()
+            return True
+
+        if sub == "status":
+            if not getattr(self.session, "auto_mode", False):
+                self._chat_msg("[dim]Auto mode is off[/]")
+                return True
+            payload = self.session.auto_status_payload()
+            mode = "readonly" if payload["readonly"] else "standard"
+            self._chat_msg(
+                f"[dim]Auto mode ({mode}): {payload['iterations_used']}/"
+                f"{payload['iterations_total']} used, "
+                f"{payload['iterations_remaining']} remaining, "
+                f"{payload['elapsed_seconds']:.2f}s elapsed[/]"
+            )
+            return True
+
+        readonly = False
+        max_iterations = 20
+        if sub == "readonly":
+            readonly = True
+            if len(parts) > 2:
+                try:
+                    max_iterations = int(parts[2])
+                except ValueError:
+                    self._chat_msg("[red]Usage: /auto [N] | /auto off | /auto status | /auto readonly [N][/]")
+                    return True
+        elif sub:
+            try:
+                max_iterations = int(parts[1])
+            except ValueError:
+                self._chat_msg("[red]Usage: /auto [N] | /auto off | /auto status | /auto readonly [N][/]")
+                return True
+
+        payload = self.session.start_auto_mode(
+            max_iterations=max_iterations,
+            readonly=readonly,
+        )
+        mode = "readonly" if payload["readonly"] else "standard"
+        self._chat_msg(
+            f"[dim]Auto mode enabled ({mode}) with {payload['iterations_total']} iterations[/]"
+        )
+        self._refresh_status_bar()
         return True
 
     async def _handle_optimizer_command(self, text: str) -> bool:
@@ -3235,16 +3325,32 @@ class TradingTerminal(App):
             return
 
         chat = self.query_one("#chat-panel", ChatPanel)
-        response_widget = chat.create_response_widget()
+        response_widget = None
         accumulated = ""
-        final_text: str | None = None
+
+        def ensure_response_widget():
+            nonlocal response_widget
+            if response_widget is None:
+                response_widget = chat.create_response_widget()
+            return response_widget
+
+        def finalize_response(text: str | None = None) -> None:
+            nonlocal response_widget, accumulated
+            raw_text = text if text is not None else accumulated
+            if response_widget is None and raw_text and raw_text.strip():
+                response_widget = chat.create_response_widget()
+            if response_widget is not None and raw_text and raw_text.strip():
+                chat.render_widget_as_markdown(response_widget, raw_text)
+                chat.scroll_end(animate=False)
+            response_widget = None
+            accumulated = ""
 
         try:
             async for event in self.session.stream_agent_events(user_input):
                 etype = event["type"]
                 if etype == "token":
                     accumulated += event["data"]
-                    response_widget.update(accumulated)
+                    ensure_response_widget().update(accumulated)
                     chat.scroll_end(animate=False)
                 elif etype == "tool_start":
                     tool = event["data"]["tool"]
@@ -3280,22 +3386,22 @@ class TradingTerminal(App):
                         self._nats_log(f"[yellow]<< {tool}[/]")
                     self._set_status("thinking...")
                 elif etype == "final":
-                    final_text = event["data"]
-                    chat.scroll_end(animate=False)
+                    finalize_response(str(event.get("data") or accumulated))
+                elif etype == "auto_started":
+                    self._refresh_status_bar()
+                elif etype == "auto_progress":
+                    self._refresh_status_bar()
+                elif etype == "auto_stopped":
+                    reason = str(event["data"].get("reason") or "")
+                    if reason:
+                        self._chat_msg(f"[dim]AUTO stopped: {reason}[/]")
+                    self._refresh_status_bar()
                 elif etype == "error":
                     chat.append_message(f"[bold red]Error: {event['data']}[/]", "error-msg")
         except Exception as e:
             chat.append_message(f"[bold red]Error: {e}[/]", "error-msg")
         else:
-            # Stream completed without raising — swap the streaming
-            # plain-text widget for a markdown-rendered version. Use
-            # the explicit final_text from the `final` event if we
-            # got one (truncations / corrections), otherwise the
-            # accumulated stream text.
-            text_to_render = final_text if final_text else accumulated
-            if text_to_render and text_to_render.strip():
-                chat.render_widget_as_markdown(response_widget, text_to_render)
-                chat.scroll_end(animate=False)
+            finalize_response()
         finally:
             self._agent_working = False
             self._set_status("idle")
@@ -3362,6 +3468,21 @@ class TradingTerminal(App):
                 await self._refresh_positions()
                 self._save_chat_history()
                 self._drain_input_queue()
+            return
+
+        if etype == "auto_started":
+            self._refresh_status_bar()
+            return
+
+        if etype == "auto_progress":
+            self._refresh_status_bar()
+            return
+
+        if etype == "auto_stopped":
+            reason = str(event["data"].get("reason") or "")
+            if reason:
+                self._chat_msg(f"[dim]AUTO stopped: {reason}[/]")
+            self._refresh_status_bar()
             return
 
         if etype == "token":
@@ -3782,6 +3903,20 @@ class TradingTerminal(App):
 
         parts: list[str] = []
 
+        # Auto mode state
+        if getattr(self.session, "auto_mode", False):
+            total = int(getattr(self.session, "auto_iterations_total", 0) or 0)
+            remaining = int(getattr(self.session, "auto_iterations_remaining", 0) or 0)
+            used = max(0, total - remaining)
+            elapsed = float(getattr(self.session, "auto_elapsed_seconds", 0.0) or 0.0)
+            if callable(getattr(self.session, "auto_elapsed_seconds", None)):
+                elapsed = float(self.session.auto_elapsed_seconds())
+            minutes = int(elapsed // 60)
+            seconds = int(elapsed % 60)
+            parts.append(
+                f"[bold yellow][AUTO][/]" f" iter {used}/{total} | {minutes:02d}:{seconds:02d}"
+            )
+
         # Activity
         activity = self._activity_status or "idle"
         parts.append(f"[bold]{activity}[/]")
@@ -3962,6 +4097,11 @@ class TradingTerminal(App):
             except asyncio.CancelledError:
                 pass
             self._remote_event_task = None
+        if getattr(self.session, "auto_mode", False) and not getattr(self.session, "is_remote", False):
+            try:
+                self.session.stop_auto_mode("terminal disconnected")
+            except Exception:
+                pass
         try:
             self._save_chat_history()
         except Exception as exc:
