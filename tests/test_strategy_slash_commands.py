@@ -91,10 +91,12 @@ class StrategySlashCommandTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         root_dir = Path(self.temp_dir.name) / "alpha"
+        store_path = root_dir / "strategies" / "aso.db"
         self.session = SimpleNamespace(
             name="alpha",
             is_remote=False,
             paths=SimpleNamespace(root_dir=root_dir),
+            strategy_store_path=str(store_path),
             strategy_runtime=_FakeRuntime(),
             publish_event=lambda *_args, **_kwargs: None,
         )

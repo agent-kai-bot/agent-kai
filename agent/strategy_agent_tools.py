@@ -608,13 +608,16 @@ def _get_runtime(session_context: Any) -> OptimizerRuntime:
 
 
 def _resolve_store_path(session_context: Any) -> Path:
+    """Resolve the global strategy store path.
+
+    Strategies are shared across all sessions (not per-session)
+    because they represent trading knowledge, not conversation
+    state. The store lives at workspaces/strategies/aso.db.
+    """
     explicit = getattr(session_context, "strategy_store_path", None)
     if explicit:
         return Path(explicit)
-    paths = getattr(session_context, "paths", None)
-    root_dir = getattr(paths, "root_dir", None)
-    if root_dir is not None:
-        return Path(root_dir) / "strategies" / DEFAULT_DB_PATH.name
+    # Global store — shared across all sessions
     return Path(DEFAULT_DB_PATH)
 
 
