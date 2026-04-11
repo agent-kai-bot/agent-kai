@@ -136,7 +136,7 @@ If you expose the daemon outside localhost, treat `workspaces/daemon-token.txt` 
 
 ## systemd user service
 
-The repo ships a user-service template at `deploy/kaid.service`. It assumes the checkout lives at `~/git/claude-local-ai-agent`; adjust the path if yours differs.
+The repo ships a user-service template at `deploy/kaid.service`. It assumes the checkout lives at `~/kai-agent`; adjust the paths in the unit file if yours differs.
 
 ```bash
 mkdir -p ~/.config/systemd/user
