@@ -98,7 +98,7 @@ class DaemonRemoteIntegrationTests(unittest.IsolatedAsyncioTestCase):
         config = uvicorn.Config(app=app, host="127.0.0.1", port=port, log_level="warning")
         server = uvicorn.Server(config)
         server_task = asyncio.create_task(server.serve())
-        session = RemoteSession(f"ws://127.0.0.1:{port}")
+        session = RemoteSession(f"ws://127.0.0.1:{port}", session_name=f"terminal-{port}")
 
         try:
             for _ in range(100):
@@ -136,8 +136,9 @@ class DaemonRemoteIntegrationTests(unittest.IsolatedAsyncioTestCase):
         config = uvicorn.Config(app=app, host="127.0.0.1", port=port, log_level="warning")
         server = uvicorn.Server(config)
         server_task = asyncio.create_task(server.serve())
-        first = RemoteSession(f"ws://127.0.0.1:{port}", session_name="shared")
-        second = RemoteSession(f"ws://127.0.0.1:{port}", session_name="shared")
+        shared_name = f"shared-{port}"
+        first = RemoteSession(f"ws://127.0.0.1:{port}", session_name=shared_name)
+        second = RemoteSession(f"ws://127.0.0.1:{port}", session_name=shared_name)
 
         try:
             for _ in range(100):
