@@ -1,0 +1,8 @@
+ok, how is the back testing going? and where do i see the alerts from the rsi divergence monitor?
+/analyze btc
+can we have the analyst alert when there is a breakout?
+did we just get an alert?
+any signals or triggers from our sub-agents?
+hows it looking
+/chart pigeon 1m
+any alerts?

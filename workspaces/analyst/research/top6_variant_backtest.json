@@ -1,0 +1,194 @@
+{
+  "params": {
+    "bb_period": 20,
+    "bb_std": 2.0,
+    "rsi_period": 14,
+    "ema_fast": 9,
+    "ema_slow": 21,
+    "vol_period": 20,
+    "trend_period": 50,
+    "breakout_lookback": 3,
+    "fade_bars": 2,
+    "max_recovery_bars": 10,
+    "min_volume_ratio": 1.2,
+    "min_vol_z": 0.5,
+    "min_dump_return": 0.004,
+    "max_dist_from_lower_band": 0.008,
+    "min_lower_wick_frac": 0.02,
+    "max_followthrough_return": 0.004,
+    "min_rsi_rebound": 4.0,
+    "min_macd_hist_improve": 0.0,
+    "require_close_above_bb_mid": false,
+    "require_close_above_ema_fast": true,
+    "require_trend_filter": false,
+    "trend_filter_buffer": 0.0,
+    "min_score": 3.0,
+    "entry_delay_bars": 1,
+    "max_hold_bars": 8,
+    "sl_pct": 0.5,
+    "tp_pct": 1.5,
+    "trail_ema_fast": false,
+    "exit_on_rsi": 68.0,
+    "cooldown_bars": 5,
+    "fee_bps": 10.0,
+    "slippage_bps": 5.0,
+    "allow_overlapping": false
+  },
+  "num_trades": 10,
+  "win_rate": 30.0,
+  "avg_trade_pct": -0.2981425831080828,
+  "median_trade_pct": -0.685461025315298,
+  "profit_factor": 0.34103073191869304,
+  "expectancy_pct": -0.2981425831080828,
+  "total_return_pct": -2.9600671802032297,
+  "sharpe": -1.4562240425972244,
+  "max_drawdown_pct": -0.6237508032534533,
+  "per_symbol": {
+    "ADA": {
+      "trades": 2,
+      "avg_trade_pct": 0.1932972263644197
+    },
+    "DOT": {
+      "trades": 2,
+      "avg_trade_pct": -0.685461025315298
+    },
+    "ETH": {
+      "trades": 1,
+      "avg_trade_pct": -0.15445560321922774
+    },
+    "INJ": {
+      "trades": 1,
+      "avg_trade_pct": -0.7497499999999933
+    },
+    "SOL": {
+      "trades": 1,
+      "avg_trade_pct": 0.38654177045287524
+    },
+    "SUI": {
+      "trades": 3,
+      "avg_trade_pct": -0.4931448001375754
+    }
+  },
+  "trades": [
+    {
+      "symbol": "ADA",
+      "entry_ts": "2026-04-09 15:15:00+00:00",
+      "exit_ts": "2026-04-09 15:30:00+00:00",
+      "entry_price": 0.25121554,
+      "exit_price": 0.25457265,
+      "bars_held": 3,
+      "return_pct": 1.1363444527288327,
+      "gross_return_pct": 1.3363444527288326,
+      "exit_reason": "rsi_exit",
+      "signal_score": 8.065680769181661
+    },
+    {
+      "symbol": "ADA",
+      "entry_ts": "2026-04-11 14:10:00+00:00",
+      "exit_ts": "2026-04-11 14:40:00+00:00",
+      "entry_price": 0.24915451,
+      "exit_price": 0.24778479,
+      "bars_held": 6,
+      "return_pct": -0.7497499999999933,
+      "gross_return_pct": -0.5497499999999933,
+      "exit_reason": "stop",
+      "signal_score": 7.5184636893565315
+    },
+    {
+      "symbol": "DOT",
+      "entry_ts": "2026-04-09 12:45:00+00:00",
+      "exit_ts": "2026-04-09 13:25:00+00:00",
+      "entry_price": 1.244622,
+      "exit_price": 1.23938,
+      "bars_held": 8,
+      "return_pct": -0.6211720506306138,
+      "gross_return_pct": -0.4211720506306138,
+      "exit_reason": "time",
+      "signal_score": 8.06745357344446
+    },
+    {
+      "symbol": "DOT",
+      "entry_ts": "2026-04-10 21:00:00+00:00",
+      "exit_ts": "2026-04-10 21:10:00+00:00",
+      "entry_price": 1.3136565,
+      "exit_price": 1.30643467,
+      "bars_held": 2,
+      "return_pct": -0.7497499999999822,
+      "gross_return_pct": -0.5497499999999822,
+      "exit_reason": "stop",
+      "signal_score": 7.393813130348792
+    },
+    {
+      "symbol": "ETH",
+      "entry_ts": "2026-04-09 01:35:00+00:00",
+      "exit_ts": "2026-04-09 02:15:00+00:00",
+      "entry_price": 2177.6883,
+      "exit_price": 2178.680115,
+      "bars_held": 8,
+      "return_pct": -0.15445560321922774,
+      "gross_return_pct": 0.04554439678077227,
+      "exit_reason": "time",
+      "signal_score": 11.736246317920886
+    },
+    {
+      "symbol": "INJ",
+      "entry_ts": "2026-04-10 21:00:00+00:00",
+      "exit_ts": "2026-04-10 21:05:00+00:00",
+      "entry_price": 3.0685335,
+      "exit_price": 3.05166424,
+      "bars_held": 1,
+      "return_pct": -0.7497499999999933,
+      "gross_return_pct": -0.5497499999999933,
+      "exit_reason": "stop",
+      "signal_score": 8.358323454224111
+    },
+    {
+      "symbol": "SOL",
+      "entry_ts": "2026-04-09 19:40:00+00:00",
+      "exit_ts": "2026-04-09 20:20:00+00:00",
+      "entry_price": 83.8629105,
+      "exit_price": 84.3548015,
+      "bars_held": 8,
+      "return_pct": 0.38654177045287524,
+      "gross_return_pct": 0.5865417704528753,
+      "exit_reason": "time",
+      "signal_score": 6.512913237433386
+    },
+    {
+      "symbol": "SUI",
+      "entry_ts": "2026-04-09 01:55:00+00:00",
+      "exit_ts": "2026-04-09 02:35:00+00:00",
+      "entry_price": 0.90575265,
+      "exit_price": 0.9077459,
+      "bars_held": 8,
+      "return_pct": 0.02006559958727134,
+      "gross_return_pct": 0.22006559958727134,
+      "exit_reason": "time",
+      "signal_score": 8.199072936643041
+    },
+    {
+      "symbol": "SUI",
+      "entry_ts": "2026-04-10 21:00:00+00:00",
+      "exit_ts": "2026-04-10 21:10:00+00:00",
+      "entry_price": 0.95377665,
+      "exit_price": 0.94853326,
+      "bars_held": 2,
+      "return_pct": -0.7497500000000044,
+      "gross_return_pct": -0.5497500000000044,
+      "exit_reason": "stop",
+      "signal_score": 6.458384583905162
+    },
+    {
+      "symbol": "SUI",
+      "entry_ts": "2026-04-11 00:30:00+00:00",
+      "exit_ts": "2026-04-11 01:00:00+00:00",
+      "entry_price": 0.94257105,
+      "exit_price": 0.93738927,
+      "bars_held": 6,
+      "return_pct": -0.7497499999999933,
+      "gross_return_pct": -0.5497499999999933,
+      "exit_reason": "stop",
+      "signal_score": 8.173964768286211
+    }
+  ]
+}

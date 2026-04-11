@@ -1,0 +1,20 @@
+{
+  "name": "shared-12535",
+  "agent_name": "kai",
+  "chat_history": [],
+  "input_queue": [],
+  "ui_state": {
+    "chart_symbol": "BTC",
+    "chart_timeframe": "1m",
+    "chart_source": "kai-api",
+    "chart_layout_mode": "dashboard",
+    "chart_color_scheme": "classic",
+    "watchlist_symbols": [
+      "BTC",
+      "ETH",
+      "SOL"
+    ],
+    "autotrade_enabled": false,
+    "activity_status": "idle"
+  }
+}

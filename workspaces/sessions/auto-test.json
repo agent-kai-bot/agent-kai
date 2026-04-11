@@ -1,0 +1,29 @@
+{
+  "name": "auto-test",
+  "agent_name": "kai",
+  "chat_history": [
+    {
+      "role": "human",
+      "content": "List the top 3 cryptocurrencies by market cap and their approximate prices"
+    },
+    {
+      "role": "ai",
+      "content": "Top 3 by market cap are typically:\n\n1. Bitcoin (BTC) — approx. $72,734  \n2. Ethereum (ETH) — approx. $2,247  \n3. XRP (XRP) — approx. $1.34  \n\nThese are approximate live prices from the current feed. [AUTO_STATE: done]"
+    }
+  ],
+  "input_queue": [],
+  "ui_state": {
+    "chart_symbol": "BTC",
+    "chart_timeframe": "1m",
+    "chart_source": "kai-api",
+    "chart_layout_mode": "dashboard",
+    "chart_color_scheme": "classic",
+    "watchlist_symbols": [
+      "BTC",
+      "ETH",
+      "SOL"
+    ],
+    "autotrade_enabled": false,
+    "activity_status": "idle"
+  }
+}

@@ -1,0 +1,21 @@
+```mermaid
+graph TD
+    Client[Client] -->|HTTPS| API[API Gateway]
+    API -->|JWT Auth| Auth[Auth Service]
+    API -->|Task CRUD| TaskSvc[Task Service]
+    TaskSvc -->|Read/Write| DB[(PostgreSQL DB)]
+    API -->|Events| EventBus[(Message Broker)]
+    EventBus --> TaskSvc
+    TaskSvc -->|Metrics| Monitor[Monitoring (Prometheus)]
+    TaskSvc -->|Logs| Logs[Logging (ELK)]
+    CI[CI/CD Pipeline] -->|Deploy| API
+    style Client fill:#f9f,stroke:#333,stroke-width:2px
+    style API fill:#bbf,stroke:#333,stroke-width:2px
+    style Auth fill:#bbf,stroke:#333,stroke-width:2px
+    style TaskSvc fill:#bbf,stroke:#333,stroke-width:2px
+    style DB fill:#ccf,stroke:#333,stroke-width:2px
+    style EventBus fill:#f99,stroke:#333,stroke-width:2px
+    style Monitor fill:#9f9,stroke:#333,stroke-width:2px
+    style Logs fill:#9cf,stroke:#333,stroke-width:2px
+    style CI fill:#9cf,stroke:#333,stroke-width:2px
+```

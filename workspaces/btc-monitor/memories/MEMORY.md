@@ -1,0 +1,11 @@
+BTC Multi-Timeframe Monitor Setup:
+- Workspace: /home/atc/git/claude-local-ai-agent/workspaces/btc-monitor
+- Monitoring criteria:
+  - BULLISH: All 3 timeframes (15m, 1h, 4h) must have Price > EMA20 AND RSI(14) > 55
+  - BEARISH: All 3 timeframes must have Price < EMA20 AND RSI(14) < 45
+- Alert cooldown: 300 seconds (5 minutes) between alerts
+- NATS subject: agent.alerts.btc
+- Check interval: 60 seconds
+- Files: monitor_daemon.sh, run_check.sh, monitor_state.json, monitor.log
+- Skill: btc-multi-timeframe-monitor
+- Note: Requires agent context to access kai_api tools (query_ohlcv, calculate_indicator, nats_publish)

@@ -97,10 +97,9 @@
   "agents": {
     "kai": {
       "description": "KAI — primary trading assistant, the user's main interface",
-      "endpoint": "kai-smart",
+      "endpoint": "codex-cli",
       "fallback_endpoints": [
-        {"endpoint": "kai-local", "model": "qwen35-gptq"},
-        {"endpoint": "codex-cli", "model": "gpt-5.4"}
+        {"endpoint": "kai-local", "model": "qwen35-gptq"}
       ],
       "max_iterations": 2000
     },
@@ -169,30 +168,27 @@
     },
     "trader": {
       "description": "Execution specialist — places trades, manages positions, order lifecycle",
-      "endpoint": "kai-smart",
+      "endpoint": "codex-cli",
       "fallback_endpoints": [
-        {"endpoint": "kai-local", "model": "qwen35-gptq"},
-        {"endpoint": "codex-cli", "model": "gpt-5.4"}
+        {"endpoint": "kai-local", "model": "qwen35-gptq"}
       ],
       "workspace": "trader",
       "max_iterations": 200
     },
     "analyst": {
       "description": "Technical analysis — indicators, patterns, chart reading, trading signals",
-      "endpoint": "kai-smart",
+      "endpoint": "codex-cli",
       "fallback_endpoints": [
-        {"endpoint": "kai-local", "model": "qwen35-gptq"},
-        {"endpoint": "codex-cli", "model": "gpt-5.4"}
+        {"endpoint": "kai-local", "model": "qwen35-gptq"}
       ],
       "workspace": "analyst",
       "max_iterations": 200
     },
     "risk-manager": {
       "description": "Capital guardian — position sizing, stop losses, exposure limits, drawdown monitoring",
-      "endpoint": "kai-smart",
+      "endpoint": "codex-cli",
       "fallback_endpoints": [
-        {"endpoint": "kai-local", "model": "qwen35-gptq"},
-        {"endpoint": "codex-cli", "model": "gpt-5.4"}
+        {"endpoint": "kai-local", "model": "qwen35-gptq"}
       ],
       "workspace": "risk-manager",
       "max_iterations": 200

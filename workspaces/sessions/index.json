@@ -1,0 +1,323 @@
+{
+  "version": 1,
+  "sessions": {
+    "terminal": {
+      "name": "terminal",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal.json",
+      "created_at": "2026-04-10T04:27:32Z",
+      "last_activity": "2026-04-11T17:44:04Z"
+    },
+    "shared": {
+      "name": "shared",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared.json",
+      "created_at": "2026-04-10T04:43:06Z",
+      "last_activity": "2026-04-11T05:35:22Z"
+    },
+    "qa-test": {
+      "name": "qa-test",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/qa-test.json",
+      "created_at": "2026-04-10T22:13:55Z",
+      "last_activity": "2026-04-10T23:07:06Z"
+    },
+    "scroll-test": {
+      "name": "scroll-test",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/scroll-test.json",
+      "created_at": "2026-04-10T23:49:56Z",
+      "last_activity": "2026-04-10T23:50:16Z"
+    },
+    "shared-6247": {
+      "name": "shared-6247",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-6247.json",
+      "created_at": "2026-04-11T05:37:05Z",
+      "last_activity": "2026-04-11T05:37:05Z"
+    },
+    "terminal-29129": {
+      "name": "terminal-29129",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-29129.json",
+      "created_at": "2026-04-11T05:37:05Z",
+      "last_activity": "2026-04-11T05:37:05Z"
+    },
+    "shared-23023": {
+      "name": "shared-23023",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-23023.json",
+      "created_at": "2026-04-11T05:37:13Z",
+      "last_activity": "2026-04-11T05:37:13Z"
+    },
+    "terminal-39495": {
+      "name": "terminal-39495",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-39495.json",
+      "created_at": "2026-04-11T05:37:13Z",
+      "last_activity": "2026-04-11T05:37:13Z"
+    },
+    "shared-57019": {
+      "name": "shared-57019",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-57019.json",
+      "created_at": "2026-04-11T05:49:37Z",
+      "last_activity": "2026-04-11T05:49:37Z"
+    },
+    "terminal-33249": {
+      "name": "terminal-33249",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-33249.json",
+      "created_at": "2026-04-11T05:49:37Z",
+      "last_activity": "2026-04-11T05:49:37Z"
+    },
+    "shared-47799": {
+      "name": "shared-47799",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-47799.json",
+      "created_at": "2026-04-11T05:50:16Z",
+      "last_activity": "2026-04-11T05:50:16Z"
+    },
+    "terminal-60181": {
+      "name": "terminal-60181",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-60181.json",
+      "created_at": "2026-04-11T05:50:16Z",
+      "last_activity": "2026-04-11T05:50:16Z"
+    },
+    "shared-8235": {
+      "name": "shared-8235",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-8235.json",
+      "created_at": "2026-04-11T13:07:00Z",
+      "last_activity": "2026-04-11T13:07:00Z"
+    },
+    "terminal-22613": {
+      "name": "terminal-22613",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-22613.json",
+      "created_at": "2026-04-11T13:07:00Z",
+      "last_activity": "2026-04-11T13:07:00Z"
+    },
+    "shared-12037": {
+      "name": "shared-12037",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-12037.json",
+      "created_at": "2026-04-11T13:08:32Z",
+      "last_activity": "2026-04-11T13:08:32Z"
+    },
+    "terminal-61727": {
+      "name": "terminal-61727",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-61727.json",
+      "created_at": "2026-04-11T13:08:32Z",
+      "last_activity": "2026-04-11T13:08:32Z"
+    },
+    "shared-32859": {
+      "name": "shared-32859",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-32859.json",
+      "created_at": "2026-04-11T13:10:21Z",
+      "last_activity": "2026-04-11T13:10:21Z"
+    },
+    "terminal-26713": {
+      "name": "terminal-26713",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-26713.json",
+      "created_at": "2026-04-11T13:10:21Z",
+      "last_activity": "2026-04-11T13:10:21Z"
+    },
+    "shared-12535": {
+      "name": "shared-12535",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-12535.json",
+      "created_at": "2026-04-11T13:30:39Z",
+      "last_activity": "2026-04-11T13:30:39Z"
+    },
+    "terminal-4201": {
+      "name": "terminal-4201",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-4201.json",
+      "created_at": "2026-04-11T13:30:40Z",
+      "last_activity": "2026-04-11T13:30:40Z"
+    },
+    "shared-43425": {
+      "name": "shared-43425",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-43425.json",
+      "created_at": "2026-04-11T13:37:19Z",
+      "last_activity": "2026-04-11T13:37:19Z"
+    },
+    "terminal-55085": {
+      "name": "terminal-55085",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-55085.json",
+      "created_at": "2026-04-11T13:37:20Z",
+      "last_activity": "2026-04-11T13:37:20Z"
+    },
+    "shared-9473": {
+      "name": "shared-9473",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-9473.json",
+      "created_at": "2026-04-11T13:42:51Z",
+      "last_activity": "2026-04-11T13:42:51Z"
+    },
+    "terminal-16155": {
+      "name": "terminal-16155",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-16155.json",
+      "created_at": "2026-04-11T13:42:52Z",
+      "last_activity": "2026-04-11T13:42:52Z"
+    },
+    "shared-44477": {
+      "name": "shared-44477",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-44477.json",
+      "created_at": "2026-04-11T13:56:28Z",
+      "last_activity": "2026-04-11T13:56:28Z"
+    },
+    "terminal-16057": {
+      "name": "terminal-16057",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-16057.json",
+      "created_at": "2026-04-11T13:56:28Z",
+      "last_activity": "2026-04-11T13:56:28Z"
+    },
+    "shared-32703": {
+      "name": "shared-32703",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-32703.json",
+      "created_at": "2026-04-11T14:03:44Z",
+      "last_activity": "2026-04-11T14:03:44Z"
+    },
+    "terminal-27363": {
+      "name": "terminal-27363",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-27363.json",
+      "created_at": "2026-04-11T14:03:44Z",
+      "last_activity": "2026-04-11T14:03:44Z"
+    },
+    "shared-12515": {
+      "name": "shared-12515",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-12515.json",
+      "created_at": "2026-04-11T14:09:02Z",
+      "last_activity": "2026-04-11T14:09:02Z"
+    },
+    "terminal-62937": {
+      "name": "terminal-62937",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-62937.json",
+      "created_at": "2026-04-11T14:09:03Z",
+      "last_activity": "2026-04-11T14:09:03Z"
+    },
+    "shared-34585": {
+      "name": "shared-34585",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-34585.json",
+      "created_at": "2026-04-11T14:10:57Z",
+      "last_activity": "2026-04-11T14:10:57Z"
+    },
+    "terminal-22421": {
+      "name": "terminal-22421",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-22421.json",
+      "created_at": "2026-04-11T14:10:57Z",
+      "last_activity": "2026-04-11T14:10:57Z"
+    },
+    "qa-aso-test": {
+      "name": "qa-aso-test",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/qa-aso-test.json",
+      "created_at": "2026-04-11T14:11:22Z",
+      "last_activity": "2026-04-11T14:30:29Z"
+    },
+    "shared-32633": {
+      "name": "shared-32633",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-32633.json",
+      "created_at": "2026-04-11T14:28:32Z",
+      "last_activity": "2026-04-11T14:28:32Z"
+    },
+    "terminal-25159": {
+      "name": "terminal-25159",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-25159.json",
+      "created_at": "2026-04-11T14:28:33Z",
+      "last_activity": "2026-04-11T14:28:33Z"
+    },
+    "shared-39947": {
+      "name": "shared-39947",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-39947.json",
+      "created_at": "2026-04-11T14:29:26Z",
+      "last_activity": "2026-04-11T14:29:26Z"
+    },
+    "terminal-7891": {
+      "name": "terminal-7891",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-7891.json",
+      "created_at": "2026-04-11T14:29:27Z",
+      "last_activity": "2026-04-11T14:29:27Z"
+    },
+    "shared-11837": {
+      "name": "shared-11837",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-11837.json",
+      "created_at": "2026-04-11T15:05:39Z",
+      "last_activity": "2026-04-11T15:05:39Z"
+    },
+    "terminal-40317": {
+      "name": "terminal-40317",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-40317.json",
+      "created_at": "2026-04-11T15:05:39Z",
+      "last_activity": "2026-04-11T15:05:39Z"
+    },
+    "shared-57589": {
+      "name": "shared-57589",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-57589.json",
+      "created_at": "2026-04-11T15:06:05Z",
+      "last_activity": "2026-04-11T15:06:05Z"
+    },
+    "terminal-28079": {
+      "name": "terminal-28079",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-28079.json",
+      "created_at": "2026-04-11T15:06:05Z",
+      "last_activity": "2026-04-11T15:06:05Z"
+    },
+    "shared-12141": {
+      "name": "shared-12141",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-12141.json",
+      "created_at": "2026-04-11T15:16:32Z",
+      "last_activity": "2026-04-11T15:16:32Z"
+    },
+    "terminal-52543": {
+      "name": "terminal-52543",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-52543.json",
+      "created_at": "2026-04-11T15:16:32Z",
+      "last_activity": "2026-04-11T15:16:32Z"
+    },
+    "shared-25831": {
+      "name": "shared-25831",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-25831.json",
+      "created_at": "2026-04-11T15:17:30Z",
+      "last_activity": "2026-04-11T15:17:30Z"
+    },
+    "terminal-59131": {
+      "name": "terminal-59131",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-59131.json",
+      "created_at": "2026-04-11T15:17:30Z",
+      "last_activity": "2026-04-11T15:17:30Z"
+    },
+    "auto-test": {
+      "name": "auto-test",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/auto-test.json",
+      "created_at": "2026-04-11T15:39:30Z",
+      "last_activity": "2026-04-11T15:39:47Z"
+    },
+    "auto-real-test": {
+      "name": "auto-real-test",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/auto-real-test.json",
+      "created_at": "2026-04-11T15:53:10Z",
+      "last_activity": "2026-04-11T15:53:26Z"
+    },
+    "slash-test": {
+      "name": "slash-test",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/slash-test.json",
+      "created_at": "2026-04-11T15:55:12Z",
+      "last_activity": "2026-04-11T16:06:09Z"
+    },
+    "auto-eval": {
+      "name": "auto-eval",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/auto-eval.json",
+      "created_at": "2026-04-11T16:26:44Z",
+      "last_activity": "2026-04-11T16:29:16Z"
+    },
+    "shared-43121": {
+      "name": "shared-43121",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-43121.json",
+      "created_at": "2026-04-11T17:43:37Z",
+      "last_activity": "2026-04-11T17:43:37Z"
+    },
+    "terminal-61481": {
+      "name": "terminal-61481",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-61481.json",
+      "created_at": "2026-04-11T17:43:38Z",
+      "last_activity": "2026-04-11T17:43:38Z"
+    },
+    "shared-11597": {
+      "name": "shared-11597",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/shared-11597.json",
+      "created_at": "2026-04-11T17:44:03Z",
+      "last_activity": "2026-04-11T17:44:03Z"
+    },
+    "terminal-62369": {
+      "name": "terminal-62369",
+      "state_path": "/home/atc/git/claude-local-ai-agent/workspaces/sessions/terminal-62369.json",
+      "created_at": "2026-04-11T17:44:03Z",
+      "last_activity": "2026-04-11T17:44:03Z"
+    }
+  }
+}

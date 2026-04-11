@@ -1,0 +1,467 @@
+{
+  "plan_name": "Daemon + Multi-Session + Web UI Migration",
+  "source_doc": "DAEMON-MIGRATION-PLAN.md",
+  "version": "1.1",
+  "status": "design — awaiting Phase 1 sign-off",
+  "last_updated": "2026-04-09",
+  "branch": "kai/tui-quality-of-life",
+
+  "decisions": {
+    "Q1_subagent_scoping": {
+      "question": "Sub-agents global across sessions, or per-session pools?",
+      "answer": "per-session pools",
+      "rationale": "Sub-agents will gain long-lived per-session memory (planned feature). Isolation must be designed in from day one, not retrofitted. Templates and underlying model-client connection pools stay global; instantiated sub-agents and their memory live inside the session."
+    },
+    "Q2_daemon_transport": {
+      "question": "TCP localhost or Unix domain socket?",
+      "answer": "TCP with configurable bind address",
+      "rationale": "Default 127.0.0.1:PORT for safety. Config flag flips to 0.0.0.0:PORT for LAN/VPN access. Bearer-token auth becomes mandatory whenever bind address is non-localhost — daemon refuses to start with 0.0.0.0 and no token configured."
+    },
+    "Q3_web_framework": {
+      "question": "Svelte+SvelteKit, React+Next.js, SolidJS, or HTMX?",
+      "answer": "Svelte + SvelteKit",
+      "rationale": "Smallest footprint (~10kb runtime), fastest iteration, native reactivity, no Redux/Zustand boilerplate."
+    },
+    "Q4_backwards_compat_cutover": {
+      "question": "Auto-spawn daemon from --terminal, or require explicit --daemon &?",
+      "answer": "auto-spawn",
+      "rationale": "Zero friction. Falls back to --standalone if auto-spawn fails or user explicitly opts out."
+    },
+    "Q5_multi_attach_semantics": {
+      "question": "Multi-controller (any client sends inputs) or single-controller (first attacher owns inputs)?",
+      "answer": "multi-controller",
+      "rationale": "Single human in the loop, single trading account. Input-collision risk is minimal and recoverable; lock-out cost of single-controller would hurt every day. Treat it like screen -x."
+    },
+    "Q6_daemon_process_management": {
+      "question": "Auto-spawn only, systemd unit only, or both?",
+      "answer": "both",
+      "rationale": "Auto-spawn for development and casual use; systemd unit at deploy/kaid.service for the homedevbox so the daemon survives reboots."
+    },
+    "Q7_persistence_boundary": {
+      "question": "Client 100% stateless, or keep client-local prefs?",
+      "answer": "client stateless for daemon-relevant state, local for pure display prefs",
+      "rationale": "Anything affecting the agent or trading lives in the daemon. Pure display preferences (terminal theme, window geometry, web UI dark/light, keybindings) stay client-local."
+    },
+    "Q8_scope_pace": {
+      "question": "Phased rollout or big-bang single cutover?",
+      "answer": "phased",
+      "rationale": "Each phase leaves current workflows working. Big-bang turns into a month-long branch."
+    }
+  },
+
+  "architecture": {
+    "mental_model": {
+      "components": [
+        {
+          "name": "kaid",
+          "role": "daemon",
+          "owns": [
+            "active sessions (named conversation contexts)",
+            "sub-agent registry and dispatcher",
+            "signal consumer (NATS subscriptions, signal fan-out)",
+            "market data streams (Coinbase WS, kai-api polls)",
+            "scheduler (cron + event triggers)",
+            "persistent stores (watchlists, chat history, autotrade, ledger)",
+            "WebSocket server",
+            "HTTP/REST API"
+          ]
+        },
+        {
+          "name": "terminal client",
+          "role": "thin Textual TUI",
+          "responsibility": "WS client + rendering + keyboard handling. Everything network/agent/NATS/market-data moves to daemon."
+        },
+        {
+          "name": "web UI client",
+          "role": "Svelte SPA",
+          "responsibility": "Same WS protocol as terminal client. Same events, same charts, same sub-agent updates. One protocol, two renderers."
+        }
+      ]
+    },
+
+    "sessions": {
+      "definition": "A named conversation context with its own agent runner, isolated state, and persisted UI/memory. Named so user can run multiple independent lines of work without stomping each other's chat history.",
+      "per_session_state": [
+        "chat_history",
+        "input_queue",
+        "AgentRunner instance with LLM conversation state, tool budget, cancellation handle",
+        "UI state (chart_symbol, chart_timeframe, chart_source, chart_size_mode, chart_color_scheme)",
+        "watchlist_symbols",
+        "autotrade_enabled",
+        "activity_status",
+        "sub-agent pool (instantiated from shared templates, per-session memory)",
+        "per-session semantic memory store"
+      ],
+      "shared_daemon_state": [
+        "sub-agent registry templates (read-only)",
+        "market data streams",
+        "signal consumer",
+        "skills, tools, config",
+        "model-client connection pools",
+        "scheduler"
+      ],
+      "persistence_layout": {
+        "session_state": "workspaces/sessions/{name}.json",
+        "session_memory": "workspaces/sessions/{name}/memory/",
+        "sub_agent_buffers": "workspaces/sessions/{name}/sub_agents/{agent}.json",
+        "session_index": "workspaces/sessions/index.json",
+        "scheduler_jobs": "workspaces/scheduler/jobs.json",
+        "daemon_token": "workspaces/daemon-token.txt",
+        "daemon_pid": "workspaces/kaid.pid"
+      }
+    },
+
+    "wire_protocol": {
+      "transport": "WebSocket, JSON envelopes, versioned",
+      "rationale": "Bidirectional, native browser support, native Python support, streaming-friendly, observable. NATS stays internal infrastructure for sub-agent dispatch and signal fan-out — not exposed to clients.",
+      "client_to_daemon": [
+        {"type": "attach", "fields": ["session", "create_if_missing"]},
+        {"type": "input", "fields": ["text"]},
+        {"type": "interrupt", "fields": []},
+        {"type": "subscribe", "fields": ["channel", "symbol", "tf"]},
+        {"type": "unsubscribe", "fields": ["channel", "symbol", "tf"]},
+        {"type": "slash", "fields": ["command", "args"]},
+        {"type": "heartbeat", "fields": []}
+      ],
+      "daemon_to_client": [
+        {"type": "session_attached", "fields": ["session", "state"]},
+        {"type": "token", "fields": ["text"]},
+        {"type": "tool_start", "fields": ["tool", "args"]},
+        {"type": "tool_end", "fields": ["tool", "elapsed_ms", "ok"]},
+        {"type": "final", "fields": ["text"]},
+        {"type": "status", "fields": ["activity", "queue"]},
+        {"type": "signal", "fields": ["signal"]},
+        {"type": "chart_bar", "fields": ["symbol", "tf", "bar"]},
+        {"type": "watchlist_price", "fields": ["symbol", "price", "volume", "change_24h_pct"]},
+        {"type": "sub_agent_event", "fields": ["agent", "phase", "task_id", "result_preview"]},
+        {"type": "scheduled_job_created", "fields": ["job"]},
+        {"type": "scheduled_job_triggered", "fields": ["job_id", "fired_at"]},
+        {"type": "scheduled_job_completed", "fields": ["job_id", "result_preview"]},
+        {"type": "scheduled_job_failed", "fields": ["job_id", "error"]},
+        {"type": "scheduled_job_cancelled", "fields": ["job_id"]},
+        {"type": "scheduled_job_paused", "fields": ["job_id"]},
+        {"type": "scheduled_job_resumed", "fields": ["job_id"]},
+        {"type": "error", "fields": ["code", "message"]}
+      ],
+      "multi_attach_semantics": "All attached clients receive all events; any attached client can send inputs. Treat as screen -x."
+    },
+
+    "scheduler": {
+      "purpose": "Daemon-resident scheduler that lets the user (or the agent on user's behalf) schedule prompts at a time, on a recurring schedule, or on an event. Triggered prompts run as normal turns inside a target session.",
+      "why_in_daemon": "Must survive client disconnects. A scheduler in the terminal would stop firing the moment user quits the TUI. Whole point is waking the daemon at 3am even with no client attached.",
+      "trigger_families": {
+        "time": {
+          "examples": ["at 7am tomorrow", "every weekday at 9:30 ET", "in 30 minutes", "first Friday of every month at noon UTC"],
+          "implementation": "APScheduler + croniter. LLM normalizes natural-language times into ISO timestamps or clean cron strings before calling the tool."
+        },
+        "event": {
+          "examples": ["if BTC drops 5% in an hour", "when long-signal scanner publishes score above 0.8 for ETH", "when custodial balance falls below $100"],
+          "implementation": "Predicate subscribers on the daemon's internal event bus (signals, market data, balance changes). Predicate is a structured filter object — no eval, no DSL parser.",
+          "filter_operators": ["eq", "ne", "gt", "gte", "lt", "lte", "in", "contains", "regex"],
+          "filter_example": {
+            "channel": "signals",
+            "filter": {
+              "score": {"gt": 0.8},
+              "symbol": "ETH",
+              "side": "long"
+            }
+          }
+        }
+      },
+      "job_model": {
+        "id": "string (e.g. job_2026_04_09_a3f1)",
+        "type": "cron | absolute | event",
+        "spec": "object — depends on type",
+        "prompt": "string",
+        "owner_session": "string",
+        "created_at": "ISO timestamp",
+        "created_by": "user | agent",
+        "last_run": "ISO timestamp or null",
+        "next_run": "ISO timestamp or null",
+        "run_count": "int",
+        "max_runs": "int or null (null = unbounded)",
+        "status": "active | paused | completed | failed | cancelled",
+        "last_result_preview": "string or null",
+        "concurrency": "skip | queue",
+        "tool_budget": "int or null"
+      },
+      "agent_tools": [
+        "schedule_at(when, prompt, session=None)",
+        "schedule_recurring(cron, prompt, session=None, max_runs=None)",
+        "schedule_when(condition, prompt, session=None, max_runs=None)",
+        "list_scheduled_jobs(session=None)",
+        "cancel_scheduled_job(job_id)",
+        "pause_scheduled_job(job_id)",
+        "resume_scheduled_job(job_id)"
+      ],
+      "slash_commands": [
+        "/schedule list",
+        "/schedule list all",
+        "/schedule add at \"...\" \"...\"",
+        "/schedule add cron \"...\" \"...\"",
+        "/schedule cancel JOB_ID",
+        "/schedule pause JOB_ID",
+        "/schedule resume JOB_ID",
+        "/schedule show JOB_ID",
+        "/schedule pause all"
+      ],
+      "execution_flow": [
+        "Scheduler wakes (cron tick / event match / manual REST)",
+        "Look up owner_session by name; mark failed if missing",
+        "Construct input envelope with source=scheduler + job_id",
+        "Enqueue on session input queue",
+        "Session processes as normal turn — agent runs, output streams, chat history gets [scheduled job: JOB_ID] marker",
+        "On completion: update last_run/next_run/run_count/last_result_preview, persist, emit scheduled_job_completed",
+        "If concurrency=skip and session busy, log + emit warning, don't enqueue"
+      ],
+      "safety_rails": [
+        "Per-session active-job soft cap (default 50, configurable)",
+        "Tool budget cap per triggered run",
+        "Self-scheduling loop detection — same session + similar params requires user confirm",
+        "/schedule pause all kill switch",
+        "5-minute catch-up window for missed triggers on daemon boot (older misses logged + skipped)"
+      ],
+      "out_of_scope": [
+        "Not a workflow engine — no DAGs, no fan-out, no conditional-job-creates-job",
+        "Not an OS-level cron replacement",
+        "No built-in email/SMS/Slack notifications (use the agent's existing tools instead)"
+      ]
+    },
+
+    "web_ui": {
+      "framework": "Svelte + SvelteKit",
+      "charts": "TradingView Lightweight Charts (free, MIT, ~40kb gzipped)",
+      "styling": "Tailwind CSS, dark by default",
+      "markdown": "svelte-markdown or equivalent",
+      "auth": "Bearer token from workspaces/daemon-token.txt; mandatory for non-localhost binds",
+      "panels": [
+        "watchlist (left)",
+        "positions (left)",
+        "chart (center)",
+        "chat (center)",
+        "alerts (right)",
+        "nats bus (right)",
+        "scheduled jobs (right)",
+        "status bar (bottom)",
+        "input box (bottom)"
+      ],
+      "rest_endpoints": [
+        "GET /api/health",
+        "GET /api/sessions",
+        "POST /api/sessions",
+        "DELETE /api/sessions/:name",
+        "GET /api/agents",
+        "GET /api/skills",
+        "GET /api/config",
+        "POST /api/config"
+      ]
+    }
+  },
+
+  "phases": [
+    {
+      "phase": 1,
+      "name": "Extract daemon-runnable core",
+      "goal": "Factor in-process code so it can run headless. No behavior change from user perspective.",
+      "tasks": [
+        {"id": 144, "label": "P1.1", "subject": "Create daemon/ package skeleton"},
+        {"id": 145, "label": "P1.2", "subject": "Define Session class with isolated state + sub-agent pool"},
+        {"id": 146, "label": "P1.3", "subject": "Extract agent runner + sub-agent registry from tui/terminal.py into daemon/core.py"},
+        {"id": 147, "label": "P1.4", "subject": "Implement per-session event bus"},
+        {"id": 148, "label": "P1.5", "subject": "Persist Session state to workspaces/sessions/{name}.json + sub_agents/"},
+        {"id": 149, "label": "P1.6", "subject": "Wire tui/terminal.py to use daemon.core.Session in-process"},
+        {"id": 150, "label": "P1.7", "subject": "Phase 1 exit: full pytest suite + manual smoke test", "exit_gate": true}
+      ]
+    },
+    {
+      "phase": 2,
+      "name": "Client adapter + WS server",
+      "goal": "Terminal can connect over WebSocket. Wire protocol freezes at end of phase.",
+      "tasks": [
+        {"id": 151, "label": "P2.1", "subject": "Implement WebSocket server in daemon/server.py (FastAPI)"},
+        {"id": 152, "label": "P2.2", "subject": "Define wire protocol envelopes + validation"},
+        {"id": 153, "label": "P2.3", "subject": "Add tui/client_adapter.py — WS client mimicking the in-process Session interface"},
+        {"id": 154, "label": "P2.4", "subject": "Add CLI flags: --daemon, --remote, --standalone"},
+        {"id": 155, "label": "P2.5", "subject": "Phase 2 exit: two-window manual test + protocol freeze", "exit_gate": true}
+      ]
+    },
+    {
+      "phase": 3,
+      "name": "Multi-session support",
+      "goal": "--session NAME works, sessions persist, multi-attach broadcast works.",
+      "tasks": [
+        {"id": 156, "label": "P3.1", "subject": "Implement --session NAME flag and session lookup/create flow"},
+        {"id": 157, "label": "P3.2", "subject": "Persist session index at workspaces/sessions/index.json"},
+        {"id": 158, "label": "P3.3", "subject": "REST endpoints: GET/POST/DELETE /api/sessions"},
+        {"id": 159, "label": "P3.4", "subject": "/sessions and /session slash commands in the terminal"},
+        {"id": 160, "label": "P3.5", "subject": "Multi-attach broadcast (multi-controller default)"},
+        {"id": 161, "label": "P3.6", "subject": "Phase 3 exit: two-session + multi-attach manual test", "exit_gate": true}
+      ]
+    },
+    {
+      "phase": 4,
+      "name": "Daemon becomes the default",
+      "goal": "Auto-spawn from --terminal, systemd unit for production, kaictl wrapper.",
+      "tasks": [
+        {"id": 162, "label": "P4.1", "subject": "Auto-spawn daemon from --terminal when not reachable"},
+        {"id": 163, "label": "P4.2", "subject": "systemd unit file at deploy/kaid.service"},
+        {"id": 164, "label": "P4.3", "subject": "bin/kaictl wrapper script"},
+        {"id": 165, "label": "P4.4", "subject": "README update — daemon vs standalone CLI cheatsheet"},
+        {"id": 166, "label": "P4.5", "subject": "Phase 4 exit: clean-clone manual test + reboot survival", "exit_gate": true}
+      ]
+    },
+    {
+      "phase": 5,
+      "name": "Scheduler",
+      "goal": "Agent can schedule prompts at a time or on an event. Daemon-resident, survives client disconnects.",
+      "tasks": [
+        {"id": 180, "label": "P5.1", "subject": "Implement Scheduler class in daemon/scheduler.py"},
+        {"id": 181, "label": "P5.2", "subject": "Define ScheduledJob model + structured filter validator"},
+        {"id": 182, "label": "P5.3", "subject": "Persist scheduler jobs at workspaces/scheduler/jobs.json"},
+        {"id": 183, "label": "P5.4", "subject": "Hook scheduler into daemon event bus for event triggers"},
+        {"id": 184, "label": "P5.5", "subject": "Trigger execution flow — dispatch into target session"},
+        {"id": 185, "label": "P5.6", "subject": "Agent tools: schedule_at, schedule_recurring, schedule_when, list/cancel/pause/resume"},
+        {"id": 186, "label": "P5.7", "subject": "Wire protocol scheduled_job_* envelopes"},
+        {"id": 187, "label": "P5.8", "subject": "/schedule slash commands + safety rails"},
+        {"id": 188, "label": "P5.9", "subject": "Phase 5 exit: scheduler smoke tests + restart catch-up verification", "exit_gate": true}
+      ]
+    },
+    {
+      "phase": 6,
+      "name": "Web UI",
+      "goal": "Browser client reaches feature parity with the terminal, including the scheduler panel.",
+      "tasks": [
+        {"id": 167, "label": "P6.1", "subject": "Scaffold web/ SvelteKit project"},
+        {"id": 168, "label": "P6.2", "subject": "FastAPI mounts the built web assets at /"},
+        {"id": 169, "label": "P6.3", "subject": "Web WS client + auth flow"},
+        {"id": 170, "label": "P6.4", "subject": "Web layout — watchlist, positions, chart, chat, alerts, nats, scheduler panels"},
+        {"id": 171, "label": "P6.5", "subject": "TradingView Lightweight Charts integration for the chart panel"},
+        {"id": 172, "label": "P6.6", "subject": "Web markdown chat rendering"},
+        {"id": 173, "label": "P6.7", "subject": "Web slash command palette (Ctrl+K)"},
+        {"id": 174, "label": "P6.8", "subject": "Phase 6 exit: feature-parity check + phone smoke test", "exit_gate": true}
+      ]
+    },
+    {
+      "phase": 7,
+      "name": "Polish + auth + docs",
+      "goal": "Ship-quality. Bearer auth, health/metrics, full regression, README overhaul.",
+      "tasks": [
+        {"id": 175, "label": "P7.1", "subject": "Bearer token auth on WS + REST"},
+        {"id": 176, "label": "P7.2", "subject": "/api/health + metrics endpoint"},
+        {"id": 177, "label": "P7.3", "subject": "Daemon + web smoke tests in pytest suite"},
+        {"id": 178, "label": "P7.4", "subject": "README overhaul for daemon + web UI + scheduler + remote access"},
+        {"id": 179, "label": "P7.5", "subject": "Phase 7 exit: full regression + ship checklist", "exit_gate": true}
+      ]
+    }
+  ],
+
+  "phase_dependencies": [
+    {"from": 150, "to": 151, "note": "Phase 1 exit blocks Phase 2 start"},
+    {"from": 155, "to": 156, "note": "Phase 2 exit blocks Phase 3 start"},
+    {"from": 161, "to": 162, "note": "Phase 3 exit blocks Phase 4 start"},
+    {"from": 166, "to": 180, "note": "Phase 4 exit blocks Phase 5 start"},
+    {"from": 188, "to": 167, "note": "Phase 5 exit blocks Phase 6 start"},
+    {"from": 174, "to": 175, "note": "Phase 6 exit blocks Phase 7 start"}
+  ],
+
+  "risks": [
+    {
+      "risk": "Protocol churn during Phase 2 invalidates Phase 6 web UI work",
+      "likelihood": "Medium",
+      "impact": "High",
+      "mitigation": "Freeze the protocol at the end of Phase 2; future additions are new message types only, never breaking changes"
+    },
+    {
+      "risk": "Daemon crash kills every attached session at once",
+      "likelihood": "Low",
+      "impact": "High",
+      "mitigation": "--standalone stays available; auto-restart via systemd; persist session state on every input so a restart loses ≤1 turn"
+    },
+    {
+      "risk": "Race conditions between multi-attached clients sending conflicting inputs",
+      "likelihood": "Medium",
+      "impact": "Medium",
+      "mitigation": "Per-session input is a single asyncio.Queue; first input in wins; both clients see it in their token stream so UI stays consistent"
+    },
+    {
+      "risk": "Sub-agents share state across sessions and accidentally leak context",
+      "likelihood": "Low",
+      "impact": "Medium",
+      "mitigation": "N/A — sub-agents are now per-session by design (Q1 decision)"
+    },
+    {
+      "risk": "Per-session sub-agent pools multiply RAM and model-client connections as sessions grow",
+      "likelihood": "Medium",
+      "impact": "Medium",
+      "mitigation": "Templates are shared; only conversation buffers and memory are duplicated. Underlying HTTP clients to local LLM / kai-api are pooled globally so sockets don't multiply with sessions"
+    },
+    {
+      "risk": "Per-session memory grows unbounded over weeks of use",
+      "likelihood": "Medium",
+      "impact": "Medium",
+      "mitigation": "Memory store enforces a per-session size cap with LRU eviction; user can /memory compact from a slash command"
+    },
+    {
+      "risk": "Self-scheduling loop: agent creates a job whose triggered run creates more jobs",
+      "likelihood": "Medium",
+      "impact": "High",
+      "mitigation": "Loop detection in schedule_* tools — same session + similar params requires user confirmation; per-session active-job soft cap; /schedule pause all kill switch"
+    },
+    {
+      "risk": "Daemon restart loses near-future scheduled triggers",
+      "likelihood": "Medium",
+      "impact": "Medium",
+      "mitigation": "5-minute catch-up window on boot re-fires recent missed triggers; older misses logged + skipped to avoid wake-up flood"
+    },
+    {
+      "risk": "Triggered job runs while user is mid-conversation in the same session",
+      "likelihood": "Medium",
+      "impact": "Low",
+      "mitigation": "concurrency: skip default for new jobs; explicit queue mode is opt-in. Either way the chat history clearly marks scheduler-sourced turns"
+    },
+    {
+      "risk": "Web UI maintenance burden competes with agent work",
+      "likelihood": "Medium",
+      "impact": "Low",
+      "mitigation": "Keep web UI small — same protocol, ~5 components, TradingView handles the hardest piece"
+    },
+    {
+      "risk": "Backwards compat breaks existing workflows (--chat, --once, etc.)",
+      "likelihood": "Medium",
+      "impact": "Medium",
+      "mitigation": "All sub-commands stay in --standalone mode until explicitly ported; document which are daemon-native and which are not"
+    },
+    {
+      "risk": "Port conflicts on shared dev machines",
+      "likelihood": "Low",
+      "impact": "Low",
+      "mitigation": "Config default + env var override + fail-loud if bind fails"
+    },
+    {
+      "risk": "State sync drift between daemon's in-memory state and persisted JSON",
+      "likelihood": "Medium",
+      "impact": "Medium",
+      "mitigation": "Single-writer per session; every input triggers a persist on the session boundary; load-then-merge for state.json"
+    }
+  ],
+
+  "what_does_not_change": [
+    "Agent runtime — AgentRunner, LLM endpoint chain, tool dispatch, memory store, NATS internal bus",
+    "kai-api cloud gateway at agent-k.ai",
+    "agent-config.json schema",
+    "Sub-agent definitions (registry, prompts, tool lists)",
+    "Slash command names and syntax",
+    "Existing 62 pytest tests must stay green through every phase",
+    "File locations the user already knows (workspaces/, agent-config.json, state.json, chat history JSONs)",
+    "Existing event bus stays as-is — scheduler is a new consumer, not a new data source"
+  ],
+
+  "totals": {
+    "phases": 7,
+    "tasks": 45,
+    "decisions_locked": 8,
+    "decisions_pending": 0
+  },
+
+  "next_action": "Awaiting user green light to start Phase 1 / Task #144 (create daemon/ package skeleton). No coding until approved."
+}

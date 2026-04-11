@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "jobs": {
+    "job_2026_04_11_125205_5218d7": {
+      "id": "job_2026_04_11_125205_5218d7",
+      "type": "cron",
+      "spec": {
+        "cron": "0 * * * *",
+        "tz": "UTC"
+      },
+      "prompt": "Run comprehensive BTC technical analysis: 1m/15m/1h/6h/daily timeframes, RSI, MACD, EMA, BB, Keltner, Squeeze indicator, volatility analysis, key levels, trade setups, and signal status. Output in clear table format with actionable recommendations.",
+      "owner_session": "terminal",
+      "created_at": "2026-04-11T12:52:05+00:00",
+      "created_by": "agent",
+      "last_run": "2026-04-11T17:00:00.001332+00:00",
+      "next_run": "2026-04-11T18:00:00+00:00",
+      "run_count": 5,
+      "max_runs": null,
+      "status": "active",
+      "last_result_preview": "## BTC Comprehensive Technical Analysis **Spot price:** **$73,016.60** **Signal status:** **No active BTC alerts** **Data note:** local **6h** endpoint error...",
+      "concurrency": "queue",
+      "tool_budget": null
+    }
+  }
+}

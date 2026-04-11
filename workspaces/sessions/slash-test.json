@@ -1,0 +1,109 @@
+{
+  "name": "slash-test",
+  "agent_name": "kai",
+  "chat_history": [
+    {
+      "role": "human",
+      "content": "/chart SOL 1m"
+    },
+    {
+      "role": "ai",
+      "content": "**SOL 1m chart**\n- **Last:** **$84.59**\n- **Short-term trend:** mildly **bullish**\n- **RSI 14:** **51.5** → neutral\n- **EMA 20:** **84.58** → price slightly above\n- **EMA 50:** **84.53** → price above\n- **MACD:** **bullish**, but weak momentum\n\n**Read:**\n- SOL is grinding sideways-to-up on the 1m.\n- Very tight range around **84.50–84.66**.\n- No strong breakout yet; momentum is positive but not impulsive.\n- No recent live scanner signals flagged on SOL.\n\n**Key levels**\n- **Support:** 84.53, then 84.50\n- **Resistance:** 84.66, then recent micro-high zone above that\n\n**Bias**\n- **Above 84.66:** continuation scalp setup\n- **Below 84.50:** likely short-term fade / range breakdown\n- Right now: **neutral-bullish, low conviction until range breaks**\n\nIf you want, I can also give you a **full mini chart read with entry/stop/target levels** for SOL 1m."
+    },
+    {
+      "role": "human",
+      "content": "/status"
+    },
+    {
+      "role": "ai",
+      "content": "**Status**\n- **Portfolio:** $100,000.00\n- **Cash:** $99,326.14\n- **Total P&L:** $0.00\n\n**Open position**\n- **BTC long** — 0.0100 @ **$67,386.20**\n- **Current:** $67,386.20\n- **Unrealized P&L:** $0.00\n\n**Agents**\n- No sub-agents running\n\n**Scheduled jobs**\n- None\n\n**ASO optimizer**\n- **Running:** no\n- **Paused:** no\n- **Candidates:** 6\n- **Active:** 0\n- **Graveyard:** 1\n- **Cycles completed today:** 0\n\nIf you want, I can also give you a **trading-only status**, **strategy lab status**, or **close the BTC paper position**."
+    },
+    {
+      "role": "human",
+      "content": "/help"
+    },
+    {
+      "role": "ai",
+      "content": "**KAI Help**\n\n**Market**\n- `/chart BTC 1m` — quick chart read\n- `/price ETH` — latest price\n- `/signals SOL` — recent scanner alerts\n- `/scan trending` — pump.fun trending tokens\n\n**Trading**\n- `/buy BTC 0.01`\n- `/sell ETH 0.5`\n- `/limit buy SOL 10 140`\n- `/positions`\n- `/status`\n\n**Strategy / Research**\n- `/backtest BTC 1h RSI<30 RSI>70`\n- `/strategies`\n- `/strategy <name>`\n- `/optimize start`\n- `/optimize status`\n\n**Scheduling**\n- `/schedule at 2025-08-20T14:00:00Z /chart BTC 5m`\n- `/schedule cron \"*/15 * * * *\" /price BTC`\n- `/jobs`\n\n**Agents**\n- `/agents`\n- `/spawn analyst`\n- `/ask analyst Analyze BTC 1h trend`\n\n**Examples**\n- `/chart SOL 1m`\n- `/price BTC`\n- `/positions`\n- `/status`\n\nIf you want, I can also give you a **full command list** or a **cheat sheet focused only on trading commands**."
+    },
+    {
+      "role": "human",
+      "content": "/sessions"
+    },
+    {
+      "role": "ai",
+      "content": "I don’t have a `/sessions` listing command exposed here.\n\nWhat I *can* show/manage:\n- `/jobs` — scheduled jobs for this session\n- `/agents` — running sub-agents\n- `/status` — trading/system status\n\nIf you want, I can also help you with:\n- **active jobs**\n- **running agents**\n- **current strategy/trading status**"
+    },
+    {
+      "role": "human",
+      "content": "/debug"
+    },
+    {
+      "role": "ai",
+      "content": "**Debug**\n- Session is responsive\n- No sub-agents running\n- No scheduled jobs\n- Paper portfolio available\n- Market data tools available\n- Strategy/backtest tools available\n\n**Available checks**\n- `/status` — portfolio + system state\n- `/agents` — running agents\n- `/jobs` — scheduled jobs\n- `/positions` — open paper trades\n\nIf you want a deeper debug read, say one of:\n- `debug market`\n- `debug agents`\n- `debug portfolio`\n- `debug strategy`"
+    },
+    {
+      "role": "human",
+      "content": "/unknowncmd"
+    },
+    {
+      "role": "ai",
+      "content": "Unknown command: `/unknowncmd`\n\nTry:\n- `/help` — command list\n- `/status` — portfolio/system status\n- `/chart BTC 1m` — chart read\n- `/positions` — open trades\n\nIf you want, paste the command you intended and I’ll map it to the right one."
+    },
+    {
+      "role": "human",
+      "content": "/status"
+    },
+    {
+      "role": "ai",
+      "content": "**Status**\n- **Portfolio:** $100,000.00\n- **Cash:** $99,326.14\n- **Total P&L:** $0.00\n\n**Open position**\n- **BTC long** — 0.0100 @ **$67,386.20**\n- **Current:** $67,386.20\n- **Unrealized P&L:** $0.00\n\n**Agents**\n- No sub-agents running\n\n**Scheduled jobs**\n- None\n\n**ASO optimizer**\n- **Running:** no\n- **Paused:** no\n- **Candidates:** 6\n- **Active:** 0\n- **Graveyard:** 1\n- **Cycles completed today:** 0\n\nIf you want, I can also give you **positions only**, **agents only**, or **optimizer only**."
+    },
+    {
+      "role": "human",
+      "content": "/help"
+    },
+    {
+      "role": "ai",
+      "content": "**KAI Help**\n\n**Market**\n- `/chart BTC 1m` — quick chart read\n- `/price ETH` — latest price\n- `/signals SOL` — recent scanner alerts\n- `/scan trending` — pump.fun trending tokens\n\n**Trading**\n- `/buy BTC 0.01`\n- `/sell ETH 0.5`\n- `/limit buy SOL 10 140`\n- `/positions`\n- `/status`\n\n**Strategy / Research**\n- `/backtest BTC 1h RSI<30 RSI>70`\n- `/strategies`\n- `/strategy <name>`\n- `/optimize start`\n- `/optimize status`\n\n**Scheduling**\n- `/schedule at 2025-08-20T14:00:00Z /chart BTC 5m`\n- `/schedule cron \"*/15 * * * *\" /price BTC`\n- `/jobs`\n\n**Agents**\n- `/agents`\n- `/spawn analyst`\n- `/ask analyst Analyze BTC 1h trend`\n\n**Examples**\n- `/chart SOL 1m`\n- `/price BTC`\n- `/positions`\n- `/status`\n\nIf you want, I can also give you:\n- **trading-only help**\n- **strategy-only help**\n- **a full command cheat sheet**"
+    },
+    {
+      "role": "human",
+      "content": "/sessions"
+    },
+    {
+      "role": "ai",
+      "content": "I don’t have a `/sessions` browser in this interface.\n\nAvailable nearby commands:\n- `/jobs` — scheduled jobs\n- `/agents` — running sub-agents\n- `/status` — portfolio + system state\n- `/positions` — open paper trades\n\nIf you want session-like visibility, I can show:\n- **current jobs**\n- **current agents**\n- **current trading status**"
+    },
+    {
+      "role": "human",
+      "content": "/debug"
+    },
+    {
+      "role": "ai",
+      "content": "**Debug**\n- Session responsive: **yes**\n- Portfolio system: **ok**\n- Market/trading tools: **available**\n- Strategy optimizer: **available**\n- Optimizer running: **no**\n- Scheduled jobs: **0**\n- Sub-agents running: **0**\n\n**Portfolio**\n- **Equity:** $100,000.00\n- **Cash:** $99,326.14\n- **Open positions:** 1\n\n**Open position**\n- **BTC long** — 0.0100 @ **$67,386.20**\n- **Current:** $67,386.20\n- **Unrealized P&L:** $0.00\n\n**Agents**\n- None running\n\n**Jobs**\n- None scheduled for this session\n\n**Optimizer**\n- **Running:** no\n- **Paused:** no\n- **Candidates:** 6\n- **Active:** 0\n- **Graveyard:** 1\n- **Cycles today:** 0\n\nIf you want deeper debug, use:\n- `debug agents`\n- `debug portfolio`\n- `debug optimizer`\n- `debug market`"
+    },
+    {
+      "role": "human",
+      "content": "/unknowncmd"
+    },
+    {
+      "role": "ai",
+      "content": "Unknown command: `/unknowncmd`\n\nTry:\n- `/help` — command list\n- `/status` — portfolio/system status\n- `/chart BTC 1m` — chart read\n- `/positions` — open trades\n\nIf you meant something specific, paste it and I’ll translate it to the right command."
+    }
+  ],
+  "input_queue": [],
+  "ui_state": {
+    "chart_symbol": "BTC",
+    "chart_timeframe": "1m",
+    "chart_source": "kai-api",
+    "chart_layout_mode": "dashboard",
+    "chart_color_scheme": "classic",
+    "watchlist_symbols": [
+      "BTC",
+      "ETH",
+      "SOL"
+    ],
+    "autotrade_enabled": false,
+    "activity_status": "idle"
+  }
+}

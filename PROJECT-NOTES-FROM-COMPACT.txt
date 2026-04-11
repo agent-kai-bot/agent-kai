@@ -1,0 +1,259 @@
+  Summary:
+     1. Primary Request and Intent:
+
+     The user has been driving an extended TUI development session for the Agent KAI crypto trading terminal. The conversation arc covered three main phases:
+
+     **Phase A — Watchlist bug fix and 5-feature quality-of-life batch:**
+     After fixing the "--- ---" watchlist bug in commit `67c4d0a`, the user asked "what other improvements?" I proposed a tiered list. They selected items 1-4 from Tier 1 plus the /status + per-tool timing item from Tier 2, with the explicit instruction:
+     "ok, yeah lets do it 1-4 then the /status + per-tool, lets just get it all done, but make sure you have commit current work and checkout a new branch as this is a big change potentially". The 5 features were:
+     1. Persist `tracked_symbols` across restarts
+     2. 24h change column on watchlist
+     3. Markdown rendering in chat panel
+     4. Status bar with live info
+     5. /status command + /debug per-tool timing
+
+     **Phase B — Daemon architecture redesign request:**
+     After the QoL batch shipped as `4422a65` on a new branch `kai/tui-quality-of-life`, the user requested a major architectural redesign with this exact wording: "ok, we need to design an updated architecture, the goal is that basically the agent is
+     running as a daemon, can launch sub-agents, etc, then the --terminal just connections an agent session, user could launch N+ sessions --terminal --session mysession1 ... we also want a web UI (NO streamlit), i need to ultrathink about this architecture"
+
+     The user's explicit requirements for the new architecture:
+     - The agent runs as a **daemon** (always-on background process)
+     - The daemon can launch sub-agents (already does)
+     - `--terminal` becomes a **client** that connects to a session on the daemon
+     - Multiple terminals can run as separate sessions: `--terminal --session mysession1`, `--terminal --session mysession2`
+     - A **web UI** is needed
+     - Web UI must NOT use Streamlit
+     - The user wants to "ultrathink" — meaning a thorough, careful design pass
+
+     **Phase C — Save the design:**
+     The user's most recent request: "ensure you save all of these details into DAEMON-MIGRATION-PLAN.md" — but a system reminder explicitly forbade me from calling any tools, including Write. So this summary captures the daemon architecture design content
+     for continuation.
+
+     2. Key Technical Concepts:
+
+     - **Textual TUI framework** (8.2.2) — DataTable column keys, Static widgets, Screen CSS classes, run_test pilot
+     - **WebSocket-based daemon-client architecture** — JSON message protocol for client-server split
+     - **Multi-session model** — named sessions with isolated conversation state, shared sub-agents
+     - **FastAPI** — backend for both WS server and REST endpoints
+     - **Svelte + SvelteKit** — recommended frontend framework (lightweight, ~10kb runtime vs React's 40kb+)
+     - **TradingView Lightweight Charts** — recommended chart library for the web UI (free, MIT, financial conventions)
+     - **Tailwind CSS** — recommended styling for fast iteration
+     - **systemd unit files** — for production daemon management
+     - **Auto-spawn pattern** — `--terminal` transparently starts the daemon if not running
+     - **Multi-attach broadcast** — multiple clients on the same session see all events (like `screen -x`)
+     - **NATS internal bus** — kept for sub-agent dispatch, NOT exposed to clients
+     - **Bearer token auth** — for non-localhost network exposure
+     - **Phased rollout** — extract core, client adapter, sessions, default cutover, web UI, polish
+     - **Rich Markdown renderable** — for in-chat markdown formatting
+     - **Load-then-merge state persistence** — pattern for state.json updates without clobbering other fields
+
+     3. Files and Code Sections:
+
+     - **tui/panels/watchlist.py** (modified for QoL batch)
+       - Why important: Container for the watchlist table; was the source of the "--- ---" bug
+       - Added `COL_CHANGE = "change_24h"` constant for the new column
+       - Added `_format_change(change)` static helper for color-coded percent rendering
+       - Modified `update_price()` to take `change_24h_pct: float | None = None` parameter
+       - Updated `on_mount()` to add 4th column "24h%" with explicit key
+       - Updated `add_symbol()` to mount 4-column rows with placeholder
+       - Format: green for positive, red for negative, dim for zero/None
+
+     ```python
+     COL_SYMBOL = "symbol"
+     COL_PRICE = "price"
+     COL_CHANGE = "change_24h"
+     COL_VOL = "vol"
+
+     @staticmethod
+     def _format_change(change: float | None) -> str:
+         if change is None:
+             return "[dim]---[/]"
+         if change > 0:
+             return f"[bold green]+{change:.2f}%[/]"
+         if change < 0:
+             return f"[bold red]{change:.2f}%[/]"
+         return "[dim]0.00%[/]"
+     ```
+
+     - **tui/panels/agent_chat.py** (modified for QoL batch)
+       - Why important: ChatPanel that displays the streaming agent conversation
+       - Added `append_markdown(text, css_class)` method using Rich Markdown renderable
+       - Added `render_widget_as_markdown(widget, text)` to swap streaming widget content to markdown after stream completes
+       - Updated `create_response_widget()` to stash `_raw_text = ""` on the widget
+       - Two-phase rendering: stream raw tokens during the stream, then swap to Rich Markdown when complete
+
+     ```python
+     def render_widget_as_markdown(self, widget: Static, text: str) -> None:
+         from rich.markdown import Markdown
+         widget._raw_text = text
+         try:
+             widget.update(Markdown(text))
+         except Exception:
+             widget.update(text)
+     ```
+
+     - **tui/terminal.py** (extensively modified for QoL batch)
+       - Why important: Main TradingTerminal class — central hub for the TUI
+       - Added `self._initial_watchlist_symbols` reading from state.json
+       - Added `_persist_watchlist_symbols(symbols)` helper using load-then-merge
+       - Updated `_seed_watchlist_prices` to fetch 1d OHLCV for kai-api 24h change derivation, pass coinbase's `price_change_24h_pct` directly through
+       - Replaced `_set_status` with state-driven version, added `_refresh_status_bar()` and periodic `_run_status_bar_refresh` task
+       - Added `_handle_status_command()` — dumps every background task state, signal consumer state, sub-agent registry, autotrade flag, debug flag, etc.
+       - Added `_handle_debug_command()` — toggles per-tool-call timing
+       - Added `_debug_enabled: bool` and `_tool_start_times: dict[str, float]` attributes
+       - Modified `_process_agent` to defer markdown render to after the loop ends (in `else:` branch), tracking `final_text` separately
+       - Added per-tool elapsed time logging when debug is enabled (green <500ms, yellow <5s, red ≥5s)
+       - Added `/status` and `/debug` to slash command dispatcher
+       - Updated welcome banner with new commands
+
+     Key new method snippet:
+     ```python
+     def _refresh_status_bar(self) -> None:
+         parts: list[str] = []
+         activity = self._activity_status or "idle"
+         parts.append(f"[bold]{activity}[/]")
+         try:
+             tf = self.TIMEFRAMES[self._current_tf_idx]
+             parts.append(f"[cyan]{self._chart_symbol}/{tf}[/]")
+         except Exception:
+             pass
+         # ... portfolio, autotrade, queue, agents fields ...
+         bar.update(" │ ".join(parts))
+     ```
+
+     - **agent-config.json** (untouched in this batch but referenced)
+       - Why important: top-level configuration for endpoints, agents, signal_handlers
+
+     - **workspaces/terminal/state.json** (runtime state file)
+       - Now stores: `chart_symbol`, `chart_timeframe`, `chart_color_scheme`, `chart_source`, `chart_size_mode`, `autotrade_enabled`, `watchlist_symbols`, `chat_history` (separate file)
+
+     4. Errors and fixes:
+
+     - **Watchlist test failure on `widget.renderable`**:
+       - Test for the markdown rendering feature failed with `AttributeError: 'Static' object has no attribute 'renderable'`
+       - Fixed by changing assertions to use `widget.content` (the same gotcha that caused the original Ctrl+Y bug — there's a feedback memory about this)
+       - Test passed after the fix
+
+     - **Branch divergence with origin/develop (earlier in conversation)**:
+       - GitHub showed `kai/self-learning-platform` as 36 commits ahead and 32 behind develop
+       - Root cause: colleague had rebased and pushed all the work to origin/develop with new SHAs
+       - Fix: rebased local branch onto origin/develop with `git rebase` which auto-skipped 32 already-applied commits, then force-pushed with `--force-with-lease`
+       - Result: clean 4-commit-ahead state
+
+     - **Push of local develop rejected (earlier)**:
+       - `git push origin develop` failed because origin/develop had been updated upstream
+       - Fix: realized the local develop's 4 commits were already on origin/develop with different SHAs (the rebase), reset local develop to origin/develop with `git reset --hard`
+
+     5. Problem Solving:
+
+     **Watchlist "--- ---" bug** (just before this summary slice): WatchlistPanel.update_price was calling `self.update_cell(symbol, "Price", price_str)` passing the column LABEL instead of the column KEY. Textual's auto-generated column keys from
+     `add_columns(...)` don't match the labels, so update_cell raised CellDoesNotExist which was silently swallowed by `except Exception: pass`. Fixed by using `add_column` (singular) with explicit `key=` arguments and exposing them as class constants.
+
+     **Markdown rendering in chat with streaming**: Two-phase approach — stream raw tokens during the stream (so the user sees live text), then swap to Rich Markdown renderable when the stream completes. Stash `_raw_text` on the widget so Ctrl+Y copy still
+     gets clean text.
+
+     **Status bar live updates**: Activity-state attribute + state-driven render method + periodic 1.5s safety-net refresh task.
+
+     **Daemon architecture design**: I provided a comprehensive proposal covering 9 sections — core mental model, what a session is, wire protocol, backwards compat, web UI stack, 8 open questions, phased rollout, risks, what doesn't change. The user has not
+      yet answered the 8 open questions.
+
+     6. All user messages:
+
+     - "ok yeah lets do it 1-4 then the /status + per-tool, lets just get it all done, but make sure you have commit current work and checkout a new branch as this is a big change potentially"
+     - "ok, we need to design an updated architecture, the goal is that basically the agent is running as a daemon, can launch sub-agents, etc, then the --terminal just connections an agent session, user could launch N+ sessions --terminal --session
+     mysession1 ... we also want a web UI (NO streamlit), i need to ultrathink about this architecture"
+     - "ensure you save all of these details into DAEMON-MIGRATION-PLAN.md" (with the no-tool-call restriction)
+
+     Earlier user messages from the broader session that are still relevant context:
+     - "ok so question, how do I configure the agent to response/react when it gets when of those" (signal handler request)
+     - "ok yeah lets add /react and also make sure in the loop works, then lets add the signal_handler json and logic and code for the tui, yes we want to support autotrade, with the user easily able to turn on or off from the slash commands"
+     - "ok do we have anything that could be sending over nats within the agent..." (test_signal_pipeline.py polluting NATS)
+     - "yes push it"
+     - "there is a lag in the tui w/ the ohlcv chart..."
+     - "hmm, but we need to see what is up with websockets, to debug them"
+     - "do we need to rebase this branch off develop?"
+     - "ok yes do it" (rebase + force push)
+     - "delete it" (backup branch)
+     - "i'd like to see if can reduce the chart window and increase the chat window..."
+     - "lets work on some other updates - the watch list, i can see symbols but price and vol show --- ---"
+     - "yes what other improvements?"
+
+     7. Pending Tasks:
+
+     - **Save the daemon architecture design to DAEMON-MIGRATION-PLAN.md** (the user's most recent request, which I cannot fulfill in this turn due to the no-tool-call restriction — must be done in the next turn)
+     - **Get user answers to the 8 open questions** in the daemon proposal:
+       1. Sessions — global sub-agents or per-session? (I recommend global)
+       2. Daemon transport — TCP localhost or Unix socket? (I recommend TCP localhost)
+       3. Web UI framework — Svelte vs React? (I recommend Svelte + SvelteKit)
+       4. Backwards compat — auto-spawn or explicit? (I recommend auto-spawn)
+       5. Multi-attach semantics — multi-controller or single-controller? (I recommend multi-controller)
+       6. Daemon process management — auto-spawn vs systemd? (I recommend supporting both)
+       7. Daemon vs client persistence boundary — client essentially stateless? (I recommend yes)
+       8. Scope — phased or big-bang? (I recommend phased)
+     - **Phase 1 of daemon migration** (extract daemon-runnable core into `daemon/` package + WebSocket server) once the user signs off
+     - **Push the kai/tui-quality-of-life branch** (already done — pushed as `4422a65`)
+
+     8. Current Work:
+
+     Immediately before this summary request, I was producing a comprehensive architectural design for the daemon + multi-session + web UI redesign in the chat. The user's exact words after I delivered the design were: "ensure you save all of these details
+     into DAEMON-MIGRATION-PLAN.md" — but a system reminder explicitly blocked me from calling tools.
+
+     The architectural design I produced covered:
+
+     **Core mental model:** Three runtime components — `kaid` daemon (owns sessions, sub-agents, signal consumer, market data fanout, persistent stores, WebSocket server), terminal client (thin Textual TUI speaking JSON over WS), web UI client (Svelte SPA
+     speaking same protocol).
+
+     **Sessions:** Named conversation contexts. Each owns its chat_history, _input_queue, UI state (chart symbol/timeframe/source/size, watchlist, autotrade flag), per-session AgentRunner instance, persisted to `workspaces/sessions/{name}.json`. Sub-agents,
+     memory, skills, market data, signal consumer are shared (NOT per-session).
+
+     **Wire protocol:** JSON over WebSocket. Messages include: client→daemon (attach, input, interrupt, subscribe, unsubscribe, heartbeat), daemon→client (session_attached, token, tool_start, tool_end, final, status, signal, chart_bar, sub_agent_event,
+     error). Multi-attach broadcast (all clients on a session see all events).
+
+     **Why WebSocket over gRPC/NATS:** Bidirectional, native browser support, native Python support, streaming-friendly, observable.
+
+     **Backwards compat:** `--terminal` auto-spawns daemon if not running, transparent to current users. `--standalone` is the escape hatch for in-process mode.
+
+     **Web UI stack recommendation:**
+     - Backend: FastAPI mounted in daemon, REST endpoints for `/api/sessions`, `/api/agents`, `/api/skills`, `/api/config`, `/api/health`
+     - Frontend: Svelte + SvelteKit (NOT Streamlit per user requirement, NOT React)
+     - Charts: TradingView Lightweight Charts
+     - Styling: Tailwind, dark by default
+     - Auth: Bearer token from `workspaces/daemon-token.txt`, localhost-only by default
+
+     **8 open questions for the user** (listed above in pending tasks)
+
+     **Phased rollout (6 phases, ~10-15 days):**
+     1. Extract daemon-runnable core (1-2 days)
+     2. Terminal becomes daemon client with `--remote` flag (2-3 days)
+     3. Sessions with `--session NAME` + persistence (1-2 days)
+     4. Daemon becomes default with auto-spawn (1 day)
+     5. Web UI — FastAPI + Svelte + TradingView charts (3-5 days)
+     6. Polish + auth + systemd unit + CLI script wrappers (1-2 days)
+
+     **Risks table** covering protocol churn, daemon crashes, race conditions, sub-agent shared state, web UI maintenance burden, backwards compat breaks, port conflicts, state sync.
+
+     **What does NOT change:** Agent runtime itself, cloud kai-api gateway, agent-config.json schema, NATS internal bus, sub-agents, slash commands, existing tests.
+
+     **Branch state at this moment:**
+     - Current branch: `kai/tui-quality-of-life` at `4422a65` (pushed to origin)
+     - Previous branch: `kai/self-learning-platform` at `67c4d0a` (pushed)
+     - Develop: `c515248` (in sync with origin)
+
+     9. Optional Next Step:
+
+     The user's most recent explicit request was: "ensure you save all of these details into DAEMON-MIGRATION-PLAN.md" — and the system reminder explicitly prevented me from calling Write in this turn.
+
+     The next step is therefore: **In the next turn, write the file `DAEMON-MIGRATION-PLAN.md` containing the full daemon architecture design.** The file should live at the project root (`/home/atc/git/claude-local-ai-agent/DAEMON-MIGRATION-PLAN.md`) since
+     the user said "save all of these details into DAEMON-MIGRATION-PLAN.md" without specifying a directory.
+
+     The file should contain all 9 sections from the design proposal: TL;DR / mental model, sessions definition, wire protocol with example message envelopes, backwards compat plan, web UI stack with framework justification, the 8 open questions awaiting
+     user answers, the 6-phase rollout with day estimates, the risks table, and the "what does NOT change" boundary statement.
+
+     After saving the file, I should ask the user to answer the 8 open questions before starting Phase 1, since the user explicitly said "i need to ultrathink about this architecture" — meaning design first, implementation only after sign-off.
+
+     The user's verbatim request was: "ensure you save all of these details into DAEMON-MIGRATION-PLAN.md" — which I will fulfill by using the Write tool in the next turn to create the file at `/home/atc/git/claude-local-ai-agent/DAEMON-MIGRATION-PLAN.md`
+     with the complete architectural proposal content that I produced in the previous assistant message.
+
+     If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at:
+     /home/atc/.claude/projects/-home-atc-git-claude-local-ai-agent/38fcbd2a-e39b-4047-aef3-27bc57f549fb.jsonl
+

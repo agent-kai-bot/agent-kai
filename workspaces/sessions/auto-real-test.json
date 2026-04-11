@@ -1,0 +1,29 @@
+{
+  "name": "auto-real-test",
+  "agent_name": "kai",
+  "chat_history": [
+    {
+      "role": "human",
+      "content": "I need you to do all of these steps without asking me: 1) Check the current BTC price 2) Check the current ETH price 3) Compare them and tell me the BTC/ETH ratio 4) Give me a brief market summary"
+    },
+    {
+      "role": "ai",
+      "content": "Here’s the quick read:\n\n- BTC price: $72,878.77\n- ETH price: $2,249.69\n- BTC/ETH ratio: 32.40\n\nComparison:\n- 1 BTC is worth about 32.4 ETH\n- BTC 24h change: +0.42%\n- ETH 24h change: +1.00%\n\nBrief market summary:\n- Both BTC and ETH are green today.\n- ETH is outperforming BTC on a 24h basis, which suggests slightly stronger relative momentum in majors outside BTC right now.\n- No recent live signals were flagged for either BTC or ETH in the signal feed, so current action looks more like steady upside than an urgent breakout alert.\n\n[AUTO_STATE: done]"
+    }
+  ],
+  "input_queue": [],
+  "ui_state": {
+    "chart_symbol": "BTC",
+    "chart_timeframe": "1m",
+    "chart_source": "kai-api",
+    "chart_layout_mode": "dashboard",
+    "chart_color_scheme": "classic",
+    "watchlist_symbols": [
+      "BTC",
+      "ETH",
+      "SOL"
+    ],
+    "autotrade_enabled": false,
+    "activity_status": "idle"
+  }
+}
