@@ -3,16 +3,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import signal
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from eth_abi import decode
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from src.shared.config import Settings, load_settings
 from src.shared.db import Database, StateStore
-from src.shared.events import DEX_SWAP_TOPICS, NEW_BLOCK_CHANNEL, NEW_SWAPS_CHANNEL, NEW_TRANSFERS_CHANNEL, REORG_CHANNEL, TRANSFER_TOPIC, V2_SWAP_TOPIC, V3_SWAP_TOPIC
+from src.shared.events import DEX_SWAP_TOPIC_FILTER, NEW_BLOCK_CHANNEL, NEW_SWAPS_CHANNEL, NEW_TRANSFERS_CHANNEL, REORG_CHANNEL, TRANSFER_TOPIC, V2_SWAP_TOPIC, V3_SWAP_TOPIC
 from src.shared.evm import decode_topic_address, from_hex_quantity, normalize_address, to_hex_quantity
 from src.shared.logging import configure_logging
 from src.shared.redis import RedisClient
@@ -20,6 +22,8 @@ from src.shared.rpc import RpcGatewayClient, build_logs_filter, fetch_block_numb
 from src.shared.utils import chunk_range, to_iso8601, utcnow
 
 LOGGER = logging.getLogger(__name__)
+BLOCK_CACHE_MAX_SIZE = 2_048
+BLOCK_CACHE_EVICT_COUNT = 256
 
 
 @dataclass(slots=True)
@@ -42,6 +46,9 @@ class IngestService:
         self.tracked_pools: list[PoolRecord] = []
         self.block_cache: dict[int, dict[str, Any]] = {}
         self._running = True
+
+    def request_shutdown(self) -> None:
+        self._running = False
 
     async def close(self) -> None:
         await self.rpc.close()
@@ -146,6 +153,8 @@ class IngestService:
 
     async def process_live_heads(self) -> None:
         async for head in self.rpc.subscribe_heads():
+            if not self._running:
+                break
             head_number = from_hex_quantity(head.get("number"))
             last_indexed = await self.state.get_int("last_indexed_block", 0)
             if head_number <= last_indexed:
@@ -219,7 +228,7 @@ class IngestService:
                         from_block=chunk_start,
                         to_block=chunk_end,
                         addresses=addresses,
-                        topics=[DEX_SWAP_TOPICS],
+                        topics=DEX_SWAP_TOPIC_FILTER,
                     )
                 ],
             )
@@ -240,13 +249,14 @@ class IngestService:
         if reorg_from is not None:
             return reorg_from
 
-        await self.insert_block(block_number, block)
         transfer_logs = await self.fetch_transfer_logs_for_block(block_number)
         swap_logs = await self.fetch_swap_logs_for_block(block_number)
-        if transfer_logs or swap_logs:
-            await self.fetch_receipts_for_logs(transfer_logs + swap_logs)
-        transfer_count = await self.persist_transfer_logs(transfer_logs)
-        swap_count = await self.persist_swap_logs(swap_logs)
+        async with self.database.connect() as connection:
+            async with connection.begin():
+                await self.insert_block(block_number, block, connection=connection)
+                transfer_count = await self.persist_transfer_logs(transfer_logs, connection=connection)
+                swap_count = await self.persist_swap_logs(swap_logs, connection=connection)
+                await self._set_state_ints(connection, {"last_indexed_block": block_number})
 
         block_timestamp = datetime.fromtimestamp(from_hex_quantity(block["timestamp"]), tz=UTC)
         await self.redis.publish_json(
@@ -276,7 +286,6 @@ class IngestService:
                     "count": swap_count,
                 },
             )
-        await self.state.set_int("last_indexed_block", block_number)
         return None
 
     async def verify_parent(self, block_number: int, block: dict[str, Any]) -> int | None:
@@ -297,43 +306,45 @@ class IngestService:
         return None
 
     async def rollback_from_block(self, rollback_from: int) -> None:
-        async with self.database.connection() as connection:
-            earliest_timestamp = (
-                await connection.execute(
-                    text("SELECT min(timestamp) FROM polygon_blocks WHERE block_number >= :rollback_from"),
-                    {"rollback_from": rollback_from},
-                )
-            ).scalar_one_or_none()
-            delete_statements = [
-                "DELETE FROM polygon_token_transfers WHERE block_number >= :rollback_from",
-                "DELETE FROM polygon_dex_swaps WHERE block_number >= :rollback_from",
-                "DELETE FROM polygon_contract_events WHERE block_number >= :rollback_from",
-                "DELETE FROM polygon_gas_metrics WHERE block_number >= :rollback_from",
-                "DELETE FROM polygon_blocks WHERE block_number >= :rollback_from",
-                "DELETE FROM polygon_token_balances WHERE last_updated_block >= :rollback_from",
-            ]
-            for statement in delete_statements:
-                await connection.execute(text(statement), {"rollback_from": rollback_from})
-            if earliest_timestamp is not None:
-                await connection.execute(
-                    text("DELETE FROM polygon_dex_ohlcv WHERE open_time >= :timestamp"),
-                    {"timestamp": earliest_timestamp - timedelta(days=1)},
-                )
-                await connection.execute(
-                    text("DELETE FROM polygon_holder_snapshots WHERE snapshot_date >= :snapshot_date"),
-                    {"snapshot_date": earliest_timestamp.date()},
-                )
-
         reset_block = rollback_from - 1
-        for key in (
-            "last_indexed_block",
-            "last_decoded_block",
-            "last_analytics_block",
-            "balance_updater_block",
-            "ohlcv_builder_block",
-            "whale_detector_block",
-        ):
-            await self.state.set_int(key, reset_block)
+        async with self.database.connect() as connection:
+            async with connection.begin():
+                earliest_timestamp = (
+                    await connection.execute(
+                        text("SELECT min(timestamp) FROM polygon_blocks WHERE block_number >= :rollback_from"),
+                        {"rollback_from": rollback_from},
+                    )
+                ).scalar_one_or_none()
+                delete_statements = [
+                    "DELETE FROM polygon_token_transfers WHERE block_number >= :rollback_from",
+                    "DELETE FROM polygon_dex_swaps WHERE block_number >= :rollback_from",
+                    "DELETE FROM polygon_contract_events WHERE block_number >= :rollback_from",
+                    "DELETE FROM polygon_gas_metrics WHERE block_number >= :rollback_from",
+                    "DELETE FROM polygon_blocks WHERE block_number >= :rollback_from",
+                    "DELETE FROM polygon_token_balances WHERE last_updated_block >= :rollback_from",
+                ]
+                for statement in delete_statements:
+                    await connection.execute(text(statement), {"rollback_from": rollback_from})
+                if earliest_timestamp is not None:
+                    await connection.execute(
+                        text("DELETE FROM polygon_dex_ohlcv WHERE open_time >= :timestamp"),
+                        {"timestamp": earliest_timestamp - timedelta(days=1)},
+                    )
+                    await connection.execute(
+                        text("DELETE FROM polygon_holder_snapshots WHERE snapshot_date >= :snapshot_date"),
+                        {"snapshot_date": earliest_timestamp.date()},
+                    )
+                await self._set_state_ints(
+                    connection,
+                    {
+                        "last_indexed_block": reset_block,
+                        "last_decoded_block": reset_block,
+                        "last_analytics_block": reset_block,
+                        "balance_updater_block": reset_block,
+                        "ohlcv_builder_block": reset_block,
+                        "whale_detector_block": reset_block,
+                    },
+                )
         await self.redis.publish_json(REORG_CHANNEL, {"rollback_from_block": rollback_from})
 
     async def fetch_block(self, block_number: int) -> dict[str, Any]:
@@ -341,8 +352,9 @@ class IngestService:
             return self.block_cache[block_number]
         block = await self.rpc.call("eth_getBlockByNumber", [to_hex_quantity(block_number), False])
         self.block_cache[block_number] = block
-        if len(self.block_cache) > 2_048:
-            oldest = sorted(self.block_cache.keys())[:256]
+        # Keep a bounded cache for reorg checks without growing unbounded in long-lived workers.
+        if len(self.block_cache) > BLOCK_CACHE_MAX_SIZE:
+            oldest = sorted(self.block_cache.keys())[:BLOCK_CACHE_EVICT_COUNT]
             for key in oldest:
                 self.block_cache.pop(key, None)
         return block
@@ -373,28 +385,48 @@ class IngestService:
                     from_block=block_number,
                     to_block=block_number,
                     addresses=[pool.pool_address for pool in self.tracked_pools],
-                    topics=[DEX_SWAP_TOPICS],
+                    topics=DEX_SWAP_TOPIC_FILTER,
                 )
             ],
         )
         return list(logs)
 
-    async def fetch_receipts_for_logs(self, logs: list[dict[str, Any]]) -> None:
-        tx_hashes = sorted({log["transactionHash"] for log in logs})
-        if not tx_hashes:
-            return
-
-        async def fetch(tx_hash: str) -> None:
-            with contextlib.suppress(Exception):
-                await self.rpc.call("eth_getTransactionReceipt", [tx_hash])
-
-        await asyncio.gather(*(fetch(tx_hash) for tx_hash in tx_hashes))
-
     async def store_block_only(self, block_number: int) -> None:
         block = await self.fetch_block(block_number)
         await self.insert_block(block_number, block)
 
-    async def insert_block(self, block_number: int, block: dict[str, Any]) -> None:
+    @contextlib.asynccontextmanager
+    async def _connection_context(self, connection: AsyncConnection | None) -> Any:
+        if connection is not None:
+            yield connection
+            return
+        async with self.database.connection() as managed:
+            yield managed
+
+    async def _set_state_ints(self, connection: AsyncConnection, values: dict[str, int]) -> None:
+        rows = [{"key": key, "value": str(value)} for key, value in values.items()]
+        if not rows:
+            return
+        await connection.execute(
+            text(
+                """
+                INSERT INTO polygon_indexer_state (key, value, updated_at)
+                VALUES (:key, :value, now())
+                ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value,
+                    updated_at = now()
+                """
+            ),
+            rows,
+        )
+
+    async def insert_block(
+        self,
+        block_number: int,
+        block: dict[str, Any],
+        *,
+        connection: AsyncConnection | None = None,
+    ) -> None:
         timestamp = datetime.fromtimestamp(from_hex_quantity(block["timestamp"]), tz=UTC)
         gas_used = from_hex_quantity(block.get("gasUsed"))
         gas_limit = max(from_hex_quantity(block.get("gasLimit")), 1)
@@ -402,8 +434,8 @@ class IngestService:
         base_fee = from_hex_quantity(block.get("baseFeePerGas"))
         base_fee_gwei = base_fee / 1_000_000_000 if base_fee else 0
         gas_used_pct = (gas_used / gas_limit) * 100
-        async with self.database.connection() as connection:
-            await connection.execute(
+        async with self._connection_context(connection) as active_connection:
+            await active_connection.execute(
                 text(
                     """
                     INSERT INTO polygon_blocks (
@@ -443,7 +475,7 @@ class IngestService:
                     "base_fee_per_gas": base_fee,
                 },
             )
-            await connection.execute(
+            await active_connection.execute(
                 text(
                     """
                     INSERT INTO polygon_gas_metrics (
@@ -476,7 +508,12 @@ class IngestService:
                 },
             )
 
-    async def persist_transfer_logs(self, logs: list[dict[str, Any]]) -> int:
+    async def persist_transfer_logs(
+        self,
+        logs: list[dict[str, Any]],
+        *,
+        connection: AsyncConnection | None = None,
+    ) -> int:
         if not logs:
             return 0
         blocks = await self._load_blocks_for_logs(logs)
@@ -484,6 +521,9 @@ class IngestService:
         for log in logs:
             topics = log.get("topics", [])
             if len(topics) < 3:
+                continue
+            value = self._parse_transfer_value(log)
+            if value is None:
                 continue
             block_number = from_hex_quantity(log["blockNumber"])
             timestamp = blocks[block_number]
@@ -495,14 +535,14 @@ class IngestService:
                     "contract_address": normalize_address(log["address"]),
                     "from_address": decode_topic_address(topics[1]),
                     "to_address": decode_topic_address(topics[2]),
-                    "value": int(log["data"], 16),
+                    "value": value,
                     "timestamp": timestamp,
                 }
             )
         if not rows:
             return 0
-        async with self.database.connection() as connection:
-            await connection.execute(
+        async with self._connection_context(connection) as active_connection:
+            await active_connection.execute(
                 text(
                     """
                     INSERT INTO polygon_token_transfers (
@@ -531,7 +571,7 @@ class IngestService:
                 rows,
             )
             for row in rows:
-                await connection.execute(
+                await active_connection.execute(
                     text(
                         """
                         UPDATE polygon_tokens
@@ -543,7 +583,19 @@ class IngestService:
                 )
         return len(rows)
 
-    async def persist_swap_logs(self, logs: list[dict[str, Any]]) -> int:
+    def _parse_transfer_value(self, log: dict[str, Any]) -> int | None:
+        try:
+            raw_data = log.get("data", "0x")
+            return int(raw_data, 16) if raw_data and raw_data != "0x" else 0
+        except (TypeError, ValueError):
+            return None
+
+    async def persist_swap_logs(
+        self,
+        logs: list[dict[str, Any]],
+        *,
+        connection: AsyncConnection | None = None,
+    ) -> int:
         if not logs:
             return 0
         blocks = await self._load_blocks_for_logs(logs)
@@ -557,8 +609,8 @@ class IngestService:
             rows.append(decoded)
         if not rows:
             return 0
-        async with self.database.connection() as connection:
-            await connection.execute(
+        async with self._connection_context(connection) as active_connection:
+            await active_connection.execute(
                 text(
                     """
                     INSERT INTO polygon_dex_swaps (
@@ -608,6 +660,8 @@ class IngestService:
                 ["uint256", "uint256", "uint256", "uint256"],
                 bytes.fromhex(log["data"][2:]),
             )
+            # Keep V2 swaps on the same signed delta convention as V3:
+            # positive means the pool sent tokens out, negative means it received them.
             return {
                 "block_number": block_number,
                 "tx_hash": log["transactionHash"],
@@ -656,7 +710,27 @@ async def run_service() -> None:
     settings = load_settings("ingest")
     configure_logging(settings.log_level)
     service = IngestService(settings)
+    loop = asyncio.get_running_loop()
+    runner = asyncio.create_task(service.run(), name="polygon-ingest-service")
+
+    def handle_shutdown() -> None:
+        if not service._running:
+            return
+        LOGGER.info("shutdown signal received, stopping ingest service")
+        service.request_shutdown()
+        if not runner.done():
+            runner.cancel()
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(signum, handle_shutdown)
     try:
-        await service.run()
+        await runner
+    except asyncio.CancelledError:
+        if service._running:
+            raise
     finally:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError):
+                loop.remove_signal_handler(signum)
         await service.close()

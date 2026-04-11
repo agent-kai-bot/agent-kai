@@ -59,6 +59,8 @@ REORG_CHANNEL = "reorg"
 WHALE_TRANSFERS_CHANNEL = "whale_transfers"
 
 DEX_SWAP_TOPICS = [V2_SWAP_TOPIC, V3_SWAP_TOPIC]
+# eth_getLogs uses a nested list to express OR matching for topic[0].
+DEX_SWAP_TOPIC_FILTER = [DEX_SWAP_TOPICS]
 GOVERNANCE_TOPICS = [
     OWNERSHIP_TRANSFERRED_TOPIC,
     UPGRADED_TOPIC,
@@ -83,4 +85,3 @@ ERC20_METADATA_CALLS = {
     "decimals": "0x313ce567",
     "totalSupply": "0x18160ddd",
 }
-

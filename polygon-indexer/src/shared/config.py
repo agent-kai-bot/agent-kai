@@ -50,6 +50,10 @@ class Settings:
     request_timeout_seconds: float = 20.0
     log_range_limit: int = 1_000
     whale_threshold_usd: float = 10_000.0
+    analytics_balance_updater_interval_seconds: int = 2
+    analytics_ohlcv_builder_interval_seconds: int = 3
+    analytics_whale_detector_interval_seconds: int = 5
+    analytics_holder_snapshots_interval_seconds: int = 300
 
     @property
     def has_alchemy(self) -> bool:
@@ -81,6 +85,10 @@ def load_settings(service_name: str) -> Settings:
         backfill_days=_env_int("BACKFILL_DAYS", 30),
         tracked_tokens=_csv_addresses(_env("TRACKED_TOKENS")),
         port=port,
+        analytics_balance_updater_interval_seconds=_env_int("ANALYTICS_BALANCE_UPDATER_INTERVAL_SECONDS", 2),
+        analytics_ohlcv_builder_interval_seconds=_env_int("ANALYTICS_OHLCV_BUILDER_INTERVAL_SECONDS", 3),
+        analytics_whale_detector_interval_seconds=_env_int("ANALYTICS_WHALE_DETECTOR_INTERVAL_SECONDS", 5),
+        analytics_holder_snapshots_interval_seconds=_env_int("ANALYTICS_HOLDER_SNAPSHOTS_INTERVAL_SECONDS", 300),
     )
 
 
@@ -90,4 +98,3 @@ def merge_addresses(*groups: Iterable[str]) -> tuple[str, ...]:
         for address in group:
             values.append(normalize_address(address))
     return tuple(dict.fromkeys(values))
-

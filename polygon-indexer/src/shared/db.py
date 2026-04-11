@@ -19,6 +19,11 @@ class Database:
         await self.engine.dispose()
 
     @asynccontextmanager
+    async def connect(self) -> AsyncConnection:
+        async with self.engine.connect() as connection:
+            yield connection
+
+    @asynccontextmanager
     async def connection(self) -> AsyncConnection:
         async with self.engine.begin() as connection:
             yield connection
@@ -73,4 +78,3 @@ class StateStore:
 
     async def set_bool(self, key: str, value: bool) -> None:
         await self.set(key, "true" if value else "false")
-

@@ -33,6 +33,12 @@ class IngestDecodeTest(unittest.TestCase):
         self.assertEqual(decoded["sender"], "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         self.assertEqual(decoded["recipient"], "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 
+    def test_parse_transfer_value_treats_empty_data_as_zero(self) -> None:
+        self.assertEqual(self.service._parse_transfer_value({"data": "0x"}), 0)
+
+    def test_parse_transfer_value_skips_malformed_data(self) -> None:
+        self.assertIsNone(self.service._parse_transfer_value({"data": "not-hex"}))
+
     def test_decode_v3_swap_log_signed_amounts(self) -> None:
         log = {
             "address": "0x2222222222222222222222222222222222222222",
@@ -57,4 +63,3 @@ class IngestDecodeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

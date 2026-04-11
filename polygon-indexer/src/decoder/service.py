@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import signal
 from datetime import UTC, datetime
 from typing import Any
 
@@ -28,6 +30,10 @@ class DecoderService:
         self.state = StateStore(self.database)
         self.redis = RedisClient(settings.redis_url)
         self.rpc = RpcGatewayClient(settings.rpc_gateway_url, timeout=settings.request_timeout_seconds)
+        self._running = True
+
+    def request_shutdown(self) -> None:
+        self._running = False
 
     async def close(self) -> None:
         await self.rpc.close()
@@ -35,10 +41,12 @@ class DecoderService:
         await self.database.dispose()
 
     async def run(self) -> None:
-        while True:
+        while self._running:
             await self.catch_up()
             await self.enrich_missing_token_metadata()
             async for channel, payload in self.redis.subscribe(NEW_BLOCK_CHANNEL, REORG_CHANNEL):
+                if not self._running:
+                    return
                 if channel == REORG_CHANNEL:
                     LOGGER.warning("decoder observed reorg event: %s", payload)
                     break
@@ -290,7 +298,27 @@ async def run_service() -> None:
     settings = load_settings("decoder")
     configure_logging(settings.log_level)
     service = DecoderService(settings)
+    loop = asyncio.get_running_loop()
+    runner = asyncio.create_task(service.run(), name="polygon-decoder-service")
+
+    def handle_shutdown() -> None:
+        if not service._running:
+            return
+        LOGGER.info("shutdown signal received, stopping decoder service")
+        service.request_shutdown()
+        if not runner.done():
+            runner.cancel()
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(signum, handle_shutdown)
     try:
-        await service.run()
+        await runner
+    except asyncio.CancelledError:
+        if service._running:
+            raise
     finally:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError):
+                loop.remove_signal_handler(signum)
         await service.close()

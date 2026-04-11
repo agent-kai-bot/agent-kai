@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -274,15 +275,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings("rpc_gateway")
     configure_logging(settings.log_level)
     state = GatewayState(settings)
-    app = FastAPI(title="Polygon RPC Gateway", version="1.0.0")
 
-    @app.on_event("startup")
-    async def _startup() -> None:
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
         await state.startup()
+        try:
+            yield
+        finally:
+            await state.shutdown()
 
-    @app.on_event("shutdown")
-    async def _shutdown() -> None:
-        await state.shutdown()
+    app = FastAPI(title="Polygon RPC Gateway", version="1.0.0", lifespan=lifespan)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -311,4 +313,3 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return
 
     return app
-

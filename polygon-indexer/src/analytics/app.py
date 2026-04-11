@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from time import perf_counter
 from typing import Any
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from sqlalchemy import text
 
 from src.shared.config import Settings, load_settings
@@ -59,10 +61,22 @@ class AnalyticsService:
 
     async def startup(self) -> None:
         self.tasks = [
-            asyncio.create_task(self._loop(self.run_balance_updater, 2), name="analytics-balance-updater"),
-            asyncio.create_task(self._loop(self.run_ohlcv_builder, 3), name="analytics-ohlcv-builder"),
-            asyncio.create_task(self._loop(self.run_whale_detector, 5), name="analytics-whale-detector"),
-            asyncio.create_task(self._loop(self.run_holder_snapshots, 300), name="analytics-holder-snapshots"),
+            asyncio.create_task(
+                self._loop(self.run_balance_updater, self.settings.analytics_balance_updater_interval_seconds),
+                name="analytics-balance-updater",
+            ),
+            asyncio.create_task(
+                self._loop(self.run_ohlcv_builder, self.settings.analytics_ohlcv_builder_interval_seconds),
+                name="analytics-ohlcv-builder",
+            ),
+            asyncio.create_task(
+                self._loop(self.run_whale_detector, self.settings.analytics_whale_detector_interval_seconds),
+                name="analytics-whale-detector",
+            ),
+            asyncio.create_task(
+                self._loop(self.run_holder_snapshots, self.settings.analytics_holder_snapshots_interval_seconds),
+                name="analytics-holder-snapshots",
+            ),
         ]
 
     async def shutdown(self) -> None:
@@ -293,6 +307,24 @@ class AnalyticsService:
                     )
         await self.state.set_int("ohlcv_builder_block", max_block)
 
+    def _quote_side(self, token0_symbol: str, token1_symbol: str, *, preferred_quote: str | None = None) -> int | None:
+        token0_symbol = token0_symbol.upper()
+        token1_symbol = token1_symbol.upper()
+        if preferred_quote:
+            preferred = preferred_quote.upper()
+            if token1_symbol == preferred and token0_symbol != preferred:
+                return 1
+            if token0_symbol == preferred and token1_symbol != preferred:
+                return 0
+            return None
+        token0_is_quote = token0_symbol in QUOTE_SYMBOLS
+        token1_is_quote = token1_symbol in QUOTE_SYMBOLS
+        if token1_is_quote and not token0_is_quote:
+            return 1
+        if token0_is_quote and not token1_is_quote:
+            return 0
+        return None
+
     def _swap_price(self, row: Any) -> tuple[Decimal, Decimal] | None:
         amount0 = units_to_decimal(int(row["amount0"]), int(row["token0_decimals"]))
         amount1 = units_to_decimal(int(row["amount1"]), int(row["token1_decimals"]))
@@ -302,9 +334,10 @@ class AnalyticsService:
             return None
         token0_symbol = str(row["token0_symbol"]).upper()
         token1_symbol = str(row["token1_symbol"]).upper()
-        if token1_symbol in QUOTE_SYMBOLS and token0_symbol not in QUOTE_SYMBOLS:
+        quote_side = self._quote_side(token0_symbol, token1_symbol)
+        if quote_side == 1:
             return abs_amount1 / abs_amount0, abs_amount1
-        if token0_symbol in QUOTE_SYMBOLS and token1_symbol not in QUOTE_SYMBOLS:
+        if quote_side == 0:
             return abs_amount0 / abs_amount1, abs_amount0
         return abs_amount1 / abs_amount0, abs_amount1
 
@@ -492,16 +525,13 @@ class AnalyticsService:
                 continue
             token0_symbol = str(row["token0_symbol"]).upper()
             token1_symbol = str(row["token1_symbol"]).upper()
-            if target_quote and token1_symbol == target_quote:
+            quote_side = self._quote_side(token0_symbol, token1_symbol, preferred_quote=target_quote)
+            if target_quote and quote_side is None:
+                continue
+            if quote_side == 1 or quote_side is None:
                 point = PricePoint(normalize_address(row["token0_address"]), token1_symbol, close, normalize_address(row["pool_address"]), row["open_time"])
-            elif target_quote and token0_symbol == target_quote:
-                point = PricePoint(normalize_address(row["token1_address"]), token0_symbol, Decimal(1) / close, normalize_address(row["pool_address"]), row["open_time"])
-            elif token1_symbol in QUOTE_SYMBOLS and token0_symbol not in QUOTE_SYMBOLS:
-                point = PricePoint(normalize_address(row["token0_address"]), token1_symbol, close, normalize_address(row["pool_address"]), row["open_time"])
-            elif token0_symbol in QUOTE_SYMBOLS and token1_symbol not in QUOTE_SYMBOLS:
-                point = PricePoint(normalize_address(row["token1_address"]), token0_symbol, Decimal(1) / close, normalize_address(row["pool_address"]), row["open_time"])
             else:
-                point = PricePoint(normalize_address(row["token0_address"]), token1_symbol, close, normalize_address(row["pool_address"]), row["open_time"])
+                point = PricePoint(normalize_address(row["token1_address"]), token0_symbol, Decimal(1) / close, normalize_address(row["pool_address"]), row["open_time"])
             existing = prices.get(point.token_address)
             if existing is None or point.open_time > existing.open_time:
                 prices[point.token_address] = point
@@ -541,15 +571,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings("analytics")
     configure_logging(settings.log_level)
     service = AnalyticsService(settings)
-    app = FastAPI(title="Polygon Analytics", version="1.0.0")
 
-    @app.on_event("startup")
-    async def _startup() -> None:
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
         await service.startup()
+        try:
+            yield
+        finally:
+            await service.shutdown()
 
-    @app.on_event("shutdown")
-    async def _shutdown() -> None:
-        await service.shutdown()
+    app = FastAPI(title="Polygon Analytics", version="1.0.0", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def log_requests(request: Request, call_next):
+        started_at = perf_counter()
+        response = await call_next(request)
+        duration_ms = (perf_counter() - started_at) * 1000
+        LOGGER.info(
+            "analytics request method=%s path=%s status=%s duration_ms=%.2f",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+        )
+        return response
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
