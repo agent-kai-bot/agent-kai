@@ -18,11 +18,25 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent.signal_consumer import Signal, SignalConsumer
+from agent.strategy_agent_tools import (
+    InProcessStrategyRuntime,
+    get_strategy_lineage,
+    move_strategy,
+    optimizer_pause,
+    optimizer_report,
+    optimizer_start,
+    optimizer_status,
+    propose_strategy,
+    render_strategy_command_result,
+    show_strategy,
+    list_strategies as list_strategy_records,
+)
 from config import DEFAULT_AGENT, NATS_URL
 from daemon.auth import DAEMON_TOKEN_PATH, ensure_daemon_token, is_local_client_host, parse_bearer_token
 from daemon.core import (
@@ -44,6 +58,7 @@ from daemon.protocol import (
     InputEnvelope,
     InterruptEnvelope,
     NatsEventEnvelope,
+    OptimizerCompletedEnvelope,
     ScheduledJobCancelledEnvelope,
     ScheduledJobCompletedEnvelope,
     ScheduledJobCreatedEnvelope,
@@ -197,6 +212,32 @@ def _load_chart_history(
 
         return fetch_candles(symbol.upper(), interval, min(limit, 300))
     raise ValueError(f"unsupported chart source '{source}'")
+
+
+class DaemonOHLCVFetcher:
+    """Optimizer fetcher backed by the daemon's existing chart-data loaders."""
+
+    def __init__(self, source: str = "kai-api") -> None:
+        self.source = source
+
+    async def fetch(self, symbol: str, timeframe: str, bars: int) -> pd.DataFrame:
+        raw_bars = await asyncio.to_thread(
+            _load_chart_history,
+            symbol,
+            timeframe,
+            self.source,
+            bars,
+        )
+        frame = pd.DataFrame(raw_bars)
+        if frame.empty:
+            raise ValueError(f"no OHLCV bars returned for {symbol} {timeframe}")
+        frame["ts"] = pd.to_datetime(frame["ts"], utc=True)
+        frame = frame.set_index("ts").sort_index()
+        columns = ["open", "high", "low", "close", "volume"]
+        missing = [column for column in columns if column not in frame.columns]
+        if missing:
+            raise ValueError(f"OHLCV bars are missing columns: {', '.join(missing)}")
+        return frame[columns]
 
 
 def _process_memory_bytes() -> int | None:
@@ -419,6 +460,12 @@ class DaemonServer:
             signal_consumer=self.signal_consumer,
             scheduler=self.scheduler,
         )
+        session.strategy_runtime = InProcessStrategyRuntime(
+            session_name=session.name,
+            agent_name=session.agent_name or self.agent_name,
+            ohlcv_fetcher=DaemonOHLCVFetcher(),
+            event_callback=session.publish_event,
+        )
         session.touch_index()
 
         managed = ManagedSession(session=session)
@@ -626,6 +673,87 @@ class DaemonServer:
             return f"Resumed scheduled job {job.id}."
 
         raise ValueError("unsupported schedule command")
+
+    async def handle_optimizer_command(self, managed: ManagedSession, command_text: str) -> str:
+        """Execute one optimizer slash command for the attached session."""
+        try:
+            parts = shlex.split(command_text)
+        except ValueError as exc:
+            raise ValueError(f"invalid optimizer command: {exc}") from exc
+
+        if not parts or parts[0] != "/optimizer":
+            raise ValueError("unsupported optimizer command")
+
+        sub = parts[1].lower() if len(parts) > 1 else "status"
+        if sub == "status":
+            return render_strategy_command_result(optimizer_status(managed.session))
+        if sub == "start":
+            max_cycles = int(parts[2]) if len(parts) > 2 else 10
+            return render_strategy_command_result(
+                optimizer_start(managed.session, max_cycles=max_cycles)
+            )
+        if sub == "pause":
+            return render_strategy_command_result(optimizer_pause(managed.session))
+        if sub == "report":
+            return render_strategy_command_result(optimizer_report(managed.session, limit=5))
+        raise ValueError("usage: /optimizer status|start [N]|pause|report")
+
+    async def handle_strategies_command(self, managed: ManagedSession, command_text: str) -> str:
+        """Execute one strategy-management slash command for the attached session."""
+        try:
+            parts = shlex.split(command_text)
+        except ValueError as exc:
+            raise ValueError(f"invalid strategies command: {exc}") from exc
+
+        if not parts or parts[0] != "/strategies":
+            raise ValueError("unsupported strategies command")
+
+        sub = parts[1].lower() if len(parts) > 1 else "list"
+        session = managed.session
+
+        if sub == "list":
+            pool = parts[2].lower() if len(parts) > 2 else "all"
+            return render_strategy_command_result(list_strategy_records(session, pool=pool))
+
+        if sub == "show":
+            if len(parts) < 3:
+                raise ValueError("usage: /strategies show NAME [VERSION]")
+            version = int(parts[3]) if len(parts) > 3 else None
+            return render_strategy_command_result(show_strategy(session, name=parts[2], version=version))
+
+        if sub == "propose":
+            yaml_str = _extract_command_remainder(command_text, "/strategies", "propose")
+            if not yaml_str:
+                raise ValueError("usage: /strategies propose YAML_OR_PATH")
+            candidate_path = Path(yaml_str).expanduser()
+            if candidate_path.is_file():
+                yaml_str = candidate_path.read_text(encoding="utf-8")
+            return render_strategy_command_result(propose_strategy(session, yaml_str=yaml_str))
+
+        if sub == "promote":
+            if len(parts) < 3:
+                raise ValueError("usage: /strategies promote NAME")
+            return render_strategy_command_result(move_strategy(session, name=parts[2], to_pool="active"))
+
+        if sub == "demote":
+            if len(parts) < 3:
+                raise ValueError("usage: /strategies demote NAME")
+            return render_strategy_command_result(move_strategy(session, name=parts[2], to_pool="candidates"))
+
+        if sub == "retire":
+            if len(parts) < 3:
+                raise ValueError("usage: /strategies retire NAME")
+            return render_strategy_command_result(move_strategy(session, name=parts[2], to_pool="graveyard"))
+
+        if sub == "lineage":
+            if len(parts) < 3:
+                raise ValueError("usage: /strategies lineage NAME")
+            return render_strategy_command_result(get_strategy_lineage(session, name=parts[2]))
+
+        raise ValueError(
+            "usage: /strategies list [pool]|show NAME [VERSION]|propose YAML_OR_PATH|"
+            "promote NAME|demote NAME|retire NAME|lineage NAME"
+        )
 
     def _require_session_job(self, session_name: str, job_id: str):
         if self.scheduler is None:
@@ -905,6 +1033,16 @@ class DaemonServer:
                 job_id=str(payload.get("job_id") or ""),
             )
 
+        if topic == "optimizer.completed":
+            return OptimizerCompletedEnvelope(
+                type="optimizer_completed",
+                session=str(payload.get("session") or session.name),
+                cycle_count=int(payload.get("cycle_count") or 0),
+                cancelled=bool(payload.get("cancelled")),
+                error=payload.get("error"),
+                last_cycle_result=payload.get("last_cycle_result"),
+            )
+
         return None
 
     @staticmethod
@@ -929,6 +1067,17 @@ async def _receive_client_envelope(websocket: WebSocket) -> ClientEnvelope:
 
 async def _send_server_envelope(websocket: WebSocket, envelope) -> None:
     await websocket.send_json(encode_envelope(envelope))
+
+
+def _extract_command_remainder(command_text: str, root: str, subcommand: str) -> str:
+    prefix = f"{root} {subcommand}"
+    stripped = command_text.strip()
+    if not stripped.startswith(prefix):
+        return ""
+    remainder = stripped[len(prefix) :].strip()
+    if len(remainder) >= 2 and remainder[0] == remainder[-1] and remainder[0] in {'"', "'"}:
+        return remainder[1:-1]
+    return remainder
 
 
 async def _send_error(websocket: WebSocket, code: str, message: str) -> None:
@@ -1178,6 +1327,48 @@ def create_app(
                             ),
                         )
                         continue
+                    if payload.text.strip().startswith("/optimizer"):
+                        try:
+                            response_text = await daemon_server.handle_optimizer_command(
+                                managed,
+                                payload.text,
+                            )
+                            await _send_server_envelope(
+                                websocket,
+                                FinalEnvelope(type="final", text=response_text),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            await _send_error(websocket, "optimizer_failed", str(exc))
+                        await _send_server_envelope(
+                            websocket,
+                            StatusEnvelope(
+                                type="status",
+                                activity=session.activity_status,
+                                queue=len(session.input_queue),
+                            ),
+                        )
+                        continue
+                    if payload.text.strip().startswith("/strategies"):
+                        try:
+                            response_text = await daemon_server.handle_strategies_command(
+                                managed,
+                                payload.text,
+                            )
+                            await _send_server_envelope(
+                                websocket,
+                                FinalEnvelope(type="final", text=response_text),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            await _send_error(websocket, "strategies_failed", str(exc))
+                        await _send_server_envelope(
+                            websocket,
+                            StatusEnvelope(
+                                type="status",
+                                activity=session.activity_status,
+                                queue=len(session.input_queue),
+                            ),
+                        )
+                        continue
                     await daemon_server.run_input(managed, payload.text)
                     continue
 
@@ -1197,6 +1388,54 @@ def create_app(
                             )
                         except Exception as exc:  # noqa: BLE001
                             await _send_error(websocket, "schedule_failed", str(exc))
+                        await _send_server_envelope(
+                            websocket,
+                            StatusEnvelope(
+                                type="status",
+                                activity=session.activity_status,
+                                queue=len(session.input_queue),
+                            ),
+                        )
+                        continue
+                    if payload.command.strip() == "/optimizer":
+                        command_text = payload.command.strip()
+                        if payload.args.strip():
+                            command_text = f"{command_text} {payload.args.strip()}"
+                        try:
+                            response_text = await daemon_server.handle_optimizer_command(
+                                managed,
+                                command_text,
+                            )
+                            await _send_server_envelope(
+                                websocket,
+                                FinalEnvelope(type="final", text=response_text),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            await _send_error(websocket, "optimizer_failed", str(exc))
+                        await _send_server_envelope(
+                            websocket,
+                            StatusEnvelope(
+                                type="status",
+                                activity=session.activity_status,
+                                queue=len(session.input_queue),
+                            ),
+                        )
+                        continue
+                    if payload.command.strip() == "/strategies":
+                        command_text = payload.command.strip()
+                        if payload.args.strip():
+                            command_text = f"{command_text} {payload.args.strip()}"
+                        try:
+                            response_text = await daemon_server.handle_strategies_command(
+                                managed,
+                                command_text,
+                            )
+                            await _send_server_envelope(
+                                websocket,
+                                FinalEnvelope(type="final", text=response_text),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            await _send_error(websocket, "strategies_failed", str(exc))
                         await _send_server_envelope(
                             websocket,
                             StatusEnvelope(

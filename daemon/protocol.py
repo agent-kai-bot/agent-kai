@@ -206,6 +206,15 @@ class ScheduledJobResumedEnvelope(ProtocolModel):
     job_id: NonEmptyString
 
 
+class OptimizerCompletedEnvelope(ProtocolModel):
+    type: Literal["optimizer_completed"]
+    session: NonEmptyString
+    cycle_count: int = 0
+    cancelled: bool = False
+    error: str | None = None
+    last_cycle_result: Any = None
+
+
 ServerEnvelope = Annotated[
     SessionAttachedEnvelope
     | TokenEnvelope
@@ -223,6 +232,7 @@ ServerEnvelope = Annotated[
     | ScheduledJobCancelledEnvelope
     | ScheduledJobPausedEnvelope
     | ScheduledJobResumedEnvelope
+    | OptimizerCompletedEnvelope
     | ErrorEnvelope,
     Field(discriminator="type"),
 ]
