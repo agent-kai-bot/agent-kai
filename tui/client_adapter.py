@@ -20,6 +20,7 @@ from daemon.protocol import (
     ChartBarEnvelope,
     ErrorEnvelope,
     FinalEnvelope,
+    OptimizerCompletedEnvelope,
     ScheduledJobCancelledEnvelope,
     ScheduledJobCompletedEnvelope,
     ScheduledJobCreatedEnvelope,
@@ -315,7 +316,8 @@ class RemoteSession:
 
         if isinstance(
             envelope,
-            ScheduledJobCreatedEnvelope
+            OptimizerCompletedEnvelope
+            | ScheduledJobCreatedEnvelope
             | ScheduledJobTriggeredEnvelope
             | ScheduledJobCompletedEnvelope
             | ScheduledJobFailedEnvelope
