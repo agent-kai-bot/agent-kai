@@ -1,0 +1,286 @@
+"""Tests for autonomous-mode session control flow and hidden turns."""
+
+from __future__ import annotations
+
+import asyncio
+import unittest
+from contextlib import contextmanager
+
+from langchain_core.messages import AIMessage, HumanMessage
+
+from agent.core import AgentRunner
+from agent.tools import file_read, file_write, shell_exec
+from daemon.core import Session
+
+
+class _DummyLogger:
+    def info(self, *_args, **_kwargs):
+        pass
+
+    def warning(self, *_args, **_kwargs):
+        pass
+
+    def error(self, *_args, **_kwargs):
+        pass
+
+
+class _FakeRunner:
+    """Minimal agent-runner stub for session auto-loop tests."""
+
+    def __init__(self, turns: list[dict] | None = None) -> None:
+        self.turns = list(turns or [])
+        self.chat_history = []
+        self.inputs: list[str] = []
+        self.continuation_flags: list[bool] = []
+        self.auto_mode_calls: list[tuple[bool, int]] = []
+        self._auto_readonly = False
+        self._is_auto_continuation = False
+        self._pause_reason: str | None = None
+
+    def set_auto_mode(self, enabled: bool, max_iterations: int = 40):
+        self.auto_mode_calls.append((enabled, max_iterations))
+
+    @contextmanager
+    def override_max_iterations(self, _limit):
+        yield
+
+    async def run(self, user_input: str):
+        index = len(self.inputs)
+        self.inputs.append(user_input)
+        self.continuation_flags.append(bool(self._is_auto_continuation))
+        turn = self.turns[index] if index < len(self.turns) else {}
+
+        for tool_name, tool_input in turn.get("tools", []):
+            yield {"type": "tool_start", "data": {"tool": tool_name, "input": tool_input}}
+            yield {"type": "tool_end", "data": {"tool": tool_name, "output": "ok"}}
+
+        final_text = turn.get("final")
+        if final_text is not None:
+            yield {"type": "final", "data": final_text}
+
+        self._pause_reason = turn.get("pause_reason")
+
+    def consume_auto_pause_reason(self) -> str | None:
+        reason = self._pause_reason
+        self._pause_reason = None
+        return reason
+
+
+async def _collect_events(session: Session, text: str) -> list[dict]:
+    return [event async for event in session.stream_agent_events(text)]
+
+
+class SessionAutoModeTests(unittest.IsolatedAsyncioTestCase):
+    """Validate autonomous loop continuation and stop conditions."""
+
+    def _make_session(self, turns: list[dict]) -> tuple[Session, _FakeRunner]:
+        session = Session("alpha")
+        runner = _FakeRunner(turns)
+        session.agent_runner = runner
+        return session, runner
+
+    async def test_continue_footer_injects_hidden_continuation(self):
+        session, runner = self._make_session(
+            [
+                {"final": "Step one complete.\n[AUTO_STATE: continue]"},
+                {"final": "Task complete.\n[AUTO_STATE: done]"},
+            ]
+        )
+        session.start_auto_mode(max_iterations=5)
+
+        events = await _collect_events(session, "Do the task")
+
+        self.assertEqual(runner.inputs, ["Do the task", "Continue with the next step."])
+        self.assertEqual(runner.continuation_flags, [False, True])
+        self.assertEqual([event["type"] for event in events].count("auto_progress"), 2)
+        self.assertEqual(events[-1]["type"], "auto_stopped")
+        self.assertEqual(events[-1]["data"]["reason"], "task complete")
+        self.assertFalse(session.auto_mode)
+
+    async def test_done_footer_stops_after_one_turn(self):
+        session, runner = self._make_session(
+            [{"final": "Done.\n[AUTO_STATE: done]"}]
+        )
+        session.start_auto_mode(max_iterations=5)
+
+        events = await _collect_events(session, "Do it")
+
+        self.assertEqual(runner.inputs, ["Do it"])
+        self.assertEqual(events[-1]["type"], "auto_stopped")
+        self.assertEqual(events[-1]["data"]["reason"], "task complete")
+
+    async def test_pause_footer_stops_with_reason(self):
+        session, _runner = self._make_session(
+            [{"final": "Need approval.\n[AUTO_STATE: pause | reason: requires approval for place_order]"}]
+        )
+        session.start_auto_mode(max_iterations=5)
+
+        events = await _collect_events(session, "Trade")
+
+        self.assertEqual(events[-1]["data"]["reason"], "requires approval for place_order")
+
+    async def test_missing_footer_stops_conservatively(self):
+        session, runner = self._make_session([{"final": "No footer here."}])
+        session.start_auto_mode(max_iterations=5)
+
+        events = await _collect_events(session, "Analyze")
+
+        self.assertEqual(runner.inputs, ["Analyze"])
+        self.assertEqual(events[-1]["data"]["reason"], "missing or malformed AUTO_STATE footer")
+
+    async def test_budget_exhaustion_stops_autonomous_loop(self):
+        session, runner = self._make_session(
+            [
+                {"final": "Keep going.\n[AUTO_STATE: continue]"},
+                {"final": "Still going.\n[AUTO_STATE: continue]"},
+                {"final": "Should never run.\n[AUTO_STATE: done]"},
+            ]
+        )
+        session.start_auto_mode(max_iterations=2)
+
+        events = await _collect_events(session, "Budget test")
+
+        self.assertEqual(runner.inputs, ["Budget test", "Continue with the next step."])
+        self.assertEqual(events[-1]["data"]["reason"], "iteration budget exhausted")
+
+    async def test_wall_clock_exceeded_stops_autonomous_loop(self):
+        session, runner = self._make_session(
+            [{"final": "Keep going.\n[AUTO_STATE: continue]"}]
+        )
+        session.start_auto_mode(max_iterations=5)
+        session.auto_max_duration = 0.0
+
+        events = await _collect_events(session, "Slow task")
+
+        self.assertEqual(runner.inputs, ["Slow task"])
+        self.assertEqual(events[-1]["data"]["reason"], "wall-clock budget exceeded")
+
+    async def test_loop_detection_stops_on_repeated_final_text(self):
+        repeated = "Same answer.\n[AUTO_STATE: continue]"
+        session, runner = self._make_session(
+            [{"final": repeated}, {"final": repeated}]
+        )
+        session.start_auto_mode(max_iterations=5)
+
+        events = await _collect_events(session, "Loop")
+
+        self.assertEqual(runner.inputs, ["Loop", "Continue with the next step."])
+        self.assertEqual(events[-1]["data"]["reason"], "loop detected: repeated final response")
+
+    async def test_loop_detection_stops_on_two_no_tool_turns(self):
+        session, _runner = self._make_session(
+            [
+                {"final": "No tools.\n[AUTO_STATE: continue]"},
+                {"final": "Still no tools.\n[AUTO_STATE: continue]"},
+            ]
+        )
+        session.start_auto_mode(max_iterations=5)
+
+        events = await _collect_events(session, "No tools")
+
+        self.assertEqual(events[-1]["data"]["reason"], "loop detected: consecutive no-tool turns")
+
+    async def test_loop_detection_stops_on_repeated_tool_call(self):
+        repeated_tool = [("query_ohlcv", {"symbol": "BTC"})]
+        session, runner = self._make_session(
+            [
+                {"tools": repeated_tool, "final": "One.\n[AUTO_STATE: continue]"},
+                {"tools": repeated_tool, "final": "Two.\n[AUTO_STATE: continue]"},
+                {"tools": repeated_tool, "final": "Three.\n[AUTO_STATE: continue]"},
+            ]
+        )
+        session.start_auto_mode(max_iterations=5)
+
+        events = await _collect_events(session, "Repeat tool")
+
+        self.assertEqual(len(runner.inputs), 3)
+        self.assertEqual(events[-1]["data"]["reason"], "loop detected: repeated tool call")
+
+    async def test_runtime_pause_reason_stops_the_loop(self):
+        session, runner = self._make_session([{"pause_reason": "requires approval for shell_exec"}])
+        session.start_auto_mode(max_iterations=5)
+
+        events = await _collect_events(session, "Blocked")
+
+        self.assertEqual(runner.inputs, ["Blocked"])
+        self.assertEqual(events[-1]["data"]["reason"], "requires approval for shell_exec")
+
+    async def test_auto_off_stops_before_next_turn(self):
+        session, runner = self._make_session(
+            [
+                {"final": "Step one.\n[AUTO_STATE: continue]"},
+                {"final": "Should never run.\n[AUTO_STATE: done]"},
+            ]
+        )
+        session.start_auto_mode(max_iterations=5)
+
+        events: list[dict] = []
+        async for event in session.stream_agent_events("Stop after one"):
+            events.append(event)
+            if event["type"] == "auto_progress":
+                session.stop_auto_mode("stopped by user")
+
+        self.assertEqual(runner.inputs, ["Stop after one"])
+        self.assertFalse(session.auto_mode)
+        self.assertEqual(events[-1]["type"], "auto_progress")
+
+
+class AgentRunnerHiddenTurnTests(unittest.IsolatedAsyncioTestCase):
+    """Validate hidden continuation persistence behavior in AgentRunner."""
+
+    async def test_auto_continuation_skips_human_message_persistence(self):
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.bus = None
+        runner.tools = []
+        runner.chat_history = []
+        runner.agent_name = "nano"
+        runner.log = _DummyLogger()
+        runner.executor = object()
+        runner.fallback_executor = None
+        runner.fallback_executors = []
+        runner._auto_mode = True
+        runner._is_auto_continuation = True
+
+        async def fake_stream(_executor, _user_input):
+            yield {"type": "final", "data": "continued\n[AUTO_STATE: done]"}
+
+        runner._stream_executor = fake_stream
+
+        _events = [event async for event in runner.run("Continue with the next step.")]
+
+        self.assertEqual(len(runner.chat_history), 1)
+        self.assertIsInstance(runner.chat_history[0], AIMessage)
+        self.assertNotIsInstance(runner.chat_history[0], HumanMessage)
+
+
+class ToolPolicyEnforcementTests(unittest.TestCase):
+    """Validate runner-side tool policy enforcement."""
+
+    def _make_runner(self, *, readonly: bool) -> AgentRunner:
+        runner = AgentRunner.__new__(AgentRunner)
+        runner._auto_mode = True
+        runner._auto_readonly = readonly
+        runner.agent_name = "nano"
+        return runner
+
+    def test_tool_requires_approval_in_auto(self):
+        runner = self._make_runner(readonly=False)
+        wrapped = AgentRunner._wrap_tool(runner, shell_exec)
+
+        with self.assertRaisesRegex(RuntimeError, "requires approval for shell_exec"):
+            wrapped.invoke({"command": "echo hi"})
+
+    def test_auto_readonly_blocks_non_read_only_tools(self):
+        runner = self._make_runner(readonly=True)
+        wrapped_write = AgentRunner._wrap_tool(runner, file_write)
+        wrapped_read = AgentRunner._wrap_tool(runner, file_read)
+
+        with self.assertRaisesRegex(RuntimeError, "auto readonly blocks non-read-only tool: file_write"):
+            wrapped_write.invoke({"path": "/tmp/blocked.txt", "content": "x"})
+
+        result = wrapped_read.invoke({"path": __file__})
+        self.assertIn("ToolPolicyEnforcementTests", result)
+
+
+if __name__ == "__main__":
+    unittest.main()

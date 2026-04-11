@@ -40,6 +40,8 @@ from agent.strategy_agent_tools import (
 from config import DEFAULT_AGENT, NATS_URL
 from daemon.auth import DAEMON_TOKEN_PATH, ensure_daemon_token, is_local_client_host, parse_bearer_token
 from daemon.core import (
+    DEFAULT_AUTO_MAX_ITERATIONS,
+    MAX_AUTO_ITERATIONS,
     Session,
     SessionEvent,
     get_indexed_session,
@@ -50,6 +52,9 @@ from daemon.core import (
 from daemon.scheduler import DaemonEventBus, Scheduler
 from daemon.protocol import (
     AttachEnvelope,
+    AutoProgressEnvelope,
+    AutoStartedEnvelope,
+    AutoStoppedEnvelope,
     ChartBarEnvelope,
     ClientEnvelope,
     ErrorEnvelope,
@@ -674,6 +679,70 @@ class DaemonServer:
 
         raise ValueError("unsupported schedule command")
 
+    async def handle_auto_command(self, managed: ManagedSession, command_text: str) -> str:
+        """Execute one autonomous-mode slash command for the attached session."""
+
+        try:
+            parts = shlex.split(command_text)
+        except ValueError as exc:
+            raise ValueError(f"invalid auto command: {exc}") from exc
+
+        if not parts or parts[0] != "/auto":
+            raise ValueError("unsupported auto command")
+
+        session = managed.session
+        sub = parts[1].lower() if len(parts) > 1 else ""
+
+        if sub == "off":
+            if not session.auto_mode:
+                return "Auto mode is already off."
+            payload = session.stop_auto_mode("stopped by user")
+            return (
+                "Auto mode stopped. "
+                f"Used {payload['iterations_used']}/{payload['iterations_total']} iterations "
+                f"in {payload['elapsed_seconds']:.2f}s."
+            )
+
+        if sub == "status":
+            if not session.auto_mode:
+                return "Auto mode is off."
+            payload = session.auto_status_payload()
+            mode = "readonly" if payload["readonly"] else "standard"
+            return (
+                f"Auto mode {mode}: "
+                f"{payload['iterations_used']}/{payload['iterations_total']} iterations used, "
+                f"{payload['iterations_remaining']} remaining, "
+                f"{payload['elapsed_seconds']:.2f}s elapsed."
+            )
+
+        readonly = False
+        max_iterations = DEFAULT_AUTO_MAX_ITERATIONS
+        args = [part.lower() if index == 1 else part for index, part in enumerate(parts[1:], start=1)]
+        if args:
+            if args[0] == "readonly":
+                readonly = True
+                if len(args) > 1:
+                    try:
+                        max_iterations = int(args[1])
+                    except ValueError as exc:
+                        raise ValueError("usage: /auto [N]|off|status|readonly [N]") from exc
+            else:
+                try:
+                    max_iterations = int(parts[1])
+                except ValueError as exc:
+                    raise ValueError("usage: /auto [N]|off|status|readonly [N]") from exc
+
+        if max_iterations < 1 or max_iterations > MAX_AUTO_ITERATIONS:
+            raise ValueError(f"auto iterations must be between 1 and {MAX_AUTO_ITERATIONS}")
+
+        payload = session.start_auto_mode(max_iterations=max_iterations, readonly=readonly)
+        mode = "readonly" if payload["readonly"] else "standard"
+        return (
+            f"Auto mode enabled ({mode}). "
+            f"Budget: {payload['iterations_total']} iterations, "
+            f"wall-clock cap: {session.auto_max_duration:.0f}s."
+        )
+
     async def handle_optimizer_command(self, managed: ManagedSession, command_text: str) -> str:
         """Execute one optimizer slash command for the attached session."""
         try:
@@ -949,6 +1018,37 @@ class DaemonServer:
                 queue=len(session.input_queue),
             )
 
+        if topic == "auto.started":
+            return AutoStartedEnvelope(
+                type="auto_started",
+                readonly=bool(payload.get("readonly")),
+                iterations_total=int(payload.get("iterations_total") or 0),
+                iterations_remaining=int(payload.get("iterations_remaining") or 0),
+                iterations_used=int(payload.get("iterations_used") or 0),
+                elapsed_seconds=float(payload.get("elapsed_seconds") or 0.0),
+            )
+
+        if topic == "auto.progress":
+            return AutoProgressEnvelope(
+                type="auto_progress",
+                readonly=bool(payload.get("readonly")),
+                iterations_total=int(payload.get("iterations_total") or 0),
+                iterations_remaining=int(payload.get("iterations_remaining") or 0),
+                iterations_used=int(payload.get("iterations_used") or 0),
+                elapsed_seconds=float(payload.get("elapsed_seconds") or 0.0),
+            )
+
+        if topic == "auto.stopped":
+            return AutoStoppedEnvelope(
+                type="auto_stopped",
+                readonly=bool(payload.get("readonly")),
+                iterations_total=int(payload.get("iterations_total") or 0),
+                iterations_remaining=int(payload.get("iterations_remaining") or 0),
+                iterations_used=int(payload.get("iterations_used") or 0),
+                elapsed_seconds=float(payload.get("elapsed_seconds") or 0.0),
+                reason=str(payload.get("reason") or ""),
+            )
+
         if topic == "input.queued" or topic == "input.dequeued":
             return StatusEnvelope(
                 type="status",
@@ -1060,6 +1160,11 @@ class DaemonServer:
             watchlist_symbols=list(session.ui_state.watchlist_symbols),
             autotrade_enabled=bool(session.ui_state.autotrade_enabled),
             activity_status=session.ui_state.activity_status,
+            auto_mode=bool(session.auto_mode),
+            auto_readonly=bool(session.auto_readonly),
+            auto_iterations_total=int(session.auto_iterations_total),
+            auto_iterations_remaining=int(session.auto_iterations_remaining),
+            auto_elapsed_seconds=round(session.auto_elapsed_seconds(), 3),
             chat_history=serialize_messages(session.chat_history),
         )
 
@@ -1309,6 +1414,27 @@ def create_app(
                     continue
 
                 if isinstance(payload, InputEnvelope):
+                    if payload.text.strip().startswith("/auto"):
+                        try:
+                            response_text = await daemon_server.handle_auto_command(
+                                managed,
+                                payload.text,
+                            )
+                            await _send_server_envelope(
+                                websocket,
+                                FinalEnvelope(type="final", text=response_text),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            await _send_error(websocket, "auto_failed", str(exc))
+                        await _send_server_envelope(
+                            websocket,
+                            StatusEnvelope(
+                                type="status",
+                                activity=session.activity_status,
+                                queue=len(session.input_queue),
+                            ),
+                        )
+                        continue
                     if payload.text.strip().startswith("/schedule"):
                         try:
                             response_text = await daemon_server.handle_schedule_command(
@@ -1376,6 +1502,30 @@ def create_app(
                     continue
 
                 if isinstance(payload, SlashEnvelope):
+                    if payload.command.strip() == "/auto":
+                        command_text = payload.command.strip()
+                        if payload.args.strip():
+                            command_text = f"{command_text} {payload.args.strip()}"
+                        try:
+                            response_text = await daemon_server.handle_auto_command(
+                                managed,
+                                command_text,
+                            )
+                            await _send_server_envelope(
+                                websocket,
+                                FinalEnvelope(type="final", text=response_text),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            await _send_error(websocket, "auto_failed", str(exc))
+                        await _send_server_envelope(
+                            websocket,
+                            StatusEnvelope(
+                                type="status",
+                                activity=session.activity_status,
+                                queue=len(session.input_queue),
+                            ),
+                        )
+                        continue
                     if payload.command.strip() == "/schedule":
                         command_text = payload.command.strip()
                         if payload.args.strip():
@@ -1491,6 +1641,8 @@ def create_app(
         except WebSocketDisconnect:
             pass
         finally:
+            if session.auto_mode:
+                session.stop_auto_mode("client disconnected")
             session.event_bus.unsubscribe(event_queue)
             forward_task.cancel()
             with suppress(asyncio.CancelledError):

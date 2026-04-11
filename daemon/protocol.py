@@ -42,6 +42,11 @@ class SessionStateSnapshot(ProtocolModel):
     watchlist_symbols: list[str] = Field(default_factory=list)
     autotrade_enabled: bool = False
     activity_status: str = "idle"
+    auto_mode: bool = False
+    auto_readonly: bool = False
+    auto_iterations_total: int = 0
+    auto_iterations_remaining: int = 0
+    auto_elapsed_seconds: float = 0.0
     chat_history: list[ChatHistoryEntry] = Field(default_factory=list)
 
 
@@ -143,6 +148,34 @@ class StatusEnvelope(ProtocolModel):
     queue: int = 0
 
 
+class AutoStartedEnvelope(ProtocolModel):
+    type: Literal["auto_started"]
+    readonly: bool = False
+    iterations_total: int = 0
+    iterations_remaining: int = 0
+    iterations_used: int = 0
+    elapsed_seconds: float = 0.0
+
+
+class AutoStoppedEnvelope(ProtocolModel):
+    type: Literal["auto_stopped"]
+    readonly: bool = False
+    iterations_total: int = 0
+    iterations_remaining: int = 0
+    iterations_used: int = 0
+    elapsed_seconds: float = 0.0
+    reason: str = ""
+
+
+class AutoProgressEnvelope(ProtocolModel):
+    type: Literal["auto_progress"]
+    readonly: bool = False
+    iterations_total: int = 0
+    iterations_remaining: int = 0
+    iterations_used: int = 0
+    elapsed_seconds: float = 0.0
+
+
 class SignalEnvelope(ProtocolModel):
     type: Literal["signal"]
     signal: Any
@@ -222,6 +255,9 @@ ServerEnvelope = Annotated[
     | ToolEndEnvelope
     | FinalEnvelope
     | StatusEnvelope
+    | AutoStartedEnvelope
+    | AutoStoppedEnvelope
+    | AutoProgressEnvelope
     | SignalEnvelope
     | ChartBarEnvelope
     | NatsEventEnvelope

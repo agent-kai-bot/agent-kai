@@ -5,6 +5,9 @@ from __future__ import annotations
 import unittest
 
 from daemon.protocol import (
+    AutoProgressEnvelope,
+    AutoStartedEnvelope,
+    AutoStoppedEnvelope,
     ChartBarEnvelope,
     NatsEventEnvelope,
     OptimizerCompletedEnvelope,
@@ -61,6 +64,9 @@ class ServerEnvelopeTests(unittest.TestCase):
                 session="terminal",
                 state=SessionStateSnapshot(
                     chart_symbol="BTC",
+                    auto_mode=True,
+                    auto_iterations_total=20,
+                    auto_iterations_remaining=19,
                     chat_history=[{"role": "human", "content": "hello"}],
                 ),
             )
@@ -70,6 +76,8 @@ class ServerEnvelopeTests(unittest.TestCase):
 
         self.assertEqual(decoded.type, "session_attached")
         self.assertEqual(decoded.state.chart_symbol, "BTC")
+        self.assertTrue(decoded.state.auto_mode)
+        self.assertEqual(decoded.state.auto_iterations_total, 20)
         self.assertEqual(decoded.state.chat_history[0].role, "human")
 
     def test_tool_end_omits_null_elapsed_on_encode(self):
@@ -100,6 +108,52 @@ class ServerEnvelopeTests(unittest.TestCase):
         self.assertEqual(chart_bar.symbol, "BTC-USD")
         self.assertEqual(status.type, "status")
         self.assertEqual(status.queue, 2)
+
+    def test_auto_envelopes_round_trip(self):
+        started = decode_server_envelope(
+            encode_envelope(
+                AutoStartedEnvelope(
+                    type="auto_started",
+                    readonly=True,
+                    iterations_total=20,
+                    iterations_remaining=20,
+                    iterations_used=0,
+                    elapsed_seconds=0.0,
+                )
+            )
+        )
+        progress = decode_server_envelope(
+            encode_envelope(
+                AutoProgressEnvelope(
+                    type="auto_progress",
+                    readonly=True,
+                    iterations_total=20,
+                    iterations_remaining=19,
+                    iterations_used=1,
+                    elapsed_seconds=1.25,
+                )
+            )
+        )
+        stopped = decode_server_envelope(
+            encode_envelope(
+                AutoStoppedEnvelope(
+                    type="auto_stopped",
+                    readonly=False,
+                    iterations_total=20,
+                    iterations_remaining=18,
+                    iterations_used=2,
+                    elapsed_seconds=2.5,
+                    reason="task complete",
+                )
+            )
+        )
+
+        self.assertEqual(started.type, "auto_started")
+        self.assertTrue(started.readonly)
+        self.assertEqual(progress.type, "auto_progress")
+        self.assertEqual(progress.iterations_used, 1)
+        self.assertEqual(stopped.type, "auto_stopped")
+        self.assertEqual(stopped.reason, "task complete")
 
     def test_nats_event_round_trip(self):
         decoded = decode_server_envelope(
