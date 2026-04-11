@@ -1,8 +1,13 @@
 export const CHART_MODE_STORAGE_PREFIX = "kai.chart.mode";
 
 export const CHART_MODES = ["full", "half", "mini", "hide"] as const;
+export const CHART_TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d", "1w"] as const;
 
 export type ChartMode = (typeof CHART_MODES)[number];
+export type ChartTimeframe = (typeof CHART_TIMEFRAMES)[number];
+export type ChartCommandInput =
+  | { mode: ChartMode; symbol?: undefined; timeframe?: undefined }
+  | { mode?: undefined; symbol?: string; timeframe?: ChartTimeframe };
 
 const CHART_MODE_LABELS: Record<ChartMode, string> = {
   full: "Full",
@@ -51,22 +56,66 @@ export function normalizeChartMode(value: string | null | undefined): ChartMode 
   return parseChartModeToken(value) ?? "full";
 }
 
-export function resolveChartModeCommand(
+export function parseChartTimeframeToken(
+  value: string | null | undefined,
+): ChartTimeframe | null {
+  if (!value) {
+    return null;
+  }
+  const normalized = value.trim().toLowerCase();
+  return (
+    CHART_TIMEFRAMES.find((timeframe) => timeframe === normalized) ?? null
+  );
+}
+
+export function resolveChartCommandInput(
   command: string,
   args: string,
-): ChartMode | null {
+): ChartCommandInput | null {
   if (command.trim().toLowerCase() !== "/chart") {
     return null;
   }
-  const normalizedArgs = args.trim().toLowerCase();
+  const normalizedArgs = args.trim();
   if (!normalizedArgs) {
     return null;
   }
   const parts = normalizedArgs.split(/\s+/).filter(Boolean);
-  if (parts[0] === "mode") {
-    return parts.length === 2 ? parseChartModeToken(parts[1]) : null;
+  if (parts[0].toLowerCase() === "mode") {
+    const mode = parts.length === 2 ? parseChartModeToken(parts[1]) : null;
+    return mode ? { mode } : null;
   }
-  return parts.length === 1 ? parseChartModeToken(parts[0]) : null;
+  if (parts.length === 1) {
+    const mode = parseChartModeToken(parts[0]);
+    if (mode) {
+      return { mode };
+    }
+    const timeframe = parseChartTimeframeToken(parts[0]);
+    if (timeframe) {
+      return { timeframe };
+    }
+    return { symbol: parts[0] };
+  }
+  if (parts.length !== 2) {
+    return null;
+  }
+
+  const [first, second] = parts;
+  if (parseChartModeToken(first) || parseChartModeToken(second)) {
+    return null;
+  }
+
+  const firstTimeframe = parseChartTimeframeToken(first);
+  const secondTimeframe = parseChartTimeframeToken(second);
+  if (firstTimeframe && secondTimeframe) {
+    return null;
+  }
+  if (firstTimeframe) {
+    return { symbol: second, timeframe: firstTimeframe };
+  }
+  if (secondTimeframe) {
+    return { symbol: first, timeframe: secondTimeframe };
+  }
+  return null;
 }
 
 function chartModeStorageKey(sessionName: string): string {

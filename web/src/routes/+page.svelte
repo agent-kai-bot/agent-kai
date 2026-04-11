@@ -6,7 +6,7 @@
     cycleChartMode,
     normalizeChartMode,
     readStoredChartMode,
-    resolveChartModeCommand,
+    resolveChartCommandInput,
     writeStoredChartMode,
     type ChartMode,
   } from "$lib/chart-mode";
@@ -160,13 +160,34 @@
     return chartQuote?.price ?? chartBars.at(-1)?.close;
   }
 
-  function setChartModeFromCommand(raw: string): boolean {
+  function setChartCommandFromInput(raw: string): boolean {
     const split = splitSlashInput(raw);
-    const nextMode = resolveChartModeCommand(split.command, split.args);
-    if (!nextMode) {
+    const command = resolveChartCommandInput(split.command, split.args);
+    if (!command) {
       return false;
     }
-    applyChartMode(nextMode);
+    if (command.mode) {
+      applyChartMode(command.mode);
+      return true;
+    }
+    let chartChanged = false;
+    let symbolChanged = false;
+    if (command.symbol && command.symbol !== chartSymbol) {
+      chartSymbol = command.symbol;
+      chartChanged = true;
+      symbolChanged = true;
+    }
+    if (command.timeframe && command.timeframe !== chartTimeframe) {
+      chartTimeframe = command.timeframe;
+      chartChanged = true;
+    }
+    if (chartChanged) {
+      if (symbolChanged) {
+        void Promise.all([refreshSidebarData(), refreshChartData()]);
+      } else {
+        void refreshChartData();
+      }
+    }
     return true;
   }
 
@@ -410,7 +431,7 @@
     }
     const text = inputDraft.trim();
     inputDraft = "";
-    if (setChartModeFromCommand(text)) {
+    if (setChartCommandFromInput(text)) {
       return;
     }
     chatMessages = [...chatMessages, { role: "human", content: text }];
@@ -443,7 +464,7 @@
       return;
     }
     const resolved = resolvePaletteQuery(raw, paletteItems);
-    if (setChartModeFromCommand(resolved)) {
+    if (setChartCommandFromInput(resolved)) {
       closePalette();
       return;
     }
