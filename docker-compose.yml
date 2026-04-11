@@ -6,3 +6,16 @@ services:
       - "4222:4222"
       - "8222:8222"
     restart: unless-stopped
+
+  agent:
+    build: .
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./workspaces:/app/workspaces
+      - ./agent-config.json:/app/agent-config.json:ro
+    environment:
+      - NATS_URL=nats://nats:4222
+    depends_on:
+      - nats
+    restart: unless-stopped

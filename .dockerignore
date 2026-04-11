@@ -1,0 +1,35 @@
+# Python
+__pycache__
+*.pyc
+.venv/
+*.egg-info/
+
+# Node
+web/node_modules/
+web/.svelte-kit/
+
+# IDE
+.vscode/
+.idea/
+
+# Git
+.git/
+.gitignore
+
+# Runtime data (mounted as volumes)
+workspaces/
+logs/
+*.log
+
+# Design docs (not needed in image)
+*.md
+!README.md
+
+# Tests (not needed in prod image)
+tests/
+regression_harness.py
+test_*.py
+
+# Temp files
+*.tmp
+.codex/
