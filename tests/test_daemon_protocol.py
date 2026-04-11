@@ -7,6 +7,7 @@ import unittest
 from daemon.protocol import (
     ChartBarEnvelope,
     NatsEventEnvelope,
+    OptimizerCompletedEnvelope,
     ScheduledJobCreatedEnvelope,
     ScheduledJobTriggeredEnvelope,
     SessionAttachedEnvelope,
@@ -139,6 +140,23 @@ class ServerEnvelopeTests(unittest.TestCase):
         self.assertEqual(created.job["id"], "job-1")
         self.assertEqual(triggered.type, "scheduled_job_triggered")
         self.assertEqual(triggered.job_id, "job-1")
+
+    def test_optimizer_completed_envelope_round_trip(self):
+        decoded = decode_server_envelope(
+            encode_envelope(
+                OptimizerCompletedEnvelope(
+                    type="optimizer_completed",
+                    session="terminal",
+                    cycle_count=3,
+                    cancelled=False,
+                    last_cycle_result={"status": "accepted"},
+                )
+            )
+        )
+
+        self.assertEqual(decoded.type, "optimizer_completed")
+        self.assertEqual(decoded.session, "terminal")
+        self.assertEqual(decoded.cycle_count, 3)
 
 
 if __name__ == "__main__":
