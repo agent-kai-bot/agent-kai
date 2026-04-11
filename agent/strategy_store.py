@@ -148,6 +148,110 @@ class LineageEntry:
     mutation: MutationRecord | None
 
 
+@dataclass(frozen=True)
+class StrategyStore:
+    """Thin OO wrapper over the module-level store functions."""
+
+    db_path: str | Path = DEFAULT_DB_PATH
+
+    def init_db(self) -> Path:
+        return init_db(self.db_path)
+
+    def save_strategy(
+        self,
+        ir: StrategyIR,
+        name: str,
+        version: int,
+        parent_id: str | None = None,
+        pool: str = "candidates",
+        created_by: str = "human",
+        yaml_source: str | None = None,
+    ) -> str:
+        return save_strategy(
+            ir,
+            name,
+            version,
+            parent_id=parent_id,
+            pool=pool,
+            created_by=created_by,
+            yaml_source=yaml_source,
+            db_path=self.db_path,
+        )
+
+    def save_run(
+        self,
+        strategy_id: str,
+        stage: str,
+        fold_index: int | None,
+        dataset_hash: str,
+        metrics: MetricsReport,
+        sample_pass: bool,
+        **kwargs,
+    ) -> str:
+        return save_run(
+            strategy_id,
+            stage,
+            fold_index,
+            dataset_hash,
+            metrics,
+            sample_pass,
+            db_path=self.db_path,
+            **kwargs,
+        )
+
+    def save_mutation(
+        self,
+        parent_id: str,
+        child_id: str,
+        mutations: list[dict[str, Any]],
+        accepted: bool,
+        rejection_reason: str | None = None,
+        **kwargs,
+    ) -> str:
+        return save_mutation(
+            parent_id,
+            child_id,
+            mutations,
+            accepted,
+            rejection_reason=rejection_reason,
+            db_path=self.db_path,
+            **kwargs,
+        )
+
+    def get_strategy(self, strategy_id: str) -> StrategyIR:
+        return get_strategy(strategy_id, self.db_path)
+
+    def get_strategy_record(self, strategy_id: str) -> StrategyRecord:
+        return get_strategy_record(strategy_id, self.db_path)
+
+    def get_lineage(self, name: str) -> list[LineageEntry]:
+        return get_lineage(name, self.db_path)
+
+    def get_latest_run(self, strategy_id: str, stage: str) -> RunRecord | None:
+        return get_latest_run(strategy_id, stage, self.db_path)
+
+    def list_strategies(self, pool: str) -> list[StrategyRecord]:
+        return list_strategies(pool, self.db_path)
+
+    def promote_strategy(
+        self,
+        strategy_id: str,
+        from_pool: str,
+        to_pool: str,
+        approved_by: str,
+        *,
+        evaluation_run_id: str | None = None,
+    ) -> str:
+        return promote_strategy(
+            strategy_id,
+            from_pool,
+            to_pool,
+            approved_by,
+            evaluation_run_id=evaluation_run_id,
+            db_path=self.db_path,
+        )
+
+
 def init_db(db_path: str | Path = DEFAULT_DB_PATH) -> Path:
     """Create the provenance database and schema if missing."""
     target = Path(db_path)
@@ -293,6 +397,16 @@ def get_strategy(strategy_id: str, db_path: str | Path = DEFAULT_DB_PATH) -> Str
     if row is None:
         raise KeyError(f"unknown strategy: {strategy_id}")
     return StrategyIR.model_validate_json(row["ir_json"])
+
+
+def get_strategy_record(strategy_id: str, db_path: str | Path = DEFAULT_DB_PATH) -> StrategyRecord:
+    """Load the full strategy record by id."""
+    init_db(db_path)
+    with _DB_LOCK, _connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM strategies WHERE id = ?", (strategy_id,)).fetchone()
+    if row is None:
+        raise KeyError(f"unknown strategy: {strategy_id}")
+    return _strategy_from_row(row)
 
 
 def get_lineage(name: str, db_path: str | Path = DEFAULT_DB_PATH) -> list[LineageEntry]:
