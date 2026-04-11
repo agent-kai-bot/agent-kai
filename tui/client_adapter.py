@@ -17,6 +17,9 @@ from langchain_core.messages import AIMessage, HumanMessage
 from daemon.core import DEFAULT_SESSION_NAME, SessionUIState, deserialize_messages
 from daemon.protocol import (
     AttachEnvelope,
+    AutoProgressEnvelope,
+    AutoStartedEnvelope,
+    AutoStoppedEnvelope,
     ChartBarEnvelope,
     ErrorEnvelope,
     FinalEnvelope,
@@ -74,6 +77,11 @@ class RemoteSession:
         self.chat_history: list[Any] = []
         self.input_queue: list[str] = []
         self.agent_runner = SimpleNamespace(chat_history=self.chat_history)
+        self.auto_mode = False
+        self.auto_readonly = False
+        self.auto_iterations_total = 0
+        self.auto_iterations_remaining = 0
+        self.auto_elapsed_seconds = 0.0
         self.signal_consumer = None
         self.sub_agent_manager = None
         self.paths = RemoteSessionPaths()
@@ -239,6 +247,11 @@ class RemoteSession:
         self.ui_state.watchlist_symbols = list(state.watchlist_symbols)
         self.ui_state.autotrade_enabled = state.autotrade_enabled
         self.ui_state.activity_status = state.activity_status
+        self.auto_mode = state.auto_mode
+        self.auto_readonly = state.auto_readonly
+        self.auto_iterations_total = state.auto_iterations_total
+        self.auto_iterations_remaining = state.auto_iterations_remaining
+        self.auto_elapsed_seconds = state.auto_elapsed_seconds
         self.chat_history[:] = deserialize_messages(
             [entry.model_dump(mode="json") for entry in state.chat_history]
         )
@@ -293,6 +306,58 @@ class RemoteSession:
         if isinstance(envelope, StatusEnvelope):
             self.set_activity_status(envelope.activity)
             return {"type": "status", "data": envelope.activity}
+
+        if isinstance(envelope, AutoStartedEnvelope):
+            self.auto_mode = True
+            self.auto_readonly = envelope.readonly
+            self.auto_iterations_total = envelope.iterations_total
+            self.auto_iterations_remaining = envelope.iterations_remaining
+            self.auto_elapsed_seconds = envelope.elapsed_seconds
+            return {
+                "type": "auto_started",
+                "data": {
+                    "readonly": envelope.readonly,
+                    "iterations_total": envelope.iterations_total,
+                    "iterations_remaining": envelope.iterations_remaining,
+                    "iterations_used": envelope.iterations_used,
+                    "elapsed_seconds": envelope.elapsed_seconds,
+                },
+            }
+
+        if isinstance(envelope, AutoProgressEnvelope):
+            self.auto_mode = True
+            self.auto_readonly = envelope.readonly
+            self.auto_iterations_total = envelope.iterations_total
+            self.auto_iterations_remaining = envelope.iterations_remaining
+            self.auto_elapsed_seconds = envelope.elapsed_seconds
+            return {
+                "type": "auto_progress",
+                "data": {
+                    "readonly": envelope.readonly,
+                    "iterations_total": envelope.iterations_total,
+                    "iterations_remaining": envelope.iterations_remaining,
+                    "iterations_used": envelope.iterations_used,
+                    "elapsed_seconds": envelope.elapsed_seconds,
+                },
+            }
+
+        if isinstance(envelope, AutoStoppedEnvelope):
+            self.auto_mode = False
+            self.auto_readonly = False
+            self.auto_iterations_total = 0
+            self.auto_iterations_remaining = 0
+            self.auto_elapsed_seconds = envelope.elapsed_seconds
+            return {
+                "type": "auto_stopped",
+                "data": {
+                    "readonly": envelope.readonly,
+                    "iterations_total": envelope.iterations_total,
+                    "iterations_remaining": envelope.iterations_remaining,
+                    "iterations_used": envelope.iterations_used,
+                    "elapsed_seconds": envelope.elapsed_seconds,
+                    "reason": envelope.reason,
+                },
+            }
 
         if isinstance(envelope, TokenEnvelope):
             return {"type": "token", "data": envelope.text}
