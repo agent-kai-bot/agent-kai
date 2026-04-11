@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import tempfile
+import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from dataclasses import asdict
@@ -19,6 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from agent.auto_prompt import parse_auto_state
 from agent.core import AgentRunner
 from agent.signal_consumer import SignalConsumer
 from agent.strategy_agent_tools import InProcessStrategyRuntime
@@ -29,6 +31,9 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 DEFAULT_SESSION_NAME = "terminal"
 DEFAULT_WATCHLIST_SYMBOLS = ("BTC", "ETH", "SOL")
+DEFAULT_AUTO_MAX_ITERATIONS = 20
+MAX_AUTO_ITERATIONS = 100
+DEFAULT_AUTO_MAX_DURATION_SECONDS = 180.0
 SESSIONS_ROOT_DIR = Path(WORKSPACES_DIR) / "sessions"
 SESSION_INDEX_PATH = SESSIONS_ROOT_DIR / "index.json"
 RESERVED_SESSION_NAMES = frozenset({"index"})
@@ -515,6 +520,12 @@ class Session:
         self.agent_name: str | None = None
         self.current_source: str = "user"
         self.current_job_id: str | None = None
+        self.auto_mode: bool = False
+        self.auto_readonly: bool = False
+        self.auto_iterations_remaining: int = 0
+        self.auto_iterations_total: int = 0
+        self.auto_start_time: float = 0.0
+        self.auto_max_duration: float = DEFAULT_AUTO_MAX_DURATION_SECONDS
 
         self.sub_agent_pool = SessionSubAgentPool(
             session_name=self.name,
@@ -559,6 +570,84 @@ class Session:
         )
         return text
 
+    @staticmethod
+    def _normalize_auto_iterations(max_iterations: int | None) -> int:
+        if max_iterations is None:
+            return DEFAULT_AUTO_MAX_ITERATIONS
+        return max(1, min(MAX_AUTO_ITERATIONS, int(max_iterations)))
+
+    @staticmethod
+    def _tool_input_key(value: Any) -> str:
+        try:
+            return json.dumps(value, sort_keys=True, default=str)
+        except TypeError:
+            return repr(value)
+
+    def auto_elapsed_seconds(self) -> float:
+        if self.auto_start_time <= 0:
+            return 0.0
+        return max(0.0, time.monotonic() - self.auto_start_time)
+
+    def auto_status_payload(self, *, reason: str | None = None) -> dict[str, Any]:
+        total = int(self.auto_iterations_total)
+        remaining = int(max(0, self.auto_iterations_remaining))
+        used = max(0, total - remaining)
+        payload = {
+            "enabled": bool(self.auto_mode),
+            "readonly": bool(self.auto_readonly),
+            "iterations_total": total,
+            "iterations_remaining": remaining,
+            "iterations_used": used,
+            "elapsed_seconds": round(self.auto_elapsed_seconds(), 3),
+        }
+        if reason:
+            payload["reason"] = reason
+        return payload
+
+    def start_auto_mode(
+        self,
+        *,
+        max_iterations: int = DEFAULT_AUTO_MAX_ITERATIONS,
+        readonly: bool = False,
+    ) -> dict[str, Any]:
+        """Enable autonomous multi-turn execution for the next task."""
+
+        normalized_iterations = self._normalize_auto_iterations(max_iterations)
+        self.auto_mode = True
+        self.auto_readonly = bool(readonly)
+        self.auto_iterations_total = normalized_iterations
+        self.auto_iterations_remaining = normalized_iterations
+        self.auto_start_time = time.monotonic()
+        if self.agent_runner is not None:
+            self.agent_runner._auto_readonly = self.auto_readonly
+            self.agent_runner.set_auto_mode(True, max_iterations=normalized_iterations)
+        payload = self.auto_status_payload()
+        self.publish_event("auto.started", payload)
+        return payload
+
+    def stop_auto_mode(self, reason: str) -> dict[str, Any]:
+        """Disable autonomous mode and publish the stop reason."""
+
+        payload = self.auto_status_payload(reason=reason)
+        payload["enabled"] = False
+        self.auto_mode = False
+        self.auto_readonly = False
+        self.auto_iterations_remaining = 0
+        self.auto_iterations_total = 0
+        self.auto_start_time = 0.0
+        if self.agent_runner is not None:
+            self.agent_runner._auto_readonly = False
+            self.agent_runner.set_auto_mode(False)
+        self.publish_event("auto.stopped", payload)
+        return payload
+
+    def publish_auto_progress(self) -> dict[str, Any]:
+        """Publish one auto-progress update to the session bus."""
+
+        payload = self.auto_status_payload()
+        self.publish_event("auto.progress", payload)
+        return payload
+
     def attach_runtime(
         self,
         *,
@@ -591,6 +680,12 @@ class Session:
             agent_name=agent_name,
         )
         self.agent_runner.chat_history = self.chat_history
+        if self.auto_mode:
+            self.agent_runner._auto_readonly = self.auto_readonly
+            self.agent_runner.set_auto_mode(
+                True,
+                max_iterations=max(1, self.auto_iterations_remaining or self.auto_iterations_total),
+            )
         self.publish_event(
             "runtime.attached",
             {"agent_name": agent_name, "bus_enabled": bus is not None},
@@ -712,12 +807,115 @@ class Session:
         )
         try:
             with budget_context:
-                async for event in self.agent_runner.run(user_input):
-                    etype = event.get("type", "unknown")
-                    data = event.get("data")
-                    payload = data if isinstance(data, dict) else {"value": data}
-                    self.publish_event(f"agent.{etype}", payload)
-                    yield event
+                current_input = user_input
+                is_auto_continuation = False
+                repeated_tool_calls: dict[tuple[str, str], int] = {}
+                consecutive_no_tool_turns = 0
+                last_final_text: str | None = None
+
+                while True:
+                    if self.auto_mode:
+                        self.agent_runner._auto_readonly = self.auto_readonly
+                        self.agent_runner.set_auto_mode(
+                            True,
+                            max_iterations=max(
+                                1,
+                                self.auto_iterations_remaining or self.auto_iterations_total or 1,
+                            ),
+                        )
+
+                    self.agent_runner._is_auto_continuation = is_auto_continuation
+                    turn_final_text = ""
+                    turn_tool_calls: list[tuple[str, str]] = []
+                    try:
+                        async for event in self.agent_runner.run(current_input):
+                            etype = event.get("type", "unknown")
+                            data = event.get("data")
+                            if etype == "final":
+                                turn_final_text = str(data or "")
+                            elif etype == "tool_start" and isinstance(data, dict):
+                                turn_tool_calls.append(
+                                    (
+                                        str(data.get("tool") or ""),
+                                        self._tool_input_key(data.get("input")),
+                                    )
+                                )
+                            payload = data if isinstance(data, dict) else {"value": data}
+                            self.publish_event(f"agent.{etype}", payload)
+                            yield event
+                    finally:
+                        self.agent_runner._is_auto_continuation = False
+
+                    if not self.auto_mode:
+                        break
+
+                    runtime_pause_reason = self.agent_runner.consume_auto_pause_reason()
+                    self.auto_iterations_remaining = max(0, self.auto_iterations_remaining - 1)
+                    progress_payload = self.publish_auto_progress()
+                    yield {"type": "auto_progress", "data": progress_payload}
+                    if not self.auto_mode:
+                        break
+
+                    if runtime_pause_reason:
+                        stopped = self.stop_auto_mode(runtime_pause_reason)
+                        yield {"type": "auto_stopped", "data": stopped}
+                        break
+
+                    auto_state, auto_reason = parse_auto_state(turn_final_text)
+                    if auto_state == "done":
+                        stopped = self.stop_auto_mode(auto_reason or "task complete")
+                        yield {"type": "auto_stopped", "data": stopped}
+                        break
+                    if auto_state == "pause":
+                        stopped = self.stop_auto_mode(auto_reason or "paused")
+                        yield {"type": "auto_stopped", "data": stopped}
+                        break
+
+                    if self.auto_iterations_remaining <= 0:
+                        stopped = self.stop_auto_mode("iteration budget exhausted")
+                        yield {"type": "auto_stopped", "data": stopped}
+                        break
+
+                    if self.auto_elapsed_seconds() > self.auto_max_duration:
+                        stopped = self.stop_auto_mode("wall-clock budget exceeded")
+                        yield {"type": "auto_stopped", "data": stopped}
+                        break
+
+                    normalized_final = turn_final_text.strip()
+                    if normalized_final and normalized_final == last_final_text:
+                        stopped = self.stop_auto_mode("loop detected: repeated final response")
+                        yield {"type": "auto_stopped", "data": stopped}
+                        break
+                    if normalized_final:
+                        last_final_text = normalized_final
+
+                    if turn_tool_calls:
+                        consecutive_no_tool_turns = 0
+                    else:
+                        consecutive_no_tool_turns += 1
+                        if consecutive_no_tool_turns >= 2:
+                            stopped = self.stop_auto_mode("loop detected: consecutive no-tool turns")
+                            yield {"type": "auto_stopped", "data": stopped}
+                            break
+
+                    loop_detected = False
+                    for tool_key in turn_tool_calls:
+                        repeated_tool_calls[tool_key] = repeated_tool_calls.get(tool_key, 0) + 1
+                        if repeated_tool_calls[tool_key] >= 3:
+                            loop_detected = True
+                            break
+                    if loop_detected:
+                        stopped = self.stop_auto_mode("loop detected: repeated tool call")
+                        yield {"type": "auto_stopped", "data": stopped}
+                        break
+
+                    if auto_state != "continue":
+                        stopped = self.stop_auto_mode("missing or malformed AUTO_STATE footer")
+                        yield {"type": "auto_stopped", "data": stopped}
+                        break
+
+                    current_input = "Continue with the next step."
+                    is_auto_continuation = True
         finally:
             self.current_source = previous_source
             self.current_job_id = previous_job_id

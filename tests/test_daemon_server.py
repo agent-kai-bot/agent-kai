@@ -36,6 +36,7 @@ class _FakeRunner:
 
     def __init__(self) -> None:
         self.chat_history = []
+        self.auto_mode_calls: list[tuple[bool, int]] = []
 
     async def run(self, user_input: str):
         yield {"type": "token", "data": f"echo:{user_input}"}
@@ -48,6 +49,12 @@ class _FakeRunner:
             "data": {"tool": "lookup", "output": "ok"},
         }
         yield {"type": "final", "data": f"done:{user_input}"}
+
+    def set_auto_mode(self, enabled: bool, max_iterations: int = 40):
+        self.auto_mode_calls.append((enabled, max_iterations))
+
+    def consume_auto_pause_reason(self):
+        return None
 
 
 def _fake_attach_runtime(
@@ -236,6 +243,51 @@ class DaemonServerTests(unittest.TestCase):
                 self.assertEqual(completed["type"], "scheduled_job_completed")
                 self.assertEqual(completed["job_id"], "job-1")
                 self.assertEqual(completed["result_preview"], "done")
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    def test_auto_slash_command_enables_status_and_stops(self, attach_runtime):
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with self._make_client() as client:
+            with client.websocket_connect("/ws") as websocket:
+                websocket.send_json(
+                    {
+                        "type": "attach",
+                        "session": "terminal",
+                        "create_if_missing": True,
+                    }
+                )
+                websocket.receive_json()
+                websocket.receive_json()
+
+                websocket.send_json({"type": "input", "text": "/auto readonly 3"})
+                enable_messages = [websocket.receive_json() for _ in range(3)]
+                started = next(
+                    message for message in enable_messages if message["type"] == "auto_started"
+                )
+                final = next(
+                    message for message in enable_messages if message["type"] == "final"
+                )
+                self.assertTrue(started["readonly"])
+                self.assertIn("readonly", final["text"])
+
+                websocket.send_json({"type": "input", "text": "/auto status"})
+                status_messages = [websocket.receive_json() for _ in range(2)]
+                status_final = next(
+                    message for message in status_messages if message["type"] == "final"
+                )
+                self.assertIn("Auto mode readonly", status_final["text"])
+
+                websocket.send_json({"type": "input", "text": "/auto off"})
+                off_messages = [websocket.receive_json() for _ in range(3)]
+                stopped = next(
+                    message for message in off_messages if message["type"] == "auto_stopped"
+                )
+                off_final = next(
+                    message for message in off_messages if message["type"] == "final"
+                )
+                self.assertEqual(stopped["reason"], "stopped by user")
+                self.assertIn("Auto mode stopped", off_final["text"])
 
     @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
     def test_schedule_slash_commands_create_and_pause_jobs(self, attach_runtime):
