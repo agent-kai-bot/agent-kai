@@ -2,19 +2,22 @@
 
 from contextlib import contextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
 
+from agent.auto_prompt import build_auto_suffix, parse_auto_state
 from agent.memory_store import MemoryStore
 from agent.memory_tool import create_memory_tool
 from agent.prompts import SYSTEM_PROMPT, build_main_system_prompt
 from agent.runtime_utils import EMPTY_RESPONSE_ERROR, ensure_non_empty_response
 from agent.skills_store import SkillStore
 from agent.skills_tool import create_skills_tools
+from agent.tool_policy import get_tool_policy
 from agent_logger import (
     get_logger,
     log_agent_event,
@@ -382,24 +385,26 @@ class AgentRunner:
 
     def __init__(self, tools, bus=None, agent_name=None):
         self.bus = bus
-        self.tools = list(tools)  # copy so we can append the memory tool
         self.chat_history = []
         self.agent_name = agent_name or "kai"
         self.log = get_logger(self.agent_name)
+        self._auto_mode = False
+        self._auto_readonly = False
+        self._auto_iterations_remaining = 0
+        self._is_auto_continuation = False
+        self._last_auto_pause_reason: str | None = None
+        self._last_auto_state: tuple[str, str | None] = ("unknown", None)
 
         cfg = get_agent_config(agent_name) if agent_name else {}
-        ep = cfg.get("endpoint")
+        self._endpoint_cfg = cfg.get("endpoint")
         # Full chain — first failure walks the list in order
-        fallback_chain = cfg.get("fallback_endpoints") or []
+        self._fallback_chain_cfg = cfg.get("fallback_endpoints") or []
         # Backwards-compat alias preserved for any external readers
         self.fallback_endpoint = cfg.get("fallback_endpoint")
         # Persisted so reload_llm() can rebuild the executors
         # without rerunning all of __init__
-        self._max_iterations = cfg.get("max_iterations", 200)
-        max_iterations = self._max_iterations
-        system_prompt = cfg.get("system_prompt")
-
-        self.llm = create_llm(ep)
+        self._base_max_iterations = cfg.get("max_iterations", 200)
+        self._system_prompt_override = cfg.get("system_prompt")
 
         # Load persistent memory and register the tool that mutates it.
         # The frozen snapshot is injected into the system prompt here;
@@ -407,9 +412,10 @@ class AgentRunner:
         # live state view but never the system prompt (preserves prefix
         # cache and keeps the LLM's notion of "what's in memory" stable
         # for the rest of the turn).
+        raw_tools = list(tools)  # copy so we can append the memory tool
         self.memory_store = build_agent_memory_store(self.agent_name)
         memory_block = render_memory_block(self.memory_store)
-        self.tools.append(create_memory_tool(self.memory_store))
+        raw_tools.append(create_memory_tool(self.memory_store))
 
         # Load skills and register the three skill tools. Skills are
         # procedural memory — on-demand recipes the agent authored in
@@ -419,61 +425,144 @@ class AgentRunner:
         # via the skill_view tool only when needed.
         self.skill_store = build_agent_skill_store(self.agent_name)
         skill_catalog = render_skill_catalog(self.skill_store)
-        self.tools.extend(create_skills_tools(self.skill_store))
+        raw_tools.extend(create_skills_tools(self.skill_store))
 
         # Compose both memory + skill catalog into the shared prompt
         # "identity" section. Join with a blank line so the headers
         # stay visually distinct.
-        identity_block = "\n\n".join(b for b in (memory_block, skill_catalog) if b)
+        self._identity_block = "\n\n".join(b for b in (memory_block, skill_catalog) if b)
+        self._raw_tools = list(raw_tools)
+        self.tools = [self._wrap_tool(tool) for tool in self._raw_tools]
 
-        # Persist the assembled prompt so reload_llm() can reuse it
-        # without re-loading memory + skills (which is expensive
-        # and would also reset the frozen system-prompt snapshot
-        # the LLM has been working with mid-session).
-        self._prompt = create_prompt(
-            build_main_system_prompt(system_prompt, memory_block=identity_block)
+        self._rebuild_executors()
+
+        log_agent_event(
+            self.agent_name,
+            "init",
+            {
+                "endpoint": self._endpoint_cfg.get("base_url") if self._endpoint_cfg else None,
+                "model": self._endpoint_cfg.get("model") if self._endpoint_cfg else None,
+                "max_iterations": self._current_max_iterations(),
+                "fallback_chain": [
+                    (f.get("base_url"), f.get("model"))
+                    for f in self._fallback_chain_cfg
+                ],
+                "tools": [t.name for t in self.tools],
+            },
         )
+
+    def _build_system_prompt(self) -> str:
+        prompt = build_main_system_prompt(
+            self._system_prompt_override,
+            memory_block=self._identity_block,
+        )
+        if self._auto_mode:
+            prompt = f"{prompt}\n\n{build_auto_suffix(self._auto_iterations_remaining)}"
+        return prompt
+
+    def _current_max_iterations(self) -> int:
+        if self._auto_mode:
+            return max(1, int(self._auto_iterations_remaining or 1))
+        return max(1, int(self._base_max_iterations or 1))
+
+    def _rebuild_executors(self) -> None:
+        """Rebuild the prompt plus the primary/fallback executors."""
+
+        self._prompt = create_prompt(self._build_system_prompt())
         prompt = self._prompt
-        agent = create_tool_calling_agent(self.llm, self.tools, prompt)
+        max_iterations = self._current_max_iterations()
+
+        self.llm = create_llm(self._endpoint_cfg)
+        primary_agent = create_tool_calling_agent(self.llm, self.tools, prompt)
         self.executor = AgentExecutor(
-            agent=agent,
+            agent=primary_agent,
             tools=self.tools,
             verbose=False,
             max_iterations=max_iterations,
             handle_parsing_errors=True,
         )
 
-        # Build executors for each fallback in the chain. Skip any
-        # that fail to initialize (e.g. an unreachable endpoint or
-        # missing credentials) so a broken fallback never blocks
-        # agent startup.
-        self.fallback_executors: list[AgentExecutor] = []
-        for fb_cfg in fallback_chain:
+        self.fallback_executors = []
+        for fb_cfg in self._fallback_chain_cfg:
             try:
                 fb_llm = create_llm(fb_cfg)
                 fb_agent = create_tool_calling_agent(fb_llm, self.tools, prompt)
-                self.fallback_executors.append(AgentExecutor(
-                    agent=fb_agent,
-                    tools=self.tools,
-                    verbose=False,
-                    max_iterations=max_iterations,
-                    handle_parsing_errors=True,
-                ))
+                self.fallback_executors.append(
+                    AgentExecutor(
+                        agent=fb_agent,
+                        tools=self.tools,
+                        verbose=False,
+                        max_iterations=max_iterations,
+                        handle_parsing_errors=True,
+                    )
+                )
             except Exception as exc:
                 self.log.warning(
                     "fallback executor build failed for %s endpoint=%s: %s",
-                    self.agent_name, fb_cfg.get("base_url"), exc,
+                    self.agent_name,
+                    fb_cfg.get("base_url"),
+                    exc,
                 )
-        # Backwards-compat alias for callers that read the singular
         self.fallback_executor = self.fallback_executors[0] if self.fallback_executors else None
 
-        log_agent_event(self.agent_name, "init", {
-            "endpoint": ep.get("base_url") if ep else None,
-            "model": ep.get("model") if ep else None,
-            "max_iterations": max_iterations,
-            "fallback_chain": [(f.get("base_url"), f.get("model")) for f in fallback_chain],
-            "tools": [t.name for t in self.tools],
-        })
+    def set_auto_mode(self, enabled: bool, max_iterations: int = 40):
+        """Enable/disable auto mode. Rebuilds prompt + executor."""
+
+        self._auto_mode = bool(enabled)
+        self._auto_iterations_remaining = max(1, int(max_iterations)) if enabled else 0
+        self._rebuild_for_auto()
+
+    def _rebuild_for_auto(self):
+        """Rebuild the system prompt and executor for auto mode."""
+
+        self._rebuild_executors()
+
+    def _check_tool_allowed(self, tool_name: str) -> None:
+        if not self._auto_mode:
+            return
+        policy = get_tool_policy(tool_name)
+        if self._auto_readonly and not policy.read_only:
+            raise RuntimeError(f"auto readonly blocks non-read-only tool: {tool_name}")
+        if policy.requires_approval_in_auto:
+            raise RuntimeError(f"requires approval for {tool_name}")
+
+    def _wrap_tool(self, tool: StructuredTool) -> StructuredTool:
+        """Wrap one tool so auto-mode policy checks run before execution."""
+
+        original_sync = getattr(tool, "func", None)
+        original_async = getattr(tool, "coroutine", None)
+
+        def _sync_wrapper(*args, **kwargs):
+            self._check_tool_allowed(tool.name)
+            if original_sync is None:
+                raise RuntimeError(f"tool {tool.name} has no sync implementation")
+            return original_sync(*args, **kwargs)
+
+        async def _async_wrapper(*args, **kwargs):
+            self._check_tool_allowed(tool.name)
+            if original_async is not None:
+                return await original_async(*args, **kwargs)
+            if original_sync is None:
+                raise RuntimeError(f"tool {tool.name} has no implementation")
+            return original_sync(*args, **kwargs)
+
+        return StructuredTool.from_function(
+            func=_sync_wrapper if original_sync is not None else None,
+            coroutine=_async_wrapper if original_async is not None else None,
+            name=tool.name,
+            description=tool.description,
+            return_direct=tool.return_direct,
+            args_schema=tool.args_schema,
+            infer_schema=False,
+            response_format=tool.response_format,
+            verbose=tool.verbose,
+            callbacks=tool.callbacks,
+            callback_manager=tool.callback_manager,
+            tags=tool.tags,
+            metadata=tool.metadata,
+            handle_tool_error=tool.handle_tool_error,
+            handle_validation_error=tool.handle_validation_error,
+        )
 
     def reload_llm(self) -> dict:
         """Re-read this agent's config and rebuild the LLM + executor in place.
@@ -501,53 +590,29 @@ class AgentRunner:
         chat-message feedback after the swap.
         """
         cfg = get_agent_config(self.agent_name) or {}
-        ep = cfg.get("endpoint")
-        fallback_chain = cfg.get("fallback_endpoints") or []
-        max_iterations = cfg.get("max_iterations", self._max_iterations)
-        self._max_iterations = max_iterations
+        self._endpoint_cfg = cfg.get("endpoint")
+        self._fallback_chain_cfg = cfg.get("fallback_endpoints") or []
+        self._base_max_iterations = cfg.get("max_iterations", self._base_max_iterations)
+        self.fallback_endpoint = cfg.get("fallback_endpoint")
+        self._rebuild_executors()
 
-        # Primary
-        self.llm = create_llm(ep)
-        primary_agent = create_tool_calling_agent(self.llm, self.tools, self._prompt)
-        self.executor = AgentExecutor(
-            agent=primary_agent,
-            tools=self.tools,
-            verbose=False,
-            max_iterations=max_iterations,
-            handle_parsing_errors=True,
+        log_agent_event(
+            self.agent_name,
+            "reload_llm",
+            {
+                "endpoint": self._endpoint_cfg.get("base_url") if self._endpoint_cfg else None,
+                "model": self._endpoint_cfg.get("model") if self._endpoint_cfg else None,
+                "fallback_chain": [
+                    (f.get("base_url"), f.get("model"))
+                    for f in self._fallback_chain_cfg
+                ],
+            },
         )
 
-        # Fallback chain
-        self.fallback_executors = []
-        for fb_cfg in fallback_chain:
-            try:
-                fb_llm = create_llm(fb_cfg)
-                fb_agent = create_tool_calling_agent(fb_llm, self.tools, self._prompt)
-                self.fallback_executors.append(AgentExecutor(
-                    agent=fb_agent,
-                    tools=self.tools,
-                    verbose=False,
-                    max_iterations=max_iterations,
-                    handle_parsing_errors=True,
-                ))
-            except Exception as exc:
-                self.log.warning(
-                    "reload_llm fallback build failed for %s endpoint=%s: %s",
-                    self.agent_name, fb_cfg.get("base_url"), exc,
-                )
-        self.fallback_executor = self.fallback_executors[0] if self.fallback_executors else None
-        self.fallback_endpoint = cfg.get("fallback_endpoint")
-
-        log_agent_event(self.agent_name, "reload_llm", {
-            "endpoint": ep.get("base_url") if ep else None,
-            "model": ep.get("model") if ep else None,
-            "fallback_chain": [(f.get("base_url"), f.get("model")) for f in fallback_chain],
-        })
-
         return {
-            "endpoint": ep.get("base_url") if ep else None,
-            "model": ep.get("model") if ep else None,
-            "provider": ep.get("provider") if ep else None,
+            "endpoint": self._endpoint_cfg.get("base_url") if self._endpoint_cfg else None,
+            "model": self._endpoint_cfg.get("model") if self._endpoint_cfg else None,
+            "provider": self._endpoint_cfg.get("provider") if self._endpoint_cfg else None,
             "fallback_count": len(self.fallback_executors),
         }
 
@@ -572,11 +637,17 @@ class AgentRunner:
 
     async def run(self, user_input: str) -> AsyncIterator[dict]:
         """Stream agent events. Falls back to secondary endpoint on error."""
-        self.chat_history.append(HumanMessage(content=user_input))
-        self.log.info("USER_INPUT agent=%s input=%s", self.agent_name, user_input[:200])
+        self._last_auto_pause_reason = None
+        self._last_auto_state = ("unknown", None)
+
+        visible_input = not getattr(self, "_is_auto_continuation", False)
+        log_input = user_input if visible_input else "[AUTO_CONTINUATION]"
+        if visible_input:
+            self.chat_history.append(HumanMessage(content=user_input))
+        self.log.info("USER_INPUT agent=%s input=%s", self.agent_name, log_input[:200])
 
         # Log the full prompt at DEBUG level
-        log_llm_request(self.agent_name, self.chat_history, input=user_input)
+        log_llm_request(self.agent_name, self.chat_history, input=log_input)
 
         accumulated = ""
         final_text = ""
@@ -606,6 +677,17 @@ class AgentRunner:
                 self.log.warning("EMPTY_RESPONSE agent=%s endpoint=primary", self.agent_name)
                 yield {"type": "error", "data": "Primary endpoint returned an empty response."}
 
+        except RuntimeError as e:
+            if getattr(self, "_auto_mode", False) and (
+                "requires approval for " in str(e)
+                or "auto readonly blocks non-read-only tool:" in str(e)
+            ):
+                self._last_auto_pause_reason = str(e)
+                self._last_auto_state = ("pause", self._last_auto_pause_reason)
+                return
+            primary_failed = True
+            self.log.error("PRIMARY_FAILED agent=%s error=%s", self.agent_name, str(e))
+            yield {"type": "error", "data": f"Primary endpoint failed: {e}"}
         except Exception as e:
             primary_failed = True
             self.log.error("PRIMARY_FAILED agent=%s error=%s", self.agent_name, str(e))
@@ -615,7 +697,7 @@ class AgentRunner:
         # one returns a non-empty, non-error result.
         attempt = 0
         for fb_executor in fallback_executors:
-            if not primary_failed:
+            if not primary_failed or self._last_auto_pause_reason is not None:
                 break
             attempt += 1
             label = f"fallback_{attempt}"
@@ -640,11 +722,26 @@ class AgentRunner:
                     primary_failed = True
                     self.log.warning("EMPTY_RESPONSE agent=%s endpoint=%s", self.agent_name, label)
                     yield {"type": "error", "data": f"Endpoint #{attempt} returned an empty response."}
+            except RuntimeError as e:
+                if getattr(self, "_auto_mode", False) and (
+                    "requires approval for " in str(e)
+                    or "auto readonly blocks non-read-only tool:" in str(e)
+                ):
+                    self._last_auto_pause_reason = str(e)
+                    self._last_auto_state = ("pause", self._last_auto_pause_reason)
+                    return
+                primary_failed = True
+                self.log.error("FALLBACK_FAILED agent=%s attempt=%d error=%s", self.agent_name, attempt, str(e))
+                yield {"type": "error", "data": f"Endpoint #{attempt} failed: {e}"}
+                final_text = f"Error: {e}"
             except Exception as e:
                 primary_failed = True
                 self.log.error("FALLBACK_FAILED agent=%s attempt=%d error=%s", self.agent_name, attempt, str(e))
                 yield {"type": "error", "data": f"Endpoint #{attempt} failed: {e}"}
                 final_text = f"Error: {e}"
+
+        if self._last_auto_pause_reason is not None:
+            return
 
         response_text = ensure_non_empty_response(final_text or accumulated)
         if response_text == EMPTY_RESPONSE_ERROR:
@@ -652,12 +749,14 @@ class AgentRunner:
         if not emitted_final or not (final_text or accumulated).strip():
             yield {"type": "final", "data": response_text}
         self.chat_history.append(AIMessage(content=response_text))
+        if getattr(self, "_auto_mode", False):
+            self._last_auto_state = parse_auto_state(response_text)
 
         # Log the full response at DEBUG
         log_llm_response(self.agent_name, response_text)
         self.log.info("AGENT_RESPONSE agent=%s length=%d", self.agent_name, len(response_text))
 
-        if self.bus:
+        if self.bus and not getattr(self, "_is_auto_continuation", False):
             try:
                 await self.bus.publish(
                     f"agent.{self.bus.agent_name}.response",
@@ -665,6 +764,18 @@ class AgentRunner:
                 )
             except Exception:
                 pass
+
+    def consume_auto_pause_reason(self) -> str | None:
+        """Return and clear the last runtime pause reason."""
+
+        reason = self._last_auto_pause_reason
+        self._last_auto_pause_reason = None
+        return reason
+
+    def get_last_auto_state(self) -> tuple[str, str | None]:
+        """Return the parsed AUTO_STATE from the last completed turn."""
+
+        return self._last_auto_state
 
     async def _stream_executor(self, executor, user_input):
         """Stream events from an AgentExecutor."""
