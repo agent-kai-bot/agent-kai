@@ -323,7 +323,13 @@ class DaemonServer:
             name: len(managed.session.input_queue)
             for name, managed in sorted(self.sessions.items())
         }
+        indexed_session_names = {entry.name for entry in list_indexed_sessions()}
+        visible_session_names = set(self.sessions) | indexed_session_names
         scheduler_jobs = self.scheduler.list_jobs() if self.scheduler is not None else []
+        if visible_session_names:
+            scheduler_jobs = [job for job in scheduler_jobs if job.owner_session in visible_session_names]
+        else:
+            scheduler_jobs = []
         scheduler_status_counts = Counter(job.status for job in scheduler_jobs)
         return {
             "agent_name": self.agent_name,
