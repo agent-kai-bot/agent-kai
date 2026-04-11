@@ -2054,9 +2054,11 @@ class TradingTerminal(App):
             if not yaml_str:
                 self._chat_msg("[red]Usage: /strategies propose YAML_OR_PATH[/]")
                 return True
-            candidate_path = Path(yaml_str).expanduser()
-            if candidate_path.is_file():
-                yaml_str = candidate_path.read_text(encoding="utf-8")
+            # Only try as a file path if short enough and doesn't look like YAML
+            if len(yaml_str) < 260 and "\n" not in yaml_str and ":" not in yaml_str:
+                candidate_path = Path(yaml_str).expanduser()
+                if candidate_path.is_file():
+                    yaml_str = candidate_path.read_text(encoding="utf-8")
             result = propose_strategy(self.session, yaml_str=yaml_str)
         elif sub == "promote":
             if len(parts) < 3:

@@ -725,9 +725,12 @@ class DaemonServer:
             yaml_str = _extract_command_remainder(command_text, "/strategies", "propose")
             if not yaml_str:
                 raise ValueError("usage: /strategies propose YAML_OR_PATH")
-            candidate_path = Path(yaml_str).expanduser()
-            if candidate_path.is_file():
-                yaml_str = candidate_path.read_text(encoding="utf-8")
+            # Only try as a file path if it's short enough to be a path
+            # and doesn't look like YAML content (no colons or newlines)
+            if len(yaml_str) < 260 and "\n" not in yaml_str and ":" not in yaml_str:
+                candidate_path = Path(yaml_str).expanduser()
+                if candidate_path.is_file():
+                    yaml_str = candidate_path.read_text(encoding="utf-8")
             return render_strategy_command_result(propose_strategy(session, yaml_str=yaml_str))
 
         if sub == "promote":
