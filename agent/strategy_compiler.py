@@ -258,7 +258,14 @@ def _parse_condition_target(operator: ConditionOperator, raw_condition: Mapping[
         return IndicatorValue(value=ref)
     if "value" not in raw_condition:
         raise ValueError("conditions must declare either value or ref")
-    return ConstantValue(value=float(raw_condition["value"]))
+    raw_value = raw_condition["value"]
+    # If the value is a string that isn't numeric, treat it as an indicator reference
+    if isinstance(raw_value, str):
+        try:
+            return ConstantValue(value=float(raw_value))
+        except ValueError:
+            return IndicatorValue(value=raw_value)
+    return ConstantValue(value=float(raw_value))
 
 
 def _parse_range_value(raw_range: Any) -> RangeValue:
