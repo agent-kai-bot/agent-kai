@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import re
 import secrets
@@ -23,6 +22,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent_logger import get_logger, log_slash_command
 from agent.signal_consumer import Signal, SignalConsumer
 from agent.strategy_agent_tools import (
     InProcessStrategyRuntime,
@@ -163,6 +163,14 @@ def _looks_like_web_asset_request(asset_path: str) -> bool:
         return False
     tail = normalized.rsplit("/", 1)[-1]
     return normalized.startswith("_app/") or "." in tail
+
+
+def _split_slash_command(command_text: str) -> tuple[str, str]:
+    stripped = command_text.strip()
+    if not stripped:
+        return ("", "")
+    command, _, remainder = stripped.partition(" ")
+    return (command, remainder.strip())
 
 
 def _resolve_web_asset_path(build_dir: Path, asset_path: str) -> Path | None:
@@ -307,7 +315,7 @@ class DaemonServer:
         self.scheduler: Scheduler | None = None
         self.daemon_token = ""
         self.started_at_monotonic: float | None = None
-        self.log = logging.getLogger(__name__)
+        self.log = get_logger("daemon.server")
 
     @staticmethod
     def _default_bus_factory(url: str, agent_name: str) -> NatsBus:
@@ -694,6 +702,12 @@ class DaemonServer:
         sub = parts[1].lower() if len(parts) > 1 else ""
 
         if sub == "off":
+            self.log.info(
+                "SLASH_AUTO action=%s budget=%d session=%s",
+                "off",
+                int(session.auto_iterations_remaining or 0),
+                session.name,
+            )
             if not session.auto_mode:
                 return "Auto mode is already off."
             payload = session.stop_auto_mode("stopped by user")
@@ -704,6 +718,12 @@ class DaemonServer:
             )
 
         if sub == "status":
+            self.log.info(
+                "SLASH_AUTO action=%s budget=%d session=%s",
+                "status",
+                int(session.auto_iterations_remaining or 0),
+                session.name,
+            )
             if not session.auto_mode:
                 return "Auto mode is off."
             payload = session.auto_status_payload()
@@ -735,6 +755,12 @@ class DaemonServer:
         if max_iterations < 1 or max_iterations > MAX_AUTO_ITERATIONS:
             raise ValueError(f"auto iterations must be between 1 and {MAX_AUTO_ITERATIONS}")
 
+        self.log.info(
+            "SLASH_AUTO action=%s budget=%d session=%s",
+            "readonly" if readonly else "start",
+            max_iterations,
+            session.name,
+        )
         payload = session.start_auto_mode(max_iterations=max_iterations, readonly=readonly)
         mode = "readonly" if payload["readonly"] else "standard"
         return (
@@ -1415,6 +1441,8 @@ def create_app(
 
                 if isinstance(payload, InputEnvelope):
                     if payload.text.strip().startswith("/auto"):
+                        command, args = _split_slash_command(payload.text)
+                        log_slash_command(session, command, args, "intercepted:auto")
                         try:
                             response_text = await daemon_server.handle_auto_command(
                                 managed,
@@ -1436,6 +1464,8 @@ def create_app(
                         )
                         continue
                     if payload.text.strip().startswith("/schedule"):
+                        command, args = _split_slash_command(payload.text)
+                        log_slash_command(session, command, args, "intercepted:schedule")
                         try:
                             response_text = await daemon_server.handle_schedule_command(
                                 managed,
@@ -1457,6 +1487,8 @@ def create_app(
                         )
                         continue
                     if payload.text.strip().startswith("/optimizer"):
+                        command, args = _split_slash_command(payload.text)
+                        log_slash_command(session, command, args, "intercepted:optimizer")
                         try:
                             response_text = await daemon_server.handle_optimizer_command(
                                 managed,
@@ -1478,6 +1510,8 @@ def create_app(
                         )
                         continue
                     if payload.text.strip().startswith("/strategies"):
+                        command, args = _split_slash_command(payload.text)
+                        log_slash_command(session, command, args, "intercepted:strategies")
                         try:
                             response_text = await daemon_server.handle_strategies_command(
                                 managed,
@@ -1498,6 +1532,9 @@ def create_app(
                             ),
                         )
                         continue
+                    if payload.text.strip().startswith("/"):
+                        command, args = _split_slash_command(payload.text)
+                        log_slash_command(session, command, args, "forwarded:input")
                     await daemon_server.run_input(managed, payload.text)
                     continue
 
@@ -1506,6 +1543,7 @@ def create_app(
                         command_text = payload.command.strip()
                         if payload.args.strip():
                             command_text = f"{command_text} {payload.args.strip()}"
+                        log_slash_command(session, payload.command.strip(), payload.args.strip(), "intercepted:auto")
                         try:
                             response_text = await daemon_server.handle_auto_command(
                                 managed,
@@ -1530,6 +1568,7 @@ def create_app(
                         command_text = payload.command.strip()
                         if payload.args.strip():
                             command_text = f"{command_text} {payload.args.strip()}"
+                        log_slash_command(session, payload.command.strip(), payload.args.strip(), "intercepted:schedule")
                         try:
                             response_text = await daemon_server.handle_schedule_command(
                                 managed,
@@ -1554,6 +1593,7 @@ def create_app(
                         command_text = payload.command.strip()
                         if payload.args.strip():
                             command_text = f"{command_text} {payload.args.strip()}"
+                        log_slash_command(session, payload.command.strip(), payload.args.strip(), "intercepted:optimizer")
                         try:
                             response_text = await daemon_server.handle_optimizer_command(
                                 managed,
@@ -1578,6 +1618,7 @@ def create_app(
                         command_text = payload.command.strip()
                         if payload.args.strip():
                             command_text = f"{command_text} {payload.args.strip()}"
+                        log_slash_command(session, payload.command.strip(), payload.args.strip(), "intercepted:strategies")
                         try:
                             response_text = await daemon_server.handle_strategies_command(
                                 managed,
@@ -1601,6 +1642,7 @@ def create_app(
                     parts = [payload.command.strip()]
                     if payload.args.strip():
                         parts.append(payload.args.strip())
+                    log_slash_command(session, payload.command.strip(), payload.args.strip(), "forwarded:slash")
                     await daemon_server.run_input(managed, " ".join(parts))
                     continue
 

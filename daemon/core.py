@@ -26,6 +26,7 @@ from agent.signal_consumer import SignalConsumer
 from agent.strategy_agent_tools import InProcessStrategyRuntime
 from agent.sub_agents import SubAgentManager
 from agent.tools import create_tools
+from agent_logger import log_auto_event
 from config import AGENTS, WORKSPACES_DIR
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -83,6 +84,15 @@ def _role_for_message(message: Any) -> str:
     if "system" in cls:
         return "system"
     return "ai"
+
+
+def _tool_name_from_auto_pause_reason(reason: str | None) -> str:
+    text = str(reason or "").strip()
+    if text.startswith("requires approval for "):
+        return text.removeprefix("requires approval for ").strip() or "unknown"
+    if text.startswith("auto readonly blocks non-read-only tool:"):
+        return text.split(":", 1)[1].strip() or "unknown"
+    return "unknown"
 
 
 def serialize_messages(messages: list[Any]) -> list[dict[str, str]]:
@@ -621,6 +631,7 @@ class Session:
         if self.agent_runner is not None:
             self.agent_runner._auto_readonly = self.auto_readonly
             self.agent_runner.set_auto_mode(True, max_iterations=normalized_iterations)
+        log_auto_event(self, "AUTO_START", [f"budget={normalized_iterations}"])
         payload = self.auto_status_payload()
         self.publish_event("auto.started", payload)
         return payload
@@ -630,6 +641,15 @@ class Session:
 
         payload = self.auto_status_payload(reason=reason)
         payload["enabled"] = False
+        log_auto_event(
+            self,
+            "AUTO_STOP",
+            [
+                f"reason={reason}",
+                f"iterations={payload['iterations_used']}",
+                f"elapsed={payload['elapsed_seconds']:.1f}s",
+            ],
+        )
         self.auto_mode = False
         self.auto_readonly = False
         self.auto_iterations_remaining = 0
@@ -815,6 +835,15 @@ class Session:
 
                 while True:
                     if self.auto_mode:
+                        current_iteration = max(
+                            1,
+                            self.auto_iterations_total - self.auto_iterations_remaining + 1,
+                        )
+                        log_auto_event(
+                            self,
+                            "AUTO_CYCLE",
+                            [f"iter={current_iteration}/{max(1, self.auto_iterations_total)}"],
+                        )
                         self.agent_runner._auto_readonly = self.auto_readonly
                         self.agent_runner.set_auto_mode(
                             True,
@@ -857,11 +886,27 @@ class Session:
                         break
 
                     if runtime_pause_reason:
+                        log_auto_event(
+                            self,
+                            "AUTO_TOOL_BLOCKED",
+                            [
+                                f"tool={_tool_name_from_auto_pause_reason(runtime_pause_reason)}",
+                                f"reason={runtime_pause_reason}",
+                            ],
+                        )
                         stopped = self.stop_auto_mode(runtime_pause_reason)
                         yield {"type": "auto_stopped", "data": stopped}
                         break
 
                     auto_state, auto_reason = parse_auto_state(turn_final_text)
+                    log_auto_event(
+                        self,
+                        "AUTO_STATE",
+                        [
+                            f"state={auto_state}",
+                            f"reason={auto_reason or '<none>'}",
+                        ],
+                    )
                     if auto_state == "done":
                         stopped = self.stop_auto_mode(auto_reason or "task complete")
                         yield {"type": "auto_stopped", "data": stopped}
@@ -883,6 +928,11 @@ class Session:
 
                     normalized_final = turn_final_text.strip()
                     if normalized_final and normalized_final == last_final_text:
+                        log_auto_event(
+                            self,
+                            "AUTO_LOOP_DETECTED",
+                            ["type=repeated_final_response"],
+                        )
                         stopped = self.stop_auto_mode("loop detected: repeated final response")
                         yield {"type": "auto_stopped", "data": stopped}
                         break
@@ -894,6 +944,11 @@ class Session:
                     else:
                         consecutive_no_tool_turns += 1
                         if consecutive_no_tool_turns >= 2:
+                            log_auto_event(
+                                self,
+                                "AUTO_LOOP_DETECTED",
+                                ["type=consecutive_no_tool_turns"],
+                            )
                             stopped = self.stop_auto_mode("loop detected: consecutive no-tool turns")
                             yield {"type": "auto_stopped", "data": stopped}
                             break
@@ -905,6 +960,11 @@ class Session:
                             loop_detected = True
                             break
                     if loop_detected:
+                        log_auto_event(
+                            self,
+                            "AUTO_LOOP_DETECTED",
+                            ["type=repeated_tool_call"],
+                        )
                         stopped = self.stop_auto_mode("loop detected: repeated tool call")
                         yield {"type": "auto_stopped", "data": stopped}
                         break
@@ -914,6 +974,7 @@ class Session:
                         yield {"type": "auto_stopped", "data": stopped}
                         break
 
+                    log_auto_event(self, "AUTO_CONTINUE", ["injecting hidden turn"])
                     current_input = "Continue with the next step."
                     is_auto_continuation = True
         finally:

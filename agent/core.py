@@ -518,13 +518,20 @@ class AgentRunner:
         self._rebuild_executors()
 
     def _check_tool_allowed(self, tool_name: str) -> None:
-        if not self._auto_mode:
-            return
         policy = get_tool_policy(tool_name)
-        if self._auto_readonly and not policy.read_only:
-            raise RuntimeError(f"auto readonly blocks non-read-only tool: {tool_name}")
-        if policy.requires_approval_in_auto:
-            raise RuntimeError(f"requires approval for {tool_name}")
+        logger = getattr(self, "log", get_logger(getattr(self, "agent_name", "kai")))
+        allowed = True
+        reason: str | None = None
+        if self._auto_mode:
+            if self._auto_readonly and not policy.read_only:
+                allowed = False
+                reason = f"auto readonly blocks non-read-only tool: {tool_name}"
+            elif policy.requires_approval_in_auto:
+                allowed = False
+                reason = f"requires approval for {tool_name}"
+        logger.info("TOOL_POLICY tool=%s allowed=%s", tool_name, allowed)
+        if not allowed and reason is not None:
+            raise RuntimeError(reason)
 
     def _wrap_tool(self, tool: StructuredTool) -> StructuredTool:
         """Wrap one tool so auto-mode policy checks run before execution."""
@@ -639,11 +646,18 @@ class AgentRunner:
         """Stream agent events. Falls back to secondary endpoint on error."""
         self._last_auto_pause_reason = None
         self._last_auto_state = ("unknown", None)
+        self.log.info(
+            "RUN auto=%s iter_remaining=%d",
+            bool(getattr(self, "_auto_mode", False)),
+            int(getattr(self, "_auto_iterations_remaining", 0) or 0),
+        )
 
         visible_input = not getattr(self, "_is_auto_continuation", False)
         log_input = user_input if visible_input else "[AUTO_CONTINUATION]"
         if visible_input:
             self.chat_history.append(HumanMessage(content=user_input))
+        else:
+            self.log.info("AUTO_HIDDEN_TURN")
         self.log.info("USER_INPUT agent=%s input=%s", self.agent_name, log_input[:200])
 
         # Log the full prompt at DEBUG level
@@ -754,7 +768,12 @@ class AgentRunner:
 
         # Log the full response at DEBUG
         log_llm_response(self.agent_name, response_text)
-        self.log.info("AGENT_RESPONSE agent=%s length=%d", self.agent_name, len(response_text))
+        self.log.info(
+            "AGENT_RESPONSE agent=%s length=%d text=%s",
+            self.agent_name,
+            len(response_text),
+            response_text[:500],
+        )
 
         if self.bus and not getattr(self, "_is_auto_continuation", False):
             try:
