@@ -947,10 +947,14 @@ def create_tools(
     session=None,
 ):
     """Create and return all agent tools."""
+    from agent.strategy_agent_tools import create_strategy_tools
+
     tools = [file_read, file_write, file_edit, shell_exec, python_exec, web_fetch, codex_exec, claude_exec]
     # Main agent ("kai") has no workspace, so the sandbox is fully isolated.
     tools.append(create_docker_sandbox_tool(workspace_host_path=None))
     tools.extend(_get_crypto_tools(signal_consumer=signal_consumer))
+    if session is not None:
+        tools.extend(create_strategy_tools(session))
     if bus:
         tools.append(create_nats_publish_tool(bus))
         tools.append(create_nats_request_tool(bus))

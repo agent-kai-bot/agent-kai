@@ -21,6 +21,7 @@ from typing import Any
 
 from agent.core import AgentRunner
 from agent.signal_consumer import SignalConsumer
+from agent.strategy_agent_tools import InProcessStrategyRuntime
 from agent.sub_agents import SubAgentManager
 from agent.tools import create_tools
 from config import AGENTS, WORKSPACES_DIR
@@ -509,6 +510,7 @@ class Session:
         self.ui_state = SessionUIState()
         self.agent_runner: Any = None
         self.signal_consumer: Any = None
+        self.strategy_runtime: Any = None
         self.event_bus = SessionEventBus(self.name)
         self.agent_name: str | None = None
         self.current_source: str = "user"
@@ -568,6 +570,12 @@ class Session:
         """Attach the in-process agent runtime to this session."""
         self.agent_name = agent_name
         self.signal_consumer = signal_consumer or SignalConsumer()
+        if self.strategy_runtime is None:
+            self.strategy_runtime = InProcessStrategyRuntime(
+                session_name=self.name,
+                agent_name=agent_name,
+                event_callback=self.publish_event,
+            )
         self.sub_agent_registry.bind_bus(bus)
 
         tools = create_tools(
