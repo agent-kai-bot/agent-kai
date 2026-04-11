@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import shlex
 import shutil
 import time
 from datetime import datetime
@@ -19,6 +20,18 @@ from agent.learning import (
     save_reflection_record,
 )
 from agent.signal_consumer import SignalConsumer
+from agent.strategy_agent_tools import (
+    get_strategy_lineage,
+    move_strategy,
+    optimizer_pause,
+    optimizer_report,
+    optimizer_start,
+    optimizer_status,
+    propose_strategy,
+    render_strategy_command_result,
+    show_strategy,
+    list_strategies as list_strategy_records,
+)
 from agent.skills_store import SkillStore
 from agent_logger import get_logger
 from config import get_skills_dir
@@ -1876,6 +1889,14 @@ class TradingTerminal(App):
             # /schedule ...          — handled by the daemon in remote mode
             return await self._handle_schedule_command(parts)
 
+        elif cmd == "/optimizer":
+            # /optimizer ...         — handled locally or forwarded to the daemon
+            return await self._handle_optimizer_command(text)
+
+        elif cmd == "/strategies":
+            # /strategies ...        — handled locally or forwarded to the daemon
+            return await self._handle_strategies_command(text)
+
         elif cmd == "/status":
             # /status                 — dump every background task state
             #                           in one chat message for debugging
@@ -1980,6 +2001,104 @@ class TradingTerminal(App):
             return False
         self._chat_msg("[red]Scheduling is only available when connected to the daemon.[/]")
         return True
+
+    async def _handle_optimizer_command(self, text: str) -> bool:
+        """Handle optimizer slash commands locally or forward remotely."""
+        if getattr(self.session, "is_remote", False):
+            return False
+        try:
+            parts = shlex.split(text)
+        except ValueError as exc:
+            self._chat_msg(f"[red]Optimizer command failed: {exc}[/]")
+            return True
+
+        sub = parts[1].lower() if len(parts) > 1 else "status"
+        if sub == "status":
+            result = optimizer_status(self.session)
+        elif sub == "start":
+            max_cycles = int(parts[2]) if len(parts) > 2 else 10
+            result = optimizer_start(self.session, max_cycles=max_cycles)
+        elif sub == "pause":
+            result = optimizer_pause(self.session)
+        elif sub == "report":
+            result = optimizer_report(self.session, limit=5)
+        else:
+            self._chat_msg("[red]Usage: /optimizer status|start [N]|pause|report[/]")
+            return True
+
+        self._chat_msg(render_strategy_command_result(result))
+        return True
+
+    async def _handle_strategies_command(self, text: str) -> bool:
+        """Handle strategy-management slash commands locally or forward remotely."""
+        if getattr(self.session, "is_remote", False):
+            return False
+        try:
+            parts = shlex.split(text)
+        except ValueError as exc:
+            self._chat_msg(f"[red]Strategies command failed: {exc}[/]")
+            return True
+
+        sub = parts[1].lower() if len(parts) > 1 else "list"
+        if sub == "list":
+            pool = parts[2].lower() if len(parts) > 2 else "all"
+            result = list_strategy_records(self.session, pool=pool)
+        elif sub == "show":
+            if len(parts) < 3:
+                self._chat_msg("[red]Usage: /strategies show NAME [VERSION][/]")
+                return True
+            version = int(parts[3]) if len(parts) > 3 else None
+            result = show_strategy(self.session, name=parts[2], version=version)
+        elif sub == "propose":
+            yaml_str = self._extract_strategies_remainder(text, "propose")
+            if not yaml_str:
+                self._chat_msg("[red]Usage: /strategies propose YAML_OR_PATH[/]")
+                return True
+            candidate_path = Path(yaml_str).expanduser()
+            if candidate_path.is_file():
+                yaml_str = candidate_path.read_text(encoding="utf-8")
+            result = propose_strategy(self.session, yaml_str=yaml_str)
+        elif sub == "promote":
+            if len(parts) < 3:
+                self._chat_msg("[red]Usage: /strategies promote NAME[/]")
+                return True
+            result = move_strategy(self.session, name=parts[2], to_pool="active")
+        elif sub == "demote":
+            if len(parts) < 3:
+                self._chat_msg("[red]Usage: /strategies demote NAME[/]")
+                return True
+            result = move_strategy(self.session, name=parts[2], to_pool="candidates")
+        elif sub == "retire":
+            if len(parts) < 3:
+                self._chat_msg("[red]Usage: /strategies retire NAME[/]")
+                return True
+            result = move_strategy(self.session, name=parts[2], to_pool="graveyard")
+        elif sub == "lineage":
+            if len(parts) < 3:
+                self._chat_msg("[red]Usage: /strategies lineage NAME[/]")
+                return True
+            result = get_strategy_lineage(self.session, name=parts[2])
+        else:
+            self._chat_msg(
+                "[red]Usage: /strategies list [pool]|show NAME [VERSION]|propose YAML_OR_PATH|"
+                "promote NAME|demote NAME|retire NAME|lineage NAME[/]"
+            )
+            return True
+
+        self._chat_msg(render_strategy_command_result(result))
+        return True
+
+    @staticmethod
+    def _extract_strategies_remainder(text: str, subcommand: str) -> str:
+        """Preserve the raw propose payload after the slash prefix."""
+        prefix = f"/strategies {subcommand}"
+        stripped = text.strip()
+        if not stripped.startswith(prefix):
+            return ""
+        remainder = stripped[len(prefix) :].strip()
+        if len(remainder) >= 2 and remainder[0] == remainder[-1] and remainder[0] in {'"', "'"}:
+            return remainder[1:-1]
+        return remainder
 
     async def _list_known_sessions(self) -> list[dict[str, Any]]:
         """Load session summaries from either the daemon or local index."""
@@ -3341,6 +3460,19 @@ class TradingTerminal(App):
             verb = etype.replace("scheduled_job_", "").replace("_", " ")
             self._chat_msg(
                 f"[dim]Scheduled job {verb}:[/] {data.get('job_id')}"
+            )
+            return
+
+        if etype == "optimizer_completed":
+            data = event["data"]
+            if data.get("error"):
+                self._chat_msg(
+                    f"[red]Optimizer failed:[/] {data.get('error')}"
+                )
+                return
+            status = "cancelled" if data.get("cancelled") else "completed"
+            self._chat_msg(
+                f"[dim]Optimizer {status}:[/] {data.get('cycle_count', 0)} cycle(s)"
             )
             return
 
