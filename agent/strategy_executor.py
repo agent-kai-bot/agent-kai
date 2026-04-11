@@ -293,7 +293,7 @@ def _check_exit(
         return {
             "exit_time": timestamp,
             "exit_bar": bar_index,
-            "exit_price": stop_price * (1.0 + ir.costs.slippage_pct),
+            "exit_price": stop_price * (1.0 - ir.costs.slippage_pct),
             "gross_exit_price": stop_price,
             "exit_reason": ExitReason.STOP_LOSS,
         }
@@ -313,7 +313,7 @@ def _check_exit(
         return {
             "exit_time": timestamp,
             "exit_bar": bar_index,
-            "exit_price": trail_price,
+            "exit_price": trail_price * (1.0 - ir.costs.slippage_pct),
             "gross_exit_price": trail_price,
             "exit_reason": ExitReason.TRAILING_STOP,
         }
@@ -332,7 +332,7 @@ def _check_exit(
 
 
 def _time_exit_price(close_price: float, slippage_pct: float) -> float:
-    return close_price * (1.0 + slippage_pct)
+    return close_price * (1.0 - slippage_pct)
 
 
 def _close_position(
