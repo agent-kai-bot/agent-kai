@@ -8,6 +8,36 @@ from agent.strategy_executor import ExitReason, TradeRecord
 from agent.strategy_metrics import compute_metrics
 
 
+def _trade(
+    *,
+    entry_time: pd.Timestamp,
+    exit_time: pd.Timestamp,
+    net_pnl: float,
+    return_pct: float,
+    exit_reason: ExitReason = ExitReason.TIME_EXIT,
+) -> TradeRecord:
+    return TradeRecord(
+        entry_time=entry_time,
+        exit_time=exit_time,
+        entry_bar=0,
+        exit_bar=1,
+        entry_price=100.0,
+        exit_price=110.0,
+        gross_entry_price=100.0,
+        gross_exit_price=111.0,
+        quantity=100.0,
+        entry_notional=10_000.0,
+        exit_notional=11_000.0,
+        gross_pnl=1_100.0,
+        net_pnl=net_pnl,
+        fees_paid=100.0,
+        bars_held=1,
+        return_pct=return_pct,
+        exit_reason=exit_reason,
+        entry_equity_before=100_000.0,
+    )
+
+
 class StrategyMetricsTests(unittest.TestCase):
     """Validate metrics against hand-built reference data."""
 
@@ -109,6 +139,71 @@ class StrategyMetricsTests(unittest.TestCase):
         self.assertAlmostEqual(report.returns.monthly_returns["2024-02"], 10.0)
         self.assertAlmostEqual(report.returns.monthly_returns["2024-03"], -4.545454545454546)
         self.assertAlmostEqual(report.returns.monthly_returns["2024-04"], 14.285714285714285)
+
+    def test_sortino_with_all_positive_returns(self):
+        equity = pd.Series(
+            [100_000.0, 101_000.0, 102_500.0, 104_000.0],
+            index=pd.date_range("2024-01-01", periods=4, freq="D"),
+        )
+
+        report = compute_metrics(equity, [], None)
+
+        self.assertIsNone(report.risk_adjusted.sortino_ratio)
+
+    def test_zero_trade_metrics(self):
+        equity = pd.Series(
+            [100_000.0, 100_000.0, 100_000.0],
+            index=pd.date_range("2024-01-01", periods=3, freq="D"),
+        )
+
+        report = compute_metrics(equity, [], None)
+
+        self.assertEqual(report.trades.total, 0)
+        self.assertEqual(report.trades.winners, 0)
+        self.assertEqual(report.trades.losers, 0)
+        self.assertIsNone(report.trades.win_rate_pct)
+        self.assertIsNone(report.trades.profit_factor)
+        self.assertIsNone(report.trades.avg_duration_bars)
+        self.assertAlmostEqual(report.cost_analysis.gross_return_pct, 0.0)
+        self.assertAlmostEqual(report.cost_analysis.net_return_pct, 0.0)
+        self.assertIsNone(report.cost_analysis.fee_burden_pct_of_gross)
+
+    def test_single_trade_metrics(self):
+        equity = pd.Series(
+            [100_000.0, 105_000.0],
+            index=pd.date_range("2024-01-01", periods=2, freq="D"),
+        )
+        trade = _trade(
+            entry_time=equity.index[0],
+            exit_time=equity.index[1],
+            net_pnl=5_000.0,
+            return_pct=0.05,
+            exit_reason=ExitReason.TAKE_PROFIT,
+        )
+
+        report = compute_metrics(equity, [trade], None)
+
+        self.assertEqual(report.trades.total, 1)
+        self.assertEqual(report.trades.winners, 1)
+        self.assertEqual(report.trades.losers, 0)
+        self.assertAlmostEqual(report.trades.win_rate_pct, 100.0)
+        self.assertEqual(report.trades.profit_factor, float("inf"))
+        self.assertAlmostEqual(report.trades.avg_win_pct, 5.0)
+        self.assertAlmostEqual(report.trades.largest_win_pct, 5.0)
+        self.assertAlmostEqual(report.trades.largest_loss_pct, 5.0)
+        self.assertAlmostEqual(report.trades.avg_duration_bars, 1.0)
+        self.assertEqual(report.stability.longest_losing_streak, 0)
+
+    def test_cvar_with_few_data_points(self):
+        equity = pd.Series(
+            [100_000.0, 90_000.0, 95_000.0],
+            index=pd.date_range("2024-01-01", periods=3, freq="D"),
+        )
+
+        report = compute_metrics(equity, [], None)
+
+        self.assertAlmostEqual(report.tail_risk.cvar_95_pct, -10.0)
+        self.assertAlmostEqual(report.tail_risk.cvar_99_pct, -10.0)
 
 
 if __name__ == "__main__":
