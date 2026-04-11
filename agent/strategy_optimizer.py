@@ -288,7 +288,8 @@ class StrategyOptimizer:
         tuning_frame: pd.DataFrame,
         lockbox_frame: pd.DataFrame,
     ) -> tuple[MetricsReport, bool, str]:
-        exec_frame = pd.concat([tuning_frame.iloc[-ir.warmup_bars :], lockbox_frame])
+        warmup_prefix = tuning_frame.iloc[-ir.warmup_bars:] if ir.warmup_bars > 0 else tuning_frame.iloc[0:0]
+        exec_frame = pd.concat([warmup_prefix, lockbox_frame])
         backtest = execute_strategy(ir, exec_frame)
         metrics = compute_metrics(backtest.equity_curve, backtest.trades, backtest.benchmark_prices)
         avg_bars_held = metrics.trades.avg_duration_bars or 0.0
