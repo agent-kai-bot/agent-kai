@@ -152,13 +152,15 @@ class StrategyAgentToolsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         root_dir = Path(self.temp_dir.name) / "session"
+        store_path = root_dir / "strategies" / DEFAULT_DB_PATH.name
         self.session = SimpleNamespace(
             name="alpha",
             paths=SimpleNamespace(root_dir=root_dir),
+            strategy_store_path=str(store_path),
             strategy_runtime=_FakeRuntime(),
             publish_event=lambda *_args, **_kwargs: None,
         )
-        self.store = StrategyStore(root_dir / "strategies" / DEFAULT_DB_PATH.name)
+        self.store = StrategyStore(store_path)
         self.store.init_db()
 
         self.root_id = self.store.save_strategy(
