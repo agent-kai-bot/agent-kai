@@ -1,0 +1,134 @@
+version: "3.9"
+
+# Polygon Indexer Stack
+# Runs on srv01 (192.168.222.243) alongside the Polygon node
+# Node RPC available at host.docker.internal:8545 (HTTP) and :8546 (WS)
+
+services:
+  # ── Postgres — primary datastore ──────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: polygon_indexer
+      POSTGRES_USER: indexer
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-indexer_dev}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5433:5432"  # non-default port to avoid conflicts
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U indexer -d polygon_indexer"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis — hot cache + pub/sub for real-time events ──────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redisdata:/data
+    ports:
+      - "127.0.0.1:6380:6379"  # non-default port
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── RPC Gateway — only service that talks to the node ─────
+  rpc-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: rpc-gateway
+    restart: unless-stopped
+    environment:
+      POLYGON_RPC_HTTP: http://host.docker.internal:8545
+      POLYGON_RPC_WS: ws://host.docker.internal:8546
+      ALCHEMY_RPC_URL: ${ALCHEMY_RPC_URL:-}
+      ALCHEMY_API_KEY: ${ALCHEMY_API_KEY:-}
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ── Ingest Service — block/log/tx ingestion ───────────────
+  ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: ingest
+    restart: unless-stopped
+    environment:
+      RPC_GATEWAY_URL: http://rpc-gateway:8000
+      DATABASE_URL: postgresql://indexer:${POSTGRES_PASSWORD:-indexer_dev}@postgres:5432/polygon_indexer
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Ingest config
+      BACKFILL_DAYS: ${BACKFILL_DAYS:-30}
+      TRACKED_TOKENS: ${TRACKED_TOKENS:-}  # comma-separated contract addresses
+      REORG_DEPTH: ${REORG_DEPTH:-64}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rpc-gateway:
+        condition: service_healthy
+
+  # ── Decoder — ABI registry + event classification ─────────
+  decoder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: decoder
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://indexer:${POSTGRES_PASSWORD:-indexer_dev}@postgres:5432/polygon_indexer
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Analytics — trading-grade derived data ────────────────
+  analytics:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: analytics
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://indexer:${POSTGRES_PASSWORD:-indexer_dev}@postgres:5432/polygon_indexer
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "127.0.0.1:8100:8000"  # internal analytics API
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  pgdata:
+  redisdata:
