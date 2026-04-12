@@ -76,6 +76,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # Ingest config
       BACKFILL_DAYS: ${BACKFILL_DAYS:-30}
+      BACKFILL_RPC_TIMEOUT_SECONDS: ${BACKFILL_RPC_TIMEOUT_SECONDS:-60}
       TRACKED_TOKENS: ${TRACKED_TOKENS:-}  # comma-separated contract addresses
       REORG_DEPTH: ${REORG_DEPTH:-64}
     depends_on:

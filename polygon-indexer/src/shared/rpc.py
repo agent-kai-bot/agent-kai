@@ -67,10 +67,14 @@ class RpcGatewayClient:
     async def close(self) -> None:
         await self.client.aclose()
 
-    async def call(self, method: str, params: list[Any] | None = None) -> Any:
+    async def call(self, method: str, params: list[Any] | None = None, *, timeout: float | None = None) -> Any:
+        payload: dict[str, Any] = {"method": method, "params": params or []}
+        if timeout is not None:
+            payload["timeout_seconds"] = timeout
         response = await self.client.post(
             f"{self.base_url}/rpc",
-            json={"method": method, "params": params or []},
+            json=payload,
+            timeout=timeout,
         )
         response.raise_for_status()
         payload = response.json()

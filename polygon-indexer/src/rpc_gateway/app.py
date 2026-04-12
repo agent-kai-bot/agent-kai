@@ -40,6 +40,7 @@ PROBE_PARAMS: dict[str, list[Any]] = {
 class RpcRequest(BaseModel):
     method: str
     params: list[Any] = Field(default_factory=list)
+    timeout_seconds: float | None = Field(default=None, gt=0)
 
 
 class MethodBudget:
@@ -172,19 +173,19 @@ class ProviderRouter:
         except Exception:
             return False
 
-    async def call(self, method: str, params: list[Any] | None = None) -> RouterResult:
+    async def call(self, method: str, params: list[Any] | None = None, *, timeout: float | None = None) -> RouterResult:
         params = params or []
         self._validate(method, params)
         budget = self.budgets.get(method, self.default_budget)
         async with budget:
             client = self._select_primary(method)
             try:
-                result = await client.call(method, params)
+                result = await client.call(method, params, timeout=timeout)
                 return RouterResult(result=result, provider=client.name)
             except Exception as exc:
                 if self._should_fallback(method, exc):
                     LOGGER.warning("falling back to alchemy for %s after local error: %s", method, exc)
-                    result = await self.alchemy.call(method, params)
+                    result = await self.alchemy.call(method, params, timeout=timeout)
                     return RouterResult(result=result, provider=self.alchemy.name)
                 raise
 
@@ -293,7 +294,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/rpc")
     async def rpc(request: RpcRequest) -> dict[str, Any]:
         try:
-            routed = await state.router.call(request.method, request.params)
+            routed = await state.router.call(request.method, request.params, timeout=request.timeout_seconds)
             return {"ok": True, "result": routed.result, "provider": routed.provider}
         except JsonRpcError as exc:
             return {"ok": False, "error": {"code": exc.code, "message": exc.message, "data": exc.data}}

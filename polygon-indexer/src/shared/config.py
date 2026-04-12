@@ -48,6 +48,7 @@ class Settings:
     host: str = "0.0.0.0"
     port: int = 8000
     request_timeout_seconds: float = 20.0
+    backfill_rpc_timeout_seconds: float = 60.0
     log_range_limit: int = 2_000
     whale_threshold_usd: float = 10_000.0
     analytics_balance_updater_interval_seconds: int = 2
@@ -85,6 +86,7 @@ def load_settings(service_name: str) -> Settings:
         backfill_days=_env_int("BACKFILL_DAYS", 30),
         tracked_tokens=_csv_addresses(_env("TRACKED_TOKENS")),
         port=port,
+        backfill_rpc_timeout_seconds=float(_env("BACKFILL_RPC_TIMEOUT_SECONDS", "60") or "60"),
         analytics_balance_updater_interval_seconds=_env_int("ANALYTICS_BALANCE_UPDATER_INTERVAL_SECONDS", 2),
         analytics_ohlcv_builder_interval_seconds=_env_int("ANALYTICS_OHLCV_BUILDER_INTERVAL_SECONDS", 3),
         analytics_whale_detector_interval_seconds=_env_int("ANALYTICS_WHALE_DETECTOR_INTERVAL_SECONDS", 5),

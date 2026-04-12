@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 from eth_abi import decode
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -18,8 +19,8 @@ from src.shared.events import DEX_SWAP_TOPIC_FILTER, NEW_BLOCK_CHANNEL, NEW_SWAP
 from src.shared.evm import decode_topic_address, from_hex_quantity, normalize_address, to_hex_quantity
 from src.shared.logging import configure_logging
 from src.shared.redis import RedisClient
-from src.shared.rpc import RpcGatewayClient, build_logs_filter, fetch_block_number
-from src.shared.utils import chunk_range, to_iso8601, utcnow
+from src.shared.rpc import JsonRpcError, RpcGatewayClient, build_logs_filter, fetch_block_number
+from src.shared.utils import to_iso8601, utcnow
 
 LOGGER = logging.getLogger(__name__)
 BLOCK_CACHE_MAX_SIZE = 2_048
@@ -168,10 +169,23 @@ class IngestService:
             await self.state.set_bool("backfill_complete", True)
             return
 
-        target_timestamp = int((utcnow() - timedelta(days=self.settings.backfill_days)).timestamp())
-        start_block = await self.find_block_for_timestamp(target_timestamp, current_head)
+        start_block = await self.state.get_int("backfill_start_block", 0)
+        if start_block <= 0:
+            target_timestamp = int((utcnow() - timedelta(days=self.settings.backfill_days)).timestamp())
+            start_block = await self.find_block_for_timestamp(target_timestamp, current_head)
         await self.state.set_int("backfill_start_block", start_block)
-        LOGGER.info("starting backfill from block %s to %s", start_block, current_head)
+        transfer_cursor = await self.state.get_int("backfill_transfer_cursor", start_block - 1)
+        swap_cursor = await self.state.get_int("backfill_swap_cursor", start_block - 1)
+        if transfer_cursor >= start_block or swap_cursor >= start_block:
+            LOGGER.info(
+                "resuming backfill from block %s to %s transfer_cursor=%s swap_cursor=%s",
+                start_block,
+                current_head,
+                transfer_cursor,
+                swap_cursor,
+            )
+        else:
+            LOGGER.info("starting backfill from block %s to %s", start_block, current_head)
 
         if self.tracked_tokens:
             await self.backfill_transfers(start_block, current_head)
@@ -204,35 +218,114 @@ class IngestService:
         return best
 
     async def backfill_transfers(self, start_block: int, end_block: int) -> None:
-        for chunk_start, chunk_end in chunk_range(start_block, end_block, self.settings.log_range_limit):
-            logs = await self.rpc.call(
-                "eth_getLogs",
-                [
-                    build_logs_filter(
-                        from_block=chunk_start,
-                        to_block=chunk_end,
-                        addresses=self.tracked_tokens,
-                        topics=[TRANSFER_TOPIC],
-                    )
-                ],
-            )
-            await self.persist_transfer_logs(logs)
+        await self._run_backfill_logs(
+            kind="transfers",
+            start_block=start_block,
+            end_block=end_block,
+            cursor_key="backfill_transfer_cursor",
+            addresses=self.tracked_tokens,
+            topics=[TRANSFER_TOPIC],
+        )
 
     async def backfill_swaps(self, start_block: int, end_block: int) -> None:
-        addresses = [pool.pool_address for pool in self.tracked_pools]
-        for chunk_start, chunk_end in chunk_range(start_block, end_block, self.settings.log_range_limit):
-            logs = await self.rpc.call(
-                "eth_getLogs",
-                [
-                    build_logs_filter(
-                        from_block=chunk_start,
-                        to_block=chunk_end,
-                        addresses=addresses,
-                        topics=DEX_SWAP_TOPIC_FILTER,
+        await self._run_backfill_logs(
+            kind="swaps",
+            start_block=start_block,
+            end_block=end_block,
+            cursor_key="backfill_swap_cursor",
+            addresses=[pool.pool_address for pool in self.tracked_pools],
+            topics=DEX_SWAP_TOPIC_FILTER,
+        )
+
+    async def _run_backfill_logs(
+        self,
+        *,
+        kind: str,
+        start_block: int,
+        end_block: int,
+        cursor_key: str,
+        addresses: list[str],
+        topics: list[Any],
+    ) -> None:
+        if not addresses or start_block > end_block:
+            return
+
+        last_processed = await self.state.get_int(cursor_key, start_block - 1)
+        current = max(start_block, last_processed + 1)
+        if current > end_block:
+            LOGGER.info("%s backfill already complete through block %s", kind, end_block)
+            return
+
+        normal_chunk_size = self.settings.log_range_limit
+        chunk_size = normal_chunk_size
+        successful_chunks = 0
+        total_blocks = max(1, end_block - start_block + 1)
+
+        while current <= end_block:
+            chunk_end = min(current + chunk_size - 1, end_block)
+            try:
+                logs = list(
+                    await self.rpc.call(
+                        "eth_getLogs",
+                        [
+                            build_logs_filter(
+                                from_block=current,
+                                to_block=chunk_end,
+                                addresses=addresses,
+                                topics=topics,
+                            )
+                        ],
+                        timeout=self.settings.backfill_rpc_timeout_seconds,
                     )
-                ],
-            )
-            await self.persist_swap_logs(logs)
+                )
+            except Exception as exc:
+                if self._is_backfill_timeout(exc):
+                    chunk_size = max(100, chunk_size // 2)
+                    LOGGER.warning("chunk reduced to %d blocks after timeout", chunk_size)
+                    continue
+                raise
+
+            async with self.database.connect() as connection:
+                async with connection.begin():
+                    await self._persist_backfill_logs(kind, logs, connection)
+                    await self._set_state_ints(connection, {cursor_key: chunk_end})
+
+            successful_chunks += 1
+            if chunk_size != normal_chunk_size:
+                chunk_size = normal_chunk_size
+
+            if successful_chunks % 10 == 0:
+                progress_pct = ((chunk_end - start_block + 1) / total_blocks) * 100
+                LOGGER.info(
+                    "BACKFILL_PROGRESS %s block=%s/%s (%.1f%%) chunks=%s",
+                    kind,
+                    chunk_end,
+                    end_block,
+                    progress_pct,
+                    successful_chunks,
+                )
+
+            current = chunk_end + 1
+
+    async def _persist_backfill_logs(self, kind: str, logs: list[dict[str, Any]], connection: AsyncConnection) -> int:
+        if kind == "transfers":
+            return await self.persist_transfer_logs(logs, connection=connection)
+        if kind == "swaps":
+            return await self.persist_swap_logs(logs, connection=connection)
+        raise ValueError(f"unsupported backfill kind: {kind}")
+
+    def _is_backfill_timeout(self, exc: Exception) -> bool:
+        timeout_errors = (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException)
+        current: BaseException | None = exc
+        while current is not None:
+            if isinstance(current, timeout_errors):
+                return True
+            if isinstance(current, JsonRpcError) and "timeout" in current.message.lower():
+                return True
+            if "timeout" in str(current).lower():
+                return True
+            current = current.__cause__ or current.__context__
+        return False
 
     async def catch_up_blocks(self, start_block: int, end_block: int) -> None:
         current = start_block
