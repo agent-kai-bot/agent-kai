@@ -48,7 +48,7 @@ class Settings:
     host: str = "0.0.0.0"
     port: int = 8000
     request_timeout_seconds: float = 20.0
-    log_range_limit: int = 1_000
+    log_range_limit: int = 2_000
     whale_threshold_usd: float = 10_000.0
     analytics_balance_updater_interval_seconds: int = 2
     analytics_ohlcv_builder_interval_seconds: int = 3

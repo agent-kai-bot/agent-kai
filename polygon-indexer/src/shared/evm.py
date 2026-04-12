@@ -21,7 +21,8 @@ def normalize_address(value: str | None) -> str:
 
 
 def topic_from_signature(signature: str) -> str:
-    return Web3.keccak(text=signature).hex()
+    raw = Web3.keccak(text=signature).hex()
+    return raw if raw.startswith("0x") else "0x" + raw
 
 
 def to_hex_quantity(value: int) -> str:

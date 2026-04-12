@@ -1,5 +1,3 @@
-version: "3.9"
-
 # Polygon Indexer Stack
 # Runs on srv01 (192.168.222.243) alongside the Polygon node
 # Node RPC available at host.docker.internal:8545 (HTTP) and :8546 (WS)
@@ -17,7 +15,7 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./initdb:/docker-entrypoint-initdb.d:ro
     ports:
-      - "127.0.0.1:5433:5432"  # non-default port to avoid conflicts
+      - "127.0.0.1:5434:5432"  # polygon indexer postgres
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U indexer -d polygon_indexer"]
       interval: 10s
@@ -32,7 +30,7 @@ services:
     volumes:
       - redisdata:/data
     ports:
-      - "127.0.0.1:6380:6379"  # non-default port
+      - "127.0.0.1:6381:6379"  # polygon indexer redis
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -73,7 +71,7 @@ services:
     restart: unless-stopped
     environment:
       RPC_GATEWAY_URL: http://rpc-gateway:8000
-      DATABASE_URL: postgresql://indexer:${POSTGRES_PASSWORD:-indexer_dev}@postgres:5432/polygon_indexer
+      DATABASE_URL: postgresql+asyncpg://indexer:${POSTGRES_PASSWORD:-indexer_dev}@postgres:5432/polygon_indexer
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # Ingest config
@@ -96,7 +94,7 @@ services:
       target: decoder
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://indexer:${POSTGRES_PASSWORD:-indexer_dev}@postgres:5432/polygon_indexer
+      DATABASE_URL: postgresql+asyncpg://indexer:${POSTGRES_PASSWORD:-indexer_dev}@postgres:5432/polygon_indexer
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
@@ -113,7 +111,7 @@ services:
       target: analytics
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://indexer:${POSTGRES_PASSWORD:-indexer_dev}@postgres:5432/polygon_indexer
+      DATABASE_URL: postgresql+asyncpg://indexer:${POSTGRES_PASSWORD:-indexer_dev}@postgres:5432/polygon_indexer
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
