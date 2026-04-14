@@ -28,6 +28,7 @@ from src.shared.utils import bucket_start, compute_gini, now_date, parse_iso8601
 
 LOGGER = logging.getLogger(__name__)
 STABLE_QUOTES = {"USDC", "USDT", "DAI"}
+WHALE_SUMMARY_REFRESH_SECONDS = 300
 
 
 def _jsonify(value: Any) -> Any:
@@ -136,6 +137,12 @@ def _compute_gas_percentile_rank(history: list[Decimal]) -> float:
     return round((less_or_equal - 1) / (len(history) - 1), 4)
 
 
+def _parse_state_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return parse_iso8601(value)
+
+
 def _passes_whale_threshold(amount_human: Decimal, usd_value: Decimal | None, threshold: Decimal) -> bool:
     if usd_value is not None:
         return usd_value >= threshold
@@ -228,6 +235,8 @@ class AnalyticsService:
         self.tasks: list[asyncio.Task[None]] = []
 
     async def startup(self) -> None:
+        await self.ensure_summary_schema()
+        await self.run_summary_updater()
         self.tasks = [
             asyncio.create_task(
                 self._loop(self.run_balance_updater, self.settings.analytics_balance_updater_interval_seconds),
@@ -244,6 +253,10 @@ class AnalyticsService:
             asyncio.create_task(
                 self._loop(self.run_holder_snapshots, self.settings.analytics_holder_snapshots_interval_seconds),
                 name="analytics-holder-snapshots",
+            ),
+            asyncio.create_task(
+                self._loop(self.run_summary_updater, self.settings.analytics_summary_updater_interval_seconds),
+                name="analytics-summary-updater",
             ),
         ]
 
@@ -272,12 +285,38 @@ class AnalyticsService:
         balance_block = await self.state.get_int("balance_updater_block", 0)
         ohlcv_block = await self.state.get_int("ohlcv_builder_block", 0)
         whale_block = await self.state.get_int("whale_detector_block", 0)
-        values = [value for value in (balance_block, ohlcv_block, whale_block) if value]
+        summary_block = await self.state.get_int("summary_updater_block", 0)
+        values = [value for value in (balance_block, ohlcv_block, whale_block, summary_block) if value]
         value = min(values) if values else 0
         await self.state.set_int("last_analytics_block", value)
 
     async def get_latest_block(self) -> int:
         return await self.state.get_int("last_indexed_block", 0)
+
+    async def ensure_summary_schema(self) -> None:
+        async with self.database.connection() as connection:
+            await connection.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS polygon_token_summary (
+                        contract_address TEXT PRIMARY KEY REFERENCES polygon_tokens(contract_address),
+                        recent_activity_1h INTEGER NOT NULL DEFAULT 0,
+                        transfers_24h INTEGER NOT NULL DEFAULT 0,
+                        whale_count_24h INTEGER NOT NULL DEFAULT 0,
+                        total_holders INTEGER NOT NULL DEFAULT 0,
+                        updated_at TIMESTAMPTZ DEFAULT now()
+                    )
+                    """
+                )
+            )
+            await connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_token_summary_transfers_24h
+                    ON polygon_token_summary(transfers_24h DESC, contract_address)
+                    """
+                )
+            )
 
     async def run_balance_updater(self) -> None:
         last_processed = await self.state.get_int("balance_updater_block", 0)
@@ -658,6 +697,232 @@ class AnalyticsService:
                     },
                 )
 
+    async def run_summary_updater(self) -> None:
+        target_block = await self.state.get_int("last_indexed_block", 0)
+        chain_head = await self.current_chain_head()
+        now = utcnow()
+        since_1h = now - timedelta(hours=1)
+        since_24h = now - timedelta(hours=24)
+        last_whale_refresh = _parse_state_datetime(await self.state.get("whale_summary_updated_at"))
+        refresh_whales = (
+            last_whale_refresh is None
+            or (now - last_whale_refresh).total_seconds() >= WHALE_SUMMARY_REFRESH_SECONDS
+        )
+
+        async with self.database.connection() as connection:
+            system_row = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT
+                            COALESCE((SELECT max(id) FROM polygon_token_transfers), 0) AS total_transfers_indexed,
+                            COALESCE((SELECT max(id) FROM polygon_contract_events), 0) AS total_events_indexed,
+                            COALESCE((SELECT count(*) FROM polygon_tokens WHERE is_tracked = true), 0) AS tracked_token_count,
+                            COALESCE(
+                                (SELECT timestamp FROM polygon_gas_metrics ORDER BY block_number DESC LIMIT 1),
+                                (SELECT timestamp FROM polygon_blocks ORDER BY block_number DESC LIMIT 1)
+                            ) AS last_updated_at
+                        """
+                    )
+                )
+            ).mappings().one()
+            cutoff_row = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT
+                            COALESCE(
+                                (SELECT min(block_number) FROM polygon_blocks WHERE timestamp >= :since_1h),
+                                :empty_block
+                            ) AS block_1h,
+                            COALESCE(
+                                (SELECT min(block_number) FROM polygon_blocks WHERE timestamp >= :since_24h),
+                                :empty_block
+                            ) AS block_24h
+                        """
+                    ),
+                    {
+                        "since_1h": since_1h,
+                        "since_24h": since_24h,
+                        "empty_block": target_block + 1,
+                    },
+                )
+            ).mappings().one()
+            summary_rows = (
+                await connection.execute(
+                    text(
+                        """
+                        WITH transfer_counts AS (
+                            SELECT
+                                contract_address,
+                                count(*) FILTER (WHERE block_number >= :block_1h) AS recent_activity_1h,
+                                count(*) AS transfers_24h
+                            FROM polygon_token_transfers
+                            WHERE block_number >= :block_24h
+                            GROUP BY contract_address
+                        ),
+                        holder_counts AS (
+                            SELECT
+                                contract_address,
+                                count(*) AS total_holders
+                            FROM polygon_token_balances
+                            WHERE balance > 0
+                            GROUP BY contract_address
+                        )
+                        SELECT
+                            t.contract_address,
+                            t.decimals,
+                            COALESCE(tc.recent_activity_1h, 0) AS recent_activity_1h,
+                            COALESCE(tc.transfers_24h, 0) AS transfers_24h,
+                            COALESCE(hc.total_holders, 0) AS total_holders
+                        FROM polygon_tokens t
+                        LEFT JOIN transfer_counts tc ON tc.contract_address = t.contract_address
+                        LEFT JOIN holder_counts hc ON hc.contract_address = t.contract_address
+                        WHERE t.is_tracked = true
+                        ORDER BY t.contract_address
+                        """
+                    ),
+                    {
+                        "block_1h": int(cutoff_row["block_1h"] or target_block + 1),
+                        "block_24h": int(cutoff_row["block_24h"] or target_block + 1),
+                    },
+                )
+            ).mappings().all()
+            existing_whales = (
+                await connection.execute(
+                    text("SELECT contract_address, whale_count_24h FROM polygon_token_summary")
+                )
+            ).mappings().all()
+
+        whale_counts = {
+            normalize_address(row["contract_address"]): int(row["whale_count_24h"] or 0)
+            for row in existing_whales
+        }
+        if refresh_whales and summary_rows:
+            whale_counts = await self.compute_whale_counts_24h(
+                block_24h=int(cutoff_row["block_24h"] or target_block + 1),
+                decimals_by_token={
+                    normalize_address(row["contract_address"]): int(row["decimals"] or 18)
+                    for row in summary_rows
+                },
+            )
+
+        summary_payload = [
+            {
+                "contract_address": normalize_address(row["contract_address"]),
+                "recent_activity_1h": int(row["recent_activity_1h"] or 0),
+                "transfers_24h": int(row["transfers_24h"] or 0),
+                "whale_count_24h": whale_counts.get(normalize_address(row["contract_address"]), 0),
+                "total_holders": int(row["total_holders"] or 0),
+                "updated_at": now,
+            }
+            for row in summary_rows
+        ]
+        transfer_count_state = json.dumps(
+            {
+                row["contract_address"]: row["transfers_24h"]
+                for row in summary_payload
+            },
+            separators=(",", ":"),
+        )
+        last_updated_at = system_row.get("last_updated_at")
+        state_rows = [
+            {"key": "chain_head_block", "value": str(chain_head if chain_head is not None else target_block)},
+            {"key": "summary_updater_block", "value": str(target_block)},
+            {"key": "total_blocks_indexed", "value": str(target_block)},
+            {"key": "total_transfers_indexed", "value": str(int(system_row["total_transfers_indexed"] or 0))},
+            {"key": "total_events_indexed", "value": str(int(system_row["total_events_indexed"] or 0))},
+            {"key": "tracked_token_count", "value": str(int(system_row["tracked_token_count"] or 0))},
+            {"key": "overview_last_updated_at", "value": to_iso8601(last_updated_at) if last_updated_at else ""},
+            {"key": "token_transfer_count_24h", "value": transfer_count_state},
+            {"key": "token_summary_updated_at", "value": to_iso8601(now)},
+        ]
+        if refresh_whales:
+            state_rows.append({"key": "whale_summary_updated_at", "value": to_iso8601(now)})
+
+        async with self.database.connection() as connection:
+            await connection.execute(
+                text(
+                    """
+                    DELETE FROM polygon_token_summary
+                    WHERE contract_address NOT IN (
+                        SELECT contract_address
+                        FROM polygon_tokens
+                        WHERE is_tracked = true
+                    )
+                    """
+                )
+            )
+            if summary_payload:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO polygon_token_summary (
+                            contract_address,
+                            recent_activity_1h,
+                            transfers_24h,
+                            whale_count_24h,
+                            total_holders,
+                            updated_at
+                        )
+                        VALUES (
+                            :contract_address,
+                            :recent_activity_1h,
+                            :transfers_24h,
+                            :whale_count_24h,
+                            :total_holders,
+                            :updated_at
+                        )
+                        ON CONFLICT (contract_address) DO UPDATE
+                        SET recent_activity_1h = EXCLUDED.recent_activity_1h,
+                            transfers_24h = EXCLUDED.transfers_24h,
+                            whale_count_24h = EXCLUDED.whale_count_24h,
+                            total_holders = EXCLUDED.total_holders,
+                            updated_at = EXCLUDED.updated_at
+                        """
+                    ),
+                    summary_payload,
+                )
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO polygon_indexer_state (key, value, updated_at)
+                    VALUES (:key, :value, now())
+                    ON CONFLICT (key) DO UPDATE
+                    SET value = EXCLUDED.value,
+                        updated_at = now()
+                    """
+                ),
+                state_rows,
+            )
+
+    async def compute_whale_counts_24h(
+        self,
+        *,
+        block_24h: int,
+        decimals_by_token: dict[str, int],
+    ) -> dict[str, int]:
+        prices = await self.load_latest_prices()
+        threshold = Decimal(str(self.settings.whale_threshold_usd))
+        rows = await self.query_all(
+            """
+            SELECT contract_address, value
+            FROM polygon_token_transfers
+            WHERE block_number >= :block_24h
+            """,
+            {"block_24h": block_24h},
+        )
+        whale_counts: dict[str, int] = {}
+        for row in rows:
+            contract = normalize_address(row["contract_address"])
+            amount_human = units_to_decimal(int(row["value"]), decimals_by_token.get(contract, 18))
+            price = prices.get(contract)
+            usd_value = amount_human * price.price if price else None
+            if not _passes_whale_threshold(amount_human, usd_value, threshold):
+                continue
+            whale_counts[contract] = whale_counts.get(contract, 0) + 1
+        return whale_counts
+
     async def load_latest_prices(self, quote: str | None = None) -> dict[str, PricePoint]:
         async with self.database.connection() as connection:
             rows = (
@@ -738,42 +1003,50 @@ class AnalyticsService:
 
 
 async def query_recent_blocks(service: AnalyticsService, limit: int) -> list[dict[str, Any]]:
-    rows = await service.query_all(
+    block_rows = await service.query_all(
         """
-        WITH recent_blocks AS (
-            SELECT block_number, timestamp, tx_count
-            FROM polygon_blocks
-            ORDER BY block_number DESC
-            LIMIT :limit
-        ),
-        transfer_counts AS (
-            SELECT block_number, count(*) AS transfer_count
-            FROM polygon_token_transfers
-            WHERE block_number IN (SELECT block_number FROM recent_blocks)
-            GROUP BY block_number
-        ),
-        swap_counts AS (
-            SELECT block_number, count(*) AS swap_count
-            FROM polygon_dex_swaps
-            WHERE block_number IN (SELECT block_number FROM recent_blocks)
-            GROUP BY block_number
-        )
-        SELECT
-            b.block_number,
-            b.timestamp,
-            b.tx_count,
-            COALESCE(t.transfer_count, 0) AS transfer_count,
-            COALESCE(s.swap_count, 0) AS swap_count,
-            COALESCE(g.gas_used_pct, 0) AS gas_used_pct
-        FROM recent_blocks b
-        LEFT JOIN transfer_counts t ON t.block_number = b.block_number
-        LEFT JOIN swap_counts s ON s.block_number = b.block_number
+        SELECT b.block_number, b.timestamp, b.tx_count, COALESCE(g.gas_used_pct, 0) AS gas_used_pct
+        FROM polygon_blocks b
         LEFT JOIN polygon_gas_metrics g ON g.block_number = b.block_number
         ORDER BY b.block_number DESC
+        LIMIT :limit
         """,
         {"limit": limit},
     )
-    rows.sort(key=lambda row: int(row["block_number"]), reverse=True)
+    if not block_rows:
+        return []
+    min_block = min(int(row["block_number"]) for row in block_rows)
+    max_block = max(int(row["block_number"]) for row in block_rows)
+    transfer_rows = await service.query_all(
+        """
+        SELECT block_number, count(*) AS transfer_count
+        FROM polygon_token_transfers
+        WHERE block_number BETWEEN :min_block AND :max_block
+        GROUP BY block_number
+        """,
+        {"min_block": min_block, "max_block": max_block},
+    )
+    swap_rows = await service.query_all(
+        """
+        SELECT block_number, count(*) AS swap_count
+        FROM polygon_dex_swaps
+        WHERE block_number BETWEEN :min_block AND :max_block
+        GROUP BY block_number
+        """,
+        {"min_block": min_block, "max_block": max_block},
+    )
+    transfer_counts = {int(row["block_number"]): int(row["transfer_count"] or 0) for row in transfer_rows}
+    swap_counts = {int(row["block_number"]): int(row["swap_count"] or 0) for row in swap_rows}
+    rows = []
+    for row in block_rows:
+        block_number = int(row["block_number"])
+        rows.append(
+            {
+                **row,
+                "transfer_count": transfer_counts.get(block_number, 0),
+                "swap_count": swap_counts.get(block_number, 0),
+            }
+        )
     return [build_recent_block_row(row) for row in rows]
 
 
@@ -820,44 +1093,27 @@ async def query_block_activity(service: AnalyticsService, block_number: int, fal
 
 
 async def query_system_totals(service: AnalyticsService) -> dict[str, Any]:
-    row = await service.query_one(
-        """
-        SELECT
-            (SELECT count(*) FROM polygon_blocks) AS total_blocks_indexed,
-            (SELECT count(*) FROM polygon_token_transfers) AS total_transfers_indexed,
-            (SELECT count(*) FROM polygon_contract_events) AS total_events_indexed,
-            (SELECT count(*) FROM polygon_tokens WHERE is_tracked = true) AS tracked_token_count,
-            GREATEST(
-                COALESCE((SELECT max(timestamp) FROM polygon_blocks), TIMESTAMPTZ 'epoch'),
-                COALESCE((SELECT max(timestamp) FROM polygon_token_transfers), TIMESTAMPTZ 'epoch'),
-                COALESCE((SELECT max(timestamp) FROM polygon_gas_metrics), TIMESTAMPTZ 'epoch')
-            ) AS last_updated_at
-        """
-    )
-    if not row:
-        return {
-            "total_blocks_indexed": 0,
-            "total_transfers_indexed": 0,
-            "total_events_indexed": 0,
-            "tracked_token_count": 0,
-            "last_updated_at": None,
-        }
-    last_updated_at = row.get("last_updated_at")
-    if isinstance(last_updated_at, datetime) and last_updated_at == datetime(1970, 1, 1, tzinfo=UTC):
-        row = dict(row)
-        row["last_updated_at"] = None
-    return row
+    latest_block = await service.get_latest_block()
+    return {
+        "total_blocks_indexed": latest_block,
+        "total_transfers_indexed": await service.state.get_int("total_transfers_indexed", 0),
+        "total_events_indexed": await service.state.get_int("total_events_indexed", 0),
+        "tracked_token_count": await service.state.get_int("tracked_token_count", 0),
+        "last_updated_at": _parse_state_datetime(await service.state.get("overview_last_updated_at")),
+    }
 
 
 async def query_status_snapshot(service: AnalyticsService) -> dict[str, Any]:
     last_indexed_block = await service.get_latest_block()
-    chain_head = await service.current_chain_head()
+    chain_head = await service.state.get_int("chain_head_block", last_indexed_block)
+    if chain_head < last_indexed_block:
+        chain_head = last_indexed_block
     last_decoded_block = await service.state.get_int("last_decoded_block", 0)
     last_analytics_block = await service.state.get_int("last_analytics_block", 0)
     backfill_complete = await service.state.get_bool("backfill_complete", False)
     backfill_start_block = await service.state.get_int("backfill_start_block", 0)
     totals = await query_system_totals(service)
-    lag_blocks = (chain_head - last_indexed_block) if chain_head is not None else None
+    lag_blocks = max(chain_head - last_indexed_block, 0) if chain_head is not None else None
     backfill_pct = _compute_backfill_pct(
         backfill_complete=backfill_complete,
         backfill_start_block=backfill_start_block,
@@ -931,9 +1187,6 @@ async def query_whale_transfers(
 
 async def query_overview(service: AnalyticsService) -> dict[str, Any]:
     status = await query_status_snapshot(service)
-    since_24h = utcnow() - timedelta(hours=24)
-    since_1h = utcnow() - timedelta(hours=1)
-
     recent_blocks = await query_recent_blocks(service, 40)
     gas_rows = await service.query_all(
         """
@@ -951,13 +1204,15 @@ async def query_overview(service: AnalyticsService) -> dict[str, Any]:
             t.name,
             t.decimals,
             hs.snapshot_date,
-            COALESCE(hs.total_holders, 0) AS total_holders,
+            COALESCE(ts.total_holders, hs.total_holders, 0) AS total_holders,
             COALESCE(hs.top10_concentration, 0) AS top10_concentration,
             COALESCE(hs.top50_concentration, 0) AS top50_concentration,
             hs.gini_coefficient,
-            COALESCE(stats.recent_activity_1h, 0) AS recent_activity_1h,
-            COALESCE(stats.transfers_24h, 0) AS transfers_24h
+            COALESCE(ts.recent_activity_1h, 0) AS recent_activity_1h,
+            COALESCE(ts.transfers_24h, 0) AS transfers_24h,
+            COALESCE(ts.whale_count_24h, 0) AS whale_count_24h
         FROM polygon_tokens t
+        LEFT JOIN polygon_token_summary ts ON ts.contract_address = t.contract_address
         LEFT JOIN LATERAL (
             SELECT snapshot_date, total_holders, top10_concentration, top50_concentration, gini_coefficient
             FROM polygon_holder_snapshots hs
@@ -965,26 +1220,9 @@ async def query_overview(service: AnalyticsService) -> dict[str, Any]:
             ORDER BY snapshot_date DESC
             LIMIT 1
         ) hs ON true
-        LEFT JOIN LATERAL (
-            SELECT
-                count(*) FILTER (WHERE tr.timestamp >= :since_1h) AS recent_activity_1h,
-                count(*) AS transfers_24h
-            FROM polygon_token_transfers tr
-            WHERE tr.contract_address = t.contract_address
-            AND tr.timestamp >= :since_24h
-        ) stats ON true
         WHERE t.is_tracked = true
-        ORDER BY stats.transfers_24h DESC, t.symbol, t.contract_address
-        """,
-        {"since_24h": since_24h, "since_1h": since_1h},
-    )
-    recent_transfer_rows = await service.query_all(
+        ORDER BY COALESCE(ts.transfers_24h, 0) DESC, t.symbol, t.contract_address
         """
-        SELECT contract_address, value
-        FROM polygon_token_transfers
-        WHERE timestamp >= :since_24h
-        """,
-        {"since_24h": since_24h},
     )
     prices = await service.load_latest_prices()
 
@@ -996,18 +1234,6 @@ async def query_overview(service: AnalyticsService) -> dict[str, Any]:
         if gas_history_values
         else Decimal(0)
     )
-
-    decimals_by_token = {normalize_address(row["contract_address"]): int(row["decimals"] or 18) for row in token_rows}
-    whale_counts: dict[str, int] = {}
-    threshold = Decimal(str(service.settings.whale_threshold_usd))
-    for row in recent_transfer_rows:
-        contract = normalize_address(row["contract_address"])
-        amount_human = units_to_decimal(int(row["value"]), decimals_by_token.get(contract, 18))
-        price = prices.get(contract)
-        usd_value = amount_human * price.price if price else None
-        if not _passes_whale_threshold(amount_human, usd_value, threshold):
-            continue
-        whale_counts[contract] = whale_counts.get(contract, 0) + 1
 
     tokens = []
     for row in token_rows:
@@ -1036,7 +1262,7 @@ async def query_overview(service: AnalyticsService) -> dict[str, Any]:
                 "top10_concentration_pct": holder_snapshot["top10_concentration_pct"],
                 "top50_concentration_pct": holder_snapshot["top50_concentration_pct"],
                 "gini_coefficient": holder_snapshot["gini_coefficient"],
-                "whale_count_24h": whale_counts.get(contract, 0),
+                "whale_count_24h": int(row.get("whale_count_24h") or 0),
             }
         )
 
@@ -1201,6 +1427,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "balance_updater_block": await service.state.get_int("balance_updater_block", 0),
             "ohlcv_builder_block": await service.state.get_int("ohlcv_builder_block", 0),
             "whale_detector_block": await service.state.get_int("whale_detector_block", 0),
+            "summary_updater_block": await service.state.get_int("summary_updater_block", 0),
         }
         return envelope(_jsonify(payload), block=latest_block)
 
@@ -1262,17 +1489,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 t.decimals,
                 t.total_supply,
                 t.first_seen_block,
-                hs.total_holders,
+                COALESCE(ts.total_holders, hs.total_holders, 0) AS total_holders,
                 hs.top10_concentration,
                 hs.top50_concentration,
                 hs.gini_coefficient,
-                (
-                    SELECT count(*)
-                    FROM polygon_token_transfers tr
-                    WHERE tr.contract_address = t.contract_address
-                    AND tr.timestamp >= now() - interval '24 hours'
-                ) AS transfers_24h
+                COALESCE(ts.transfers_24h, 0) AS transfers_24h
             FROM polygon_tokens t
+            LEFT JOIN polygon_token_summary ts ON ts.contract_address = t.contract_address
             LEFT JOIN LATERAL (
                 SELECT total_holders, top10_concentration, top50_concentration, gini_coefficient
                 FROM polygon_holder_snapshots hs

@@ -59,6 +59,18 @@ CREATE TABLE IF NOT EXISTS polygon_token_balances (
 
 CREATE INDEX idx_balances_contract ON polygon_token_balances(contract_address, balance DESC);
 
+-- Token summary cache (maintained by analytics)
+CREATE TABLE IF NOT EXISTS polygon_token_summary (
+    contract_address TEXT PRIMARY KEY REFERENCES polygon_tokens(contract_address),
+    recent_activity_1h INTEGER NOT NULL DEFAULT 0,
+    transfers_24h INTEGER NOT NULL DEFAULT 0,
+    whale_count_24h INTEGER NOT NULL DEFAULT 0,
+    total_holders INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX idx_token_summary_transfers_24h ON polygon_token_summary(transfers_24h DESC, contract_address);
+
 -- Holder snapshots (daily, for tracking concentration over time)
 CREATE TABLE IF NOT EXISTS polygon_holder_snapshots (
     id BIGSERIAL PRIMARY KEY,

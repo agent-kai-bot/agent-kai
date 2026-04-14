@@ -71,6 +71,7 @@ class IngestService:
         await self.ensure_tracked_tokens()
         await self.refresh_tracking_sets()
         current_head = await fetch_block_number(self.rpc)
+        await self.state.set_int("chain_head_block", current_head)
         backfill_complete = await self.state.get_bool("backfill_complete", False)
         if not backfill_complete:
             await self.run_backfill(current_head)
@@ -157,6 +158,7 @@ class IngestService:
             if not self._running:
                 break
             head_number = from_hex_quantity(head.get("number"))
+            await self.state.set_int("chain_head_block", head_number)
             last_indexed = await self.state.get_int("last_indexed_block", 0)
             if head_number <= last_indexed:
                 continue
@@ -430,6 +432,7 @@ class IngestService:
                 await self._set_state_ints(
                     connection,
                     {
+                        "chain_head_block": reset_block,
                         "last_indexed_block": reset_block,
                         "last_decoded_block": reset_block,
                         "last_analytics_block": reset_block,

@@ -55,6 +55,7 @@ class Settings:
     analytics_ohlcv_builder_interval_seconds: int = 3
     analytics_whale_detector_interval_seconds: int = 5
     analytics_holder_snapshots_interval_seconds: int = 300
+    analytics_summary_updater_interval_seconds: int = 30
 
     @property
     def has_alchemy(self) -> bool:
@@ -91,6 +92,7 @@ def load_settings(service_name: str) -> Settings:
         analytics_ohlcv_builder_interval_seconds=_env_int("ANALYTICS_OHLCV_BUILDER_INTERVAL_SECONDS", 3),
         analytics_whale_detector_interval_seconds=_env_int("ANALYTICS_WHALE_DETECTOR_INTERVAL_SECONDS", 5),
         analytics_holder_snapshots_interval_seconds=_env_int("ANALYTICS_HOLDER_SNAPSHOTS_INTERVAL_SECONDS", 300),
+        analytics_summary_updater_interval_seconds=_env_int("ANALYTICS_SUMMARY_UPDATER_INTERVAL_SECONDS", 30),
     )
 
 
