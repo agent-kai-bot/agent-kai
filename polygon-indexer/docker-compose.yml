@@ -128,6 +128,18 @@ services:
       timeout: 5s
       retries: 3
 
+  # ── Dashboard — SvelteKit static app via nginx ───────────
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3200:80"
+    depends_on:
+      analytics:
+        condition: service_healthy
+
 volumes:
   pgdata:
   redisdata:

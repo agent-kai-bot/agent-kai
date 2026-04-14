@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -11,11 +13,12 @@ from time import perf_counter
 from typing import Any
 
 from fastapi import FastAPI, Query, Request
+from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 
 from src.shared.config import Settings, load_settings
 from src.shared.db import Database, StateStore
-from src.shared.events import INTERVAL_SECONDS, QUOTE_SYMBOLS, WHALE_TRANSFERS_CHANNEL
+from src.shared.events import INTERVAL_SECONDS, NEW_BLOCK_CHANNEL, QUOTE_SYMBOLS, WHALE_TRANSFERS_CHANNEL
 from src.shared.evm import ZERO_ADDRESS, normalize_address, units_to_decimal
 from src.shared.http import envelope
 from src.shared.logging import configure_logging
@@ -48,6 +51,171 @@ class PricePoint:
     price: Decimal
     pool_address: str
     open_time: datetime
+
+
+def _decimal_to_float(value: Decimal | int | float | None) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
+def _decimal_to_string(value: Decimal | int | str | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return format(Decimal(value), "f")
+
+
+def _ratio_to_pct(value: Decimal | int | float | None) -> float | None:
+    if value is None:
+        return None
+    return round(float(Decimal(value) * Decimal(100)), 1)
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def _compute_backfill_pct(
+    *,
+    backfill_complete: bool,
+    backfill_start_block: int,
+    last_indexed_block: int,
+    chain_head: int | None,
+) -> float:
+    if backfill_complete:
+        return 100.0
+    if chain_head is None or chain_head <= 0:
+        return 0.0
+    if backfill_start_block <= 0 or backfill_start_block >= chain_head:
+        return 100.0 if last_indexed_block >= chain_head else 0.0
+    progress = (last_indexed_block - backfill_start_block) / max(chain_head - backfill_start_block, 1)
+    return round(_clamp(progress, 0.0, 1.0) * 100, 1)
+
+
+def _compute_tps(rows: list[dict[str, Any]], window: int = 20) -> float:
+    if not rows:
+        return 0.0
+    sample = rows[:window]
+    if len(sample) == 1:
+        tx_count = int(sample[0].get("tx_count") or 0)
+        return round(tx_count / 2.0, 1)
+    newest = sample[0]["timestamp"]
+    oldest = sample[-1]["timestamp"]
+    if not isinstance(newest, datetime) or not isinstance(oldest, datetime):
+        return 0.0
+    elapsed = max((newest - oldest).total_seconds(), 1.0)
+    total_txs = sum(int(row.get("tx_count") or 0) for row in sample)
+    return round(total_txs / elapsed, 1)
+
+
+def _compute_rate(rows: list[dict[str, Any]], field: str, window: int = 20) -> float:
+    if not rows:
+        return 0.0
+    sample = rows[:window]
+    if len(sample) == 1:
+        value = int(sample[0].get(field) or 0)
+        return round(value / 2.0, 1)
+    newest = sample[0]["timestamp"]
+    oldest = sample[-1]["timestamp"]
+    if not isinstance(newest, datetime) or not isinstance(oldest, datetime):
+        return 0.0
+    elapsed = max((newest - oldest).total_seconds(), 1.0)
+    total = sum(int(row.get(field) or 0) for row in sample)
+    return round(total / elapsed, 1)
+
+
+def _compute_gas_percentile_rank(history: list[Decimal]) -> float:
+    if not history:
+        return 0.0
+    if len(history) == 1:
+        return 0.0
+    current = history[0]
+    less_or_equal = sum(1 for value in history if value <= current)
+    return round((less_or_equal - 1) / (len(history) - 1), 4)
+
+
+def _passes_whale_threshold(amount_human: Decimal, usd_value: Decimal | None, threshold: Decimal) -> bool:
+    if usd_value is not None:
+        return usd_value >= threshold
+    return amount_human >= threshold
+
+
+def build_whale_transfer_payload(
+    row: dict[str, Any],
+    *,
+    price: PricePoint | None,
+    min_usd: Decimal | None = None,
+) -> dict[str, Any] | None:
+    decimals = int(row.get("decimals") or row.get("token_decimals") or 18)
+    amount_human = units_to_decimal(int(row["value"]), decimals)
+    usd_value = amount_human * price.price if price else None
+    if min_usd is not None and not _passes_whale_threshold(amount_human, usd_value, min_usd):
+        return None
+    symbol = row.get("symbol") or row.get("token_symbol") or ""
+    payload = {
+        "block_number": int(row["block_number"]),
+        "tx_hash": row["tx_hash"],
+        "contract_address": normalize_address(row["contract_address"]),
+        "symbol": symbol,
+        "token_symbol": symbol,
+        "token_decimals": decimals,
+        "from_address": normalize_address(row["from_address"]),
+        "to_address": normalize_address(row["to_address"]),
+        "value": _decimal_to_string(row["value"]),
+        "amount": format(amount_human, "f"),
+        "amount_human": format(amount_human, "f"),
+        "usd_value": _decimal_to_float(usd_value),
+        "timestamp": row["timestamp"],
+        "quote_symbol": price.quote_symbol if price else None,
+    }
+    return payload
+
+
+def normalize_whale_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+    normalized.setdefault("symbol", normalized.get("token_symbol", ""))
+    normalized.setdefault("token_symbol", normalized.get("symbol", ""))
+    normalized.setdefault("token_decimals", int(normalized.get("decimals") or 18))
+    normalized.setdefault("value", normalized.get("value") or normalized.get("amount") or "0")
+    normalized.setdefault("amount", normalized.get("amount_human") or normalized.get("amount") or "0")
+    normalized.setdefault("amount_human", normalized.get("amount_human") or normalized.get("amount") or "0")
+    normalized.setdefault("usd_value", normalized.get("usd_value"))
+    return normalized
+
+
+def build_holder_rows(
+    holders: list[dict[str, Any]],
+    *,
+    decimals: int,
+    tracked_total_balance: Decimal,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for holder in holders:
+        row = dict(holder)
+        balance = Decimal(row["balance"])
+        balance_human = units_to_decimal(int(balance), decimals)
+        row["balance_human"] = format(balance_human, "f")
+        row["pct_of_tracked"] = round(float((balance / tracked_total_balance) * Decimal(100)), 1) if tracked_total_balance else 0.0
+        normalized.append(row)
+    return normalized
+
+
+def build_recent_block_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "block_number": int(row["block_number"]),
+        "timestamp": row["timestamp"],
+        "tx_count": int(row.get("tx_count") or 0),
+        "transfer_count": int(row.get("transfer_count") or 0),
+        "swap_count": int(row.get("swap_count") or 0),
+        "gas_used_pct": round(float(Decimal(row.get("gas_used_pct") or 0)), 1),
+    }
+
+
+def format_sse_event(event: str, payload: dict[str, Any]) -> str:
+    encoded = json.dumps(_jsonify(payload), separators=(",", ":"))
+    return f"event: {event}\ndata: {encoded}\n\n"
 
 
 class AnalyticsService:
@@ -384,8 +552,8 @@ class AnalyticsService:
             max_block = max(max_block, row["block_number"])
             normalized = units_to_decimal(int(row["value"]), int(row["decimals"]))
             price = price_map.get(normalize_address(row["contract_address"]))
-            usd_value = normalized * price.price if price else Decimal(0)
-            if usd_value < Decimal(str(self.settings.whale_threshold_usd)):
+            usd_value = normalized * price.price if price else None
+            if not _passes_whale_threshold(normalized, usd_value, Decimal(str(self.settings.whale_threshold_usd))):
                 continue
             await self.redis.publish_json(
                 WHALE_TRANSFERS_CHANNEL,
@@ -393,12 +561,14 @@ class AnalyticsService:
                     "block_number": row["block_number"],
                     "tx_hash": row["tx_hash"],
                     "contract_address": normalize_address(row["contract_address"]),
+                    "token_symbol": row["symbol"],
+                    "token_decimals": int(row["decimals"]),
                     "from_address": normalize_address(row["from_address"]),
                     "to_address": normalize_address(row["to_address"]),
-                    "amount": format(normalized, "f"),
-                    "usd_value": format(usd_value, "f"),
+                    "value": format(Decimal(row["value"]), "f"),
+                    "amount_human": format(normalized, "f"),
+                    "usd_value": _decimal_to_float(usd_value),
                     "timestamp": to_iso8601(row["timestamp"]),
-                    "symbol": row["symbol"],
                 },
             )
         await self.state.set_int("whale_detector_block", max_block)
@@ -567,6 +737,431 @@ class AnalyticsService:
         return rows[0] if rows else None
 
 
+async def query_recent_blocks(service: AnalyticsService, limit: int) -> list[dict[str, Any]]:
+    rows = await service.query_all(
+        """
+        WITH recent_blocks AS (
+            SELECT block_number, timestamp, tx_count
+            FROM polygon_blocks
+            ORDER BY block_number DESC
+            LIMIT :limit
+        ),
+        transfer_counts AS (
+            SELECT block_number, count(*) AS transfer_count
+            FROM polygon_token_transfers
+            WHERE block_number IN (SELECT block_number FROM recent_blocks)
+            GROUP BY block_number
+        ),
+        swap_counts AS (
+            SELECT block_number, count(*) AS swap_count
+            FROM polygon_dex_swaps
+            WHERE block_number IN (SELECT block_number FROM recent_blocks)
+            GROUP BY block_number
+        )
+        SELECT
+            b.block_number,
+            b.timestamp,
+            b.tx_count,
+            COALESCE(t.transfer_count, 0) AS transfer_count,
+            COALESCE(s.swap_count, 0) AS swap_count,
+            COALESCE(g.gas_used_pct, 0) AS gas_used_pct
+        FROM recent_blocks b
+        LEFT JOIN transfer_counts t ON t.block_number = b.block_number
+        LEFT JOIN swap_counts s ON s.block_number = b.block_number
+        LEFT JOIN polygon_gas_metrics g ON g.block_number = b.block_number
+        ORDER BY b.block_number DESC
+        """,
+        {"limit": limit},
+    )
+    rows.sort(key=lambda row: int(row["block_number"]), reverse=True)
+    return [build_recent_block_row(row) for row in rows]
+
+
+async def query_block_activity(service: AnalyticsService, block_number: int, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
+    row = await service.query_one(
+        """
+        WITH transfer_counts AS (
+            SELECT count(*) AS transfer_count
+            FROM polygon_token_transfers
+            WHERE block_number = :block_number
+        ),
+        swap_counts AS (
+            SELECT count(*) AS swap_count
+            FROM polygon_dex_swaps
+            WHERE block_number = :block_number
+        )
+        SELECT
+            b.block_number,
+            b.timestamp,
+            b.tx_count,
+            COALESCE((SELECT transfer_count FROM transfer_counts), :fallback_transfer_count) AS transfer_count,
+            COALESCE((SELECT swap_count FROM swap_counts), :fallback_swap_count) AS swap_count,
+            COALESCE(g.gas_used_pct, 0) AS gas_used_pct
+        FROM polygon_blocks b
+        LEFT JOIN polygon_gas_metrics g ON g.block_number = b.block_number
+        WHERE b.block_number = :block_number
+        """,
+        {
+            "block_number": block_number,
+            "fallback_transfer_count": int((fallback or {}).get("transfer_count") or 0),
+            "fallback_swap_count": int((fallback or {}).get("swap_count") or 0),
+        },
+    )
+    if row:
+        return build_recent_block_row(row)
+    return {
+        "block_number": block_number,
+        "timestamp": (fallback or {}).get("timestamp"),
+        "tx_count": 0,
+        "transfer_count": int((fallback or {}).get("transfer_count") or 0),
+        "swap_count": int((fallback or {}).get("swap_count") or 0),
+        "gas_used_pct": 0.0,
+    }
+
+
+async def query_system_totals(service: AnalyticsService) -> dict[str, Any]:
+    row = await service.query_one(
+        """
+        SELECT
+            (SELECT count(*) FROM polygon_blocks) AS total_blocks_indexed,
+            (SELECT count(*) FROM polygon_token_transfers) AS total_transfers_indexed,
+            (SELECT count(*) FROM polygon_contract_events) AS total_events_indexed,
+            (SELECT count(*) FROM polygon_tokens WHERE is_tracked = true) AS tracked_token_count,
+            GREATEST(
+                COALESCE((SELECT max(timestamp) FROM polygon_blocks), TIMESTAMPTZ 'epoch'),
+                COALESCE((SELECT max(timestamp) FROM polygon_token_transfers), TIMESTAMPTZ 'epoch'),
+                COALESCE((SELECT max(timestamp) FROM polygon_gas_metrics), TIMESTAMPTZ 'epoch')
+            ) AS last_updated_at
+        """
+    )
+    if not row:
+        return {
+            "total_blocks_indexed": 0,
+            "total_transfers_indexed": 0,
+            "total_events_indexed": 0,
+            "tracked_token_count": 0,
+            "last_updated_at": None,
+        }
+    last_updated_at = row.get("last_updated_at")
+    if isinstance(last_updated_at, datetime) and last_updated_at == datetime(1970, 1, 1, tzinfo=UTC):
+        row = dict(row)
+        row["last_updated_at"] = None
+    return row
+
+
+async def query_status_snapshot(service: AnalyticsService) -> dict[str, Any]:
+    last_indexed_block = await service.get_latest_block()
+    chain_head = await service.current_chain_head()
+    last_decoded_block = await service.state.get_int("last_decoded_block", 0)
+    last_analytics_block = await service.state.get_int("last_analytics_block", 0)
+    backfill_complete = await service.state.get_bool("backfill_complete", False)
+    backfill_start_block = await service.state.get_int("backfill_start_block", 0)
+    totals = await query_system_totals(service)
+    lag_blocks = (chain_head - last_indexed_block) if chain_head is not None else None
+    backfill_pct = _compute_backfill_pct(
+        backfill_complete=backfill_complete,
+        backfill_start_block=backfill_start_block,
+        last_indexed_block=last_indexed_block,
+        chain_head=chain_head,
+    )
+    return {
+        "chain_head": chain_head,
+        "last_indexed_block": last_indexed_block,
+        "last_decoded_block": last_decoded_block,
+        "last_analytics_block": last_analytics_block,
+        "last_indexed": last_indexed_block,
+        "lag_blocks": lag_blocks,
+        "lag": lag_blocks,
+        "backfill_complete": backfill_complete,
+        "backfill_start_block": backfill_start_block,
+        "backfill_pct": backfill_pct,
+        "total_blocks_indexed": int(totals["total_blocks_indexed"] or 0),
+        "total_transfers_indexed": int(totals["total_transfers_indexed"] or 0),
+        "total_events_indexed": int(totals["total_events_indexed"] or 0),
+        "tracked_token_count": int(totals["tracked_token_count"] or 0),
+        "last_updated_at": totals["last_updated_at"],
+    }
+
+
+async def query_whale_transfers(
+    service: AnalyticsService,
+    *,
+    since_dt: datetime,
+    min_usd: float,
+    limit: int,
+) -> list[dict[str, Any]]:
+    scan_limit = min(max(limit * 50, 500), 5000)
+    rows = await service.query_all(
+        """
+        SELECT
+            t.block_number,
+            t.tx_hash,
+            t.contract_address,
+            t.from_address,
+            t.to_address,
+            t.value,
+            t.timestamp,
+            tok.symbol,
+            tok.decimals
+        FROM polygon_token_transfers t
+        JOIN polygon_tokens tok ON tok.contract_address = t.contract_address
+        WHERE t.timestamp >= :since_dt
+        ORDER BY t.timestamp DESC
+        LIMIT :scan_limit
+        """,
+        {"since_dt": since_dt, "scan_limit": scan_limit},
+    )
+    prices = await service.load_latest_prices()
+    threshold = Decimal(str(min_usd))
+    whales: list[dict[str, Any]] = []
+    for row in rows:
+        payload = build_whale_transfer_payload(
+            row,
+            price=prices.get(normalize_address(row["contract_address"])),
+            min_usd=threshold,
+        )
+        if payload is None:
+            continue
+        whales.append(payload)
+        if len(whales) >= limit:
+            break
+    whales.sort(key=lambda row: row["timestamp"], reverse=True)
+    return whales
+
+
+async def query_overview(service: AnalyticsService) -> dict[str, Any]:
+    status = await query_status_snapshot(service)
+    since_24h = utcnow() - timedelta(hours=24)
+    since_1h = utcnow() - timedelta(hours=1)
+
+    recent_blocks = await query_recent_blocks(service, 40)
+    gas_rows = await service.query_all(
+        """
+        SELECT block_number, base_fee_gwei, gas_used_pct, tx_count, timestamp
+        FROM polygon_gas_metrics
+        ORDER BY block_number DESC
+        LIMIT 100
+        """
+    )
+    token_rows = await service.query_all(
+        """
+        SELECT
+            t.contract_address,
+            t.symbol,
+            t.name,
+            t.decimals,
+            hs.snapshot_date,
+            COALESCE(hs.total_holders, 0) AS total_holders,
+            COALESCE(hs.top10_concentration, 0) AS top10_concentration,
+            COALESCE(hs.top50_concentration, 0) AS top50_concentration,
+            hs.gini_coefficient,
+            COALESCE(stats.recent_activity_1h, 0) AS recent_activity_1h,
+            COALESCE(stats.transfers_24h, 0) AS transfers_24h
+        FROM polygon_tokens t
+        LEFT JOIN LATERAL (
+            SELECT snapshot_date, total_holders, top10_concentration, top50_concentration, gini_coefficient
+            FROM polygon_holder_snapshots hs
+            WHERE hs.contract_address = t.contract_address
+            ORDER BY snapshot_date DESC
+            LIMIT 1
+        ) hs ON true
+        LEFT JOIN LATERAL (
+            SELECT
+                count(*) FILTER (WHERE tr.timestamp >= :since_1h) AS recent_activity_1h,
+                count(*) AS transfers_24h
+            FROM polygon_token_transfers tr
+            WHERE tr.contract_address = t.contract_address
+            AND tr.timestamp >= :since_24h
+        ) stats ON true
+        WHERE t.is_tracked = true
+        ORDER BY stats.transfers_24h DESC, t.symbol, t.contract_address
+        """,
+        {"since_24h": since_24h, "since_1h": since_1h},
+    )
+    recent_transfer_rows = await service.query_all(
+        """
+        SELECT contract_address, value
+        FROM polygon_token_transfers
+        WHERE timestamp >= :since_24h
+        """,
+        {"since_24h": since_24h},
+    )
+    prices = await service.load_latest_prices()
+
+    gas_history_values = [Decimal(row["base_fee_gwei"] or 0) for row in gas_rows]
+    gas_history = [_decimal_to_float(value) or 0.0 for value in reversed(gas_history_values)]
+    current_gas = gas_history_values[0] if gas_history_values else Decimal(0)
+    gas_avg_20 = (
+        sum(gas_history_values[:20], Decimal(0)) / Decimal(min(len(gas_history_values), 20))
+        if gas_history_values
+        else Decimal(0)
+    )
+
+    decimals_by_token = {normalize_address(row["contract_address"]): int(row["decimals"] or 18) for row in token_rows}
+    whale_counts: dict[str, int] = {}
+    threshold = Decimal(str(service.settings.whale_threshold_usd))
+    for row in recent_transfer_rows:
+        contract = normalize_address(row["contract_address"])
+        amount_human = units_to_decimal(int(row["value"]), decimals_by_token.get(contract, 18))
+        price = prices.get(contract)
+        usd_value = amount_human * price.price if price else None
+        if not _passes_whale_threshold(amount_human, usd_value, threshold):
+            continue
+        whale_counts[contract] = whale_counts.get(contract, 0) + 1
+
+    tokens = []
+    for row in token_rows:
+        contract = normalize_address(row["contract_address"])
+        price = prices.get(contract)
+        holder_snapshot = {
+            "snapshot_date": row.get("snapshot_date"),
+            "total_holders": int(row["total_holders"] or 0),
+            "top10_concentration_pct": _ratio_to_pct(row["top10_concentration"]) or 0.0,
+            "top50_concentration_pct": _ratio_to_pct(row.get("top50_concentration")) or 0.0,
+            "gini_coefficient": _decimal_to_float(row.get("gini_coefficient")),
+        }
+        tokens.append(
+            {
+                "contract_address": contract,
+                "symbol": row["symbol"],
+                "name": row["name"],
+                "decimals": int(row["decimals"] or 18),
+                "transfers_24h": int(row["transfers_24h"] or 0),
+                "recent_activity_1h": int(row.get("recent_activity_1h") or 0),
+                "recent_activity_24h": int(row["transfers_24h"] or 0),
+                "latest_price": _decimal_to_string(price.price) if price else None,
+                "price_quote": price.quote_symbol if price else None,
+                "holder_snapshot": holder_snapshot,
+                "total_holders": holder_snapshot["total_holders"],
+                "top10_concentration_pct": holder_snapshot["top10_concentration_pct"],
+                "top50_concentration_pct": holder_snapshot["top50_concentration_pct"],
+                "gini_coefficient": holder_snapshot["gini_coefficient"],
+                "whale_count_24h": whale_counts.get(contract, 0),
+            }
+        )
+
+    gas_current_gwei = _decimal_to_float(current_gas) or 0.0
+    gas_avg_20_block_gwei = _decimal_to_float(gas_avg_20) or 0.0
+    tps_current = _compute_tps(recent_blocks)
+    transfers_per_second = _compute_rate(recent_blocks, "transfer_count")
+    system_summary = {
+        "total_blocks_indexed": status["total_blocks_indexed"],
+        "total_transfers_indexed": status["total_transfers_indexed"],
+        "total_events_indexed": status["total_events_indexed"],
+        "tracked_token_count": status["tracked_token_count"],
+        "last_updated_at": status["last_updated_at"],
+    }
+    pulse = {
+        "block_number": status["last_indexed_block"],
+        "chain_head": status["chain_head"],
+        "lag_blocks": status["lag_blocks"],
+        "backfill_complete": status["backfill_complete"],
+        "backfill_pct": status["backfill_pct"],
+        "gas_current_gwei": gas_current_gwei,
+        "gas_avg_20_block_gwei": gas_avg_20_block_gwei,
+        "tps_current": tps_current,
+        "transfers_per_second": transfers_per_second,
+    }
+
+    return {
+        "status": status,
+        "system_summary": system_summary,
+        "pulse": pulse,
+        "chain_head": status["chain_head"],
+        "last_indexed_block": status["last_indexed_block"],
+        "head_lag_blocks": status["lag_blocks"],
+        "backfill_complete": status["backfill_complete"],
+        "backfill_pct": status["backfill_pct"],
+        "gas_current_gwei": gas_current_gwei,
+        "gas_avg_20_block_gwei": gas_avg_20_block_gwei,
+        "tps_current": tps_current,
+        "transfers_per_second": transfers_per_second,
+        "gas_percentile_rank": _compute_gas_percentile_rank(gas_history_values),
+        "gas_history_100_blocks": gas_history,
+        "total_blocks_indexed": status["total_blocks_indexed"],
+        "total_transfers_indexed": status["total_transfers_indexed"],
+        "total_events_indexed": status["total_events_indexed"],
+        "tracked_token_count": status["tracked_token_count"],
+        "last_updated_at": status["last_updated_at"],
+        "tokens": tokens,
+        "recent_blocks": recent_blocks,
+    }
+
+
+async def build_head_event_payload(service: AnalyticsService, payload: dict[str, Any]) -> dict[str, Any]:
+    block_number = int(payload["block_number"])
+    block_row = await query_block_activity(service, block_number, fallback=payload)
+    recent_blocks = await query_recent_blocks(service, 20)
+    gas_row = await service.query_one(
+        """
+        SELECT
+            g.base_fee_gwei,
+            (
+                SELECT avg(base_fee_gwei)
+                FROM polygon_gas_metrics
+                WHERE block_number >= g.block_number - 20
+            ) AS avg_base_fee_20
+        FROM polygon_gas_metrics g
+        WHERE g.block_number = :block_number
+        """,
+        {"block_number": block_number},
+    )
+    status = await query_status_snapshot(service)
+    return {
+        **block_row,
+        "last_indexed_block": status["last_indexed_block"],
+        "chain_head": status["chain_head"],
+        "last_indexed": status["last_indexed"],
+        "lag_blocks": status["lag_blocks"],
+        "head_lag_blocks": status["lag"],
+        "backfill_complete": status["backfill_complete"],
+        "backfill_pct": status["backfill_pct"],
+        "total_transfers_indexed": status["total_transfers_indexed"],
+        "last_updated_at": status["last_updated_at"],
+        "gas_current_gwei": _decimal_to_float(gas_row["base_fee_gwei"]) if gas_row else 0.0,
+        "gas_avg_20_block_gwei": _decimal_to_float(gas_row["avg_base_fee_20"]) if gas_row else 0.0,
+        "tps_current": _compute_tps(recent_blocks),
+        "transfers_per_second": _compute_rate(recent_blocks, "transfer_count"),
+    }
+
+
+async def stream_sse_events(
+    service: AnalyticsService,
+    *,
+    status_interval_seconds: float = 10.0,
+) -> AsyncIterator[str]:
+    queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
+
+    async def forward_redis() -> None:
+        async for channel, payload in service.redis.subscribe(NEW_BLOCK_CHANNEL, WHALE_TRANSFERS_CHANNEL):
+            if channel == NEW_BLOCK_CHANNEL:
+                await queue.put(("head", await build_head_event_payload(service, payload)))
+            elif channel == WHALE_TRANSFERS_CHANNEL:
+                await queue.put(("whale", normalize_whale_event_payload(payload)))
+
+    async def emit_status() -> None:
+        while True:
+            await queue.put(("status", await query_status_snapshot(service)))
+            await asyncio.sleep(status_interval_seconds)
+
+    redis_task = asyncio.create_task(forward_redis(), name="polygon-sse-forward-redis")
+    status_task = asyncio.create_task(emit_status(), name="polygon-sse-status")
+    try:
+        latest_blocks = await query_recent_blocks(service, 1)
+        if latest_blocks:
+            yield format_sse_event("head", await build_head_event_payload(service, latest_blocks[0]))
+        while True:
+            event, payload = await queue.get()
+            yield format_sse_event(event, payload)
+    finally:
+        redis_task.cancel()
+        status_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await redis_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await status_task
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings("analytics")
     configure_logging(settings.log_level)
@@ -581,6 +1176,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await service.shutdown()
 
     app = FastAPI(title="Polygon Analytics", version="1.0.0", lifespan=lifespan)
+    app.state.analytics_service = service
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
@@ -607,6 +1203,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "whale_detector_block": await service.state.get_int("whale_detector_block", 0),
         }
         return envelope(_jsonify(payload), block=latest_block)
+
+    @app.get("/v1/polygon/overview")
+    async def polygon_overview() -> dict[str, Any]:
+        latest_block = await service.get_latest_block()
+        overview = await query_overview(service)
+        return envelope(_jsonify(overview), block=latest_block)
+
+    @app.get("/v1/polygon/blocks/recent")
+    async def polygon_recent_blocks(limit: int = Query(default=40, ge=1, le=100)) -> dict[str, Any]:
+        latest_block = await service.get_latest_block()
+        rows = await query_recent_blocks(service, limit)
+        return envelope(_jsonify(rows), block=latest_block)
 
     @app.get("/v1/polygon/tokens")
     async def list_tokens() -> dict[str, Any]:
@@ -636,6 +1244,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ORDER BY t.symbol, t.contract_address
             """
         )
+        for row in rows:
+            row["top10_concentration_pct"] = _ratio_to_pct(row.get("top10_concentration"))
+            row["top50_concentration_pct"] = _ratio_to_pct(row.get("top50_concentration"))
         return envelope(_jsonify(rows), block=latest_block)
 
     @app.get("/v1/polygon/tokens/{address}")
@@ -679,12 +1290,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             row = dict(row)
             row["latest_price"] = format(price.price, "f") if price else None
             row["quote_symbol"] = price.quote_symbol if price else None
+            row["top10_concentration_pct"] = _ratio_to_pct(row.get("top10_concentration"))
+            row["top50_concentration_pct"] = _ratio_to_pct(row.get("top50_concentration"))
         return envelope(_jsonify(row or {}), block=latest_block)
 
     @app.get("/v1/polygon/tokens/{address}/holders")
     async def token_holders(address: str, limit: int = Query(default=100, le=500)) -> dict[str, Any]:
         contract = normalize_address(address)
         latest_block = await service.get_latest_block()
+        token_meta = await service.query_one(
+            """
+            SELECT decimals
+            FROM polygon_tokens
+            WHERE contract_address = :contract
+            """,
+            {"contract": contract},
+        )
+        tracked_total_row = await service.query_one(
+            """
+            SELECT COALESCE(sum(balance), 0) AS tracked_total_balance
+            FROM polygon_token_balances
+            WHERE contract_address = :contract
+            AND balance > 0
+            """,
+            {"contract": contract},
+        )
         holders = await service.query_all(
             """
             SELECT wallet_address, balance, last_updated_block, last_updated_at
@@ -706,6 +1336,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             """,
             {"contract": contract},
         )
+        decimals = int((token_meta or {}).get("decimals") or 18)
+        tracked_total_balance = Decimal((tracked_total_row or {}).get("tracked_total_balance") or 0)
+        holders = build_holder_rows(holders, decimals=decimals, tracked_total_balance=tracked_total_balance)
+        if snapshot:
+            snapshot = dict(snapshot)
+            snapshot["top10_concentration_pct"] = _ratio_to_pct(snapshot.get("top10_concentration"))
+            snapshot["top50_concentration_pct"] = _ratio_to_pct(snapshot.get("top50_concentration"))
         return envelope(_jsonify({"holders": holders, "snapshot": snapshot}), block=latest_block)
 
     @app.get("/v1/polygon/tokens/{address}/transfers")
@@ -879,69 +1516,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return envelope(_jsonify(rows), block=latest_block)
 
     @app.get("/v1/polygon/whale-transfers")
-    async def whale_transfers(since: str | None = None, min_usd: float = 10_000.0) -> dict[str, Any]:
+    async def whale_transfers(
+        since: str | None = None,
+        min_usd: float = 10_000.0,
+        limit: int = Query(default=30, ge=1, le=500),
+    ) -> dict[str, Any]:
         latest_block = await service.get_latest_block()
         since_dt = parse_iso8601(since) or (utcnow() - timedelta(days=1))
-        rows = await service.query_all(
-            """
-            SELECT
-                t.block_number,
-                t.tx_hash,
-                t.contract_address,
-                t.from_address,
-                t.to_address,
-                t.value,
-                t.timestamp,
-                tok.symbol,
-                tok.decimals
-            FROM polygon_token_transfers t
-            JOIN polygon_tokens tok ON tok.contract_address = t.contract_address
-            WHERE t.timestamp >= :since_dt
-            ORDER BY t.timestamp DESC
-            LIMIT 2000
-            """,
-            {"since_dt": since_dt},
-        )
-        prices = await service.load_latest_prices()
-        whales = []
-        for row in rows:
-            price = prices.get(normalize_address(row["contract_address"]))
-            if not price:
-                continue
-            amount = units_to_decimal(int(row["value"]), int(row["decimals"]))
-            usd_value = amount * price.price
-            if usd_value < Decimal(str(min_usd)):
-                continue
-            whales.append(
-                {
-                    "block_number": row["block_number"],
-                    "tx_hash": row["tx_hash"],
-                    "contract_address": normalize_address(row["contract_address"]),
-                    "symbol": row["symbol"],
-                    "from_address": normalize_address(row["from_address"]),
-                    "to_address": normalize_address(row["to_address"]),
-                    "amount": amount,
-                    "usd_value": usd_value,
-                    "timestamp": row["timestamp"],
-                    "quote_symbol": price.quote_symbol,
-                }
-            )
-        whales.sort(key=lambda item: Decimal(item["usd_value"]), reverse=True)
-        return envelope(_jsonify(whales[:200]), block=latest_block)
+        whales = await query_whale_transfers(service, since_dt=since_dt, min_usd=min_usd, limit=limit)
+        return envelope(_jsonify(whales), block=latest_block)
 
     @app.get("/v1/polygon/status")
     async def status() -> dict[str, Any]:
         latest_block = await service.get_latest_block()
-        chain_head = await service.current_chain_head()
-        payload = {
-            "last_indexed_block": latest_block,
-            "last_decoded_block": await service.state.get_int("last_decoded_block", 0),
-            "last_analytics_block": await service.state.get_int("last_analytics_block", 0),
-            "chain_head": chain_head,
-            "lag_blocks": (chain_head - latest_block) if chain_head is not None else None,
-            "backfill_complete": await service.state.get_bool("backfill_complete", False),
-            "backfill_start_block": await service.state.get_int("backfill_start_block", 0),
-        }
+        payload = await query_status_snapshot(service)
         return envelope(_jsonify(payload), block=latest_block)
+
+    @app.get("/v1/polygon/stream")
+    async def polygon_stream() -> StreamingResponse:
+        return StreamingResponse(
+            stream_sse_events(service),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     return app
