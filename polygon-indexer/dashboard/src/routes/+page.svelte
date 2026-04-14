@@ -12,7 +12,7 @@
 
   onMount(() => {
     dashboard.bootstrap();
-    return () => dashboard.disconnect();
+    return () => dashboard.destroy();
   });
 </script>
 
@@ -26,7 +26,7 @@
 
 <div class="min-h-screen text-slate-100">
   <ChainPulseBar connected={$dashboard.connected} overview={$dashboard.overview} />
-  <BlockTape blocks={$dashboard.blocks} />
+  <BlockTape blocks={$dashboard.overview?.recent_blocks ?? []} />
 
   <main class="mx-auto flex max-w-[1920px] flex-col gap-4 px-4 py-4 xl:px-6">
     {#if $dashboard.loading}
@@ -55,5 +55,5 @@
     {/if}
   </main>
 
-  <TokenInspectorDrawer drawer={$dashboard.drawer} onClose={dashboard.closeToken} />
+  <TokenInspectorDrawer drawer={$dashboard.inspector} onClose={dashboard.closeToken} />
 </div>
