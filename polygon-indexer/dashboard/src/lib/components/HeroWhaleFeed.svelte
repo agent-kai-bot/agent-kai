@@ -45,6 +45,7 @@
   <div
     bind:this={feedBody}
     class="feed-body thin-scrollbar"
+    role="presentation"
     on:mouseenter={() => (paused = true)}
     on:mouseleave={() => (paused = false)}
   >

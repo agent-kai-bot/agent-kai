@@ -132,10 +132,9 @@ services:
   dashboard:
     build:
       context: ./dashboard
-      dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - "127.0.0.1:3200:80"
+      - "3200:3200"
     depends_on:
       analytics:
         condition: service_healthy

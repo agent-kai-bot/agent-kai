@@ -24,19 +24,39 @@
     }
   }
 
+  function handleBackdropKeydown(event) {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      close();
+    }
+  }
+
   $: if (inspector?.open) {
-    window.addEventListener('keydown', handleKeydown);
+    if (typeof window !== 'undefined') {
+      window.addEventListener('keydown', handleKeydown);
+    }
   } else {
-    window.removeEventListener('keydown', handleKeydown);
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('keydown', handleKeydown);
+    }
   }
 
   onDestroy(() => {
-    window.removeEventListener('keydown', handleKeydown);
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('keydown', handleKeydown);
+    }
   });
 </script>
 
 {#if inspector?.open}
-  <div class="overlay-scrim" transition:fade={{ duration: 180 }} on:click={close}></div>
+  <div
+    class="overlay-scrim"
+    role="button"
+    tabindex="0"
+    transition:fade={{ duration: 180 }}
+    on:click={close}
+    on:keydown={handleBackdropKeydown}
+  ></div>
 
   <aside class="drawer-wrap">
     <section class="drawer panel" transition:fly={{ x: 420, duration: 220 }}>
