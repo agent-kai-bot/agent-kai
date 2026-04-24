@@ -939,6 +939,140 @@ def create_scheduler_tools(scheduler, session):
     ]
 
 
+def create_chart_view_tools(session):
+    """Create chart-view tools bound to the current daemon session.
+
+    Args:
+        session: Daemon ``Session`` instance whose UI state should be
+            inspected or changed.
+
+    Returns:
+        Tools that let the agent inspect and mutate the user's chart.
+    """
+
+    def _get_chart_view() -> dict:
+        """Return the current chart view for this session."""
+        return session.chart_view_payload()
+
+    def _set_chart_view(
+        symbol: str | None = None,
+        timeframe: str | None = None,
+        source: str | None = None,
+        mode: str | None = None,
+    ) -> dict:
+        """Update the current chart view for this session.
+
+        Args:
+            symbol: Optional chart symbol such as ``BTC`` or ``ETH``.
+            timeframe: Optional timeframe such as ``1m``, ``15m`` or ``1h``.
+            source: Optional source, currently ``kai-api`` or ``coinbase``.
+            mode: Optional layout mode: ``full``, ``half``, ``mini`` or
+                ``hide``.
+
+        Returns:
+            Updated chart-view payload.
+        """
+        chart = session.set_chart_view(
+            symbol=symbol,
+            timeframe=timeframe,
+            source=source,
+            mode=mode,
+        )
+        session.save()
+        return chart
+
+    return [
+        StructuredTool.from_function(
+            func=_get_chart_view,
+            name="get_chart_view",
+            description=(
+                "Return the user's current chart view. Use this before "
+                "answering questions about the visible chart or before "
+                "changing only one chart field."
+            ),
+        ),
+        StructuredTool.from_function(
+            func=_set_chart_view,
+            name="set_chart_view",
+            description=(
+                "Change the user's visible chart in the web UI. Inputs are "
+                "optional and can be combined: symbol (e.g. BTC, ETH, "
+                "SOL), timeframe (1m, 5m, 15m, 1h, 4h, 1d, 1w), source "
+                "(kai-api or coinbase), and mode (full, half, mini, hide). "
+                "Use this when the user asks to switch symbols, timeframes, "
+                "sources, or chart size."
+            ),
+        ),
+    ]
+
+
+def create_watchlist_tools(session):
+    """Create watchlist tools bound to the current daemon session.
+
+    Args:
+        session: Daemon ``Session`` instance whose watchlist state should be
+            inspected or changed.
+
+    Returns:
+        Tools that let the agent inspect and mutate the user's watchlist.
+    """
+
+    def _get_watchlist() -> dict:
+        """Return the current watchlist for this session."""
+        return session.watchlist_payload()
+
+    def _add_watchlist_symbol(symbol: str) -> dict:
+        """Add one symbol to the user's watchlist."""
+        watchlist = session.add_watchlist_symbol(symbol)
+        session.save()
+        return watchlist
+
+    def _remove_watchlist_symbol(symbol: str) -> dict:
+        """Remove one symbol from the user's watchlist."""
+        watchlist = session.remove_watchlist_symbol(symbol)
+        session.save()
+        return watchlist
+
+    def _set_watchlist(symbols: list[str]) -> dict:
+        """Replace the user's watchlist with a normalized symbol list."""
+        watchlist = session.set_watchlist_symbols(symbols)
+        session.save()
+        return watchlist
+
+    return [
+        StructuredTool.from_function(
+            func=_get_watchlist,
+            name="get_watchlist",
+            description="Return the user's current web UI watchlist symbols.",
+        ),
+        StructuredTool.from_function(
+            func=_add_watchlist_symbol,
+            name="add_watchlist_symbol",
+            description=(
+                "Add a symbol to the user's web UI watchlist. Input: symbol "
+                "(for example BTC, ETH, SOL, or BIO). Use when the user asks "
+                "to add a coin/token to the watchlist."
+            ),
+        ),
+        StructuredTool.from_function(
+            func=_remove_watchlist_symbol,
+            name="remove_watchlist_symbol",
+            description=(
+                "Remove a symbol from the user's web UI watchlist. Input: "
+                "symbol."
+            ),
+        ),
+        StructuredTool.from_function(
+            func=_set_watchlist,
+            name="set_watchlist",
+            description=(
+                "Replace the user's web UI watchlist. Input: symbols, a list "
+                "of symbols."
+            ),
+        ),
+    ]
+
+
 def create_tools(
     bus=None,
     sub_agent_manager=None,
@@ -947,14 +1081,28 @@ def create_tools(
     session=None,
 ):
     """Create and return all agent tools."""
+    from agent.forgejo_tools import create_forgejo_tools
+    from agent.sdlc_results import create_sdlc_result_tools
     from agent.strategy_agent_tools import create_strategy_tools
+    from agent.taskboard_tools import create_taskboard_tools
 
-    tools = [file_read, file_write, file_edit, shell_exec, python_exec, web_fetch, codex_exec, claude_exec]
+    tools = [
+        file_read,
+        file_write,
+        file_edit,
+        shell_exec,
+        python_exec,
+        web_fetch,
+        codex_exec,
+        claude_exec,
+    ]
     # Main agent ("kai") has no workspace, so the sandbox is fully isolated.
     tools.append(create_docker_sandbox_tool(workspace_host_path=None))
     tools.extend(_get_crypto_tools(signal_consumer=signal_consumer))
     if session is not None:
         tools.extend(create_strategy_tools(session))
+        tools.extend(create_chart_view_tools(session))
+        tools.extend(create_watchlist_tools(session))
     if bus:
         tools.append(create_nats_publish_tool(bus))
         tools.append(create_nats_request_tool(bus))
@@ -963,6 +1111,9 @@ def create_tools(
         tools.append(create_list_agents_tool(sub_agent_manager))
     if scheduler is not None and session is not None:
         tools.extend(create_scheduler_tools(scheduler, session))
+    tools.extend(create_taskboard_tools(getattr(session, "taskboard_context", None)))
+    tools.extend(create_forgejo_tools())
+    tools.extend(create_sdlc_result_tools())
     return tools
 
 
@@ -977,9 +1128,25 @@ def create_sub_agent_tools(bus, workspace_host_path: str | None = None, signal_c
             ``file_write`` and run them sandboxed in the same step.
         signal_consumer: Optional ``SignalConsumer`` for the get_signals tool.
     """
-    tools = [file_read, file_write, file_edit, shell_exec, python_exec, web_fetch, codex_exec, claude_exec]
+    from agent.forgejo_tools import create_forgejo_tools
+    from agent.sdlc_results import create_sdlc_result_tools
+    from agent.taskboard_tools import create_taskboard_tools
+
+    tools = [
+        file_read,
+        file_write,
+        file_edit,
+        shell_exec,
+        python_exec,
+        web_fetch,
+        codex_exec,
+        claude_exec,
+    ]
     tools.append(create_docker_sandbox_tool(workspace_host_path=workspace_host_path))
     tools.extend(_get_crypto_tools(signal_consumer=signal_consumer))
     if bus:
         tools.append(create_nats_publish_tool(bus))
+    tools.extend(create_taskboard_tools())
+    tools.extend(create_forgejo_tools())
+    tools.extend(create_sdlc_result_tools())
     return tools

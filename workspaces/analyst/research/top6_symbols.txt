@@ -1,0 +1,6 @@
+SOL
+ADA
+DOT
+SUI
+ETH
+INJ

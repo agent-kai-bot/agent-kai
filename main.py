@@ -75,10 +75,25 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help="Attach the terminal to the named daemon/session context",
     )
-    parser.add_argument("--name", default=DEFAULT_AGENT, help=f"Agent name (default: {DEFAULT_AGENT})")
+    parser.add_argument(
+        "--name",
+        default=DEFAULT_AGENT,
+        help=f"Agent name (default: {DEFAULT_AGENT})",
+    )
     parser.add_argument("--nats-url", default=NATS_URL, help=f"NATS URL (default: {NATS_URL})")
     parser.add_argument("--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="Override log level from config")
+    parser.add_argument(
+        "--host",
+        default=None,
+        help="Daemon bind host when using --daemon",
+    )
+    parser.add_argument(
+        "--port",
+        default=None,
+        type=int,
+        help="Daemon bind port when using --daemon",
+    )
     return parser
 
 
@@ -96,6 +111,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--remote and --standalone are mutually exclusive")
     if args.session and not args.terminal:
         parser.error("--session requires --terminal")
+    if (args.host is not None or args.port is not None) and not args.daemon:
+        parser.error("--host and --port require --daemon")
 
 
 def _resolve_terminal_session_name(args: argparse.Namespace) -> str:
@@ -112,8 +129,8 @@ async def _run_daemon(args: argparse.Namespace) -> None:
     app = create_app(agent_name=args.name, nats_url=args.nats_url)
     config = uvicorn.Config(
         app=app,
-        host=DEFAULT_DAEMON_HOST,
-        port=DEFAULT_DAEMON_PORT,
+        host=args.host or DEFAULT_DAEMON_HOST,
+        port=args.port or DEFAULT_DAEMON_PORT,
         log_level=(args.log_level or "INFO").lower(),
     )
     server = uvicorn.Server(config)

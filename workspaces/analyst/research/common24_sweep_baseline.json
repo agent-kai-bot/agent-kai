@@ -1,0 +1,13 @@
+{
+  "rows": 9504,
+  "num_symbols": 11,
+  "num_dump_events": 0,
+  "symbol_summary": [],
+  "top_dump_events": [],
+  "top_recovery_symbols": [],
+  "horizons": [
+    3,
+    6,
+    12
+  ]
+}

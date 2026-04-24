@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import re
 import secrets
@@ -23,6 +22,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent_logger import get_logger, log_slash_command
 from agent.signal_consumer import Signal, SignalConsumer
 from agent.strategy_agent_tools import (
     InProcessStrategyRuntime,
@@ -37,8 +37,21 @@ from agent.strategy_agent_tools import (
     show_strategy,
     list_strategies as list_strategy_records,
 )
-from config import DEFAULT_AGENT, NATS_URL
-from daemon.auth import DAEMON_TOKEN_PATH, ensure_daemon_token, is_local_client_host, parse_bearer_token
+from config import (
+    AGENTS,
+    DEFAULT_AGENT,
+    ENDPOINTS,
+    NATS_URL,
+    get_agent_config,
+    list_endpoint_models,
+    set_agent_reasoning_effort,
+)
+from daemon.auth import (
+    DAEMON_TOKEN_PATH,
+    ensure_daemon_token,
+    is_local_client_host,
+    parse_bearer_token,
+)
 from daemon.core import (
     DEFAULT_AUTO_MAX_ITERATIONS,
     MAX_AUTO_ITERATIONS,
@@ -56,6 +69,7 @@ from daemon.protocol import (
     AutoStartedEnvelope,
     AutoStoppedEnvelope,
     ChartBarEnvelope,
+    ChartViewEnvelope,
     ClientEnvelope,
     ErrorEnvelope,
     FinalEnvelope,
@@ -81,10 +95,12 @@ from daemon.protocol import (
     ToolEndEnvelope,
     ToolStartEnvelope,
     UnsubscribeEnvelope,
+    WatchlistEnvelope,
     decode_client_envelope,
     encode_envelope,
 )
 from nats_bus.bus import NatsBus
+from taskboard_gateway.app import create_gateway_app as create_taskboard_gateway_app
 
 DEFAULT_DAEMON_HOST = "127.0.0.1"
 DEFAULT_DAEMON_PORT = 8765
@@ -101,6 +117,10 @@ _SCHEDULE_TOMORROW_PATTERN = re.compile(
     r"^tomorrow(?:\s+(?P<time>.+))?$",
     re.IGNORECASE,
 )
+SNAPSHOT_CHAT_HISTORY_MAX_MESSAGES = 200
+SNAPSHOT_CHAT_HISTORY_MAX_CHARS = 180_000
+TOKEN_FLUSH_INTERVAL_SECONDS = 0.04
+TOKEN_FLUSH_CHARS = 48
 
 
 def _utc_now() -> datetime:
@@ -152,9 +172,15 @@ def _parse_schedule_at_value(raw: str, *, now: datetime | None = None) -> str:
                 microsecond=0,
             )
             return target.isoformat()
-        raise ValueError("unsupported tomorrow time format; use ISO, 'in N minutes', or 'tomorrow 7am'")
+        raise ValueError(
+            "unsupported tomorrow time format; "
+            "use ISO, 'in N minutes', or 'tomorrow 7am'"
+        )
 
-    raise ValueError("unsupported schedule time format; use ISO, 'in N minutes', or 'tomorrow 7am'")
+    raise ValueError(
+        "unsupported schedule time format; "
+        "use ISO, 'in N minutes', or 'tomorrow 7am'"
+    )
 
 
 def _looks_like_web_asset_request(asset_path: str) -> bool:
@@ -165,9 +191,21 @@ def _looks_like_web_asset_request(asset_path: str) -> bool:
     return normalized.startswith("_app/") or "." in tail
 
 
+def _split_slash_command(command_text: str) -> tuple[str, str]:
+    stripped = command_text.strip()
+    if not stripped:
+        return ("", "")
+    command, _, remainder = stripped.partition(" ")
+    return (command, remainder.strip())
+
+
 def _resolve_web_asset_path(build_dir: Path, asset_path: str) -> Path | None:
     normalized = asset_path.strip("/")
-    candidate = (build_dir / normalized).resolve() if normalized else (build_dir / "index.html").resolve()
+    candidate = (
+        (build_dir / normalized).resolve()
+        if normalized
+        else (build_dir / "index.html").resolve()
+    )
     try:
         candidate.relative_to(build_dir.resolve())
     except ValueError:
@@ -219,6 +257,119 @@ def _load_chart_history(
     raise ValueError(f"unsupported chart source '{source}'")
 
 
+def _endpoint_default_model(endpoint_name: str) -> str | None:
+    """Return the configured default model for an endpoint."""
+    endpoint = ENDPOINTS.get(endpoint_name) or {}
+    models = list_endpoint_models(endpoint_name)
+    if endpoint.get("default_model"):
+        return str(endpoint["default_model"])
+    return models[0] if models else None
+
+
+def _normalize_endpoint_ref(ref: Any) -> tuple[str | None, str | None]:
+    """Extract the endpoint and model names from an agent endpoint ref."""
+    if isinstance(ref, str):
+        if "/" in ref:
+            endpoint_name, model_name = ref.split("/", 1)
+            return endpoint_name, model_name
+        return ref, None
+    if isinstance(ref, dict):
+        endpoint_name = ref.get("endpoint") or ref.get("name")
+        model_name = ref.get("model")
+        return (
+            str(endpoint_name) if endpoint_name else None,
+            str(model_name) if model_name else None,
+        )
+    return None, None
+
+
+def _agent_model_summary(
+    agent_name: str,
+    agent_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Return one agent's selected model state for the UI."""
+    resolved = get_agent_config(agent_name)
+    endpoint_cfg = resolved.get("endpoint") or {}
+    endpoint_name, model_name = _normalize_endpoint_ref(agent_config.get("endpoint"))
+    explicit_model = agent_config.get("model")
+    if isinstance(explicit_model, str) and explicit_model:
+        model_name = explicit_model
+    model_name = model_name or endpoint_cfg.get("model") or (
+        _endpoint_default_model(endpoint_name) if endpoint_name else None
+    )
+
+    fallback_refs = agent_config.get("fallback_endpoints")
+    if not isinstance(fallback_refs, list):
+        fallback = agent_config.get("fallback_endpoint")
+        fallback_refs = [fallback] if fallback else []
+
+    fallbacks: list[dict[str, Any]] = []
+    resolved_fallbacks = resolved.get("fallback_endpoints") or []
+    for index, fallback_ref in enumerate(fallback_refs):
+        fallback_endpoint, fallback_model = _normalize_endpoint_ref(fallback_ref)
+        resolved_fallback = (
+            resolved_fallbacks[index]
+            if index < len(resolved_fallbacks)
+            else {}
+        )
+        fallbacks.append(
+            {
+                "endpoint": fallback_endpoint,
+                "model": fallback_model or resolved_fallback.get("model"),
+                "provider": resolved_fallback.get("provider"),
+                "base_url": resolved_fallback.get("base_url"),
+            }
+        )
+
+    return {
+        "name": agent_name,
+        "description": agent_config.get("description", ""),
+        "endpoint": endpoint_name,
+        "model": model_name,
+        "provider": endpoint_cfg.get("provider"),
+        "base_url": endpoint_cfg.get("base_url"),
+        "reasoning_effort": endpoint_cfg.get("reasoning_effort"),
+        "text_verbosity": endpoint_cfg.get("text_verbosity"),
+        "max_iterations": resolved.get("max_iterations"),
+        "fallbacks": fallbacks,
+    }
+
+
+def _serialized_message_length(message: dict[str, str]) -> int:
+    """Return the content length for one serialized chat message."""
+    return len(str(message.get("content", "")))
+
+
+def _recent_serialized_messages(
+    messages: list[dict[str, str]],
+    *,
+    max_messages: int = SNAPSHOT_CHAT_HISTORY_MAX_MESSAGES,
+    max_chars: int = SNAPSHOT_CHAT_HISTORY_MAX_CHARS,
+) -> list[dict[str, str]]:
+    """Return a bounded recent chat-history slice for websocket attach.
+
+    Args:
+        messages: Serialized chat messages ordered oldest to newest.
+        max_messages: Maximum number of messages to return.
+        max_chars: Approximate content-character budget.
+
+    Returns:
+        Recent messages ordered oldest to newest.
+    """
+    selected: list[dict[str, str]] = []
+    total_chars = 0
+    for message in reversed(messages):
+        message_chars = _serialized_message_length(message)
+        if selected and total_chars + message_chars > max_chars:
+            break
+        selected.append(message)
+        total_chars += message_chars
+        if len(selected) >= max_messages:
+            break
+    selected.reverse()
+    return selected
+
+
 class DaemonOHLCVFetcher:
     """Optimizer fetcher backed by the daemon's existing chart-data loaders."""
 
@@ -263,6 +414,7 @@ class ManagedSession:
 
     session: Session
     input_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    current_input_task: asyncio.Task | None = None
 
 
 @dataclass
@@ -279,6 +431,37 @@ class SessionCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1)
+
+
+class ModelSwitchRequest(BaseModel):
+    """Payload for changing an agent's primary model at runtime."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    endpoint: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    reasoning_effort: str | None = Field(default=None, min_length=1)
+
+
+class ChartViewUpdateRequest(BaseModel):
+    """Payload for updating a session chart view."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str | None = None
+    timeframe: str | None = None
+    source: str | None = None
+    mode: str | None = None
+
+
+class WatchlistUpdateRequest(BaseModel):
+    """Payload for updating a session watchlist."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbols: list[str] | None = None
+    add: str | None = None
+    remove: str | None = None
 
 
 class DaemonServer:
@@ -307,7 +490,7 @@ class DaemonServer:
         self.scheduler: Scheduler | None = None
         self.daemon_token = ""
         self.started_at_monotonic: float | None = None
-        self.log = logging.getLogger(__name__)
+        self.log = get_logger("daemon.server")
 
     @staticmethod
     def _default_bus_factory(url: str, agent_name: str) -> NatsBus:
@@ -373,7 +556,11 @@ class DaemonServer:
         visible_session_names = set(self.sessions) | indexed_session_names
         scheduler_jobs = self.scheduler.list_jobs() if self.scheduler is not None else []
         if visible_session_names:
-            scheduler_jobs = [job for job in scheduler_jobs if job.owner_session in visible_session_names]
+            scheduler_jobs = [
+                job
+                for job in scheduler_jobs
+                if job.owner_session in visible_session_names
+            ]
         else:
             scheduler_jobs = []
         scheduler_status_counts = Counter(job.status for job in scheduler_jobs)
@@ -418,9 +605,30 @@ class DaemonServer:
         }
 
     def _is_authorized(self, *, token: str | None, client_host: str | None) -> bool:
-        if token and self.daemon_token and secrets.compare_digest(token, self.daemon_token):
+        if token and self._token_is_accepted(token):
             return True
         return self.allow_unauthenticated_local and is_local_client_host(client_host)
+
+    def _token_is_accepted(self, token: str) -> bool:
+        """Return whether a bearer token is accepted by daemon routes.
+
+        Args:
+            token: Candidate bearer token.
+
+        Returns:
+            True when the token matches the daemon token or configured
+            taskboard/OpenClaw gateway token.
+        """
+
+        for accepted in (
+            self.daemon_token,
+            os.getenv("AGENT_GATEWAY_TOKEN", "").strip(),
+            os.getenv("OPENCLAW_GATEWAY_TOKEN", "").strip(),
+            os.getenv("OPENCLAW_TOKEN", "").strip(),
+        ):
+            if accepted and secrets.compare_digest(token, accepted):
+                return True
+        return False
 
     def require_http_auth(self, request: Request) -> None:
         """Reject unauthorized REST requests."""
@@ -489,6 +697,7 @@ class DaemonServer:
         """Run one input turn through the target session."""
         result = InputRunResult()
         async with managed.input_lock:
+            managed.current_input_task = asyncio.current_task()
             managed.session.set_activity_status("thinking...")
             try:
                 async for event in managed.session.stream_agent_events(
@@ -501,14 +710,138 @@ class DaemonServer:
                         result.final_text = str(event.get("data") or "")
                     elif event.get("type") == "error":
                         result.error = str(event.get("data") or "agent stream failed")
+            except asyncio.CancelledError:
+                result.error = "current LLM stream stopped"
+                managed.session.publish_event("agent.error", {"value": result.error})
+                if managed.session.auto_mode:
+                    managed.session.stop_auto_mode("stopped by user")
             except Exception as exc:  # noqa: BLE001
                 result.error = str(exc)
                 managed.session.publish_event("agent.error", {"value": str(exc)})
             finally:
+                if managed.current_input_task is asyncio.current_task():
+                    managed.current_input_task = None
                 managed.session.set_activity_status("idle")
                 with suppress(Exception):
                     managed.session.save()
         return result
+
+    async def stop_session_run(self, session_name: str) -> dict[str, Any]:
+        """Cancel the current LLM stream for a live session.
+
+        Args:
+            session_name: Name of the session whose active turn should stop.
+
+        Returns:
+            A JSON-serializable summary of the stop request.
+        """
+        managed = self.sessions.get(Session(session_name).name)
+        if managed is None:
+            raise KeyError(f"session '{session_name}' is not live")
+
+        cancelled = False
+        if (
+            managed.current_input_task is not None
+            and not managed.current_input_task.done()
+        ):
+            managed.current_input_task.cancel()
+            cancelled = True
+            await asyncio.sleep(0)
+
+        if managed.session.auto_mode:
+            managed.session.stop_auto_mode("stopped by user")
+
+        if managed.session.input_queue:
+            managed.session.input_queue.clear()
+            managed.session.publish_event("input.dequeued", {"depth": 0})
+
+        managed.session.set_activity_status("idle")
+        return {
+            "session": managed.session.name,
+            "stopped": cancelled,
+            "activity_status": managed.session.activity_status,
+            "queue_depth": len(managed.session.input_queue),
+        }
+
+    def model_registry(self) -> dict[str, Any]:
+        """Return configured agents and endpoint models for UI selection."""
+        endpoint_summaries = []
+        for endpoint_name, endpoint_cfg in sorted(ENDPOINTS.items()):
+            models = list_endpoint_models(endpoint_name)
+            endpoint_summaries.append(
+                {
+                    "name": endpoint_name,
+                    "provider": endpoint_cfg.get("provider", "openai"),
+                    "base_url": endpoint_cfg.get("base_url", ""),
+                    "default_model": _endpoint_default_model(endpoint_name),
+                    "models": models,
+                }
+            )
+        return {
+            "agents": [
+                _agent_model_summary(agent_name, agent_cfg)
+                for agent_name, agent_cfg in sorted(AGENTS.items())
+            ],
+            "endpoints": endpoint_summaries,
+        }
+
+    def switch_agent_model(
+        self,
+        agent_name: str,
+        *,
+        endpoint: str,
+        model: str,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any]:
+        """Switch one configured agent to an endpoint/model pair."""
+        if agent_name not in AGENTS:
+            raise KeyError(f"unknown agent '{agent_name}'")
+        if endpoint not in ENDPOINTS:
+            raise ValueError(f"unknown endpoint '{endpoint}'")
+        available_models = list_endpoint_models(endpoint)
+        if model not in available_models:
+            raise ValueError(
+                f"model '{model}' is not configured for endpoint '{endpoint}'"
+            )
+
+        AGENTS[agent_name]["endpoint"] = endpoint
+        AGENTS[agent_name]["model"] = model
+        if reasoning_effort:
+            set_agent_reasoning_effort(agent_name, reasoning_effort)
+
+        reloaded_sessions: list[dict[str, Any]] = []
+        for session_name, managed in sorted(self.sessions.items()):
+            if managed.session.agent_name != agent_name:
+                continue
+            runner = managed.session.agent_runner
+            reload_llm = getattr(runner, "reload_llm", None)
+            if not callable(reload_llm):
+                continue
+            reload_result = reload_llm()
+            reloaded_sessions.append(
+                {
+                    "session": session_name,
+                    "model": reload_result.get("model"),
+                    "provider": reload_result.get("provider"),
+                    "reasoning_effort": reload_result.get("reasoning_effort"),
+                    "fallback_count": reload_result.get("fallback_count", 0),
+                }
+            )
+
+        selected = _agent_model_summary(agent_name, AGENTS[agent_name])
+        self.log.info(
+            "MODEL_SWITCH agent=%s endpoint=%s model=%s reasoning=%s "
+            "reloaded_sessions=%d",
+            agent_name,
+            endpoint,
+            model,
+            reasoning_effort or AGENTS[agent_name].get("reasoning_effort"),
+            len(reloaded_sessions),
+        )
+        return {
+            "agent": selected,
+            "reloaded_sessions": reloaded_sessions,
+        }
 
     async def publish_daemon_event(self, channel: str, payload: dict[str, Any]) -> None:
         """Publish one daemon-scoped event to scheduler subscribers."""
@@ -694,6 +1027,12 @@ class DaemonServer:
         sub = parts[1].lower() if len(parts) > 1 else ""
 
         if sub == "off":
+            self.log.info(
+                "SLASH_AUTO action=%s budget=%d session=%s",
+                "off",
+                int(session.auto_iterations_remaining or 0),
+                session.name,
+            )
             if not session.auto_mode:
                 return "Auto mode is already off."
             payload = session.stop_auto_mode("stopped by user")
@@ -704,6 +1043,12 @@ class DaemonServer:
             )
 
         if sub == "status":
+            self.log.info(
+                "SLASH_AUTO action=%s budget=%d session=%s",
+                "status",
+                int(session.auto_iterations_remaining or 0),
+                session.name,
+            )
             if not session.auto_mode:
                 return "Auto mode is off."
             payload = session.auto_status_payload()
@@ -717,7 +1062,10 @@ class DaemonServer:
 
         readonly = False
         max_iterations = DEFAULT_AUTO_MAX_ITERATIONS
-        args = [part.lower() if index == 1 else part for index, part in enumerate(parts[1:], start=1)]
+        args = [
+            part.lower() if index == 1 else part
+            for index, part in enumerate(parts[1:], start=1)
+        ]
         if args:
             if args[0] == "readonly":
                 readonly = True
@@ -735,6 +1083,12 @@ class DaemonServer:
         if max_iterations < 1 or max_iterations > MAX_AUTO_ITERATIONS:
             raise ValueError(f"auto iterations must be between 1 and {MAX_AUTO_ITERATIONS}")
 
+        self.log.info(
+            "SLASH_AUTO action=%s budget=%d session=%s",
+            "readonly" if readonly else "start",
+            max_iterations,
+            session.name,
+        )
         payload = session.start_auto_mode(max_iterations=max_iterations, readonly=readonly)
         mode = "readonly" if payload["readonly"] else "standard"
         return (
@@ -764,7 +1118,9 @@ class DaemonServer:
         if sub == "pause":
             return render_strategy_command_result(optimizer_pause(managed.session))
         if sub == "report":
-            return render_strategy_command_result(optimizer_report(managed.session, limit=5))
+            return render_strategy_command_result(
+                optimizer_report(managed.session, limit=5)
+            )
         raise ValueError("usage: /optimizer status|start [N]|pause|report")
 
     async def handle_strategies_command(self, managed: ManagedSession, command_text: str) -> str:
@@ -782,13 +1138,17 @@ class DaemonServer:
 
         if sub == "list":
             pool = parts[2].lower() if len(parts) > 2 else "all"
-            return render_strategy_command_result(list_strategy_records(session, pool=pool))
+            return render_strategy_command_result(
+                list_strategy_records(session, pool=pool)
+            )
 
         if sub == "show":
             if len(parts) < 3:
                 raise ValueError("usage: /strategies show NAME [VERSION]")
             version = int(parts[3]) if len(parts) > 3 else None
-            return render_strategy_command_result(show_strategy(session, name=parts[2], version=version))
+            return render_strategy_command_result(
+                show_strategy(session, name=parts[2], version=version)
+            )
 
         if sub == "propose":
             yaml_str = _extract_command_remainder(command_text, "/strategies", "propose")
@@ -800,22 +1160,30 @@ class DaemonServer:
                 candidate_path = Path(yaml_str).expanduser()
                 if candidate_path.is_file():
                     yaml_str = candidate_path.read_text(encoding="utf-8")
-            return render_strategy_command_result(propose_strategy(session, yaml_str=yaml_str))
+            return render_strategy_command_result(
+                propose_strategy(session, yaml_str=yaml_str)
+            )
 
         if sub == "promote":
             if len(parts) < 3:
                 raise ValueError("usage: /strategies promote NAME")
-            return render_strategy_command_result(move_strategy(session, name=parts[2], to_pool="active"))
+            return render_strategy_command_result(
+                move_strategy(session, name=parts[2], to_pool="active")
+            )
 
         if sub == "demote":
             if len(parts) < 3:
                 raise ValueError("usage: /strategies demote NAME")
-            return render_strategy_command_result(move_strategy(session, name=parts[2], to_pool="candidates"))
+            return render_strategy_command_result(
+                move_strategy(session, name=parts[2], to_pool="candidates")
+            )
 
         if sub == "retire":
             if len(parts) < 3:
                 raise ValueError("usage: /strategies retire NAME")
-            return render_strategy_command_result(move_strategy(session, name=parts[2], to_pool="graveyard"))
+            return render_strategy_command_result(
+                move_strategy(session, name=parts[2], to_pool="graveyard")
+            )
 
         if sub == "lineage":
             if len(parts) < 3:
@@ -934,6 +1302,74 @@ class DaemonServer:
         remove_indexed_session(normalized)
         return {"deleted": True, "name": normalized}
 
+    async def get_session_chart_view(self, name: str) -> dict[str, Any]:
+        """Return the current chart view for a persisted session."""
+        managed = await self.get_or_create_session(name, create_if_missing=False)
+        return {
+            "session": managed.session.name,
+            "chart": managed.session.chart_view_payload(),
+        }
+
+    async def update_session_chart_view(
+        self,
+        name: str,
+        *,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+        source: str | None = None,
+        mode: str | None = None,
+    ) -> dict[str, Any]:
+        """Update a session chart view and persist it.
+
+        Args:
+            name: Session name.
+            symbol: Optional chart symbol.
+            timeframe: Optional chart timeframe.
+            source: Optional chart source.
+            mode: Optional chart layout mode.
+
+        Returns:
+            JSON-ready payload with the updated chart view.
+        """
+        managed = await self.get_or_create_session(name, create_if_missing=False)
+        chart = managed.session.set_chart_view(
+            symbol=symbol,
+            timeframe=timeframe,
+            source=source,
+            mode=mode,
+        )
+        managed.session.save()
+        return {"session": managed.session.name, "chart": chart}
+
+    async def get_session_watchlist(self, name: str) -> dict[str, Any]:
+        """Return the current watchlist for a persisted session."""
+        managed = await self.get_or_create_session(name, create_if_missing=False)
+        return {
+            "session": managed.session.name,
+            "watchlist": managed.session.watchlist_payload(),
+        }
+
+    async def update_session_watchlist(
+        self,
+        name: str,
+        *,
+        symbols: list[str] | None = None,
+        add: str | None = None,
+        remove: str | None = None,
+    ) -> dict[str, Any]:
+        """Update a session watchlist and persist it."""
+        managed = await self.get_or_create_session(name, create_if_missing=False)
+        if symbols is not None:
+            watchlist = managed.session.set_watchlist_symbols(symbols)
+        elif add is not None:
+            watchlist = managed.session.add_watchlist_symbol(add)
+        elif remove is not None:
+            watchlist = managed.session.remove_watchlist_symbol(remove)
+        else:
+            watchlist = managed.session.watchlist_payload()
+        managed.session.save()
+        return {"session": managed.session.name, "watchlist": watchlist}
+
     async def forward_session_events(
         self,
         websocket: WebSocket,
@@ -943,8 +1379,34 @@ class DaemonServer:
     ) -> None:
         """Translate session-bus events into daemon wire messages."""
         tool_start_times: dict[str, float] = {}
+        token_buffer: list[str] = []
+        token_buffer_started = 0.0
+
+        async def flush_tokens() -> None:
+            """Send buffered LLM text to the websocket."""
+            nonlocal token_buffer, token_buffer_started
+            if not token_buffer:
+                return
+            text = "".join(token_buffer)
+            token_buffer = []
+            token_buffer_started = 0.0
+            await _send_server_envelope(
+                websocket,
+                TokenEnvelope(type="token", text=text),
+            )
+
         while True:
-            event = await event_queue.get()
+            if token_buffer:
+                try:
+                    event = await asyncio.wait_for(
+                        event_queue.get(),
+                        timeout=TOKEN_FLUSH_INTERVAL_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    await flush_tokens()
+                    continue
+            else:
+                event = await event_queue.get()
             message = self._event_to_message(
                 session=session,
                 event=event,
@@ -953,6 +1415,20 @@ class DaemonServer:
             )
             if message is None:
                 continue
+            if isinstance(message, TokenEnvelope):
+                if not token_buffer:
+                    token_buffer_started = time.monotonic()
+                token_buffer.append(message.text)
+                buffered_chars = sum(len(item) for item in token_buffer)
+                should_flush = (
+                    buffered_chars >= TOKEN_FLUSH_CHARS
+                    or time.monotonic() - token_buffer_started
+                    >= TOKEN_FLUSH_INTERVAL_SECONDS
+                )
+                if should_flush:
+                    await flush_tokens()
+                continue
+            await flush_tokens()
             await _send_server_envelope(websocket, message)
 
     def _event_to_message(
@@ -1077,6 +1553,33 @@ class DaemonServer:
                 bar=payload.get("bar"),
             )
 
+        if topic == "ui_state.updated":
+            return ChartViewEnvelope(
+                type="chart_view",
+                chart_symbol=str(
+                    payload.get("chart_symbol") or session.ui_state.chart_symbol
+                ),
+                chart_timeframe=str(
+                    payload.get("chart_timeframe") or session.ui_state.chart_timeframe
+                ),
+                chart_source=str(
+                    payload.get("chart_source") or session.ui_state.chart_source
+                ),
+                chart_layout_mode=str(
+                    payload.get("chart_layout_mode")
+                    or session.ui_state.chart_layout_mode
+                ),
+            )
+
+        if topic == "watchlist.updated":
+            return WatchlistEnvelope(
+                type="watchlist",
+                watchlist_symbols=list(
+                    payload.get("watchlist_symbols")
+                    or session.ui_state.watchlist_symbols
+                ),
+            )
+
         if topic == "nats.message":
             if not subscriptions.get("nats"):
                 return None
@@ -1151,6 +1654,8 @@ class DaemonServer:
     @staticmethod
     def session_snapshot(session: Session) -> SessionStateSnapshot:
         """Serialize the attach-time state snapshot for one session."""
+        serialized_history = serialize_messages(session.chat_history)
+        recent_history = _recent_serialized_messages(serialized_history)
         return SessionStateSnapshot(
             chart_symbol=session.ui_state.chart_symbol,
             chart_timeframe=session.ui_state.chart_timeframe,
@@ -1165,7 +1670,9 @@ class DaemonServer:
             auto_iterations_total=int(session.auto_iterations_total),
             auto_iterations_remaining=int(session.auto_iterations_remaining),
             auto_elapsed_seconds=round(session.auto_elapsed_seconds(), 3),
-            chat_history=serialize_messages(session.chat_history),
+            chat_history=recent_history,
+            chat_history_total=len(serialized_history),
+            chat_history_omitted=max(0, len(serialized_history) - len(recent_history)),
         )
 
 
@@ -1208,8 +1715,23 @@ def create_app(
     web_build_dir: str | Path | None = None,
     token_path: str | Path | None = None,
     allow_unauthenticated_local: bool = True,
+    include_taskboard_gateway: bool = True,
 ) -> FastAPI:
-    """Build the FastAPI app that exposes the daemon WebSocket server."""
+    """Build the FastAPI app that exposes the daemon WebSocket server.
+
+    Args:
+        agent_name: Default local agent name for daemon sessions.
+        nats_url: NATS connection URL.
+        bus_factory: Optional bus factory for tests.
+        scheduler_factory: Optional scheduler factory for tests.
+        web_build_dir: Optional static web build directory.
+        token_path: Optional daemon bearer token path.
+        allow_unauthenticated_local: Whether local daemon calls bypass auth.
+        include_taskboard_gateway: Whether to register taskboard gateway routes.
+
+    Returns:
+        Configured FastAPI application.
+    """
     daemon_server = DaemonServer(
         agent_name=agent_name,
         nats_url=nats_url,
@@ -1231,6 +1753,10 @@ def create_app(
     app = FastAPI(lifespan=lifespan)
     build_dir = Path(web_build_dir) if web_build_dir is not None else DEFAULT_WEB_BUILD_DIR
 
+    if include_taskboard_gateway:
+        taskboard_app = create_taskboard_gateway_app()
+        app.router.routes.extend(taskboard_app.router.routes)
+
     @app.get("/api/health")
     async def health_endpoint(request: Request) -> dict[str, Any]:
         daemon_server.require_http_auth(request)
@@ -1245,6 +1771,36 @@ def create_app(
     async def list_sessions_endpoint(request: Request) -> dict[str, Any]:
         daemon_server.require_http_auth(request)
         return {"sessions": daemon_server.list_sessions()}
+
+    @app.get("/api/models")
+    async def model_registry_endpoint(request: Request) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
+        return daemon_server.model_registry()
+
+    @app.post("/api/models/{agent_name}")
+    async def switch_model_endpoint(
+        request: Request,
+        agent_name: str,
+        payload: ModelSwitchRequest,
+    ) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
+        try:
+            return daemon_server.switch_agent_model(
+                agent_name,
+                endpoint=payload.endpoint,
+                model=payload.model,
+                reasoning_effort=payload.reasoning_effort,
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
 
     @app.get("/api/market/watchlist")
     async def watchlist_endpoint(request: Request, symbols: str = "") -> dict[str, Any]:
@@ -1309,7 +1865,10 @@ def create_app(
         return snapshot
 
     @app.post("/api/sessions", status_code=status.HTTP_201_CREATED)
-    async def create_session_endpoint(request: Request, payload: SessionCreateRequest) -> dict[str, Any]:
+    async def create_session_endpoint(
+        request: Request,
+        payload: SessionCreateRequest,
+    ) -> dict[str, Any]:
         daemon_server.require_http_auth(request)
         try:
             session_info = await daemon_server.create_session(payload.name)
@@ -1330,6 +1889,114 @@ def create_app(
         daemon_server.require_http_auth(request)
         try:
             return await daemon_server.delete_session(session_name)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    @app.get("/api/sessions/{session_name}/ui/chart")
+    async def get_session_chart_endpoint(
+        request: Request,
+        session_name: str,
+    ) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
+        try:
+            return await daemon_server.get_session_chart_view(session_name)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    @app.patch("/api/sessions/{session_name}/ui/chart")
+    async def update_session_chart_endpoint(
+        request: Request,
+        session_name: str,
+        payload: ChartViewUpdateRequest,
+    ) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
+        try:
+            return await daemon_server.update_session_chart_view(
+                session_name,
+                symbol=payload.symbol,
+                timeframe=payload.timeframe,
+                source=payload.source,
+                mode=payload.mode,
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    @app.get("/api/sessions/{session_name}/ui/watchlist")
+    async def get_session_watchlist_endpoint(
+        request: Request,
+        session_name: str,
+    ) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
+        try:
+            return await daemon_server.get_session_watchlist(session_name)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    @app.patch("/api/sessions/{session_name}/ui/watchlist")
+    async def update_session_watchlist_endpoint(
+        request: Request,
+        session_name: str,
+        payload: WatchlistUpdateRequest,
+    ) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
+        try:
+            return await daemon_server.update_session_watchlist(
+                session_name,
+                symbols=payload.symbols,
+                add=payload.add,
+                remove=payload.remove,
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    @app.post("/api/sessions/{session_name}/stop")
+    async def stop_session_endpoint(
+        request: Request,
+        session_name: str,
+    ) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
+        try:
+            return await daemon_server.stop_session_run(session_name)
         except KeyError as exc:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1415,6 +2082,8 @@ def create_app(
 
                 if isinstance(payload, InputEnvelope):
                     if payload.text.strip().startswith("/auto"):
+                        command, args = _split_slash_command(payload.text)
+                        log_slash_command(session, command, args, "intercepted:auto")
                         try:
                             response_text = await daemon_server.handle_auto_command(
                                 managed,
@@ -1436,6 +2105,8 @@ def create_app(
                         )
                         continue
                     if payload.text.strip().startswith("/schedule"):
+                        command, args = _split_slash_command(payload.text)
+                        log_slash_command(session, command, args, "intercepted:schedule")
                         try:
                             response_text = await daemon_server.handle_schedule_command(
                                 managed,
@@ -1457,6 +2128,8 @@ def create_app(
                         )
                         continue
                     if payload.text.strip().startswith("/optimizer"):
+                        command, args = _split_slash_command(payload.text)
+                        log_slash_command(session, command, args, "intercepted:optimizer")
                         try:
                             response_text = await daemon_server.handle_optimizer_command(
                                 managed,
@@ -1478,6 +2151,8 @@ def create_app(
                         )
                         continue
                     if payload.text.strip().startswith("/strategies"):
+                        command, args = _split_slash_command(payload.text)
+                        log_slash_command(session, command, args, "intercepted:strategies")
                         try:
                             response_text = await daemon_server.handle_strategies_command(
                                 managed,
@@ -1498,6 +2173,9 @@ def create_app(
                             ),
                         )
                         continue
+                    if payload.text.strip().startswith("/"):
+                        command, args = _split_slash_command(payload.text)
+                        log_slash_command(session, command, args, "forwarded:input")
                     await daemon_server.run_input(managed, payload.text)
                     continue
 
@@ -1506,6 +2184,12 @@ def create_app(
                         command_text = payload.command.strip()
                         if payload.args.strip():
                             command_text = f"{command_text} {payload.args.strip()}"
+                        log_slash_command(
+                            session,
+                            payload.command.strip(),
+                            payload.args.strip(),
+                            "intercepted:auto",
+                        )
                         try:
                             response_text = await daemon_server.handle_auto_command(
                                 managed,
@@ -1530,6 +2214,12 @@ def create_app(
                         command_text = payload.command.strip()
                         if payload.args.strip():
                             command_text = f"{command_text} {payload.args.strip()}"
+                        log_slash_command(
+                            session,
+                            payload.command.strip(),
+                            payload.args.strip(),
+                            "intercepted:schedule",
+                        )
                         try:
                             response_text = await daemon_server.handle_schedule_command(
                                 managed,
@@ -1554,6 +2244,12 @@ def create_app(
                         command_text = payload.command.strip()
                         if payload.args.strip():
                             command_text = f"{command_text} {payload.args.strip()}"
+                        log_slash_command(
+                            session,
+                            payload.command.strip(),
+                            payload.args.strip(),
+                            "intercepted:optimizer",
+                        )
                         try:
                             response_text = await daemon_server.handle_optimizer_command(
                                 managed,
@@ -1578,6 +2274,12 @@ def create_app(
                         command_text = payload.command.strip()
                         if payload.args.strip():
                             command_text = f"{command_text} {payload.args.strip()}"
+                        log_slash_command(
+                            session,
+                            payload.command.strip(),
+                            payload.args.strip(),
+                            "intercepted:strategies",
+                        )
                         try:
                             response_text = await daemon_server.handle_strategies_command(
                                 managed,
@@ -1601,6 +2303,12 @@ def create_app(
                     parts = [payload.command.strip()]
                     if payload.args.strip():
                         parts.append(payload.args.strip())
+                    log_slash_command(
+                        session,
+                        payload.command.strip(),
+                        payload.args.strip(),
+                        "forwarded:slash",
+                    )
                     await daemon_server.run_input(managed, " ".join(parts))
                     continue
 
@@ -1608,11 +2316,10 @@ def create_app(
                     continue
 
                 if isinstance(payload, InterruptEnvelope):
-                    await _send_error(
-                        websocket,
-                        "unsupported",
-                        "interrupt is not implemented yet",
-                    )
+                    try:
+                        await daemon_server.stop_session_run(session.name)
+                    except Exception as exc:  # noqa: BLE001
+                        await _send_error(websocket, "interrupt_failed", str(exc))
                     continue
 
                 if isinstance(payload, SubscribeEnvelope):

@@ -1,6 +1,7 @@
 """LangChain agent core — AgentRunner wrapping AgentExecutor with fallback."""
 
 from contextlib import contextmanager
+import os
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -38,6 +39,34 @@ from config import (
     get_skills_dir,
     get_user_profile_path,
 )
+
+DEFAULT_LLM_HISTORY_MAX_MESSAGES = 80
+DEFAULT_LLM_HISTORY_MAX_CHARS = 80_000
+
+
+def _env_int(name: str, default: int) -> int:
+    """Return a positive integer from an environment variable.
+
+    Args:
+        name: Environment variable name.
+        default: Fallback value when unset or invalid.
+
+    Returns:
+        A positive integer suitable for runtime limits.
+    """
+    try:
+        value = int(os.getenv(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _message_content_length(message: Any) -> int:
+    """Return an approximate text length for a LangChain message."""
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return len(content)
+    return len(str(content)) if content is not None else 0
 
 
 def create_llm(endpoint_cfg=None):
@@ -394,6 +423,7 @@ class AgentRunner:
         self._is_auto_continuation = False
         self._last_auto_pause_reason: str | None = None
         self._last_auto_state: tuple[str, str | None] = ("unknown", None)
+        self._active_llm_chat_history: list[Any] | None = None
 
         cfg = get_agent_config(agent_name) if agent_name else {}
         self._endpoint_cfg = cfg.get("endpoint")
@@ -465,6 +495,65 @@ class AgentRunner:
             return max(1, int(self._auto_iterations_remaining or 1))
         return max(1, int(self._base_max_iterations or 1))
 
+    def _endpoint_log_payload(self) -> dict:
+        """Return the active model selection in log-friendly form."""
+        endpoint_cfg = self._endpoint_cfg or {}
+        return {
+            "provider": endpoint_cfg.get("provider"),
+            "base_url": endpoint_cfg.get("base_url"),
+            "model": endpoint_cfg.get("model"),
+            "reasoning_effort": endpoint_cfg.get("reasoning_effort"),
+            "fallback_chain": [
+                {
+                    "provider": fallback.get("provider"),
+                    "base_url": fallback.get("base_url"),
+                    "model": fallback.get("model"),
+                }
+                for fallback in self._fallback_chain_cfg
+            ],
+        }
+
+    def _chat_history_for_llm(self) -> list[Any]:
+        """Return a bounded chat history for one LLM invocation.
+
+        The session still persists complete chat history on disk, but sending
+        megabytes of prior turns to every request makes short prompts slow and
+        expensive. This keeps the most recent messages within configurable
+        count and character limits.
+
+        Returns:
+            Recent chat messages ordered oldest to newest.
+        """
+        max_messages = _env_int(
+            "AGENT_LLM_HISTORY_MAX_MESSAGES",
+            DEFAULT_LLM_HISTORY_MAX_MESSAGES,
+        )
+        max_chars = _env_int(
+            "AGENT_LLM_HISTORY_MAX_CHARS",
+            DEFAULT_LLM_HISTORY_MAX_CHARS,
+        )
+        selected: list[Any] = []
+        total_chars = 0
+        for message in reversed(self.chat_history):
+            message_chars = _message_content_length(message)
+            if selected and total_chars + message_chars > max_chars:
+                break
+            selected.append(message)
+            total_chars += message_chars
+            if len(selected) >= max_messages:
+                break
+        selected.reverse()
+        omitted = max(0, len(self.chat_history) - len(selected))
+        if omitted:
+            self.log.info(
+                "LLM_HISTORY_TRUNCATED agent=%s kept=%d omitted=%d chars=%d",
+                self.agent_name,
+                len(selected),
+                omitted,
+                total_chars,
+            )
+        return selected
+
     def _rebuild_executors(self) -> None:
         """Rebuild the prompt plus the primary/fallback executors."""
 
@@ -504,6 +593,15 @@ class AgentRunner:
                     exc,
                 )
         self.fallback_executor = self.fallback_executors[0] if self.fallback_executors else None
+        endpoint_payload = self._endpoint_log_payload()
+        self.log.info(
+            "MODEL_SELECTED agent=%s provider=%s model=%s fallback_count=%d",
+            self.agent_name,
+            endpoint_payload.get("provider"),
+            endpoint_payload.get("model"),
+            len(self.fallback_executors),
+        )
+        log_agent_event(self.agent_name, "model_selected", endpoint_payload)
 
     def set_auto_mode(self, enabled: bool, max_iterations: int = 40):
         """Enable/disable auto mode. Rebuilds prompt + executor."""
@@ -518,13 +616,20 @@ class AgentRunner:
         self._rebuild_executors()
 
     def _check_tool_allowed(self, tool_name: str) -> None:
-        if not self._auto_mode:
-            return
         policy = get_tool_policy(tool_name)
-        if self._auto_readonly and not policy.read_only:
-            raise RuntimeError(f"auto readonly blocks non-read-only tool: {tool_name}")
-        if policy.requires_approval_in_auto:
-            raise RuntimeError(f"requires approval for {tool_name}")
+        logger = getattr(self, "log", get_logger(getattr(self, "agent_name", "kai")))
+        allowed = True
+        reason: str | None = None
+        if self._auto_mode:
+            if self._auto_readonly and not policy.read_only:
+                allowed = False
+                reason = f"auto readonly blocks non-read-only tool: {tool_name}"
+            elif policy.requires_approval_in_auto:
+                allowed = False
+                reason = f"requires approval for {tool_name}"
+        logger.info("TOOL_POLICY tool=%s allowed=%s", tool_name, allowed)
+        if not allowed and reason is not None:
+            raise RuntimeError(reason)
 
     def _wrap_tool(self, tool: StructuredTool) -> StructuredTool:
         """Wrap one tool so auto-mode policy checks run before execution."""
@@ -613,6 +718,11 @@ class AgentRunner:
             "endpoint": self._endpoint_cfg.get("base_url") if self._endpoint_cfg else None,
             "model": self._endpoint_cfg.get("model") if self._endpoint_cfg else None,
             "provider": self._endpoint_cfg.get("provider") if self._endpoint_cfg else None,
+            "reasoning_effort": (
+                self._endpoint_cfg.get("reasoning_effort")
+                if self._endpoint_cfg
+                else None
+            ),
             "fallback_count": len(self.fallback_executors),
         }
 
@@ -639,15 +749,31 @@ class AgentRunner:
         """Stream agent events. Falls back to secondary endpoint on error."""
         self._last_auto_pause_reason = None
         self._last_auto_state = ("unknown", None)
+        self.log.info(
+            "RUN auto=%s iter_remaining=%d provider=%s model=%s",
+            bool(getattr(self, "_auto_mode", False)),
+            int(getattr(self, "_auto_iterations_remaining", 0) or 0),
+            (getattr(self, "_endpoint_cfg", None) or {}).get("provider"),
+            (getattr(self, "_endpoint_cfg", None) or {}).get("model"),
+        )
 
         visible_input = not getattr(self, "_is_auto_continuation", False)
         log_input = user_input if visible_input else "[AUTO_CONTINUATION]"
         if visible_input:
             self.chat_history.append(HumanMessage(content=user_input))
+        else:
+            self.log.info("AUTO_HIDDEN_TURN")
         self.log.info("USER_INPUT agent=%s input=%s", self.agent_name, log_input[:200])
+        self._active_llm_chat_history = self._chat_history_for_llm()
 
         # Log the full prompt at DEBUG level
-        log_llm_request(self.agent_name, self.chat_history, input=log_input)
+        log_llm_request(
+            self.agent_name,
+            self._active_llm_chat_history,
+            input=log_input,
+            history_total=len(self.chat_history),
+            history_sent=len(self._active_llm_chat_history),
+        )
 
         accumulated = ""
         final_text = ""
@@ -657,7 +783,11 @@ class AgentRunner:
             getattr(
                 self,
                 "fallback_executors",
-                ([] if getattr(self, "fallback_executor", None) is None else [self.fallback_executor]),
+                (
+                    []
+                    if getattr(self, "fallback_executor", None) is None
+                    else [self.fallback_executor]
+                ),
             )
         )
 
@@ -674,7 +804,10 @@ class AgentRunner:
 
             if not primary_failed and not (final_text or accumulated).strip():
                 primary_failed = True
-                self.log.warning("EMPTY_RESPONSE agent=%s endpoint=primary", self.agent_name)
+                self.log.warning(
+                    "EMPTY_RESPONSE agent=%s endpoint=primary",
+                    self.agent_name,
+                )
                 yield {"type": "error", "data": "Primary endpoint returned an empty response."}
 
         except RuntimeError as e:
@@ -720,8 +853,15 @@ class AgentRunner:
                         primary_failed = True
                 if not primary_failed and not (final_text or accumulated).strip():
                     primary_failed = True
-                    self.log.warning("EMPTY_RESPONSE agent=%s endpoint=%s", self.agent_name, label)
-                    yield {"type": "error", "data": f"Endpoint #{attempt} returned an empty response."}
+                    self.log.warning(
+                        "EMPTY_RESPONSE agent=%s endpoint=%s",
+                        self.agent_name,
+                        label,
+                    )
+                    yield {
+                        "type": "error",
+                        "data": f"Endpoint #{attempt} returned an empty response.",
+                    }
             except RuntimeError as e:
                 if getattr(self, "_auto_mode", False) and (
                     "requires approval for " in str(e)
@@ -731,12 +871,22 @@ class AgentRunner:
                     self._last_auto_state = ("pause", self._last_auto_pause_reason)
                     return
                 primary_failed = True
-                self.log.error("FALLBACK_FAILED agent=%s attempt=%d error=%s", self.agent_name, attempt, str(e))
+                self.log.error(
+                    "FALLBACK_FAILED agent=%s attempt=%d error=%s",
+                    self.agent_name,
+                    attempt,
+                    str(e),
+                )
                 yield {"type": "error", "data": f"Endpoint #{attempt} failed: {e}"}
                 final_text = f"Error: {e}"
             except Exception as e:
                 primary_failed = True
-                self.log.error("FALLBACK_FAILED agent=%s attempt=%d error=%s", self.agent_name, attempt, str(e))
+                self.log.error(
+                    "FALLBACK_FAILED agent=%s attempt=%d error=%s",
+                    self.agent_name,
+                    attempt,
+                    str(e),
+                )
                 yield {"type": "error", "data": f"Endpoint #{attempt} failed: {e}"}
                 final_text = f"Error: {e}"
 
@@ -754,7 +904,12 @@ class AgentRunner:
 
         # Log the full response at DEBUG
         log_llm_response(self.agent_name, response_text)
-        self.log.info("AGENT_RESPONSE agent=%s length=%d", self.agent_name, len(response_text))
+        self.log.info(
+            "AGENT_RESPONSE agent=%s length=%d text=%s",
+            self.agent_name,
+            len(response_text),
+            response_text[:500],
+        )
 
         if self.bus and not getattr(self, "_is_auto_continuation", False):
             try:
@@ -779,8 +934,9 @@ class AgentRunner:
 
     async def _stream_executor(self, executor, user_input):
         """Stream events from an AgentExecutor."""
+        chat_history = self._active_llm_chat_history or self.chat_history
         async for event in executor.astream_events(
-            {"input": user_input, "chat_history": self.chat_history},
+            {"input": user_input, "chat_history": chat_history},
             version="v2",
         ):
             kind = event["event"]

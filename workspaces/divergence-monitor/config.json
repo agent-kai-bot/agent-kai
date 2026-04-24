@@ -1,0 +1,15 @@
+{
+  "symbol": "BTC",
+  "interval": "1m",
+  "parameters": {
+    "rsi_period": 14,
+    "rsi_buy_threshold": 45,
+    "rsi_sell_threshold": 55,
+    "ema_period": 20,
+    "stop_loss_pct": 0.003,
+    "take_profit_pct": 0.006
+  },
+  "alert_subject": "agent.alerts.divergence",
+  "cooldown_seconds": 60,
+  "check_interval_seconds": 60
+}

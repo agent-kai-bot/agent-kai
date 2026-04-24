@@ -11,11 +11,17 @@ services:
     build: .
     ports:
       - "8765:8765"
+      - "18789:8765"
     volumes:
       - ./workspaces:/app/workspaces
       - ./agent-config.json:/app/agent-config.json:ro
     environment:
       - NATS_URL=nats://nats:4222
+      - TASKBOARD_URL=${TASKBOARD_URL:-http://host.docker.internal:8080}
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-}
+      - TASKBOARD_BEARER_TOKEN=${TASKBOARD_BEARER_TOKEN:-}
+      - FORGEJO_URL=${FORGEJO_URL:-}
+      - FORGEJO_TOKEN=${FORGEJO_TOKEN:-}
     depends_on:
       - nats
     restart: unless-stopped

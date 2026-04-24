@@ -1,0 +1,16 @@
+[Unit]
+Description=RSI Divergence Reversal Monitor
+After=network.target nats.service
+
+[Service]
+Type=simple
+User=atc
+WorkingDirectory=/home/atc/git/claude-local-ai-agent/workspaces/divergence-monitor
+ExecStart=/usr/bin/python3 monitor.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

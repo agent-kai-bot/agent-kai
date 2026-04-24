@@ -3,10 +3,9 @@
 
   import {
     chartModeLabel,
-    cycleChartMode,
     normalizeChartMode,
     readStoredChartMode,
-    resolveChartModeCommand,
+    resolveChartCommandInput,
     writeStoredChartMode,
     type ChartMode,
   } from "$lib/chart-mode";
@@ -21,9 +20,21 @@
     DEFAULT_SESSION_NAME,
   } from "$lib/daemon/client";
   import { readStoredToken, writeStoredToken } from "$lib/daemon/storage";
+  import {
+    buildSymbolSuggestions,
+    normalizeMarketSymbol,
+    normalizeSignalAlert,
+    signalChartPatch,
+    signalCountsBySymbol,
+    type SignalAlert,
+  } from "$lib/market-ui";
   import type {
     CandleBar,
     ChatHistoryEntry,
+    ChartViewPatch,
+    ChartViewState,
+    EndpointModelSummary,
+    ModelAgentSummary,
     PortfolioSnapshot,
     ScheduledJobEnvelope,
     ServerEnvelope,
@@ -35,10 +46,12 @@
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import EventPanel, { type EventRow } from "$lib/components/EventPanel.svelte";
   import PositionsPanel from "$lib/components/PositionsPanel.svelte";
+  import SignalPanel from "$lib/components/SignalPanel.svelte";
   import WatchlistPanel from "$lib/components/WatchlistPanel.svelte";
 
   const client = new DaemonClient();
   const localhostHosts = new Set(["localhost", "127.0.0.1", "::1"]);
+  const reasoningChoices = ["none", "minimal", "low", "medium", "high", "xhigh"];
 
   let token = $state("");
   let sessionName = $state(DEFAULT_SESSION_NAME);
@@ -57,6 +70,9 @@
   let chartSymbol = $state("BTC");
   let chartTimeframe = $state("1m");
   let chartSource = $state("kai-api");
+  let symbolSearch = $state("");
+  let symbolSearchOpen = $state(false);
+  let activeSuggestionIndex = $state(0);
   let chatMessages = $state<ChatHistoryEntry[]>([]);
   let streamingReply = $state("");
   let chartQuote = $state<WatchlistQuote | null>(null);
@@ -64,7 +80,8 @@
   let portfolio = $state<PortfolioSnapshot>({ positions: [], pnl: {} });
   let chartBars = $state<CandleBar[]>([]);
   let chartStatus = $state("waiting for a session");
-  let alerts = $state<EventRow[]>([]);
+  let signalAlerts = $state<SignalAlert[]>([]);
+  let selectedSignalId = $state("");
   let natsEvents = $state<EventRow[]>([]);
   let schedulerEvents = $state<EventRow[]>([]);
   let inputDraft = $state("");
@@ -73,17 +90,40 @@
   let paletteItems = $state<CommandPaletteItem[]>(filterPaletteItems(""));
   let pollingHandle: number | null = null;
   let daemonConnection = $state<Awaited<ReturnType<DaemonClient["attach"]>> | null>(null);
+  let modelAgents = $state<ModelAgentSummary[]>([]);
+  let modelEndpoints = $state<EndpointModelSummary[]>([]);
+  let selectedModelAgent = $state("kai");
+  let selectedModelRef = $state("");
+  let selectedReasoningEffort = $state("medium");
+  let modelStatus = $state("model info unavailable");
+  let isSwitchingModel = $state(false);
+  let isStoppingStream = $state(false);
+  let isUpdatingChart = $state(false);
+  let chartUpdateError = $state("");
+  let chartUpdateNotice = $state("");
+  let lastChartUpdateMs = $state<number | null>(null);
+  let streamStartedAt = $state<number | null>(null);
+  let firstTokenAt = $state<number | null>(null);
+  let streamChunkCount = $state(0);
+  let streamCharacterCount = $state(0);
+  let leftPanePct = $state(20);
+  let rightPanePct = $state(20);
+  let chartPanePct = $state(56);
 
   function isScheduledJobEnvelope(envelope: ServerEnvelope): envelope is ScheduledJobEnvelope {
     return envelope.type.startsWith("scheduled_job_");
   }
 
-  function pushRow(
-    items: EventRow[],
-    next: EventRow,
+  function pushRow<T>(
+    items: T[],
+    next: T,
     limit = 8,
-  ): EventRow[] {
+  ): T[] {
     return [next, ...items].slice(0, limit);
+  }
+
+  function nowMs(): number {
+    return typeof performance === "undefined" ? Date.now() : performance.now();
   }
 
   function stopPolling(): void {
@@ -120,6 +160,54 @@
     }
     if (snapshotSummary) {
       snapshotSummary = `${chartSymbol} ${chartTimeframe} · ${chartSource} · chart ${chartMode} · ${chatMessages.length} chat messages`;
+    }
+  }
+
+  function applyChartViewState(chartView: ChartViewState): void {
+    const previousSymbol = chartSymbol;
+    const previousTimeframe = chartTimeframe;
+    const previousSource = chartSource;
+    chartSymbol = chartView.chart_symbol;
+    chartTimeframe = chartView.chart_timeframe;
+    chartSource = chartView.chart_source;
+    syncSymbolSearch();
+    applyChartMode(normalizeChartMode(chartView.chart_layout_mode));
+    if (daemonConnection) {
+      daemonConnection.snapshot.chart_symbol = chartSymbol;
+      daemonConnection.snapshot.chart_timeframe = chartTimeframe;
+      daemonConnection.snapshot.chart_source = chartSource;
+      daemonConnection.snapshot.chart_layout_mode = chartMode;
+    }
+    const changedMarket =
+      previousSymbol !== chartSymbol ||
+      previousTimeframe !== chartTimeframe ||
+      previousSource !== chartSource;
+    if (changedMarket) {
+      void Promise.all([refreshSidebarData(), refreshChartData()]);
+    }
+  }
+
+  async function requestChartViewUpdate(patch: ChartViewPatch): Promise<void> {
+    if (!daemonConnection) {
+      return;
+    }
+    const startedAt = nowMs();
+    isUpdatingChart = true;
+    chartUpdateError = "";
+    chartUpdateNotice = "";
+    try {
+      const response = await client.updateChartView(
+        daemonConnection.session,
+        patch,
+        token,
+      );
+      applyChartViewState(response.chart);
+      lastChartUpdateMs = Math.round(nowMs() - startedAt);
+      chartUpdateNotice = `Updated ${response.chart.chart_symbol} ${response.chart.chart_timeframe}`;
+    } catch (error) {
+      chartUpdateError = error instanceof Error ? error.message : String(error);
+    } finally {
+      isUpdatingChart = false;
     }
   }
 
@@ -160,13 +248,410 @@
     return chartQuote?.price ?? chartBars.at(-1)?.close;
   }
 
-  function setChartModeFromCommand(raw: string): boolean {
+  function symbolSuggestions() {
+    return buildSymbolSuggestions({
+      activeSymbol: chartSymbol,
+      watchlist,
+      quotes: watchlistQuotes,
+      signals: signalAlerts,
+      query: symbolSearch,
+    });
+  }
+
+  function syncSymbolSearch(): void {
+    symbolSearch = chartSymbol;
+    activeSuggestionIndex = 0;
+  }
+
+  function signalCounts(): Record<string, number> {
+    return signalCountsBySymbol(signalAlerts);
+  }
+
+  function chartUpdateLabel(): string {
+    if (isUpdatingChart) {
+      return "Updating chart";
+    }
+    if (chartUpdateError) {
+      return chartUpdateError;
+    }
+    if (chartUpdateNotice) {
+      return lastChartUpdateMs === null
+        ? chartUpdateNotice
+        : `${chartUpdateNotice} in ${lastChartUpdateMs}ms`;
+    }
+    return "Ready";
+  }
+
+  function streamLatencyLabel(): string {
+    if (firstTokenAt !== null && streamStartedAt !== null) {
+      return `${Math.round(firstTokenAt - streamStartedAt)}ms first token`;
+    }
+    if (streamStartedAt !== null && currentStatus !== "idle") {
+      return "waiting for first token";
+    }
+    return "stream idle";
+  }
+
+  function streamThroughputLabel(): string {
+    if (
+      firstTokenAt === null ||
+      streamCharacterCount === 0 ||
+      streamStartedAt === null
+    ) {
+      return "0 chunks";
+    }
+    const elapsedSeconds = Math.max((nowMs() - firstTokenAt) / 1000, 0.1);
+    const charsPerSecond = Math.round(streamCharacterCount / elapsedSeconds);
+    return `${streamChunkCount} chunks · ${charsPerSecond} chars/s`;
+  }
+
+  function chartAnalysisPrompts(): Array<{ label: string; prompt: string }> {
+    const context = `${chartSymbol} ${chartTimeframe} chart from ${chartSource}`;
+    return [
+      {
+        label: "Wyckoff + Fib",
+        prompt: (
+          `Analyze the currently visible ${context} using Wyckoff market ` +
+          "structure and Fibonacci retracement/extension levels. Cover the " +
+          "likely phase, key support/resistance, invalidation level, upside " +
+          "and downside scenarios, confidence, and whether the best action is " +
+          "wait, enter, reduce, or avoid."
+        ),
+      },
+      {
+        label: "Trend Read",
+        prompt: (
+          `Analyze the currently visible ${context} as a trend-following setup. ` +
+          "Focus on trend direction, market structure, moving momentum, volume " +
+          "confirmation, pullback zones, breakout risk, and the cleanest entry " +
+          "and invalidation plan."
+        ),
+      },
+      {
+        label: "Risk Setup",
+        prompt: (
+          `Analyze the currently visible ${context} for a trade decision. ` +
+          "Summarize bullish and bearish evidence, define entry zones, stop " +
+          "placement, targets, reward/risk, position-sizing considerations, " +
+          "and conditions that would make the setup invalid."
+        ),
+      },
+    ];
+  }
+
+  function resetStreamMetrics(): void {
+    streamStartedAt = nowMs();
+    firstTokenAt = null;
+    streamChunkCount = 0;
+    streamCharacterCount = 0;
+  }
+
+  function recordStreamToken(text: string): void {
+    const now = nowMs();
+    if (streamStartedAt === null) {
+      streamStartedAt = now;
+    }
+    if (firstTokenAt === null) {
+      firstTokenAt = now;
+    }
+    streamChunkCount += 1;
+    streamCharacterCount += text.length;
+  }
+
+  function clamp(value: number, minimum: number, maximum: number): number {
+    return Math.min(Math.max(value, minimum), maximum);
+  }
+
+  function dashboardGridStyle(): string {
+    return `--left-pane: ${leftPanePct}%; --right-pane: ${rightPanePct}%;`;
+  }
+
+  function centerColumnStyle(): string {
+    return `--chart-pane: ${chartPanePct}%;`;
+  }
+
+  function resizeColumnPane(event: PointerEvent, pane: "left" | "right"): void {
+    const grid = (event.currentTarget as HTMLElement).parentElement;
+    if (!grid) {
+      return;
+    }
+    const bounds = grid.getBoundingClientRect();
+    const pointerId = event.pointerId;
+    (event.currentTarget as HTMLElement).setPointerCapture(pointerId);
+    const onMove = (moveEvent: PointerEvent) => {
+      const relativeX = clamp(moveEvent.clientX - bounds.left, 0, bounds.width);
+      if (pane === "left") {
+        leftPanePct = clamp((relativeX / bounds.width) * 100, 12, 38);
+      } else {
+        rightPanePct = clamp(
+          ((bounds.width - relativeX) / bounds.width) * 100,
+          12,
+          38,
+        );
+      }
+    };
+    const onEnd = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("pointercancel", onEnd);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onEnd);
+    window.addEventListener("pointercancel", onEnd);
+  }
+
+  function resizeChartPane(event: PointerEvent): void {
+    const column = (event.currentTarget as HTMLElement).parentElement;
+    if (!column) {
+      return;
+    }
+    const bounds = column.getBoundingClientRect();
+    const pointerId = event.pointerId;
+    (event.currentTarget as HTMLElement).setPointerCapture(pointerId);
+    const onMove = (moveEvent: PointerEvent) => {
+      const relativeY = clamp(moveEvent.clientY - bounds.top, 0, bounds.height);
+      chartPanePct = clamp((relativeY / bounds.height) * 100, 24, 74);
+    };
+    const onEnd = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("pointercancel", onEnd);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onEnd);
+    window.addEventListener("pointercancel", onEnd);
+  }
+
+  async function selectChartSymbol(symbol: string): Promise<void> {
+    const target = normalizeMarketSymbol(symbol);
+    if (!target) {
+      return;
+    }
+    chartUpdateError = "";
+    const existingQuote = watchlistQuotes.find((quote) => quote.symbol === target);
+    if (!existingQuote || existingQuote.error) {
+      const [quote] = await client.fetchWatchlistQuotes([target], token);
+      if (!quote || quote.error || typeof quote.price !== "number") {
+        chartUpdateError = `${target} was not found`;
+        symbolSearch = target;
+        symbolSearchOpen = true;
+        return;
+      }
+    }
+    symbolSearchOpen = false;
+    symbolSearch = target;
+    await requestChartViewUpdate({ symbol: target });
+  }
+
+  async function selectSignalAlert(alert: SignalAlert): Promise<void> {
+    selectedSignalId = alert.id;
+    await requestChartViewUpdate(signalChartPatch(alert));
+  }
+
+  async function addWatchlistSymbol(symbol: string): Promise<void> {
+    const target = normalizeMarketSymbol(symbol);
+    if (!target || watchlist.includes(target)) {
+      return;
+    }
+    if (!daemonConnection) {
+      watchlist = [...watchlist, target];
+      return;
+    }
+    const response = await client.updateSessionWatchlist(
+      daemonConnection.session,
+      { add: target },
+      token,
+    );
+    watchlist = response.watchlist.watchlist_symbols;
+    await refreshSidebarData();
+  }
+
+  async function removeWatchlistSymbol(symbol: string): Promise<void> {
+    const target = normalizeMarketSymbol(symbol);
+    if (daemonConnection) {
+      const response = await client.updateSessionWatchlist(
+        daemonConnection.session,
+        { remove: target },
+        token,
+      );
+      watchlist = response.watchlist.watchlist_symbols;
+    } else {
+      watchlist = watchlist.filter((item) => item !== target);
+    }
+    watchlistQuotes = watchlistQuotes.filter((quote) => quote.symbol !== target);
+    await refreshSidebarData();
+  }
+
+  function chartSymbolIsWatched(): boolean {
+    return watchlist.includes(chartSymbol);
+  }
+
+  async function toggleChartSymbolWatchlist(): Promise<void> {
+    if (chartSymbolIsWatched()) {
+      await removeWatchlistSymbol(chartSymbol);
+      chartUpdateNotice = `Removed ${chartSymbol} from watchlist`;
+      return;
+    }
+    await addWatchlistSymbol(chartSymbol);
+    chartUpdateNotice = `Added ${chartSymbol} to watchlist`;
+  }
+
+  function onSymbolSelectorFocusOut(event: FocusEvent): void {
+    const current = event.currentTarget as HTMLElement;
+    const next = event.relatedTarget as Node | null;
+    if (!next || !current.contains(next)) {
+      symbolSearchOpen = false;
+    }
+  }
+
+  function onSymbolSearchKeydown(event: KeyboardEvent): void {
+    if (event.key === "Escape") {
+      symbolSearchOpen = false;
+      syncSymbolSearch();
+      return;
+    }
+    const suggestions = symbolSuggestions();
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      symbolSearchOpen = true;
+      activeSuggestionIndex = Math.min(
+        activeSuggestionIndex + 1,
+        Math.max(suggestions.length - 1, 0),
+      );
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      symbolSearchOpen = true;
+      activeSuggestionIndex = Math.max(activeSuggestionIndex - 1, 0);
+      return;
+    }
+    if (event.key !== "Enter") {
+      return;
+    }
+    event.preventDefault();
+    const activeSuggestion = suggestions[activeSuggestionIndex]?.symbol;
+    const target = activeSuggestion ?? normalizeMarketSymbol(symbolSearch);
+    if (target) {
+      void selectChartSymbol(target);
+    }
+  }
+
+  function modelRefFor(agent: ModelAgentSummary | undefined): string {
+    if (!agent?.endpoint || !agent?.model) {
+      return "";
+    }
+    return `${agent.endpoint}/${agent.model}`;
+  }
+
+  function selectedAgentSummary(): ModelAgentSummary | undefined {
+    return modelAgents.find((agent) => agent.name === selectedModelAgent);
+  }
+
+  function selectedAgentLabel(): string {
+    const agent = selectedAgentSummary();
+    if (!agent) {
+      return "unknown";
+    }
+    return `${agent.name}: ${agent.endpoint ?? "endpoint?"}/${agent.model ?? "model?"} · ${agent.reasoning_effort ?? "default"} thinking`;
+  }
+
+  function modelChoices(): Array<{ value: string; label: string }> {
+    return modelEndpoints.flatMap((endpoint) =>
+      endpoint.models.map((model) => ({
+        value: `${endpoint.name}/${model}`,
+        label: `${endpoint.name} / ${model}`,
+      })),
+    );
+  }
+
+  function syncSelectedModelRef(): void {
+    const agent = selectedAgentSummary();
+    const currentRef = modelRefFor(agent);
+    selectedModelRef = currentRef || modelChoices()[0]?.value || "";
+    selectedReasoningEffort = agent?.reasoning_effort || "medium";
+  }
+
+  function onModelAgentChange(): void {
+    syncSelectedModelRef();
+  }
+
+  async function refreshModelInfo(): Promise<void> {
+    try {
+      const registry = await client.fetchModelRegistry(token);
+      modelAgents = registry.agents;
+      modelEndpoints = registry.endpoints;
+      if (!modelAgents.some((agent) => agent.name === selectedModelAgent)) {
+        selectedModelAgent = modelAgents[0]?.name ?? "kai";
+      }
+      syncSelectedModelRef();
+      modelStatus = `model: ${selectedAgentLabel()}`;
+    } catch (error) {
+      modelStatus = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  async function switchSelectedModel(): Promise<void> {
+    if (!selectedModelAgent || !selectedModelRef || isSwitchingModel) {
+      return;
+    }
+    const [endpoint, ...modelParts] = selectedModelRef.split("/");
+    const model = modelParts.join("/");
+    if (!endpoint || !model) {
+      modelStatus = "select an endpoint and model";
+      return;
+    }
+    isSwitchingModel = true;
+    modelStatus = "switching model...";
+    try {
+      const result = await client.switchAgentModel(
+        selectedModelAgent,
+        endpoint,
+        model,
+        token,
+        selectedReasoningEffort,
+      );
+      await refreshModelInfo();
+      const reloadCount = result.reloaded_sessions.length;
+      modelStatus = `model: ${result.agent.name}: ${endpoint}/${model} · ${result.agent.reasoning_effort ?? selectedReasoningEffort} thinking; reloaded ${reloadCount}`;
+    } catch (error) {
+      modelStatus = error instanceof Error ? error.message : String(error);
+    } finally {
+      isSwitchingModel = false;
+    }
+  }
+
+  async function stopCurrentStream(): Promise<void> {
+    if (!activeSession || isStoppingStream) {
+      return;
+    }
+    isStoppingStream = true;
+    try {
+      await client.stopSession(activeSession, token);
+      daemonConnection?.interrupt();
+      streamingReply = "";
+      currentStatus = "idle";
+    } catch (error) {
+      attachError = error instanceof Error ? error.message : String(error);
+    } finally {
+      isStoppingStream = false;
+    }
+  }
+
+  async function setChartCommandFromInput(raw: string): Promise<boolean> {
     const split = splitSlashInput(raw);
-    const nextMode = resolveChartModeCommand(split.command, split.args);
-    if (!nextMode) {
+    const command = resolveChartCommandInput(split.command, split.args);
+    if (!command) {
       return false;
     }
-    applyChartMode(nextMode);
+    if (command.mode) {
+      await requestChartViewUpdate({ mode: command.mode });
+      return true;
+    }
+    await requestChartViewUpdate({
+      symbol: command.symbol,
+      timeframe: command.timeframe,
+    });
     return true;
   }
 
@@ -249,6 +734,7 @@
     }
 
     if (envelope.type === "token") {
+      recordStreamToken(envelope.text);
       streamingReply += envelope.text;
       return;
     }
@@ -259,15 +745,20 @@
       return;
     }
 
+    if (envelope.type === "chart_view") {
+      applyChartViewState(envelope);
+      return;
+    }
+
+    if (envelope.type === "watchlist") {
+      watchlist = envelope.watchlist_symbols;
+      void refreshSidebarData();
+      return;
+    }
+
     if (envelope.type === "signal") {
-      const symbol = String(envelope.signal.symbol ?? "?");
-      const side = String(envelope.signal.side ?? envelope.signal.direction ?? "signal");
-      const score = envelope.signal.score;
-      alerts = pushRow(alerts, {
-        headline: `${symbol} ${side.toUpperCase()}`,
-        detail: typeof score === "number" ? `score ${score.toFixed(2)}` : "signal received",
-        tone: "positive",
-      });
+      const alert = normalizeSignalAlert(envelope.signal, signalAlerts.length);
+      signalAlerts = pushRow(signalAlerts, alert, 20);
       return;
     }
 
@@ -286,11 +777,6 @@
 
     if (envelope.type === "error") {
       attachError = envelope.message;
-      alerts = pushRow(alerts, {
-        headline: envelope.code,
-        detail: envelope.message,
-        tone: "danger",
-      });
       return;
     }
   }
@@ -303,6 +789,7 @@
       chartSymbol = "BTC";
       chartTimeframe = "1m";
       chartSource = "kai-api";
+      syncSymbolSearch();
       chartQuote = null;
       watchlist = [];
       chatMessages = [];
@@ -312,9 +799,15 @@
     chartSymbol = snapshot.chart_symbol;
     chartTimeframe = snapshot.chart_timeframe;
     chartSource = snapshot.chart_source;
+    syncSymbolSearch();
     restoreChartMode(snapshot.chart_layout_mode);
     watchlist = snapshot.watchlist_symbols;
-    snapshotSummary = `${chartSymbol} ${chartTimeframe} · ${chartSource} · chart ${chartMode} · ${snapshot.chat_history.length} chat messages`;
+    const totalMessages = snapshot.chat_history_total ?? snapshot.chat_history.length;
+    const recentLabel =
+      snapshot.chat_history_omitted && snapshot.chat_history_omitted > 0
+        ? `${snapshot.chat_history.length}/${totalMessages} recent chat messages`
+        : `${totalMessages} chat messages`;
+    snapshotSummary = `${chartSymbol} ${chartTimeframe} · ${chartSource} · chart ${chartMode} · ${recentLabel}`;
     chatMessages = [...snapshot.chat_history];
   }
 
@@ -361,6 +854,7 @@
       queueDepth = daemonConnection.queueDepth;
       connectionStatus = `attached to session ${activeSession}`;
       applySnapshot();
+      await refreshModelInfo();
       await refreshSessions();
       await Promise.all([refreshSidebarData(), refreshChartData()]);
       startPolling();
@@ -391,11 +885,17 @@
     portfolio = { positions: [], pnl: {} };
     chartBars = [];
     chartStatus = "waiting for a session";
-    alerts = [];
+    signalAlerts = [];
+    selectedSignalId = "";
     natsEvents = [];
     schedulerEvents = [];
     chatMessages = [];
     streamingReply = "";
+    streamStartedAt = null;
+    firstTokenAt = null;
+    streamChunkCount = 0;
+    streamCharacterCount = 0;
+    modelStatus = modelAgents.length ? `model: ${selectedAgentLabel()}` : "model info unavailable";
     stopPolling();
   }
 
@@ -404,17 +904,18 @@
     void attachSession();
   }
 
-  function sendMessage(): void {
+  async function sendMessage(): Promise<void> {
     if (!daemonConnection || !inputDraft.trim()) {
       return;
     }
     const text = inputDraft.trim();
     inputDraft = "";
-    if (setChartModeFromCommand(text)) {
+    if (await setChartCommandFromInput(text)) {
       return;
     }
     chatMessages = [...chatMessages, { role: "human", content: text }];
     streamingReply = "";
+    resetStreamMetrics();
     if (text.startsWith("/")) {
       const firstSpace = text.indexOf(" ");
       const command = firstSpace === -1 ? text : text.slice(0, firstSpace);
@@ -425,9 +926,20 @@
     daemonConnection.sendInput(text);
   }
 
+  async function sendPromptPreset(prompt: string): Promise<void> {
+    if (!daemonConnection || !prompt.trim()) {
+      return;
+    }
+    const text = prompt.trim();
+    chatMessages = [...chatMessages, { role: "human", content: text }];
+    streamingReply = "";
+    resetStreamMetrics();
+    daemonConnection.sendInput(text);
+  }
+
   function onInputSubmit(event: SubmitEvent): void {
     event.preventDefault();
-    sendMessage();
+    void sendMessage();
   }
 
   function onInputKeydown(event: KeyboardEvent): void {
@@ -435,15 +947,15 @@
       return;
     }
     event.preventDefault();
-    sendMessage();
+    void sendMessage();
   }
 
-  function executePaletteCommand(raw: string): void {
+  async function executePaletteCommand(raw: string): Promise<void> {
     if (!daemonConnection) {
       return;
     }
     const resolved = resolvePaletteQuery(raw, paletteItems);
-    if (setChartModeFromCommand(resolved)) {
+    if (await setChartCommandFromInput(resolved)) {
       closePalette();
       return;
     }
@@ -459,6 +971,7 @@
       },
     ];
     streamingReply = "";
+    resetStreamMetrics();
     daemonConnection.sendSlash(split.command, split.args);
     closePalette();
   }
@@ -467,6 +980,7 @@
     tokenRequired = !localhostHosts.has(window.location.hostname);
     token = tokenRequired ? readStoredToken() : "";
     void refreshSessions();
+    void refreshModelInfo();
     const onKeydown = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
@@ -476,7 +990,7 @@
         closePalette();
       } else if (paletteOpen && event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
-        executePaletteCommand(paletteQuery);
+        void executePaletteCommand(paletteQuery);
       }
     };
     window.addEventListener("keydown", onKeydown);
@@ -523,30 +1037,57 @@
             <span>session: <strong>{activeSession}</strong></span>
             <span>status: <strong>{currentStatus}</strong></span>
             <span>queue: <strong>{queueDepth}</strong></span>
-            <span class="dashboard-chart-pill">
-              chart:
-              <strong>
-                {chartSymbol} {chartTimeframe} [{chartMode}]
-              </strong>
-              <button
-                aria-label="Cycle chart size"
-                class="chart-mode-toggle"
-                onclick={() => applyChartMode(cycleChartMode(chartMode))}
-                type="button"
-              >
-                {chartModeLabel(chartMode)}
-              </button>
-            </span>
+            <span>model: <strong>{selectedAgentLabel()}</strong></span>
+            <span>chart: <strong>{chartSymbol} {chartTimeframe}</strong></span>
             <span>positions: <strong>{portfolio.positions.length}</strong></span>
             <span>watchlist: <strong>{watchlist.length}</strong></span>
           </div>
         </div>
 
         <div class="dashboard-actions">
+          <div class="model-picker">
+            <select
+              aria-label="Agent"
+              bind:value={selectedModelAgent}
+              onchange={onModelAgentChange}
+            >
+              {#each modelAgents as agent (agent.name)}
+                <option value={agent.name}>{agent.name}</option>
+              {/each}
+            </select>
+            <select aria-label="Model" bind:value={selectedModelRef}>
+              {#each modelChoices() as choice (choice.value)}
+                <option value={choice.value}>{choice.label}</option>
+              {/each}
+            </select>
+            <select aria-label="Thinking level" bind:value={selectedReasoningEffort}>
+              {#each reasoningChoices as effort}
+                <option value={effort}>{effort} thinking</option>
+              {/each}
+            </select>
+            <button
+              class="secondary"
+              disabled={isSwitchingModel || !selectedModelRef}
+              onclick={() => void switchSelectedModel()}
+              type="button"
+            >
+              {#if isSwitchingModel}Switching...{:else}Switch{/if}
+            </button>
+          </div>
+          <button
+            class="danger"
+            disabled={isStoppingStream || currentStatus === "idle"}
+            onclick={() => void stopCurrentStream()}
+            type="button"
+          >
+            {#if isStoppingStream}Stopping...{:else}Stop{/if}
+          </button>
           <button onclick={disconnectSession} type="button">Disconnect</button>
           <button class="secondary" onclick={openPalette} type="button">Ctrl+K</button>
         </div>
       </header>
+
+      <p class="model-status">{modelStatus}</p>
 
       {#if snapshotSummary}
         <p class="dashboard-summary">{snapshotSummary}</p>
@@ -556,13 +1097,176 @@
         <p class="dashboard-error">{attachError}</p>
       {/if}
 
-      <div class="dashboard-grid">
+      <div class="dashboard-grid" style={dashboardGridStyle()}>
         <div class="dashboard-column left">
-          <WatchlistPanel initiallyOpen={false} mobileCollapsible={true} quotes={watchlistQuotes} />
+          <WatchlistPanel
+            activeSymbol={chartSymbol}
+            initiallyOpen={false}
+            mobileCollapsible={true}
+            onAddSymbol={(symbol) => void addWatchlistSymbol(symbol)}
+            onRemoveSymbol={(symbol) => void removeWatchlistSymbol(symbol)}
+            onSelect={(symbol) => void selectChartSymbol(symbol)}
+            quotes={watchlistQuotes}
+            signalCounts={signalCounts()}
+          />
           <PositionsPanel initiallyOpen={false} mobileCollapsible={true} {portfolio} />
         </div>
 
-        <div class="dashboard-column center" data-chart-mode={chartMode}>
+        <button
+          aria-label="Resize left panel"
+          class="pane-resizer left-resizer"
+          onpointerdown={(event) => resizeColumnPane(event, "left")}
+          type="button"
+        ></button>
+
+        <div
+          class="dashboard-column center"
+          data-chart-mode={chartMode}
+          style={centerColumnStyle()}
+        >
+          <section class="chart-toolbar" aria-label="Chart controls">
+            <div class="chart-toolbar-main">
+              <div class="symbol-combobox" onfocusout={onSymbolSelectorFocusOut}>
+                <label for="chart-symbol-search">Symbol</label>
+                <input
+                  id="chart-symbol-search"
+                  aria-activedescendant={symbolSearchOpen ? `symbol-option-${activeSuggestionIndex}` : undefined}
+                  aria-autocomplete="list"
+                  aria-controls="symbol-results"
+                  aria-expanded={symbolSearchOpen}
+                  aria-haspopup="listbox"
+                  bind:value={symbolSearch}
+                  onfocus={() => {
+                    symbolSearchOpen = true;
+                    syncSymbolSearch();
+                  }}
+                  oninput={() => {
+                    symbolSearchOpen = true;
+                    activeSuggestionIndex = 0;
+                  }}
+                  onkeydown={onSymbolSearchKeydown}
+                  placeholder="BTC"
+                  role="combobox"
+                  type="search"
+                />
+                {#if symbolSearchOpen}
+                  <div class="symbol-results" id="symbol-results" role="listbox">
+                    {#if symbolSuggestions().length}
+                      {#each symbolSuggestions() as suggestion, index (suggestion.symbol)}
+                        <button
+                          id={`symbol-option-${index}`}
+                          class:active={index === activeSuggestionIndex}
+                          aria-selected={index === activeSuggestionIndex}
+                          onclick={() => void selectChartSymbol(suggestion.symbol)}
+                          role="option"
+                          type="button"
+                        >
+                          <strong>{suggestion.symbol}</strong>
+                          <span>{suggestion.source}</span>
+                        </button>
+                      {/each}
+                    {:else if normalizeMarketSymbol(symbolSearch)}
+                      <button
+                        class="active"
+                        aria-selected="true"
+                        onclick={() => void selectChartSymbol(symbolSearch)}
+                        role="option"
+                        type="button"
+                      >
+                        <strong>{normalizeMarketSymbol(symbolSearch)}</strong>
+                        <span>custom</span>
+                      </button>
+                    {:else}
+                      <p>No symbols</p>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+
+              <div class="timeframe-group" aria-label="Chart timeframe">
+                {#each ["1m", "5m", "15m", "1h", "4h", "1d", "1w"] as timeframe}
+                  <button
+                    class:active={timeframe === chartTimeframe}
+                    disabled={isUpdatingChart}
+                    onclick={() => void requestChartViewUpdate({ timeframe })}
+                    type="button"
+                  >
+                    {timeframe}
+                  </button>
+                {/each}
+              </div>
+
+              <label class="source-select">
+                <span>Source</span>
+                <select
+                  disabled={isUpdatingChart}
+                  value={chartSource}
+                  onchange={(event) => void requestChartViewUpdate({
+                    source: event.currentTarget.value,
+                  })}
+                >
+                  <option value="kai-api">kai-api</option>
+                  <option value="coinbase">coinbase</option>
+                </select>
+              </label>
+
+              <div class="mode-group" aria-label="Chart size">
+                {#each ["full", "half", "mini", "hide"] as mode}
+                  <button
+                    class:active={mode === chartMode}
+                    disabled={isUpdatingChart}
+                    onclick={() => void requestChartViewUpdate({ mode })}
+                    type="button"
+                  >
+                    {chartModeLabel(normalizeChartMode(mode))}
+                  </button>
+                {/each}
+              </div>
+
+              <button
+                aria-label={chartSymbolIsWatched()
+                  ? `Remove ${chartSymbol} from watchlist`
+                  : `Add ${chartSymbol} to watchlist`}
+                aria-pressed={chartSymbolIsWatched()}
+                class:active={chartSymbolIsWatched()}
+                class="toolbar-star"
+                onclick={() => void toggleChartSymbolWatchlist()}
+                title={chartSymbolIsWatched()
+                  ? `Remove ${chartSymbol} from watchlist`
+                  : `Add ${chartSymbol} to watchlist`}
+                type="button"
+              >
+                {#if chartSymbolIsWatched()}★{:else}☆{/if}
+              </button>
+
+              <button
+                class="toolbar-refresh"
+                disabled={isUpdatingChart}
+                onclick={() => void Promise.all([refreshSidebarData(), refreshChartData()])}
+                type="button"
+              >
+                Refresh
+              </button>
+            </div>
+
+            <div
+              class:error={Boolean(chartUpdateError)}
+              class:pending={isUpdatingChart}
+              class="chart-toolbar-status"
+            >
+              <span>{chartUpdateLabel()}</span>
+              <span>{formatPrice(chartPrice())}</span>
+              <span
+                class:negative={Boolean(chartQuote && typeof chartQuote.price_change_24h_pct === "number" && chartQuote.price_change_24h_pct < 0)}
+                class:positive={Boolean(chartQuote && typeof chartQuote.price_change_24h_pct === "number" && chartQuote.price_change_24h_pct > 0)}
+              >
+                {formatChange(chartQuote?.price_change_24h_pct)}
+              </span>
+              <span>{streamLatencyLabel()}</span>
+              <span>{streamThroughputLabel()}</span>
+            </div>
+          </section>
+
           {#if chartMode === "hide"}
             <section class="chart-status-bar">
               <div class="chart-status-copy">
@@ -575,7 +1279,10 @@
                   {formatChange(chartQuote?.price_change_24h_pct)}
                 </span>
               </div>
-              <button onclick={() => applyChartMode(lastVisibleChartMode)} type="button">
+              <button
+                onclick={() => void requestChartViewUpdate({ mode: lastVisibleChartMode })}
+                type="button"
+              >
                 Show Chart
               </button>
             </section>
@@ -592,6 +1299,13 @@
             />
           {/if}
 
+          <button
+            aria-label="Resize chart and chat panels"
+            class="pane-resizer row-resizer"
+            onpointerdown={resizeChartPane}
+            type="button"
+          ></button>
+
           <ChatPanel
             initiallyOpen={false}
             messages={chatMessages}
@@ -600,6 +1314,17 @@
           />
 
           <form class="chat-input" onsubmit={onInputSubmit}>
+            <div class="prompt-presets" aria-label="Chart analysis prompts">
+              {#each chartAnalysisPrompts() as preset}
+                <button
+                  disabled={!daemonConnection}
+                  onclick={() => void sendPromptPreset(preset.prompt)}
+                  type="button"
+                >
+                  {preset.label}
+                </button>
+              {/each}
+            </div>
             <textarea
               bind:value={inputDraft}
               onkeydown={onInputKeydown}
@@ -610,15 +1335,21 @@
           </form>
         </div>
 
+        <button
+          aria-label="Resize right panel"
+          class="pane-resizer right-resizer"
+          onpointerdown={(event) => resizeColumnPane(event, "right")}
+          type="button"
+        ></button>
+
         <div class="dashboard-column right">
-          <EventPanel
-            eyebrow="Signals"
-            emptyMessage="No alert envelopes yet."
+          <SignalPanel
+            activeSymbol={chartSymbol}
+            alerts={signalAlerts}
             initiallyOpen={false}
-            items={alerts}
             mobileCollapsible={true}
-            subtitle={`${alerts.length} recent`}
-            title="Alerts"
+            onSelect={(alert) => void selectSignalAlert(alert)}
+            selectedId={selectedSignalId}
           />
           <EventPanel
             eyebrow="Bus"

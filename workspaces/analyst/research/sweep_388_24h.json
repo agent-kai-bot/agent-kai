@@ -1,0 +1,70 @@
+{
+  "rows": 11271,
+  "num_symbols": 39,
+  "num_dump_events": 1,
+  "horizons": [
+    3,
+    6,
+    12
+  ],
+  "symbol_summary": [
+    {
+      "symbol": "TRIA",
+      "dump_event_count": 1,
+      "worst_dump_body_pct": -0.0142,
+      "max_vol_ratio": 2.6194,
+      "max_vol_z": 3.6734,
+      "closest_lower_bb_dist": -0.0055,
+      "avg_dump_severity": 10.974,
+      "max_dump_severity": 10.974,
+      "bb_mid_reclaim_rate": 0.0,
+      "ema_fast_reclaim_rate": 100.0,
+      "lower_low_rate": 100.0,
+      "fwd_ret_3_mean_pct": -0.4333,
+      "fwd_ret_3_median_pct": -0.4333,
+      "fwd_ret_6_mean_pct": 0.0481,
+      "fwd_ret_6_median_pct": 0.0481,
+      "fwd_ret_12_mean_pct": -0.7703,
+      "fwd_ret_12_median_pct": -0.7703,
+      "recovery_score": 10.8184
+    }
+  ],
+  "top_recovery_symbols": [
+    {
+      "symbol": "TRIA",
+      "dump_event_count": 1,
+      "worst_dump_body_pct": -0.0142,
+      "max_vol_ratio": 2.6194,
+      "max_vol_z": 3.6734,
+      "closest_lower_bb_dist": -0.0055,
+      "avg_dump_severity": 10.974,
+      "max_dump_severity": 10.974,
+      "bb_mid_reclaim_rate": 0.0,
+      "ema_fast_reclaim_rate": 100.0,
+      "lower_low_rate": 100.0,
+      "fwd_ret_3_mean_pct": -0.4333,
+      "fwd_ret_3_median_pct": -0.4333,
+      "fwd_ret_6_mean_pct": 0.0481,
+      "fwd_ret_6_median_pct": 0.0481,
+      "fwd_ret_12_mean_pct": -0.7703,
+      "fwd_ret_12_median_pct": -0.7703,
+      "recovery_score": 10.8184
+    }
+  ],
+  "top_dump_events": [
+    {
+      "ts": "2026-04-10 19:25:00+00:00",
+      "symbol": "TRIA",
+      "close": 0.0208,
+      "body_pct": -0.0142,
+      "vol_ratio": 2.6194,
+      "vol_z": 3.6734,
+      "dist_from_bb_lower": -0.0055,
+      "lower_wick_frac": 0.1667,
+      "dump_severity": 10.974,
+      "fwd_ret_3": -0.4333,
+      "fwd_ret_6": 0.0481,
+      "fwd_ret_12": -0.7703
+    }
+  ]
+}

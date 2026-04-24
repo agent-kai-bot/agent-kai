@@ -41,6 +41,7 @@ COPY main.py .
 COPY agent-config.json .
 COPY agent/ agent/
 COPY daemon/ daemon/
+COPY taskboard_gateway/ taskboard_gateway/
 COPY tui/ tui/
 COPY bin/ bin/
 COPY deploy/ deploy/
@@ -48,7 +49,8 @@ COPY deploy/ deploy/
 # Create workspaces dir (will be mounted as volume)
 RUN mkdir -p workspaces/strategies workspaces/sessions
 
-# Default port for the daemon
+# Default daemon port. Docker Compose may map 18789 to this same daemon app
+# for OpenClaw/taskboard compatibility.
 EXPOSE 8765
 
 # Health check

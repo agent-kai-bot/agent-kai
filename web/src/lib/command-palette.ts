@@ -48,7 +48,7 @@ export const PALETTE_ITEMS: CommandPaletteItem[] = [
   },
   {
     command: "/chart BTC 1h",
-    description: "Ask the session to analyze a specific chart setup.",
+    description: "Switch the chart to BTC on the 1h timeframe.",
   },
 ];
 

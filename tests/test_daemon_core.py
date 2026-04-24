@@ -121,6 +121,45 @@ class SessionEventBusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status_event.topic, "status.updated")
         self.assertEqual(status_event.session_name, "alpha")
 
+    async def test_chart_view_updates_publish_to_session_bus(self):
+        session = Session("alpha")
+        events = session.subscribe_events("ui_state.updated")
+
+        chart = session.set_chart_view(
+            symbol="eth",
+            timeframe="15m",
+            source="coinbase",
+            mode="mini",
+        )
+        event = await asyncio.wait_for(events.get(), timeout=0.1)
+
+        self.assertEqual(chart["chart_symbol"], "ETH")
+        self.assertEqual(chart["chart_timeframe"], "15m")
+        self.assertEqual(chart["chart_source"], "coinbase")
+        self.assertEqual(chart["chart_layout_mode"], "mini")
+        self.assertEqual(event.topic, "ui_state.updated")
+        self.assertEqual(event.payload["chart_symbol"], "ETH")
+
+    def test_chart_view_rejects_invalid_fields(self):
+        session = Session("alpha")
+
+        with self.assertRaises(ValueError):
+            session.set_chart_view(timeframe="2m")
+
+    async def test_watchlist_updates_publish_to_session_bus(self):
+        session = Session("alpha")
+        events = session.subscribe_events("watchlist.updated")
+
+        watchlist = session.add_watchlist_symbol("bio")
+        event = await asyncio.wait_for(events.get(), timeout=0.1)
+
+        self.assertIn("BIO", watchlist["watchlist_symbols"])
+        self.assertEqual(event.topic, "watchlist.updated")
+        self.assertIn("BIO", event.payload["watchlist_symbols"])
+
+        replaced = session.set_watchlist_symbols(["eth", "bio", "ETH"])
+        self.assertEqual(replaced["watchlist_symbols"], ["ETH", "BIO"])
+
     async def test_stream_agent_events_republishes_runner_events(self):
         session = Session("alpha")
         token_events = session.subscribe_events("agent.token")

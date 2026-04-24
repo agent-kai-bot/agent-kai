@@ -1,5 +1,11 @@
 import type {
   CandleBar,
+  ChartViewPatch,
+  ChartViewResponse,
+  WatchlistPatch,
+  WatchlistResponse,
+  ModelRegistryResponse,
+  ModelSwitchResponse,
   PortfolioSnapshot,
   ServerEnvelope,
   SessionAttachedEnvelope,
@@ -125,6 +131,10 @@ export class DaemonConnection {
     );
   }
 
+  interrupt(): void {
+    this.socket.send(JSON.stringify({ type: "interrupt" }));
+  }
+
   subscribe(channel: "chart" | "signals" | "nats", symbol?: string, tf?: string): void {
     this.socket.send(
       JSON.stringify({
@@ -146,6 +156,13 @@ export class DaemonConnection {
     } else if (envelope.type === "status") {
       this.activityStatus = envelope.activity;
       this.queueDepth = envelope.queue;
+    } else if (envelope.type === "chart_view") {
+      this.snapshot.chart_symbol = envelope.chart_symbol;
+      this.snapshot.chart_timeframe = envelope.chart_timeframe;
+      this.snapshot.chart_source = envelope.chart_source;
+      this.snapshot.chart_layout_mode = envelope.chart_layout_mode;
+    } else if (envelope.type === "watchlist") {
+      this.snapshot.watchlist_symbols = envelope.watchlist_symbols;
     }
     this.onEnvelope?.(envelope);
   }
@@ -167,8 +184,41 @@ export class DaemonClient {
       options?.webSocketFactory ?? ((url: string) => new WebSocket(url));
   }
 
-  private async requestJson(path: string, token = ""): Promise<JsonRecord> {
+  private async requestJson(
+    path: string,
+    token = "",
+    init: RequestInit = {},
+  ): Promise<JsonRecord> {
+    const headers = {
+      ...(buildAuthHeaders(token) ?? {}),
+      ...(init.headers ?? {}),
+    };
     const response = await this.fetchImpl(`${this.baseHttpUrl}${path}`, {
+      ...init,
+      headers,
+    });
+    if (!response.ok) {
+      throw new Error(`${path} failed (${response.status})`);
+    }
+    const payload = (await response.json()) as unknown;
+    return payload && typeof payload === "object" ? (payload as JsonRecord) : {};
+  }
+
+  private async postJson(
+    path: string,
+    payload: JsonRecord,
+    token = "",
+  ): Promise<JsonRecord> {
+    return this.requestJson(path, token, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  private async postEmpty(path: string, token = ""): Promise<JsonRecord> {
+    const response = await this.fetchImpl(`${this.baseHttpUrl}${path}`, {
+      method: "POST",
       headers: buildAuthHeaders(token),
     });
     if (!response.ok) {
@@ -178,11 +228,131 @@ export class DaemonClient {
     return payload && typeof payload === "object" ? (payload as JsonRecord) : {};
   }
 
+  private async patchJson(
+    path: string,
+    payload: JsonRecord,
+    token = "",
+  ): Promise<JsonRecord> {
+    return this.requestJson(path, token, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+
   async listSessions(token = ""): Promise<SessionSummary[]> {
     const payload = (await this.requestJson("/api/sessions", token)) as {
       sessions?: SessionSummary[];
     };
     return Array.isArray(payload.sessions) ? payload.sessions : [];
+  }
+
+  async fetchModelRegistry(token = ""): Promise<ModelRegistryResponse> {
+    const payload = (await this.requestJson("/api/models", token)) as Partial<ModelRegistryResponse>;
+    return {
+      agents: Array.isArray(payload.agents) ? payload.agents : [],
+      endpoints: Array.isArray(payload.endpoints) ? payload.endpoints : [],
+    };
+  }
+
+  async switchAgentModel(
+    agentName: string,
+    endpoint: string,
+    model: string,
+    token = "",
+    reasoningEffort?: string,
+  ): Promise<ModelSwitchResponse> {
+    const body = reasoningEffort
+      ? { endpoint, model, reasoning_effort: reasoningEffort }
+      : { endpoint, model };
+    const payload = (await this.postJson(
+      `/api/models/${encodeURIComponent(agentName)}`,
+      body,
+      token,
+    )) as Partial<ModelSwitchResponse>;
+    return {
+      agent: payload.agent ?? { name: agentName, endpoint, model },
+      reloaded_sessions: Array.isArray(payload.reloaded_sessions)
+        ? payload.reloaded_sessions
+        : [],
+    };
+  }
+
+  async stopSession(sessionName: string, token = ""): Promise<JsonRecord> {
+    return this.postEmpty(
+      `/api/sessions/${encodeURIComponent(sessionName)}/stop`,
+      token,
+    );
+  }
+
+  async fetchChartView(
+    sessionName: string,
+    token = "",
+  ): Promise<ChartViewResponse> {
+    const payload = (await this.requestJson(
+      `/api/sessions/${encodeURIComponent(sessionName)}/ui/chart`,
+      token,
+    )) as Partial<ChartViewResponse>;
+    return {
+      session: payload.session ?? sessionName,
+      chart: payload.chart ?? {
+        chart_symbol: "BTC",
+        chart_timeframe: "1m",
+        chart_source: "kai-api",
+        chart_layout_mode: "full",
+      },
+    };
+  }
+
+  async updateChartView(
+    sessionName: string,
+    patch: ChartViewPatch,
+    token = "",
+  ): Promise<ChartViewResponse> {
+    const payload = (await this.patchJson(
+      `/api/sessions/${encodeURIComponent(sessionName)}/ui/chart`,
+      patch,
+      token,
+    )) as Partial<ChartViewResponse>;
+    return {
+      session: payload.session ?? sessionName,
+      chart: payload.chart ?? {
+        chart_symbol: "BTC",
+        chart_timeframe: "1m",
+        chart_source: "kai-api",
+        chart_layout_mode: "full",
+      },
+    };
+  }
+
+  async fetchSessionWatchlist(
+    sessionName: string,
+    token = "",
+  ): Promise<WatchlistResponse> {
+    const payload = (await this.requestJson(
+      `/api/sessions/${encodeURIComponent(sessionName)}/ui/watchlist`,
+      token,
+    )) as Partial<WatchlistResponse>;
+    return {
+      session: payload.session ?? sessionName,
+      watchlist: payload.watchlist ?? { watchlist_symbols: [] },
+    };
+  }
+
+  async updateSessionWatchlist(
+    sessionName: string,
+    patch: WatchlistPatch,
+    token = "",
+  ): Promise<WatchlistResponse> {
+    const payload = (await this.patchJson(
+      `/api/sessions/${encodeURIComponent(sessionName)}/ui/watchlist`,
+      patch,
+      token,
+    )) as Partial<WatchlistResponse>;
+    return {
+      session: payload.session ?? sessionName,
+      watchlist: payload.watchlist ?? { watchlist_symbols: [] },
+    };
   }
 
   async fetchWatchlistQuotes(

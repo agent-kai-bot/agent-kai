@@ -58,6 +58,22 @@ def get_logger(name: str) -> logging.Logger:
 
 # ── Convenience loggers for common patterns ──────────────────
 
+def _coerce_session_name(session) -> str:
+    if hasattr(session, "name"):
+        return str(getattr(session, "name"))
+    return str(session)
+
+
+def _format_log_parts(data) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, dict):
+        return " ".join(f"{key}={value}" for key, value in data.items())
+    if isinstance(data, (list, tuple)):
+        return " ".join(str(item) for item in data if str(item))
+    return str(data)
+
+
 def log_llm_request(agent_name: str, messages: list, **kwargs):
     """Log the full prompt being sent to the LLM (DEBUG level)."""
     logger = get_logger(agent_name)
@@ -127,3 +143,26 @@ def log_agent_event(agent_name: str, event_type: str, data=None):
     """Log an agent lifecycle event (spawn, stop, error, fallback, etc.)."""
     logger = get_logger(agent_name)
     logger.info("AGENT_EVENT agent=%s event=%s data=%s", agent_name, event_type, str(data)[:200] if data else "")
+
+
+def log_auto_event(session, event_type: str, data=None):
+    """Log one autonomous-mode event with the session name attached."""
+    logger = get_logger("auto")
+    session_name = _coerce_session_name(session)
+    suffix = _format_log_parts(data)
+    if suffix:
+        logger.info("%s session=%s %s", event_type, session_name, suffix)
+        return
+    logger.info("%s session=%s", event_type, session_name)
+
+
+def log_slash_command(session, command: str, args: str = "", handler: str = ""):
+    """Log slash-command routing decisions."""
+    logger = get_logger("daemon.server")
+    logger.info(
+        "SLASH_COMMAND session=%s command=%s args=%s handler=%s",
+        _coerce_session_name(session),
+        command,
+        args,
+        handler,
+    )

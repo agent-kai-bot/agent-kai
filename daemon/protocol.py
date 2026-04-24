@@ -47,6 +47,8 @@ class SessionStateSnapshot(ProtocolModel):
     auto_iterations_total: int = 0
     auto_iterations_remaining: int = 0
     auto_elapsed_seconds: float = 0.0
+    chat_history_total: int = 0
+    chat_history_omitted: int = 0
     chat_history: list[ChatHistoryEntry] = Field(default_factory=list)
 
 
@@ -188,6 +190,19 @@ class ChartBarEnvelope(ProtocolModel):
     bar: Any
 
 
+class ChartViewEnvelope(ProtocolModel):
+    type: Literal["chart_view"]
+    chart_symbol: str
+    chart_timeframe: str
+    chart_source: str
+    chart_layout_mode: str
+
+
+class WatchlistEnvelope(ProtocolModel):
+    type: Literal["watchlist"]
+    watchlist_symbols: list[str]
+
+
 class NatsEventEnvelope(ProtocolModel):
     type: Literal["nats_event"]
     direction: NonEmptyString
@@ -260,6 +275,8 @@ ServerEnvelope = Annotated[
     | AutoProgressEnvelope
     | SignalEnvelope
     | ChartBarEnvelope
+    | ChartViewEnvelope
+    | WatchlistEnvelope
     | NatsEventEnvelope
     | ScheduledJobCreatedEnvelope
     | ScheduledJobTriggeredEnvelope

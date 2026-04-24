@@ -10,6 +10,7 @@ import asyncio
 import fcntl
 import json
 import os
+import re
 import tempfile
 import time
 from contextlib import contextmanager, nullcontext
@@ -26,6 +27,7 @@ from agent.signal_consumer import SignalConsumer
 from agent.strategy_agent_tools import InProcessStrategyRuntime
 from agent.sub_agents import SubAgentManager
 from agent.tools import create_tools
+from agent_logger import log_auto_event
 from config import AGENTS, WORKSPACES_DIR
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -34,6 +36,20 @@ DEFAULT_WATCHLIST_SYMBOLS = ("BTC", "ETH", "SOL")
 DEFAULT_AUTO_MAX_ITERATIONS = 20
 MAX_AUTO_ITERATIONS = 100
 DEFAULT_AUTO_MAX_DURATION_SECONDS = 180.0
+SUPPORTED_CHART_TIMEFRAMES = frozenset({"1m", "5m", "15m", "1h", "4h", "1d", "1w"})
+SUPPORTED_CHART_SOURCES = frozenset({"kai-api", "coinbase"})
+SUPPORTED_CHART_LAYOUT_MODES = frozenset({"full", "half", "mini", "hide"})
+CHART_LAYOUT_ALIASES = {
+    "dashboard": "full",
+    "inspect": "full",
+    "default": "full",
+    "zen": "half",
+    "chat": "mini",
+    "minimal": "mini",
+    "hidden": "hide",
+    "off": "hide",
+}
+CHART_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._/-]{0,24}$")
 SESSIONS_ROOT_DIR = Path(WORKSPACES_DIR) / "sessions"
 SESSION_INDEX_PATH = SESSIONS_ROOT_DIR / "index.json"
 RESERVED_SESSION_NAMES = frozenset({"index"})
@@ -83,6 +99,57 @@ def _role_for_message(message: Any) -> str:
     if "system" in cls:
         return "system"
     return "ai"
+
+
+def _tool_name_from_auto_pause_reason(reason: str | None) -> str:
+    text = str(reason or "").strip()
+    if text.startswith("requires approval for "):
+        return text.removeprefix("requires approval for ").strip() or "unknown"
+    if text.startswith("auto readonly blocks non-read-only tool:"):
+        return text.split(":", 1)[1].strip() or "unknown"
+    return "unknown"
+
+
+def _normalize_chart_symbol(symbol: str) -> str:
+    """Normalize and validate a chart symbol."""
+    normalized = str(symbol).strip().upper()
+    if not normalized or not CHART_SYMBOL_PATTERN.fullmatch(normalized):
+        raise ValueError(
+            "chart symbol must be 1-25 chars of letters, numbers, '.', '_', '-' or '/'"
+        )
+    return normalized
+
+
+def _normalize_chart_timeframe(timeframe: str) -> str:
+    """Normalize and validate a chart timeframe."""
+    normalized = str(timeframe).strip().lower()
+    if normalized not in SUPPORTED_CHART_TIMEFRAMES:
+        supported = ", ".join(sorted(SUPPORTED_CHART_TIMEFRAMES))
+        raise ValueError(
+            f"unsupported chart timeframe '{timeframe}'; use one of {supported}"
+        )
+    return normalized
+
+
+def _normalize_chart_source(source: str) -> str:
+    """Normalize and validate a chart data source."""
+    normalized = str(source).strip().lower()
+    if normalized not in SUPPORTED_CHART_SOURCES:
+        supported = ", ".join(sorted(SUPPORTED_CHART_SOURCES))
+        raise ValueError(f"unsupported chart source '{source}'; use one of {supported}")
+    return normalized
+
+
+def _normalize_chart_layout_mode(mode: str) -> str:
+    """Normalize and validate a chart layout mode."""
+    normalized = str(mode).strip().lower()
+    normalized = CHART_LAYOUT_ALIASES.get(normalized, normalized)
+    if normalized not in SUPPORTED_CHART_LAYOUT_MODES:
+        supported = ", ".join(sorted(SUPPORTED_CHART_LAYOUT_MODES))
+        raise ValueError(
+            f"unsupported chart layout mode '{mode}'; use one of {supported}"
+        )
+    return normalized
 
 
 def serialize_messages(messages: list[Any]) -> list[dict[str, str]]:
@@ -195,7 +262,11 @@ def _load_session_index_entries(
         if not isinstance(state_path, str) or not state_path:
             state_path = str(SessionPaths.for_name(name).state_path)
         if not isinstance(created_at, str) or not created_at:
-            created_at = last_activity if isinstance(last_activity, str) and last_activity else _utc_now_iso()
+            created_at = (
+                last_activity
+                if isinstance(last_activity, str) and last_activity
+                else _utc_now_iso()
+            )
         if not isinstance(last_activity, str) or not last_activity:
             last_activity = created_at
         entries[name] = SessionIndexEntry(
@@ -238,8 +309,16 @@ def upsert_indexed_session(
         payload = _read_json_dict(index_path)
         raw_sessions = payload.get("sessions")
         sessions = raw_sessions if isinstance(raw_sessions, dict) else {}
-        existing = sessions.get(normalized) if isinstance(sessions.get(normalized), dict) else {}
-        created_at = existing.get("created_at") if isinstance(existing.get("created_at"), str) else activity_at
+        existing = (
+            sessions.get(normalized)
+            if isinstance(sessions.get(normalized), dict)
+            else {}
+        )
+        created_at = (
+            existing.get("created_at")
+            if isinstance(existing.get("created_at"), str)
+            else activity_at
+        )
         entry = SessionIndexEntry(
             name=normalized,
             state_path=entry_path,
@@ -553,6 +632,100 @@ class Session:
     ) -> SessionEvent:
         return self.event_bus.publish(topic, payload)
 
+    def chart_view_payload(self) -> dict[str, Any]:
+        """Return the current chart view as a JSON-ready dict."""
+        return {
+            "chart_symbol": self.ui_state.chart_symbol,
+            "chart_timeframe": self.ui_state.chart_timeframe,
+            "chart_source": self.ui_state.chart_source,
+            "chart_layout_mode": self.ui_state.chart_layout_mode,
+        }
+
+    def watchlist_payload(self) -> dict[str, Any]:
+        """Return the current watchlist as a JSON-ready dict."""
+        return {"watchlist_symbols": list(self.ui_state.watchlist_symbols)}
+
+    def set_watchlist_symbols(self, symbols: list[str]) -> dict[str, Any]:
+        """Replace the session watchlist and publish a watchlist event.
+
+        Args:
+            symbols: Symbols to track. Symbols are normalized, deduplicated, and
+                validated with the same syntax as chart symbols.
+
+        Returns:
+            Updated watchlist payload.
+
+        Raises:
+            ValueError: If a supplied symbol is invalid.
+        """
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for symbol in symbols:
+            item = _normalize_chart_symbol(symbol)
+            if item in seen:
+                continue
+            normalized.append(item)
+            seen.add(item)
+        self.ui_state.watchlist_symbols = normalized
+        payload = self.watchlist_payload()
+        self.publish_event("watchlist.updated", payload)
+        return payload
+
+    def add_watchlist_symbol(self, symbol: str) -> dict[str, Any]:
+        """Add one symbol to the watchlist and publish an update."""
+        normalized = _normalize_chart_symbol(symbol)
+        if normalized not in self.ui_state.watchlist_symbols:
+            self.ui_state.watchlist_symbols.append(normalized)
+        payload = self.watchlist_payload()
+        self.publish_event("watchlist.updated", payload)
+        return payload
+
+    def remove_watchlist_symbol(self, symbol: str) -> dict[str, Any]:
+        """Remove one symbol from the watchlist and publish an update."""
+        normalized = _normalize_chart_symbol(symbol)
+        self.ui_state.watchlist_symbols = [
+            item for item in self.ui_state.watchlist_symbols if item != normalized
+        ]
+        payload = self.watchlist_payload()
+        self.publish_event("watchlist.updated", payload)
+        return payload
+
+    def set_chart_view(
+        self,
+        *,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+        source: str | None = None,
+        mode: str | None = None,
+    ) -> dict[str, Any]:
+        """Update the session chart view and publish a UI-state event.
+
+        Args:
+            symbol: Optional chart symbol such as ``BTC`` or ``ETH``.
+            timeframe: Optional timeframe, e.g. ``1m``, ``15m`` or ``1h``.
+            source: Optional data source, currently ``kai-api`` or ``coinbase``.
+            mode: Optional layout mode, one of ``full``, ``half``, ``mini`` or
+                ``hide``. A few legacy aliases are accepted.
+
+        Returns:
+            The updated chart view payload.
+
+        Raises:
+            ValueError: If any supplied field is unsupported.
+        """
+        if symbol is not None:
+            self.ui_state.chart_symbol = _normalize_chart_symbol(symbol)
+        if timeframe is not None:
+            self.ui_state.chart_timeframe = _normalize_chart_timeframe(timeframe)
+        if source is not None:
+            self.ui_state.chart_source = _normalize_chart_source(source)
+        if mode is not None:
+            self.ui_state.chart_layout_mode = _normalize_chart_layout_mode(mode)
+
+        payload = self.chart_view_payload()
+        self.publish_event("ui_state.updated", payload)
+        return payload
+
     def queue_input(self, text: str) -> None:
         self.input_queue.append(text)
         self.publish_event(
@@ -621,6 +794,7 @@ class Session:
         if self.agent_runner is not None:
             self.agent_runner._auto_readonly = self.auto_readonly
             self.agent_runner.set_auto_mode(True, max_iterations=normalized_iterations)
+        log_auto_event(self, "AUTO_START", [f"budget={normalized_iterations}"])
         payload = self.auto_status_payload()
         self.publish_event("auto.started", payload)
         return payload
@@ -630,6 +804,15 @@ class Session:
 
         payload = self.auto_status_payload(reason=reason)
         payload["enabled"] = False
+        log_auto_event(
+            self,
+            "AUTO_STOP",
+            [
+                f"reason={reason}",
+                f"iterations={payload['iterations_used']}",
+                f"elapsed={payload['elapsed_seconds']:.1f}s",
+            ],
+        )
         self.auto_mode = False
         self.auto_readonly = False
         self.auto_iterations_remaining = 0
@@ -815,6 +998,15 @@ class Session:
 
                 while True:
                     if self.auto_mode:
+                        current_iteration = max(
+                            1,
+                            self.auto_iterations_total - self.auto_iterations_remaining + 1,
+                        )
+                        log_auto_event(
+                            self,
+                            "AUTO_CYCLE",
+                            [f"iter={current_iteration}/{max(1, self.auto_iterations_total)}"],
+                        )
                         self.agent_runner._auto_readonly = self.auto_readonly
                         self.agent_runner.set_auto_mode(
                             True,
@@ -857,11 +1049,27 @@ class Session:
                         break
 
                     if runtime_pause_reason:
+                        log_auto_event(
+                            self,
+                            "AUTO_TOOL_BLOCKED",
+                            [
+                                f"tool={_tool_name_from_auto_pause_reason(runtime_pause_reason)}",
+                                f"reason={runtime_pause_reason}",
+                            ],
+                        )
                         stopped = self.stop_auto_mode(runtime_pause_reason)
                         yield {"type": "auto_stopped", "data": stopped}
                         break
 
                     auto_state, auto_reason = parse_auto_state(turn_final_text)
+                    log_auto_event(
+                        self,
+                        "AUTO_STATE",
+                        [
+                            f"state={auto_state}",
+                            f"reason={auto_reason or '<none>'}",
+                        ],
+                    )
                     if auto_state == "done":
                         stopped = self.stop_auto_mode(auto_reason or "task complete")
                         yield {"type": "auto_stopped", "data": stopped}
@@ -883,6 +1091,11 @@ class Session:
 
                     normalized_final = turn_final_text.strip()
                     if normalized_final and normalized_final == last_final_text:
+                        log_auto_event(
+                            self,
+                            "AUTO_LOOP_DETECTED",
+                            ["type=repeated_final_response"],
+                        )
                         stopped = self.stop_auto_mode("loop detected: repeated final response")
                         yield {"type": "auto_stopped", "data": stopped}
                         break
@@ -894,7 +1107,14 @@ class Session:
                     else:
                         consecutive_no_tool_turns += 1
                         if consecutive_no_tool_turns >= 2:
-                            stopped = self.stop_auto_mode("loop detected: consecutive no-tool turns")
+                            log_auto_event(
+                                self,
+                                "AUTO_LOOP_DETECTED",
+                                ["type=consecutive_no_tool_turns"],
+                            )
+                            stopped = self.stop_auto_mode(
+                                "loop detected: consecutive no-tool turns"
+                            )
                             yield {"type": "auto_stopped", "data": stopped}
                             break
 
@@ -905,6 +1125,11 @@ class Session:
                             loop_detected = True
                             break
                     if loop_detected:
+                        log_auto_event(
+                            self,
+                            "AUTO_LOOP_DETECTED",
+                            ["type=repeated_tool_call"],
+                        )
                         stopped = self.stop_auto_mode("loop detected: repeated tool call")
                         yield {"type": "auto_stopped", "data": stopped}
                         break
@@ -914,6 +1139,7 @@ class Session:
                         yield {"type": "auto_stopped", "data": stopped}
                         break
 
+                    log_auto_event(self, "AUTO_CONTINUE", ["injecting hidden turn"])
                     current_input = "Continue with the next step."
                     is_auto_continuation = True
         finally:
