@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import tempfile
 import unittest
@@ -56,6 +57,22 @@ class _FakeRunner:
     def consume_auto_pause_reason(self):
         return None
 
+    def reload_llm(self):
+        return {
+            "model": "gpt-5.5",
+            "provider": "codex-cli",
+            "fallback_count": 1,
+        }
+
+
+class _SlowRunner(_FakeRunner):
+    """Runner stub that stays inside a stream until cancelled."""
+
+    async def run(self, user_input: str):
+        yield {"type": "token", "data": f"started:{user_input}"}
+        await asyncio.sleep(60)
+        yield {"type": "final", "data": "should-not-finish"}
+
 
 def _fake_attach_runtime(
     session,
@@ -67,6 +84,22 @@ def _fake_attach_runtime(
 ):
     del bus, signal_consumer, scheduler
     runner = _FakeRunner()
+    session.agent_runner = runner
+    session.agent_name = agent_name
+    runner.chat_history = session.chat_history
+    return runner
+
+
+def _slow_attach_runtime(
+    session,
+    *,
+    bus=None,
+    agent_name="kai",
+    signal_consumer=None,
+    scheduler=None,
+):
+    del bus, signal_consumer, scheduler
+    runner = _SlowRunner()
     session.agent_runner = runner
     session.agent_name = agent_name
     runner.chat_history = session.chat_history
@@ -199,6 +232,31 @@ class DaemonServerTests(unittest.TestCase):
                 self.assertEqual(nats_event["direction"], "pub")
                 self.assertEqual(nats_event["subject"], "agent.broadcast")
                 self.assertEqual(nats_event["payload"]["message"], "hello")
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    def test_chart_view_events_are_forwarded(self, attach_runtime):
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with self._make_client() as client:
+            with client.websocket_connect("/ws") as websocket:
+                websocket.send_json(
+                    {
+                        "type": "attach",
+                        "session": "terminal",
+                        "create_if_missing": True,
+                    }
+                )
+                websocket.receive_json()
+                websocket.receive_json()
+
+                session = client.app.state.daemon_server.sessions["terminal"].session
+                session.set_chart_view(symbol="ETH", timeframe="15m", mode="mini")
+
+                chart_view = websocket.receive_json()
+                self.assertEqual(chart_view["type"], "chart_view")
+                self.assertEqual(chart_view["chart_symbol"], "ETH")
+                self.assertEqual(chart_view["chart_timeframe"], "15m")
+                self.assertEqual(chart_view["chart_layout_mode"], "mini")
 
     @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
     def test_scheduled_job_events_are_forwarded(self, attach_runtime):
@@ -335,7 +393,9 @@ class DaemonServerTests(unittest.TestCase):
 
                         add_messages = [websocket.receive_json() for _ in range(3)]
                         created = next(
-                            message for message in add_messages if message["type"] == "scheduled_job_created"
+                            message
+                            for message in add_messages
+                            if message["type"] == "scheduled_job_created"
                         )
                         final = next(
                             message for message in add_messages if message["type"] == "final"
@@ -510,6 +570,47 @@ class DaemonServerIndexTests(unittest.IsolatedAsyncioTestCase):
                         "[scheduled job: job-turn]",
                         [message.content for message in managed.session.chat_history],
                     )
+                finally:
+                    await server.shutdown()
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    async def test_stop_session_run_cancels_active_input(self, attach_runtime):
+        """Stop requests cancel the current stream and restore idle state."""
+
+        attach_runtime.side_effect = _slow_attach_runtime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+            ):
+                server = DaemonServer(
+                    agent_name="kai",
+                    nats_url="nats://unit-test",
+                    bus_factory=None,
+                )
+
+                await server.startup()
+                try:
+                    managed = await server.get_or_create_session(
+                        "terminal",
+                        create_if_missing=True,
+                    )
+                    task = asyncio.create_task(server.run_input(managed, "slow"))
+                    for _ in range(50):
+                        if managed.current_input_task is not None:
+                            break
+                        await asyncio.sleep(0.01)
+                    else:
+                        self.fail("input task was not registered")
+
+                    stopped = await server.stop_session_run("terminal")
+                    result = await asyncio.wait_for(task, timeout=1)
+
+                    self.assertTrue(stopped["stopped"])
+                    self.assertEqual(result.error, "current LLM stream stopped")
+                    self.assertEqual(managed.session.activity_status, "idle")
+                    self.assertIsNone(managed.current_input_task)
                 finally:
                     await server.shutdown()
 
@@ -744,6 +845,169 @@ class DaemonServerRestTests(unittest.TestCase):
                     self.assertEqual(missing.status_code, 404)
                     self.assertIn("does not exist", missing.json()["detail"])
 
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    def test_rest_chart_view_get_patch_and_validation(self, attach_runtime):
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+            ):
+                with self._make_client() as client:
+                    created = client.post("/api/sessions", json={"name": "alpha"})
+                    self.assertEqual(created.status_code, 201)
+
+                    updated = client.patch(
+                        "/api/sessions/alpha/ui/chart",
+                        json={
+                            "symbol": "eth",
+                            "timeframe": "15m",
+                            "source": "coinbase",
+                            "mode": "mini",
+                        },
+                    )
+                    self.assertEqual(updated.status_code, 200)
+                    chart = updated.json()["chart"]
+                    self.assertEqual(chart["chart_symbol"], "ETH")
+                    self.assertEqual(chart["chart_timeframe"], "15m")
+                    self.assertEqual(chart["chart_source"], "coinbase")
+                    self.assertEqual(chart["chart_layout_mode"], "mini")
+
+                    fetched = client.get("/api/sessions/alpha/ui/chart")
+                    self.assertEqual(fetched.status_code, 200)
+                    self.assertEqual(fetched.json()["chart"], chart)
+
+                    invalid = client.patch(
+                        "/api/sessions/alpha/ui/chart",
+                        json={"timeframe": "2m"},
+                    )
+                    self.assertEqual(invalid.status_code, 400)
+                    self.assertIn(
+                        "unsupported chart timeframe",
+                        invalid.json()["detail"],
+                    )
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    def test_rest_watchlist_get_patch_and_validation(self, attach_runtime):
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+            ):
+                with self._make_client() as client:
+                    created = client.post("/api/sessions", json={"name": "alpha"})
+                    self.assertEqual(created.status_code, 201)
+
+                    added = client.patch(
+                        "/api/sessions/alpha/ui/watchlist",
+                        json={"add": "bio"},
+                    )
+                    self.assertEqual(added.status_code, 200)
+                    self.assertIn(
+                        "BIO",
+                        added.json()["watchlist"]["watchlist_symbols"],
+                    )
+
+                    removed = client.patch(
+                        "/api/sessions/alpha/ui/watchlist",
+                        json={"remove": "BTC"},
+                    )
+                    self.assertEqual(removed.status_code, 200)
+                    self.assertNotIn(
+                        "BTC",
+                        removed.json()["watchlist"]["watchlist_symbols"],
+                    )
+
+                    replaced = client.patch(
+                        "/api/sessions/alpha/ui/watchlist",
+                        json={"symbols": ["eth", "bio", "ETH"]},
+                    )
+                    self.assertEqual(
+                        replaced.json()["watchlist"]["watchlist_symbols"],
+                        ["ETH", "BIO"],
+                    )
+
+                    fetched = client.get("/api/sessions/alpha/ui/watchlist")
+                    self.assertEqual(fetched.status_code, 200)
+                    self.assertEqual(
+                        fetched.json()["watchlist"],
+                        replaced.json()["watchlist"],
+                    )
+
+                    invalid = client.patch(
+                        "/api/sessions/alpha/ui/watchlist",
+                        json={"add": ""},
+                    )
+                    self.assertEqual(invalid.status_code, 400)
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    def test_rest_model_registry_and_switch(self, attach_runtime):
+        """REST exposes model state and reloads live sessions on switch."""
+
+        from config import AGENTS
+
+        attach_runtime.side_effect = _fake_attach_runtime
+        original_agents = copy.deepcopy(AGENTS)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                base_dir = Path(tmpdir)
+                with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                    "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+                ):
+                    with self._make_client() as client:
+                        created = client.post("/api/sessions", json={"name": "alpha"})
+                        self.assertEqual(created.status_code, 201)
+
+                        registry = client.get("/api/models")
+                        self.assertEqual(registry.status_code, 200)
+                        payload = registry.json()
+                        agent_names = {agent["name"] for agent in payload["agents"]}
+                        endpoint_names = {
+                            endpoint["name"] for endpoint in payload["endpoints"]
+                        }
+                        self.assertIn("kai", agent_names)
+                        self.assertIn("codex-cli", endpoint_names)
+
+                        switched = client.post(
+                            "/api/models/kai",
+                            json={
+                                "endpoint": "codex-cli",
+                                "model": "gpt-5.5",
+                                "reasoning_effort": "high",
+                            },
+                        )
+                        self.assertEqual(switched.status_code, 200)
+                        switch_payload = switched.json()
+                        self.assertEqual(switch_payload["agent"]["model"], "gpt-5.5")
+                        self.assertEqual(
+                            switch_payload["agent"]["reasoning_effort"],
+                            "high",
+                        )
+                        self.assertEqual(
+                            switch_payload["reloaded_sessions"][0]["session"],
+                            "alpha",
+                        )
+                        self.assertEqual(AGENTS["kai"]["model"], "gpt-5.5")
+                        self.assertEqual(AGENTS["kai"]["reasoning_effort"], "high")
+        finally:
+            AGENTS.clear()
+            AGENTS.update(original_agents)
+
+    def test_rest_model_switch_rejects_unknown_model(self):
+        """Model switch validation rejects unconfigured model ids."""
+
+        with self._make_client() as client:
+            response = client.post(
+                "/api/models/kai",
+                json={"endpoint": "codex-cli", "model": "not-real"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("not configured", response.json()["detail"])
+
     @mock.patch("daemon.server._fetch_watchlist_quote")
     def test_rest_watchlist_quotes_and_portfolio_snapshot(self, fetch_watchlist_quote):
         fetch_watchlist_quote.side_effect = [
@@ -797,7 +1061,16 @@ class DaemonServerRestTests(unittest.TestCase):
 
     @mock.patch(
         "daemon.server._load_chart_history",
-        return_value=[{"ts": "2026-04-10T00:00:00Z", "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 42}],
+        return_value=[
+            {
+                "ts": "2026-04-10T00:00:00Z",
+                "open": 1,
+                "high": 2,
+                "low": 0.5,
+                "close": 1.5,
+                "volume": 42,
+            }
+        ],
     )
     def test_rest_chart_history_snapshot(self, load_chart_history):
         with self._make_client() as client:
@@ -858,6 +1131,30 @@ class DaemonServerAuthTests(unittest.TestCase):
                     self.assertEqual(authorized.status_code, 200)
                     self.assertEqual(authorized.json(), {"sessions": []})
 
+    def test_rest_accepts_configured_gateway_token(self):
+        """Daemon routes accept the deployed taskboard gateway token."""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir) / "sessions"
+            token_path = Path(tmpdir) / "daemon-token.txt"
+            token_path.write_text("secret-token\n", encoding="utf-8")
+
+            with mock.patch.dict(
+                "os.environ",
+                {"OPENCLAW_GATEWAY_TOKEN": "gateway-token"},
+            ):
+                with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                    "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+                ):
+                    with self._make_client(token_path) as client:
+                        authorized = client.get(
+                            "/api/sessions",
+                            headers={"Authorization": "Bearer gateway-token"},
+                        )
+
+            self.assertEqual(authorized.status_code, 200)
+            self.assertEqual(authorized.json(), {"sessions": []})
+
     @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
     def test_websocket_rejects_unauthorized_client(self, attach_runtime):
         attach_runtime.side_effect = _fake_attach_runtime
@@ -903,6 +1200,41 @@ class DaemonServerAuthTests(unittest.TestCase):
                         attached = websocket.receive_json()
                         self.assertEqual(attached["type"], "session_attached")
                         self.assertEqual(attached["session"], "terminal")
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    def test_websocket_accepts_configured_gateway_token(self, attach_runtime):
+        """WebSocket auth accepts the deployed taskboard gateway token."""
+
+        attach_runtime.side_effect = _fake_attach_runtime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir) / "sessions"
+            token_path = Path(tmpdir) / "daemon-token.txt"
+            token_path.write_text("secret-token\n", encoding="utf-8")
+
+            with mock.patch.dict(
+                "os.environ",
+                {"OPENCLAW_GATEWAY_TOKEN": "gateway-token"},
+            ):
+                with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                    "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+                ):
+                    with self._make_client(token_path) as client:
+                        with client.websocket_connect(
+                            "/ws?token=gateway-token"
+                        ) as websocket:
+                            websocket.send_json(
+                                {
+                                    "type": "attach",
+                                    "session": "terminal",
+                                    "create_if_missing": True,
+                                }
+                            )
+
+                            attached = websocket.receive_json()
+
+            self.assertEqual(attached["type"], "session_attached")
+            self.assertEqual(attached["session"], "terminal")
 
 
 class DaemonServerHealthTests(unittest.TestCase):
@@ -973,6 +1305,57 @@ class DaemonServerHealthTests(unittest.TestCase):
                     self.assertEqual(metrics_payload["sessions"]["activity"], {"alpha": "idle"})
                     self.assertEqual(metrics_payload["scheduler"]["job_count"], 0)
                     self.assertEqual(metrics_payload["scheduler"]["status_counts"], {})
+
+
+class DaemonTaskboardGatewayTests(unittest.TestCase):
+    """Validate taskboard gateway routes are part of the daemon app."""
+
+    @staticmethod
+    def _make_client() -> TestClient:
+        """Create a daemon app client with the embedded taskboard gateway.
+
+        Returns:
+            Test client for the daemon app.
+        """
+
+        app = create_app(
+            agent_name="kai",
+            nats_url="nats://unit-test",
+            bus_factory=_FakeBus,
+        )
+        return TestClient(app)
+
+    def test_taskboard_status_route_is_served_by_daemon(self):
+        """Daemon app exposes the taskboard gateway status endpoint."""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch.dict("os.environ", {"TASKBOARD_RUNS_DIR": tmpdir}):
+                with self._make_client() as client:
+                    response = client.get("/api/status")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["service"], "taskboard-agent-gateway")
+
+    def test_taskboard_sessions_list_route_is_served_by_daemon(self):
+        """Daemon app exposes taskboard ``sessions_list``."""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch.dict("os.environ", {"TASKBOARD_RUNS_DIR": tmpdir}):
+                with self._make_client() as client:
+                    response = client.post(
+                        "/tools/invoke",
+                        json={
+                            "tool": "sessions_list",
+                            "args": {"limit": 5, "messageLimit": 0},
+                        },
+                    )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["result"]["details"]["sessions"], [])
 
 
 class DaemonServerWebAssetTests(unittest.TestCase):

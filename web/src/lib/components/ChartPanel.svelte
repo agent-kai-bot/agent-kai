@@ -43,6 +43,7 @@
   let candleSeries: ISeriesApi<"Candlestick"> | null = null;
   let volumeSeries: ISeriesApi<"Histogram"> | null = null;
   let hasFitted = false;
+  let lastMarketKey = "";
 
   function minimumCanvasHeight(currentMode: ChartMode): number {
     if (currentMode === "mini") {
@@ -152,6 +153,11 @@
   });
 
   $effect(() => {
+    const marketKey = `${symbol}:${timeframe}:${source}`;
+    if (marketKey !== lastMarketKey) {
+      lastMarketKey = marketKey;
+      hasFitted = false;
+    }
     bars;
     applyBars();
   });

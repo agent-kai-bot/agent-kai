@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 *.pyo
 logs/
+*.log
+*.pid
+*.lock
 eval_results.json
 eval_results/
 .claude/
@@ -22,9 +25,30 @@ ANTHROPIC-API-KEY.txt
 !.env.example
 
 # Per-user runtime state
-workspaces/terminal/state.json
+workspaces/terminal/
 workspaces/kaid.pid
 workspaces/daemon-token.txt
+workspaces/**/__pycache__/
+workspaces/**/memories/
+workspaces/**/*.db
+workspaces/**/monitor_state.json
+workspaces/**/workspaces/terminal/
+workspaces/scheduler/
+workspaces/sessions/
 
 # Internal design proposals — drafts, not part of published docs
 docs/proposals/
+ASO-*.md
+AUTONOMOUS-AGENT-*.md
+CODEX-AGENT-GUIDE.md
+DAEMON-MIGRATION-PLAN.md
+PROJECT-NOTES-FROM-COMPACT.txt
+PROJECT_SUMMARY.md
+REPORT-SERVICE-PLAN.md
+TASKBOARD-*.md
+Ui-DAEMON-UP-GRADE.JSON
+WEB-QA-PLAN.md
+agent-k-ai-npm-custom-location.conf
+architecture.mmd
+docs/MARKET-INTERACTION-UX-SPEC.md
+workspaces/user.md

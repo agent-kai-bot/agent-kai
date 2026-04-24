@@ -1,0 +1,1516 @@
+openapi: 3.1.0
+info:
+  title: agent-k.ai Public API
+  version: 1.0.0
+  description: |-
+    Public REST API for agent-k.ai — billable AI chat with market context, plus the market-data, news, and token endpoints that power the KAI trading terminal.
+
+    ## Quick start
+
+    1. **Create an account** via `POST /v1/auth/register` (or sign up on the web dashboard).
+    2. **Mint an API key** via `POST /v1/auth/api-keys`. Copy the secret — it's only shown once.
+    3. **Top up KAI credits** either by going through Stripe Checkout (`POST /v1/billing/stripe/checkout`) or by depositing SOL / USDC to your account's on-chain deposit address (visible on the web dashboard's Account page).
+    4. **Call the API** with the secret as a Bearer token:
+
+        curl https://agent-k.ai/v1/billing/balance \
+            -H 'Authorization: Bearer kai-...'
+
+    ## Authentication
+
+    Every `/v1/*` endpoint except `/v1/health` requires either a Bearer JWT (from `/v1/auth/login`) or an API key (from `/v1/auth/api-keys`). API keys are preferred for scripts and server-to-server use because they are long-lived and individually revocable.
+
+        Authorization: Bearer kai-...
+
+    ## Billing model
+
+    All billable calls are debited from your **custodial KAI balance** in micros (1 KAI = 1,000,000 micros). The per-call cost is driven by tokens in/out times the configured rate for the selected model, multiplied by a small service fee. Full cost breakdowns are returned inline on every AI response and are also queryable via `GET /v1/billing/usage`.
+
+    ## Response envelope
+
+    Successful responses wrap their payload in:
+
+        {
+          "v": 1,
+          "data": { ... }
+        }
+
+    The `v` field lets us version response shapes without breaking older clients.
+  contact:
+    name: agent-k.ai
+    url: https://agent-k.ai
+servers:
+- url: https://agent-k.ai
+  description: Production
+tags:
+- name: Auth
+  description: Register, sign in, and manage API keys.
+- name: Stripe
+  description: Stripe Checkout for topping up KAI credits with a card.
+- name: System
+  description: Health check and capability listings.
+- name: Billing
+  description: Check your KAI credit balance and metered usage history.
+- name: AI
+  description: Billable AI endpoints — the reason you're here.
+- name: Market Data
+  description: OHLCV candles, indicators, and symbols.
+- name: News
+  description: Recent financial news feed.
+- name: Tokens
+  description: Token metadata and trending lists across networks.
+- name: PumpFun
+  description: pump.fun top tokens.
+security:
+- BearerAuth: []
+- ApiKeyHeader: []
+paths:
+  /v1/auth/register:
+    post:
+      tags:
+      - Auth
+      summary: Create a new account
+      description: |-
+        Register with email + password. Returns the account id and a bearer JWT you can use immediately, though most API clients create and use a long-lived API key instead (see POST /v1/auth/api-keys).
+
+        Register a new account with email and password.
+
+        Creates the account, ensures a custodial balance row exists, and
+        returns a bearer JWT for immediate use.
+
+        Args:
+            payload: Registration details (email, password, display_name).
+            session: Async database session (injected).
+
+        Returns:
+            Envelope containing the bearer token and account info.
+
+        Raises:
+            HTTPException: 409 if the email is already registered.
+      operationId: register_v1_auth_register_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope_AuthTokenResponse_'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /v1/auth/login:
+    post:
+      tags:
+      - Auth
+      summary: Sign in with email + password
+      description: |-
+        Returns a short-lived bearer JWT. For scripts and back-end integrations prefer POST /v1/auth/api-keys which issues long-lived keys that can be revoked individually.
+
+        Authenticate with email and password.
+
+        Args:
+            payload: Login credentials (email, password).
+            session: Async database session (injected).
+
+        Returns:
+            Envelope containing the bearer JWT and account info.
+
+        Raises:
+            HTTPException: 401 if credentials are invalid.
+      operationId: login_v1_auth_login_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope_AuthTokenResponse_'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /v1/auth/api-keys:
+    get:
+      tags:
+      - Auth
+      summary: List your API keys
+      description: |-
+        Returns every API key attached to the authenticated account, including each key's id, label, last-four characters, created_at, and last_used_at. The secret itself is only visible once, at creation time.
+
+        List all API keys for the authenticated account.
+
+        Args:
+            auth: Authenticated user context (injected).
+            session: Async database session (injected).
+
+        Returns:
+            Envelope containing a list of API key metadata items.
+      operationId: list_api_keys_v1_auth_api_keys_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope_list_APIKeyListItem__'
+    post:
+      tags:
+      - Auth
+      summary: Create a new API key
+      description: |-
+        Creates a long-lived API key bound to your account. The response is the **only** time the full secret is returned — store it somewhere safe. Use the secret as a Bearer token on subsequent calls:
+
+            Authorization: Bearer kai-...
+
+
+        Create a new API key for the authenticated account.
+
+        The raw key is returned only once at creation time and cannot be
+        retrieved again.
+
+        Args:
+            payload: Key creation options (optional name).
+            auth: Authenticated user context (injected).
+            session: Async database session (injected).
+
+        Returns:
+            Envelope containing the key metadata including the raw key.
+
+        Raises:
+            HTTPException: 400 if the account already has 5 active keys.
+      operationId: create_api_key_v1_auth_api_keys_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAPIKeyRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope_APIKeyResponse_'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /v1/auth/api-keys/{key_id}:
+    delete:
+      tags:
+      - Auth
+      summary: Revoke an API key
+      description: |-
+        Immediately invalidates the key. Subsequent requests using it return 401.
+
+        Revoke an API key by its database ID.
+
+        Args:
+            key_id: Database ID of the key to revoke.
+            auth: Authenticated user context (injected).
+            session: Async database session (injected).
+
+        Returns:
+            Envelope confirming revocation with the key ID.
+
+        Raises:
+            HTTPException: 404 if the key is not found for this account.
+      operationId: revoke_api_key_v1_auth_api_keys__key_id__delete
+      parameters:
+      - name: key_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: Key Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope_dict_'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /v1/billing/stripe/checkout:
+    post:
+      tags:
+      - Stripe
+      summary: Create a Stripe Checkout session to buy credits
+      description: |-
+        Returns a Stripe Checkout URL. Redirect the user there to complete payment; the credits land in their custodial balance once Stripe confirms the charge (via our internal webhook). Only useful if you intend to drive users through the hosted checkout page.
+
+        Create a Stripe Checkout Session to purchase KAI credits with USD.
+
+        Args:
+            payload: Checkout parameters (amount, URLs).
+            auth: Authenticated user context (injected).
+            session: Async database session (injected).
+
+        Returns:
+            Envelope containing the checkout URL, session ID, and
+            estimated KAI token amount.
+
+        Raises:
+            HTTPException: 503 if Stripe is not configured, 400 if amount
+                is invalid or KAI price is unavailable.
+      operationId: create_checkout_v1_billing_stripe_checkout_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckoutRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope_CheckoutResponse_'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /v1/health:
+    get:
+      tags:
+      - System
+      summary: Health check
+      description: |-
+        Liveness probe. Returns 200 when the API is reachable.
+
+        Return a lightweight health-check response.
+
+        This endpoint is unauthenticated and intended for load-balancer
+        probes and uptime monitors.
+
+        Returns:
+            A dict with ``status``, ``version``, and ``service`` fields.
+      operationId: health_v1_health_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+  /v1/models:
+    get:
+      tags:
+      - System
+      summary: List available AI models
+      description: |-
+        Returns the public model aliases you can pass to ``POST /v1/chat/completions`` or ``POST /v1/ai/chat``. Each entry includes:
+
+        - ``id`` — the public alias you pass as ``model`` in a chat request (e.g. ``kai-fast``, ``kai-smart``).
+        - ``description`` — what it's good for.
+        - ``default_reasoning`` — whether chain-of-thought is on by default for this alias. ``null`` means the server uses the upstream model's native default.
+        - ``upstream_model`` — the underlying model id, exposed for transparency. Power users can pass this directly to ``/v1/chat/completions`` as a raw passthrough if they want to bypass the alias layer.
+        - ``provider`` / ``status`` — where it runs and whether it's currently reachable.
+
+        List the AI models available for chat completions.
+
+        Pulls from the shared ``MODEL_ALIASES`` table in ``services.ai_models``
+        so ``/v1/chat/completions`` and this endpoint stay in sync. Each entry
+        includes the public model id, a human description, the default
+        reasoning flag (so callers know whether to pass their own), and the
+        resolved upstream model id for transparency.
+
+        Args:
+            auth: Authenticated caller identity injected by ``RequireAuth``.
+
+        Returns:
+            An ``Envelope`` wrapping a list of model descriptor dicts.
+      operationId: list_models_v1_models_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope_list_dict__'
+  /v1/billing/balance:
+    get:
+      tags:
+      - Billing
+      summary: Get your current KAI credit balance
+      description: |-
+        Returns the authenticated account's custodial balance in both **micros** (1 KAI = 1,000,000 micros) and KAI. Every metered AI request debits this balance; top up with POST /v1/billing/stripe/checkout (card) or by depositing SOL/USDC to the deposit address shown on the web dashboard.
+
+        Retrieve the current KAI credit balance for the authenticated account.
+
+        Args:
+            auth: Authenticated caller identity injected by ``RequireAuth``.
+            session: Async database session for balance lookup.
+
+        Returns:
+            An ``Envelope`` wrapping a ``BalanceResponse`` containing the
+            account ID and balance in both micro-KAI and whole-KAI units.
+      operationId: get_balance_v1_billing_balance_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope_BalanceResponse_'
+  /v1/billing/usage:
+    get:
+      tags:
+      - Billing
+      summary: Get your metered request history
+      description: |-
+        Paginated list of every billable request the account has made. Each row includes endpoint, tokens_in, tokens_out, cost_micros, latency_ms, and created_at. Useful for cost attribution in your own dashboards.
+
+        Retrieve recent API usage records for the authenticated account.
+
+        Records are ordered newest-first.  The ``limit`` parameter is capped
+        at 500 to prevent oversized responses.
+
+        Args:
+            auth: Authenticated caller identity injected by ``RequireAuth``.
+            session: Async database session for usage lookup.
+            limit: Maximum number of records to return (default 50, max 500).
+
+        Returns:
+            An ``Envelope`` wrapping a list of ``UsageRecord`` objects.
+      operationId: get_usage_v1_billing_usage_get
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 50
+          title: Limit
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope_list_UsageRecord__'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /v1/ai/chat:
+    post:
+      tags:
+      - AI
+      summary: Run an AI chat completion (metered, simple shape)
+      description: |-
+        The main billable endpoint. Sends a plain-text ``message`` to the selected LLM and returns the assistant's answer together with token counts, latency, and the exact cost debited from your balance.
+
+        **Model selection.** Pass ``model`` to pick a specific model — call ``GET /v1/models`` to list the models you're allowed to request. Omitting ``model`` uses the server default.
+
+        **Token limit.** ``max_tokens`` caps the completion length (1-8192). Input tokens are not capped by this field; they're driven by the length of your ``message``.
+
+        **Cost model.** You're billed per 1k tokens in and out using the configured rate for the selected model, multiplied by a small service fee. The full breakdown — ``llm_usd``, ``fee_multiplier``, ``total_usd``, ``total_micros``, ``kai_price_usd`` — is returned inline in the response's ``cost`` field, and the debited amount is also recorded in ``GET /v1/billing/usage``.
+
+        Simple LLM chat completion that debits the caller's KAI balance.
+
+        Args:
+            payload: User prompt and optional model / max_tokens.
+            auth: Resolved AuthContext (API key, wallet session, or bearer).
+            session: Async DB session for balance, usage, and ledger writes.
+
+        Returns:
+            An ``Envelope[ChatResponse]`` containing the model answer, token
+            counts, latency, and a cost breakdown in USD and KAI micros.
+
+        Raises:
+            HTTPException 402: If the caller has no available KAI balance.
+            HTTPException 502: If the upstream LLM is unavailable or errors.
+            HTTPException 503: If the KAI/USD price service is unavailable.
+      operationId: chat_v1_ai_chat_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope_ChatResponse_'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /v1/chat/completions:
+    post:
+      tags:
+      - AI
+      summary: OpenAI-compatible chat completions (metered)
+      description: |-
+        Drop-in replacement for ``POST https://api.openai.com/v1/chat/completions``. Accepts the same ``{messages, model, max_tokens, temperature, top_p, stream, stop}`` request shape and returns the same response shape — meaning existing OpenAI SDKs (``openai``, ``langchain``, ``llamaindex``, etc.) work against agent-k.ai with just a ``base_url`` change.
+
+            client = OpenAI(base_url='https://agent-k.ai/v1', api_key='kai-...')
+            resp = client.chat.completions.create(
+                model='kai-fast',
+                messages=[{'role': 'user', 'content': 'hi'}],
+                stream=True,
+            )
+
+        **Models.** Pass one of the public aliases:
+
+        - ``kai-fast`` — chain-of-thought disabled. Fewer generated tokens → much cheaper in practice. Use for classification, routing, simple Q&A, and anything that doesn't benefit from multi-step reasoning.
+        - ``kai-smart`` — chain-of-thought enabled (default if ``model`` is omitted). Full reasoning power. Use for analysis, market structure, code generation.
+
+        Both aliases currently map to the same underlying model (qwen35-gptq) and are billed at the **same per-1k-token rate**. The cost savings on ``kai-fast`` are organic — it simply generates 10-100x fewer tokens for the same prompt because the hidden reasoning stage is skipped entirely. ``GET /v1/models`` returns the live alias table.
+
+        **Streaming.** Set ``stream=true`` to get Server-Sent Events in the OpenAI chunked format, terminated by ``data: [DONE]``. The final chunk before ``[DONE]`` carries ``usage.prompt_tokens`` / ``usage.completion_tokens`` / ``usage.total_tokens``.
+
+        **Reasoning override.** The ``reasoning: bool`` request field overrides the alias default per-call. ``model: kai-smart`` + ``reasoning: false`` gives you kai-fast behavior without switching model ids. ``model: kai-fast`` + ``reasoning: true`` forces thinking on even on the fast alias. Omit the field to use the alias default.
+
+        **Billing.** Both streaming and non-streaming requests debit your custodial KAI balance based on the actual token counts reported by the upstream model, priced per 1k tokens times the standard service fee. Every request is recorded in ``GET /v1/billing/usage`` with endpoint ``/v1/chat/completions``. Reasoning tokens are counted as normal completion tokens — use ``kai-fast`` or ``reasoning: false`` to avoid paying for them.
+
+        OpenAI-compatible chat completions endpoint (metered).
+
+        Accepts the same request shape as ``POST https://api.openai.com/v1/chat/completions``
+        and returns the same response shape. Supports streaming via
+        ``stream=true`` (Server-Sent Events, terminated by ``data: [DONE]``).
+
+        Billing:
+
+        - Both streaming and non-streaming requests debit the caller's custodial
+          KAI balance based on the **actual** token counts reported by the
+          upstream model (``prompt_tokens`` + ``completion_tokens``).
+        - For streaming requests the debit happens after the last chunk is
+          sent — the final chunk carries the ``usage`` object courtesy of
+          ``stream_options={"include_usage": True}``.
+        - If the KAI/USD price oracle is unavailable at debit time the request
+          is served free of charge and a server-side warning is logged.
+
+        Raises:
+            HTTPException 402: Insufficient KAI balance.
+            HTTPException 502: Upstream LLM unreachable or errored.
+      operationId: chat_completions_v1_chat_completions_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /v1/market/ohlcv/{symbol}:
+    get:
+      tags:
+      - Market Data
+      summary: Fetch OHLCV candles for a symbol
+      description: |-
+        Historical OHLCV (open, high, low, close, volume) for a CEX symbol at a given timeframe. Returns compact float arrays ready for charting.
+
+        Return historical OHLCV candles for a symbol.
+
+        Args:
+            symbol: Trading pair (e.g. BTCUSDT, ETHUSDT).
+            auth: Resolved caller identity used to enforce rate limits.
+            market_session: Async TimescaleDB session.
+            interval: Candle timeframe (1m, 5m, 15m, 1h, 4h, 12h, 1d).
+            limit: Maximum number of candles to return (1-1000).
+            from_ms: Optional start timestamp in milliseconds.
+            to_ms: Optional end timestamp in milliseconds.
+
+        Returns:
+            Envelope containing a list of ``[timestamp, open, high, low, close, volume]`` rows.
+
+        Raises:
+            HTTPException 404: If no candles exist for the requested range.
+      operationId: get_ohlcv_v1_market_ohlcv__symbol__get
+      parameters:
+      - name: symbol
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Symbol
+      - name: interval
+        in: query
+        required: false
+        schema:
+          type: string
+          description: 'Timeframe: 1m, 5m, 15m, 1h, 4h, 1d'
+          default: 1h
+          title: Interval
+        description: 'Timeframe: 1m, 5m, 15m, 1h, 4h, 1d'
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 1000
+          minimum: 1
+          default: 100
+          title: Limit
+      - name: from
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          description: Start timestamp (ms)
+          title: From
+        description: Start timestamp (ms)
+      - name: to
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          description: End timestamp (ms)
+          title: To
+        description: End timestamp (ms)
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope_list_'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /v1/news:
+    get:
+      tags:
+      - News
+      summary: Recent financial news
+      description: |-
+        Recent market news enriched with AI sentiment / summary / categorization. Filterable by symbol, category, and time window.
+
+        Return recent crypto news articles for a symbol.
+
+        Args:
+            auth: Resolved caller identity used to enforce rate limits.
+            session: Async DB session.
+            symbol: Ticker to scope news results (e.g. BTC-USD, ETH-USD).
+
+        Returns:
+            Envelope wrapping a list of news article dictionaries.
+      operationId: get_news_v1_news_get
+      parameters:
+      - name: symbol
+        in: query
+        required: false
+        schema:
+          type: string
+          description: Symbol to fetch news for
+          default: BTC-USD
+          title: Symbol
+        description: Symbol to fetch news for
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope_list_'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /v1/tokens/trending:
+    get:
+      tags:
+      - Tokens
+      summary: Trending tokens for a network
+      description: |-
+        Returns the top trending tokens on a given EVM or Solana network, ranked by volume. Useful for populating market-screener UIs.
+
+        Return trending tokens for a network from Codex.
+
+        Args:
+            auth: Resolved caller identity used to enforce rate limits.
+            network_id: Codex network identifier (Solana mainnet default).
+            limit: Maximum number of tokens to return (1-100).
+
+        Returns:
+            Envelope containing a list of raw Codex trending entries.
+
+        Raises:
+            HTTPException 502: If Codex returns an error.
+      operationId: trending_tokens_v1_tokens_trending_get
+      parameters:
+      - name: networkId
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 1399811149
+          title: Networkid
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 100
+          minimum: 1
+          default: 20
+          title: Limit
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope_list_'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /v1/tokens/{network_id}/{address}:
+    get:
+      tags:
+      - Tokens
+      summary: Fetch a specific token by network + address
+      description: |-
+        Returns full metadata for a token (symbol, name, decimals, market cap, price, volume, image_url) by its on-chain address on a given network id.
+
+        Return detail for a single token from the Redis catalog.
+
+        Args:
+            network_id: Codex network identifier.
+            address: Token contract address.
+            auth: Resolved caller identity used to enforce rate limits.
+
+        Returns:
+            Envelope wrapping the token record, or an empty dict if missing.
+      operationId: get_token_detail_v1_tokens__network_id___address__get
+      parameters:
+      - name: network_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: Network Id
+      - name: address
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Address
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope_dict_'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /v1/pumpfun/top:
+    get:
+      tags:
+      - PumpFun
+      summary: Top tokens on pump.fun
+      description: |-
+        Current top pump.fun Solana tokens by market activity.
+
+        Return top pump.fun tokens by recent activity.
+
+        Args:
+            auth: Resolved caller identity used to enforce rate limits.
+            limit: Maximum number of tokens to return (1-50).
+            hours: Lookback window in hours (1-72).
+
+        Returns:
+            Envelope containing a dict with ``tokens`` and ``network_id`` keys.
+
+        Raises:
+            HTTPException 502: If the upstream pump.fun / Bitquery API errors.
+      operationId: top_pump_tokens_v1_pumpfun_top_get
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 50
+          minimum: 1
+          default: 10
+          title: Limit
+      - name: hours
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 72
+          minimum: 1
+          default: 24
+          title: Hours
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope_dict_'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT or kai-<hex>
+      description: |-
+        Use either a JWT from POST /v1/auth/login or an API key secret from POST /v1/auth/api-keys.
+
+            Authorization: Bearer kai-...
+    ApiKeyHeader:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: Alternative to Bearer auth. Send the raw API key secret.
+  schemas:
+    APIKeyListItem:
+      properties:
+        id:
+          type: integer
+          title: Id
+        key_prefix:
+          type: string
+          title: Key Prefix
+        name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Name
+        tier:
+          type: string
+          title: Tier
+        rate_limit_rpm:
+          type: integer
+          title: Rate Limit Rpm
+        rate_limit_tpm:
+          type: integer
+          title: Rate Limit Tpm
+        is_active:
+          type: boolean
+          title: Is Active
+        created_at:
+          type: string
+          title: Created At
+        last_used_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Last Used At
+      type: object
+      required:
+      - id
+      - key_prefix
+      - tier
+      - rate_limit_rpm
+      - rate_limit_tpm
+      - is_active
+      - created_at
+      title: APIKeyListItem
+      description: |-
+        Single item in the API key listing response.
+
+        Attributes:
+            id: Database ID of the key.
+            key_prefix: Short display prefix.
+            name: Optional human-readable label.
+            tier: Pricing/access tier.
+            rate_limit_rpm: Requests-per-minute limit.
+            rate_limit_tpm: Tokens-per-minute limit.
+            is_active: Whether the key is currently active.
+            created_at: ISO timestamp of key creation.
+            last_used_at: ISO timestamp of last use, or None.
+    APIKeyResponse:
+      properties:
+        id:
+          type: integer
+          title: Id
+        raw_key:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Raw Key
+        key_prefix:
+          type: string
+          title: Key Prefix
+        name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Name
+        tier:
+          type: string
+          title: Tier
+        rate_limit_rpm:
+          type: integer
+          title: Rate Limit Rpm
+        rate_limit_tpm:
+          type: integer
+          title: Rate Limit Tpm
+      type: object
+      required:
+      - id
+      - key_prefix
+      - tier
+      - rate_limit_rpm
+      - rate_limit_tpm
+      title: APIKeyResponse
+      description: |-
+        Response after creating an API key.
+
+        Attributes:
+            id: Database ID of the key.
+            raw_key: The plaintext API key (only returned at creation).
+            key_prefix: Short display prefix for UI listing.
+            name: Optional human-readable label.
+            tier: Pricing/access tier.
+            rate_limit_rpm: Requests-per-minute limit.
+            rate_limit_tpm: Tokens-per-minute limit.
+    AuthTokenResponse:
+      properties:
+        token:
+          type: string
+          title: Token
+        account_id:
+          type: string
+          title: Account Id
+        email:
+          type: string
+          title: Email
+      type: object
+      required:
+      - token
+      - account_id
+      - email
+      title: AuthTokenResponse
+      description: |-
+        Response containing a bearer JWT after successful auth.
+
+        Attributes:
+            token: The bearer JWT for subsequent API requests.
+            account_id: UUID of the authenticated account.
+            email: Email address of the authenticated account.
+    BalanceResponse:
+      properties:
+        account_id:
+          type: string
+          title: Account Id
+        balance_micros:
+          type: integer
+          title: Balance Micros
+        balance_kai:
+          type: number
+          title: Balance Kai
+      type: object
+      required:
+      - account_id
+      - balance_micros
+      - balance_kai
+      title: BalanceResponse
+      description: |-
+        Response payload for the current KAI credit balance.
+
+        Attributes:
+            account_id: Unique identifier for the account.
+            balance_micros: Balance expressed in micro-KAI (1 KAI = 1 000 000).
+            balance_kai: Human-readable balance in whole KAI units.
+    ChatCompletionRequest:
+      properties:
+        model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Model
+          description: Model id. Defaults to the server's configured model if omitted.
+        messages:
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+          type: array
+          minItems: 1
+          title: Messages
+        max_tokens:
+          anyOf:
+          - type: integer
+            maximum: 8192.0
+            minimum: 1.0
+          - type: 'null'
+          title: Max Tokens
+        temperature:
+          anyOf:
+          - type: number
+            maximum: 2.0
+            minimum: 0.0
+          - type: 'null'
+          title: Temperature
+        top_p:
+          anyOf:
+          - type: number
+            maximum: 1.0
+            minimum: 0.0
+          - type: 'null'
+          title: Top P
+        stream:
+          type: boolean
+          title: Stream
+          default: false
+        stop:
+          anyOf:
+          - {}
+          - type: 'null'
+          title: Stop
+          description: String or list of strings at which the LLM should stop generating.
+        n:
+          anyOf:
+          - type: integer
+            maximum: 1.0
+            minimum: 1.0
+          - type: 'null'
+          title: N
+          default: 1
+        user:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: User
+          description: Opaque identifier for the end-user, passed through to the upstream LLM for abuse
+            monitoring.
+        reasoning:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Reasoning
+          description: 'Enable or disable chain-of-thought / ''thinking'' mode for reasoning-capable models
+            (Qwen3, DeepSeek-R1, etc.). When ``false`` the model skips hidden reasoning tokens entirely
+            — responses are much faster and **substantially cheaper**: a trivial prompt like ''say hi''
+            uses ~2 completion tokens with reasoning off versus ~190 with reasoning on, since reasoning
+            tokens are billed at the same per-token rate as visible output tokens. When ``true`` reasoning
+            is explicitly enabled. When unset (``null``, the default) the server uses the model''s native
+            default, which is reasoning ON for reasoning-capable models.'
+      type: object
+      required:
+      - messages
+      title: ChatCompletionRequest
+      description: Subset of the OpenAI Chat Completions request body we support.
+    ChatCost:
+      properties:
+        llm_usd:
+          type: number
+          title: Llm Usd
+        fee_multiplier:
+          type: number
+          title: Fee Multiplier
+        total_usd:
+          type: number
+          title: Total Usd
+        total_micros:
+          type: integer
+          title: Total Micros
+        kai_price_usd:
+          type: number
+          title: Kai Price Usd
+      type: object
+      required:
+      - llm_usd
+      - fee_multiplier
+      - total_usd
+      - total_micros
+      - kai_price_usd
+      title: ChatCost
+      description: |-
+        Pricing breakdown for a single chat request.
+
+        Attributes:
+            llm_usd: Raw LLM cost before fee, in USD.
+            fee_multiplier: Multiplier applied to ``llm_usd`` (e.g. 1.20).
+            total_usd: Final USD cost after fee.
+            total_micros: Final cost expressed in KAI micros (1 KAI = 1e6).
+            kai_price_usd: KAI/USD price used for conversion at request time.
+    ChatMessage:
+      properties:
+        role:
+          type: string
+          enum:
+          - system
+          - user
+          - assistant
+          - tool
+          title: Role
+        content:
+          type: string
+          title: Content
+        name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Name
+      type: object
+      required:
+      - role
+      - content
+      title: ChatMessage
+      description: A single OpenAI-style chat message.
+    ChatRequest:
+      properties:
+        message:
+          type: string
+          maxLength: 10000
+          minLength: 1
+          title: Message
+        model:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Model
+        max_tokens:
+          anyOf:
+          - type: integer
+            maximum: 8192.0
+            minimum: 1.0
+          - type: 'null'
+          title: Max Tokens
+      type: object
+      required:
+      - message
+      title: ChatRequest
+      description: |-
+        Request body for a v1 chat completion.
+
+        Attributes:
+            message: The user prompt / question to send to the model.
+            model: Optional explicit model name. Defaults to the configured
+                ``openai_model`` if not provided.
+            max_tokens: Optional cap on output tokens.
+    ChatResponse:
+      properties:
+        answer:
+          type: string
+          title: Answer
+        tokens_in:
+          type: integer
+          title: Tokens In
+        tokens_out:
+          type: integer
+          title: Tokens Out
+        latency_ms:
+          type: integer
+          title: Latency Ms
+        cost:
+          $ref: '#/components/schemas/ChatCost'
+      type: object
+      required:
+      - answer
+      - tokens_in
+      - tokens_out
+      - latency_ms
+      - cost
+      title: ChatResponse
+      description: |-
+        Response body for a v1 chat completion.
+
+        Attributes:
+            answer: Model-generated text.
+            tokens_in: Input/prompt tokens consumed.
+            tokens_out: Output/completion tokens generated.
+            latency_ms: Total request latency including LLM call.
+            cost: Pricing breakdown for the request.
+    CheckoutRequest:
+      properties:
+        amount_usd_cents:
+          type: integer
+          maximum: 100000.0
+          minimum: 100.0
+          title: Amount Usd Cents
+          description: Amount in USD cents ($1-$1000)
+        success_url:
+          type: string
+          title: Success Url
+          description: URL to redirect after successful payment
+        cancel_url:
+          type: string
+          title: Cancel Url
+          description: URL to redirect if payment is cancelled
+      type: object
+      required:
+      - amount_usd_cents
+      - success_url
+      - cancel_url
+      title: CheckoutRequest
+      description: |-
+        Request body for creating a Stripe checkout session.
+
+        Attributes:
+            amount_usd_cents: Payment amount in US cents (100-100000).
+            success_url: Redirect URL after successful payment.
+            cancel_url: Redirect URL if payment is cancelled.
+    CheckoutResponse:
+      properties:
+        checkout_url:
+          type: string
+          title: Checkout Url
+        session_id:
+          type: string
+          title: Session Id
+        estimated_kai:
+          type: integer
+          title: Estimated Kai
+      type: object
+      required:
+      - checkout_url
+      - session_id
+      - estimated_kai
+      title: CheckoutResponse
+      description: |-
+        Response after creating a Stripe checkout session.
+
+        Attributes:
+            checkout_url: Stripe-hosted checkout page URL.
+            session_id: Stripe checkout session identifier.
+            estimated_kai: Estimated KAI tokens at current market price.
+    CreateAPIKeyRequest:
+      properties:
+        name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Name
+      type: object
+      title: CreateAPIKeyRequest
+      description: |-
+        Request body for creating a new API key.
+
+        Attributes:
+            name: Optional human-readable label for the key.
+    Envelope_APIKeyResponse_:
+      properties:
+        v:
+          type: integer
+          title: V
+          description: Payload schema version
+          default: 1
+        data:
+          $ref: '#/components/schemas/APIKeyResponse'
+      type: object
+      required:
+      - data
+      title: Envelope[APIKeyResponse]
+    Envelope_AuthTokenResponse_:
+      properties:
+        v:
+          type: integer
+          title: V
+          description: Payload schema version
+          default: 1
+        data:
+          $ref: '#/components/schemas/AuthTokenResponse'
+      type: object
+      required:
+      - data
+      title: Envelope[AuthTokenResponse]
+    Envelope_BalanceResponse_:
+      properties:
+        v:
+          type: integer
+          title: V
+          description: Payload schema version
+          default: 1
+        data:
+          $ref: '#/components/schemas/BalanceResponse'
+      type: object
+      required:
+      - data
+      title: Envelope[BalanceResponse]
+    Envelope_ChatResponse_:
+      properties:
+        v:
+          type: integer
+          title: V
+          description: Payload schema version
+          default: 1
+        data:
+          $ref: '#/components/schemas/ChatResponse'
+      type: object
+      required:
+      - data
+      title: Envelope[ChatResponse]
+    Envelope_CheckoutResponse_:
+      properties:
+        v:
+          type: integer
+          title: V
+          description: Payload schema version
+          default: 1
+        data:
+          $ref: '#/components/schemas/CheckoutResponse'
+      type: object
+      required:
+      - data
+      title: Envelope[CheckoutResponse]
+    Envelope_dict_:
+      properties:
+        v:
+          type: integer
+          title: V
+          description: Payload schema version
+          default: 1
+        data:
+          additionalProperties: true
+          type: object
+          title: Data
+      type: object
+      required:
+      - data
+      title: Envelope[dict]
+    Envelope_list_:
+      properties:
+        v:
+          type: integer
+          title: V
+          description: Payload schema version
+          default: 1
+        data:
+          items: {}
+          type: array
+          title: Data
+      type: object
+      required:
+      - data
+      title: Envelope[list]
+    Envelope_list_APIKeyListItem__:
+      properties:
+        v:
+          type: integer
+          title: V
+          description: Payload schema version
+          default: 1
+        data:
+          items:
+            $ref: '#/components/schemas/APIKeyListItem'
+          type: array
+          title: Data
+      type: object
+      required:
+      - data
+      title: Envelope[list[APIKeyListItem]]
+    Envelope_list_UsageRecord__:
+      properties:
+        v:
+          type: integer
+          title: V
+          description: Payload schema version
+          default: 1
+        data:
+          items:
+            $ref: '#/components/schemas/UsageRecord'
+          type: array
+          title: Data
+      type: object
+      required:
+      - data
+      title: Envelope[list[UsageRecord]]
+    Envelope_list_dict__:
+      properties:
+        v:
+          type: integer
+          title: V
+          description: Payload schema version
+          default: 1
+        data:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Data
+      type: object
+      required:
+      - data
+      title: Envelope[list[dict]]
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    LoginRequest:
+      properties:
+        email:
+          type: string
+          format: email
+          title: Email
+        password:
+          type: string
+          title: Password
+      type: object
+      required:
+      - email
+      - password
+      title: LoginRequest
+      description: |-
+        Request body for email/password login.
+
+        Attributes:
+            email: The registered email address.
+            password: The account password.
+    RegisterRequest:
+      properties:
+        email:
+          type: string
+          format: email
+          title: Email
+        password:
+          type: string
+          minLength: 8
+          title: Password
+        display_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Display Name
+      type: object
+      required:
+      - email
+      - password
+      title: RegisterRequest
+      description: |-
+        Request body for new account registration.
+
+        Attributes:
+            email: Valid email address for the account.
+            password: Account password (minimum 8 characters).
+            display_name: Optional human-readable display name.
+    UsageRecord:
+      properties:
+        id:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Id
+        endpoint:
+          type: string
+          title: Endpoint
+        tokens_in:
+          type: integer
+          title: Tokens In
+        tokens_out:
+          type: integer
+          title: Tokens Out
+        cost_micros:
+          type: integer
+          title: Cost Micros
+        latency_ms:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Latency Ms
+        created_at:
+          type: string
+          title: Created At
+      type: object
+      required:
+      - endpoint
+      - tokens_in
+      - tokens_out
+      - cost_micros
+      - created_at
+      title: UsageRecord
+      description: |-
+        Single API usage record returned in usage history.
+
+        Attributes:
+            id: Primary key of the api_usage row. Used as the "request #" on
+                the account page.
+            endpoint: The API path that was called.
+            tokens_in: Number of prompt tokens consumed by the request.
+            tokens_out: Number of completion tokens produced.
+            cost_micros: Cost of the request in micro-KAI.
+            latency_ms: Server-side latency for the LLM call, if captured.
+            created_at: ISO-8601 timestamp when the request was made.
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+        input:
+          title: Input
+        ctx:
+          type: object
+          title: Context
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError

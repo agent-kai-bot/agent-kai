@@ -66,6 +66,41 @@ bin/kaictl stop
 
 When `kaictl` or terminal auto-spawn starts the daemon, stdout and stderr go to `logs/kaid.log`.
 
+## Taskboard Gateway
+
+The daemon exposes an OpenClaw-compatible gateway for the taskboard. Point the
+taskboard's `OPENCLAW_GATEWAY_URL` at the daemon and keep the taskboard as the
+workflow/state source of truth.
+
+```bash
+export OPENCLAW_GATEWAY_TOKEN="shared-gateway-token"
+export TASKBOARD_URL="http://localhost:8080"
+export TASKBOARD_BEARER_TOKEN="taskboard-api-token"
+
+python main.py --daemon
+# serves http://127.0.0.1:8765/tools/invoke
+
+python main.py --daemon --host 0.0.0.0 --port 18789
+# serves the daemon and taskboard gateway on http://HOST:18789/
+```
+
+Supported tool invocations:
+
+- `sessions_spawn`
+- `sessions_send`
+- `sessions_list`
+
+The embedded compatibility gateway also supports `POST /api/cron/wake` for taskboard
+comment notifications and `POST /api/sessions/{session_key}/abort` for stop
+requests. `sessions_send` returns `result.details.reply` for synchronous
+command-bar traffic and queues follow-ups when the target run is already active.
+
+Docker Compose maps both `8765` and `18789` on the host to the same daemon
+process, so existing taskboards configured for `OPENCLAW_GATEWAY_URL` on
+`18789` can use the daemon without a second gateway service. The taskboard role
+ids `developer`, `code-reviewer`, `security-auditor`, `architect`, `qa-agent`,
+`ux-manager`, and `deep-research` are configured in `agent-config.json`.
+
 ## Web UI
 
 The daemon serves the built Svelte web client at `/`. Until you build it, the root route shows a placeholder page instead of the dashboard.

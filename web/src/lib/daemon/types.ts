@@ -12,6 +12,8 @@ export type SessionStateSnapshot = {
   watchlist_symbols: string[];
   autotrade_enabled: boolean;
   activity_status: string;
+  chat_history_total?: number;
+  chat_history_omitted?: number;
   chat_history: ChatHistoryEntry[];
 };
 
@@ -59,6 +61,84 @@ export type PortfolioSnapshot = {
     total_pnl_pct?: number;
     [key: string]: number | string | undefined;
   };
+};
+
+export type ModelFallbackSummary = {
+  endpoint?: string | null;
+  model?: string | null;
+  provider?: string | null;
+  base_url?: string | null;
+};
+
+export type ModelAgentSummary = {
+  name: string;
+  description?: string;
+  endpoint?: string | null;
+  model?: string | null;
+  provider?: string | null;
+  base_url?: string | null;
+  reasoning_effort?: string | null;
+  text_verbosity?: string | null;
+  max_iterations?: number | null;
+  fallbacks?: ModelFallbackSummary[];
+};
+
+export type EndpointModelSummary = {
+  name: string;
+  provider?: string;
+  base_url?: string;
+  default_model?: string | null;
+  models: string[];
+};
+
+export type ModelRegistryResponse = {
+  agents: ModelAgentSummary[];
+  endpoints: EndpointModelSummary[];
+};
+
+export type ModelSwitchResponse = {
+  agent: ModelAgentSummary;
+  reloaded_sessions: Array<{
+    session: string;
+    model?: string | null;
+    provider?: string | null;
+    reasoning_effort?: string | null;
+    fallback_count?: number;
+  }>;
+};
+
+export type ChartViewState = {
+  chart_symbol: string;
+  chart_timeframe: string;
+  chart_source: string;
+  chart_layout_mode: string;
+};
+
+export type ChartViewPatch = {
+  symbol?: string;
+  timeframe?: string;
+  source?: string;
+  mode?: string;
+};
+
+export type ChartViewResponse = {
+  session: string;
+  chart: ChartViewState;
+};
+
+export type WatchlistState = {
+  watchlist_symbols: string[];
+};
+
+export type WatchlistPatch = {
+  symbols?: string[];
+  add?: string;
+  remove?: string;
+};
+
+export type WatchlistResponse = {
+  session: string;
+  watchlist: WatchlistState;
 };
 
 export type SessionAttachedEnvelope = {
@@ -114,6 +194,14 @@ export type ChartBarEnvelope = {
   bar: CandleBar;
 };
 
+export type ChartViewEnvelope = ChartViewState & {
+  type: "chart_view";
+};
+
+export type WatchlistEnvelope = WatchlistState & {
+  type: "watchlist";
+};
+
 export type NatsEventEnvelope = {
   type: "nats_event";
   direction: string;
@@ -140,6 +228,8 @@ export type ServerEnvelope =
   | ToolEndEnvelope
   | SignalEnvelope
   | ChartBarEnvelope
+  | ChartViewEnvelope
+  | WatchlistEnvelope
   | NatsEventEnvelope
   | ScheduledJobEnvelope;
 

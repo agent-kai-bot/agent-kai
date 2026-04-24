@@ -130,6 +130,150 @@ describe("daemon client helpers", () => {
       { headers: { Authorization: "Bearer secret" } },
     );
   });
+
+  it("loads and updates model selection through daemon REST API", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            agents: [{ name: "kai", endpoint: "codex-cli", model: "gpt-5.4" }],
+            endpoints: [
+              {
+                name: "codex-cli",
+                provider: "codex-cli",
+                default_model: "gpt-5.4",
+                models: ["gpt-5.5", "gpt-5.4"],
+              },
+            ],
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            agent: {
+              name: "kai",
+              endpoint: "codex-cli",
+              model: "gpt-5.5",
+              reasoning_effort: "high",
+            },
+            reloaded_sessions: [
+              {
+                session: "terminal",
+                model: "gpt-5.5",
+                reasoning_effort: "high",
+              },
+            ],
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            session: "terminal",
+            chart: {
+              chart_symbol: "ETH",
+              chart_timeframe: "15m",
+              chart_source: "coinbase",
+              chart_layout_mode: "mini",
+            },
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            session: "terminal",
+            watchlist: { watchlist_symbols: ["BTC", "ETH", "BIO"] },
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify({ stopped: true })));
+
+    const client = new DaemonClient({
+      baseHttpUrl: "http://127.0.0.1:8765",
+      fetchImpl,
+      webSocketFactory: vi.fn() as never,
+    });
+
+    const registry = await client.fetchModelRegistry("secret");
+    const switched = await client.switchAgentModel(
+      "kai",
+      "codex-cli",
+      "gpt-5.5",
+      "secret",
+      "high",
+    );
+    const chart = await client.updateChartView(
+      "terminal",
+      { symbol: "ETH", timeframe: "15m", source: "coinbase", mode: "mini" },
+      "secret",
+    );
+    const watchlist = await client.updateSessionWatchlist(
+      "terminal",
+      { add: "BIO" },
+      "secret",
+    );
+    const stopped = await client.stopSession("terminal", "secret");
+
+    expect(registry.agents[0]?.model).toBe("gpt-5.4");
+    expect(switched.agent.model).toBe("gpt-5.5");
+    expect(switched.agent.reasoning_effort).toBe("high");
+    expect(chart.chart.chart_symbol).toBe("ETH");
+    expect(watchlist.watchlist.watchlist_symbols).toContain("BIO");
+    expect(stopped.stopped).toBe(true);
+    expect(fetchImpl).toHaveBeenNthCalledWith(
+      2,
+      "http://127.0.0.1:8765/api/models/kai",
+      {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer secret",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          endpoint: "codex-cli",
+          model: "gpt-5.5",
+          reasoning_effort: "high",
+        }),
+      },
+    );
+    expect(fetchImpl).toHaveBeenNthCalledWith(
+      3,
+      "http://127.0.0.1:8765/api/sessions/terminal/ui/chart",
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: "Bearer secret",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          symbol: "ETH",
+          timeframe: "15m",
+          source: "coinbase",
+          mode: "mini",
+        }),
+      },
+    );
+    expect(fetchImpl).toHaveBeenNthCalledWith(
+      4,
+      "http://127.0.0.1:8765/api/sessions/terminal/ui/watchlist",
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: "Bearer secret",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ add: "BIO" }),
+      },
+    );
+    expect(fetchImpl).toHaveBeenNthCalledWith(
+      5,
+      "http://127.0.0.1:8765/api/sessions/terminal/stop",
+      { method: "POST", headers: { Authorization: "Bearer secret" } },
+    );
+  });
 });
 
 describe("daemon attach handshake", () => {
@@ -166,6 +310,12 @@ describe("daemon attach handshake", () => {
               queue: 0,
             }),
           });
+          socket?.emit("message", {
+            data: JSON.stringify({
+              type: "watchlist",
+              watchlist_symbols: ["BTC", "ETH", "BIO"],
+            }),
+          });
         });
         return socket;
       },
@@ -189,5 +339,6 @@ describe("daemon attach handshake", () => {
     });
     expect(connection.session).toBe("terminal");
     expect(connection.snapshot.chart_symbol).toBe("BTC");
+    expect(connection.snapshot.watchlist_symbols).toContain("BIO");
   });
 });
