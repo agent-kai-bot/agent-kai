@@ -575,18 +575,6 @@ body.dashboard-active {
   grid-template-rows: auto minmax(8rem, var(--chart-pane, 56%)) 0.55rem minmax(8rem, 1fr) auto;
 }
 
-.dashboard-column.center[data-chart-mode="full"] {
-  grid-template-rows: auto minmax(8rem, var(--chart-pane, 56%)) 0.55rem minmax(8rem, 1fr) auto;
-}
-
-.dashboard-column.center[data-chart-mode="half"] {
-  grid-template-rows: auto minmax(8rem, var(--chart-pane, 50%)) 0.55rem minmax(8rem, 1fr) auto;
-}
-
-.dashboard-column.center[data-chart-mode="mini"] {
-  grid-template-rows: auto minmax(7rem, var(--chart-pane, 34%)) 0.55rem minmax(8rem, 1fr) auto;
-}
-
 .dashboard-column.center[data-chart-mode="hide"] {
   grid-template-rows: auto minmax(3.4rem, auto) 0.55rem minmax(0, 1fr) auto;
 }

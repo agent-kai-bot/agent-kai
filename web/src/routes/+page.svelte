@@ -2,7 +2,6 @@
   import { onDestroy, onMount } from "svelte";
 
   import {
-    chartModeLabel,
     normalizeChartMode,
     readStoredChartMode,
     resolveChartCommandInput,
@@ -52,6 +51,11 @@
   const client = new DaemonClient();
   const localhostHosts = new Set(["localhost", "127.0.0.1", "::1"]);
   const reasoningChoices = ["none", "minimal", "low", "medium", "high", "xhigh"];
+  const chartPanePresets: Record<Exclude<ChartMode, "hide">, number> = {
+    full: 56,
+    half: 50,
+    mini: 34,
+  };
 
   let token = $state("");
   let sessionName = $state(DEFAULT_SESSION_NAME);
@@ -152,6 +156,7 @@
   function applyChartMode(nextMode: ChartMode): void {
     if (nextMode !== "hide") {
       lastVisibleChartMode = nextMode;
+      chartPanePct = chartPanePresets[nextMode];
     }
     chartMode = nextMode;
     if (daemonConnection) {
@@ -420,6 +425,10 @@
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onEnd);
     window.addEventListener("pointercancel", onEnd);
+  }
+
+  async function resetChartSplit(): Promise<void> {
+    await requestChartViewUpdate({ mode: "full" });
   }
 
   async function selectChartSymbol(symbol: string): Promise<void> {
@@ -1210,18 +1219,24 @@
                 </select>
               </label>
 
-              <div class="mode-group" aria-label="Chart size">
-                {#each ["full", "half", "mini", "hide"] as mode}
-                  <button
-                    class:active={mode === chartMode}
-                    disabled={isUpdatingChart}
-                    onclick={() => void requestChartViewUpdate({ mode })}
-                    type="button"
-                  >
-                    {chartModeLabel(normalizeChartMode(mode))}
-                  </button>
-                {/each}
-              </div>
+              <button
+                disabled={isUpdatingChart}
+                onclick={() => void resetChartSplit()}
+                title="Reset the chart and chat split"
+                type="button"
+              >
+                Reset Split
+              </button>
+
+              <button
+                class:active={chartMode === "hide"}
+                disabled={isUpdatingChart}
+                onclick={() => void requestChartViewUpdate({ mode: "hide" })}
+                title="Collapse the chart and give the center panel to chat"
+                type="button"
+              >
+                Hide Chart
+              </button>
 
               <button
                 aria-label={chartSymbolIsWatched()
