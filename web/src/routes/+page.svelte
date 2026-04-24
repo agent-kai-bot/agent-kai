@@ -1053,6 +1053,155 @@
           </div>
         </div>
 
+        <section class="chart-toolbar" aria-label="Chart controls">
+          <div class="chart-toolbar-main">
+            <div class="symbol-combobox" onfocusout={onSymbolSelectorFocusOut}>
+              <label for="chart-symbol-search">Symbol</label>
+              <input
+                id="chart-symbol-search"
+                aria-activedescendant={symbolSearchOpen ? `symbol-option-${activeSuggestionIndex}` : undefined}
+                aria-autocomplete="list"
+                aria-controls="symbol-results"
+                aria-expanded={symbolSearchOpen}
+                aria-haspopup="listbox"
+                bind:value={symbolSearch}
+                onfocus={() => {
+                  symbolSearchOpen = true;
+                  syncSymbolSearch();
+                }}
+                oninput={() => {
+                  symbolSearchOpen = true;
+                  activeSuggestionIndex = 0;
+                }}
+                onkeydown={onSymbolSearchKeydown}
+                placeholder="BTC"
+                role="combobox"
+                type="search"
+              />
+              {#if symbolSearchOpen}
+                <div class="symbol-results" id="symbol-results" role="listbox">
+                  {#if symbolSuggestions().length}
+                    {#each symbolSuggestions() as suggestion, index (suggestion.symbol)}
+                      <button
+                        id={`symbol-option-${index}`}
+                        class:active={index === activeSuggestionIndex}
+                        aria-selected={index === activeSuggestionIndex}
+                        onclick={() => void selectChartSymbol(suggestion.symbol)}
+                        role="option"
+                        type="button"
+                      >
+                        <strong>{suggestion.symbol}</strong>
+                        <span>{suggestion.source}</span>
+                      </button>
+                    {/each}
+                  {:else if normalizeMarketSymbol(symbolSearch)}
+                    <button
+                      class="active"
+                      aria-selected="true"
+                      onclick={() => void selectChartSymbol(symbolSearch)}
+                      role="option"
+                      type="button"
+                    >
+                      <strong>{normalizeMarketSymbol(symbolSearch)}</strong>
+                      <span>custom</span>
+                    </button>
+                  {:else}
+                    <p>No symbols</p>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+
+            <div class="timeframe-group" aria-label="Chart timeframe">
+              {#each ["1m", "5m", "15m", "1h", "4h", "1d", "1w"] as timeframe}
+                <button
+                  class:active={timeframe === chartTimeframe}
+                  disabled={isUpdatingChart}
+                  onclick={() => void requestChartViewUpdate({ timeframe })}
+                  type="button"
+                >
+                  {timeframe}
+                </button>
+              {/each}
+            </div>
+
+            <label class="source-select">
+              <span>Source</span>
+              <select
+                disabled={isUpdatingChart}
+                value={chartSource}
+                onchange={(event) => void requestChartViewUpdate({
+                  source: event.currentTarget.value,
+                })}
+              >
+                <option value="kai-api">kai-api</option>
+                <option value="coinbase">coinbase</option>
+              </select>
+            </label>
+
+            <button
+              disabled={isUpdatingChart}
+              onclick={() => void resetChartSplit()}
+              title="Reset the chart and chat split"
+              type="button"
+            >
+              Reset Split
+            </button>
+
+            <button
+              class:active={chartMode === "hide"}
+              disabled={isUpdatingChart}
+              onclick={() => void requestChartViewUpdate({ mode: "hide" })}
+              title="Collapse the chart and give the center panel to chat"
+              type="button"
+            >
+              Hide Chart
+            </button>
+
+            <button
+              aria-label={chartSymbolIsWatched()
+                ? `Remove ${chartSymbol} from watchlist`
+                : `Add ${chartSymbol} to watchlist`}
+              aria-pressed={chartSymbolIsWatched()}
+              class:active={chartSymbolIsWatched()}
+              class="toolbar-star"
+              onclick={() => void toggleChartSymbolWatchlist()}
+              title={chartSymbolIsWatched()
+                ? `Remove ${chartSymbol} from watchlist`
+                : `Add ${chartSymbol} to watchlist`}
+              type="button"
+            >
+              {#if chartSymbolIsWatched()}★{:else}☆{/if}
+            </button>
+
+            <button
+              class="toolbar-refresh"
+              disabled={isUpdatingChart}
+              onclick={() => void Promise.all([refreshSidebarData(), refreshChartData()])}
+              type="button"
+            >
+              Refresh
+            </button>
+          </div>
+
+          <div
+            class:error={Boolean(chartUpdateError)}
+            class:pending={isUpdatingChart}
+            class="chart-toolbar-status"
+          >
+            <span>{chartUpdateLabel()}</span>
+            <span>{formatPrice(chartPrice())}</span>
+            <span
+              class:negative={Boolean(chartQuote && typeof chartQuote.price_change_24h_pct === "number" && chartQuote.price_change_24h_pct < 0)}
+              class:positive={Boolean(chartQuote && typeof chartQuote.price_change_24h_pct === "number" && chartQuote.price_change_24h_pct > 0)}
+            >
+              {formatChange(chartQuote?.price_change_24h_pct)}
+            </span>
+            <span>{streamLatencyLabel()}</span>
+            <span>{streamThroughputLabel()}</span>
+          </div>
+        </section>
+
         <div class="dashboard-actions">
           <div class="model-picker">
             <select
@@ -1133,155 +1282,6 @@
           data-chart-mode={chartMode}
           style={centerColumnStyle()}
         >
-          <section class="chart-toolbar" aria-label="Chart controls">
-            <div class="chart-toolbar-main">
-              <div class="symbol-combobox" onfocusout={onSymbolSelectorFocusOut}>
-                <label for="chart-symbol-search">Symbol</label>
-                <input
-                  id="chart-symbol-search"
-                  aria-activedescendant={symbolSearchOpen ? `symbol-option-${activeSuggestionIndex}` : undefined}
-                  aria-autocomplete="list"
-                  aria-controls="symbol-results"
-                  aria-expanded={symbolSearchOpen}
-                  aria-haspopup="listbox"
-                  bind:value={symbolSearch}
-                  onfocus={() => {
-                    symbolSearchOpen = true;
-                    syncSymbolSearch();
-                  }}
-                  oninput={() => {
-                    symbolSearchOpen = true;
-                    activeSuggestionIndex = 0;
-                  }}
-                  onkeydown={onSymbolSearchKeydown}
-                  placeholder="BTC"
-                  role="combobox"
-                  type="search"
-                />
-                {#if symbolSearchOpen}
-                  <div class="symbol-results" id="symbol-results" role="listbox">
-                    {#if symbolSuggestions().length}
-                      {#each symbolSuggestions() as suggestion, index (suggestion.symbol)}
-                        <button
-                          id={`symbol-option-${index}`}
-                          class:active={index === activeSuggestionIndex}
-                          aria-selected={index === activeSuggestionIndex}
-                          onclick={() => void selectChartSymbol(suggestion.symbol)}
-                          role="option"
-                          type="button"
-                        >
-                          <strong>{suggestion.symbol}</strong>
-                          <span>{suggestion.source}</span>
-                        </button>
-                      {/each}
-                    {:else if normalizeMarketSymbol(symbolSearch)}
-                      <button
-                        class="active"
-                        aria-selected="true"
-                        onclick={() => void selectChartSymbol(symbolSearch)}
-                        role="option"
-                        type="button"
-                      >
-                        <strong>{normalizeMarketSymbol(symbolSearch)}</strong>
-                        <span>custom</span>
-                      </button>
-                    {:else}
-                      <p>No symbols</p>
-                    {/if}
-                  </div>
-                {/if}
-              </div>
-
-              <div class="timeframe-group" aria-label="Chart timeframe">
-                {#each ["1m", "5m", "15m", "1h", "4h", "1d", "1w"] as timeframe}
-                  <button
-                    class:active={timeframe === chartTimeframe}
-                    disabled={isUpdatingChart}
-                    onclick={() => void requestChartViewUpdate({ timeframe })}
-                    type="button"
-                  >
-                    {timeframe}
-                  </button>
-                {/each}
-              </div>
-
-              <label class="source-select">
-                <span>Source</span>
-                <select
-                  disabled={isUpdatingChart}
-                  value={chartSource}
-                  onchange={(event) => void requestChartViewUpdate({
-                    source: event.currentTarget.value,
-                  })}
-                >
-                  <option value="kai-api">kai-api</option>
-                  <option value="coinbase">coinbase</option>
-                </select>
-              </label>
-
-              <button
-                disabled={isUpdatingChart}
-                onclick={() => void resetChartSplit()}
-                title="Reset the chart and chat split"
-                type="button"
-              >
-                Reset Split
-              </button>
-
-              <button
-                class:active={chartMode === "hide"}
-                disabled={isUpdatingChart}
-                onclick={() => void requestChartViewUpdate({ mode: "hide" })}
-                title="Collapse the chart and give the center panel to chat"
-                type="button"
-              >
-                Hide Chart
-              </button>
-
-              <button
-                aria-label={chartSymbolIsWatched()
-                  ? `Remove ${chartSymbol} from watchlist`
-                  : `Add ${chartSymbol} to watchlist`}
-                aria-pressed={chartSymbolIsWatched()}
-                class:active={chartSymbolIsWatched()}
-                class="toolbar-star"
-                onclick={() => void toggleChartSymbolWatchlist()}
-                title={chartSymbolIsWatched()
-                  ? `Remove ${chartSymbol} from watchlist`
-                  : `Add ${chartSymbol} to watchlist`}
-                type="button"
-              >
-                {#if chartSymbolIsWatched()}★{:else}☆{/if}
-              </button>
-
-              <button
-                class="toolbar-refresh"
-                disabled={isUpdatingChart}
-                onclick={() => void Promise.all([refreshSidebarData(), refreshChartData()])}
-                type="button"
-              >
-                Refresh
-              </button>
-            </div>
-
-            <div
-              class:error={Boolean(chartUpdateError)}
-              class:pending={isUpdatingChart}
-              class="chart-toolbar-status"
-            >
-              <span>{chartUpdateLabel()}</span>
-              <span>{formatPrice(chartPrice())}</span>
-              <span
-                class:negative={Boolean(chartQuote && typeof chartQuote.price_change_24h_pct === "number" && chartQuote.price_change_24h_pct < 0)}
-                class:positive={Boolean(chartQuote && typeof chartQuote.price_change_24h_pct === "number" && chartQuote.price_change_24h_pct > 0)}
-              >
-                {formatChange(chartQuote?.price_change_24h_pct)}
-              </span>
-              <span>{streamLatencyLabel()}</span>
-              <span>{streamThroughputLabel()}</span>
-            </div>
-          </section>
-
           {#if chartMode === "hide"}
             <section class="chart-status-bar">
               <div class="chart-status-copy">
