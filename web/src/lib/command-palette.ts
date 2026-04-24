@@ -9,7 +9,7 @@ export const PALETTE_ITEMS: CommandPaletteItem[] = [
   {
     command: "/chart full",
     title: "Chart: Full",
-    description: "Resize the center column to the default 60/40 chart-first split.",
+    description: "Reset the center column to the default chart-first split.",
   },
   {
     command: "/chart half",
