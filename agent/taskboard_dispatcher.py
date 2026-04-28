@@ -16,24 +16,34 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agent.prompt_renderer import render_taskboard_fire_prompt
+from agent.taskboard_status_router import roles_to_fire
 
 LOGGER = logging.getLogger(__name__)
 
 BACKPRESSURE_SUBJECT = "ops.alerts.taskboard_dispatcher_backpressure"
+SPAWN_FAILED_SUBJECT = "ops.alerts.taskboard_dispatcher.spawn_failed"
 DISPATCHER_SOURCE = "taskboard_dispatcher"
 ACTIVE_SESSION_STATUSES = ("accepted", "spawning", "starting", "running")
+AUDIT_PENDING_STATUSES = ("spawned", "spawn_failed", "stuck_aborted")
 DEFAULT_MAX_CONCURRENT_SPAWNS = 6
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_SWEEP_INTERVAL_SECONDS = 60.0
 DEFAULT_STUCK_AFTER_SECONDS = 60 * 60
+SECRET_ENV_VARS = (
+    "TASKBOARD_BEARER_TOKEN",
+    "TASKBOARD_SESSION_TOKEN",
+    "OPENCLAW_GATEWAY_TOKEN",
+    "OPENCLAW_TOKEN",
+)
 
 
 class TaskboardTaskClient(Protocol):
-    """Protocol for fetching the latest taskboard task.
+    """Protocol for fetching taskboard state and posting audit comments.
 
     Example:
-        Test clients can implement ``fetch_task`` with an in-memory
-        dictionary and pass themselves to :class:`TaskboardDispatcher`.
+        Test clients can implement ``fetch_task`` and
+        ``post_audit_comment`` with an in-memory dictionary and pass
+        themselves to :class:`TaskboardDispatcher`.
     """
 
     def fetch_task(self, task_id: int) -> dict[str, Any] | Awaitable[dict[str, Any]]:
@@ -44,6 +54,21 @@ class TaskboardTaskClient(Protocol):
 
         Returns:
             Latest task payload as a dictionary.
+        """
+
+    def post_audit_comment(
+        self,
+        task_id: int,
+        content: str,
+    ) -> Any | Awaitable[Any]:
+        """Post a dispatcher audit comment on a task.
+
+        Args:
+            task_id: Taskboard task id.
+            content: Comment body to post.
+
+        Returns:
+            Optional taskboard client result.
         """
 
 
@@ -105,11 +130,19 @@ class PendingWebhookRow:
         row_id: Stable row identifier used for updates.
         payload: Parsed webhook payload.
         received_at: Raw received timestamp if present.
+        dispatch_status: Current dispatcher status for this row.
+        session_id: Session id recorded on the queue row, if present.
+        last_error: Last dispatcher error recorded on the queue row, if present.
+        audit_posted_at: Timestamp proving the taskboard audit comment posted.
     """
 
     row_id: Any
     payload: dict[str, Any]
     received_at: str | None = None
+    dispatch_status: str | None = None
+    session_id: str | None = None
+    last_error: str | None = None
+    audit_posted_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -119,10 +152,16 @@ class StuckSession:
     Attributes:
         session_id: Session identifier to abort.
         webhook_pending_id: Optional queue row id linked to the session.
+        task_id: Taskboard task id linked to the session, if known.
+        fire_generation: Taskboard fire generation linked to the session.
+        agent_id: Dispatcher agent id linked to the session.
     """
 
     session_id: str
     webhook_pending_id: str | None
+    task_id: int | None
+    fire_generation: int | None
+    agent_id: str | None
 
 
 @dataclass(frozen=True)
@@ -135,6 +174,7 @@ class _QueueSchema:
     received_column: str | None
     session_column: str | None
     error_column: str | None
+    audit_posted_column: str | None
 
 
 ROLE_ROUTES: dict[str, TaskboardRoleRoute] = {
@@ -259,6 +299,43 @@ class DefaultTaskboardTaskClient:
         if not envelope.get("ok"):
             raise RuntimeError(str(envelope.get("error") or envelope.get("body")))
         return _extract_task(envelope.get("body"))
+
+    def post_audit_comment(self, task_id: int, content: str) -> dict[str, Any]:
+        """Post one dispatcher audit comment to the taskboard.
+
+        Args:
+            task_id: Taskboard task id.
+            content: Audit comment body.
+
+        Returns:
+            Parsed taskboard response envelope.
+
+        Raises:
+            RuntimeError: If the taskboard reports a failed response.
+            ValueError: If the response cannot be interpreted as JSON.
+        """
+
+        from agent.taskboard_tools import TaskboardClient, TaskboardContext
+
+        client = TaskboardClient(
+            TaskboardContext(
+                base_url=self.base_url,
+                bearer_token=self.bearer_token,
+            ),
+            timeout_seconds=self.timeout_seconds,
+        )
+        raw = client.comment(
+            task_id,
+            _audit_actor_for_content(content),
+            content,
+        )
+        try:
+            envelope = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("taskboard response was not JSON") from exc
+        if not envelope.get("ok"):
+            raise RuntimeError(str(envelope.get("error") or envelope.get("body")))
+        return envelope
 
 
 class DaemonTaskboardSpawner:
@@ -420,6 +497,11 @@ class TaskboardDispatcher:
         """
 
         counts: dict[str, int] = {}
+        for row in self._store.pending_audit_rows():
+            posted = await self._post_audit_for_row(row)
+            if posted:
+                self._store.mark_audit_posted(row)
+                counts["audit_posted"] = counts.get("audit_posted", 0) + 1
         await self._publish_backpressure_alarm_if_needed()
         pending_rows = self._store.pending_rows()
         active_count = self._store.active_session_count()
@@ -429,7 +511,7 @@ class TaskboardDispatcher:
             status = await self._process_row(row)
             counts[status] = counts.get(status, 0) + 1
             if status == "spawned":
-                active_count += 1
+                active_count = self._store.active_session_count()
         return counts
 
     async def sweep_stuck_sessions(self) -> int:
@@ -451,6 +533,14 @@ class TaskboardDispatcher:
                     "stuck_aborted",
                     session_id=session.session_id,
                 )
+            if session.task_id is not None:
+                content = _stuck_session_comment(
+                    task_id=session.task_id,
+                    session_id=session.session_id,
+                )
+                posted = await self._post_audit_comment(session.task_id, content)
+                if posted and session.webhook_pending_id is not None:
+                    self._store.mark_audit_posted_by_id(session.webhook_pending_id)
             LOGGER.warning(
                 "taskboard_fire_stuck_aborted session_id=%s",
                 session.session_id,
@@ -460,88 +550,150 @@ class TaskboardDispatcher:
     async def _process_row(self, row: PendingWebhookRow) -> str:
         reserved_key: tuple[int, int, str] | None = None
         try:
+            from_status = row.payload.get("from_status")
+            to_status = row.payload.get("to_status")
+            role_names = roles_to_fire(
+                str(from_status) if from_status is not None else None,
+                str(to_status) if to_status is not None else None,
+            )
+            if not role_names:
+                self._store.mark_processed(row, "no_op_transition")
+                return "no_op_transition"
+
             payload_task = _extract_task(row.payload)
             task_id = _extract_task_id(row.payload, payload_task)
             fire_generation = _extract_fire_generation(row.payload, payload_task)
             if fire_generation is None:
                 raise ValueError("taskboard payload is missing fire_generation")
             latest_task = await self._fetch_latest_task(task_id)
-            latest_generation = _extract_fire_generation(latest_task)
-            if latest_generation is not None and latest_generation > fire_generation:
-                self._store.mark_processed(row, "superseded")
-                return "superseded"
 
-            role_text = str(latest_task.get("agent") or payload_task.get("agent") or "")
-            try:
-                route = resolve_taskboard_role(role_text)
-            except ValueError:
-                LOGGER.warning(
-                    "taskboard_fire_unknown_role task_id=%s role=%s",
-                    task_id,
-                    role_text,
+            session_results: list[tuple[TaskboardRoleRoute, str]] = []
+            duplicate_count = 0
+            for role_text in role_names:
+                try:
+                    route = resolve_taskboard_role(role_text)
+                except ValueError:
+                    LOGGER.warning(
+                        "taskboard_fire_unknown_role task_id=%s role=%s",
+                        task_id,
+                        role_text,
+                    )
+                    self._store.mark_processed(row, "unknown_role")
+                    return "unknown_role"
+
+                reserved = self._store.reserve_session(
+                    task_id=task_id,
+                    fire_generation=fire_generation,
+                    agent_id=route.agent_id,
+                    webhook_pending_id=str(row.row_id),
                 )
-                self._store.mark_processed(row, "unknown_role")
-                return "unknown_role"
+                if not reserved:
+                    existing_session = self._store.session_for_key(
+                        task_id=task_id,
+                        fire_generation=fire_generation,
+                        agent_id=route.agent_id,
+                    )
+                    if (
+                        existing_session
+                        and existing_session.get("webhook_pending_id") == str(row.row_id)
+                        and existing_session.get("session_id")
+                    ):
+                        session_results.append((route, str(existing_session["session_id"])))
+                        continue
+                    duplicate_count += 1
+                    continue
+                reserved_key = (task_id, fire_generation, route.agent_id)
 
-            reserved = self._store.reserve_session(
-                task_id=task_id,
-                fire_generation=fire_generation,
-                agent_id=route.agent_id,
-                webhook_pending_id=str(row.row_id),
-            )
-            if not reserved:
-                self._store.mark_processed(row, "duplicate")
-                return "duplicate"
-            reserved_key = (task_id, fire_generation, route.agent_id)
+                prompt = render_taskboard_fire_prompt(route.role, latest_task)
+                requested_session_id = _build_session_id(
+                    task_id=task_id,
+                    fire_generation=fire_generation,
+                    agent_id=route.agent_id,
+                )
+                try:
+                    spawn_result = self.session_manager.spawn(
+                        session_id=requested_session_id,
+                        task_id=task_id,
+                        fire_generation=fire_generation,
+                        role=route.role,
+                        agent_id=route.agent_id,
+                        model=route.model,
+                        profile=route.profile,
+                        prompt=prompt,
+                        task=latest_task,
+                    )
+                    if inspect.isawaitable(spawn_result):
+                        spawn_result = await spawn_result
+                except Exception as exc:  # noqa: BLE001
+                    self._store.mark_session_failed(*reserved_key)
+                    error_message = _redact_known_secrets(str(exc))
+                    self._store.mark_processed(row, "spawn_failed", error=error_message)
+                    await self._post_spawn_failure_audit(
+                        row=row,
+                        task_id=task_id,
+                        fire_generation=fire_generation,
+                        role=route.agent_id,
+                        error=exc,
+                    )
+                    reserved_key = None
+                    return "spawn_failed"
+                session_id = _normalize_spawn_session_id(
+                    spawn_result,
+                    default=requested_session_id,
+                )
+                self._store.finalize_session(
+                    task_id=task_id,
+                    fire_generation=fire_generation,
+                    agent_id=route.agent_id,
+                    session_id=session_id,
+                )
+                session_results.append((route, session_id))
+                reserved_key = None
 
-            prompt = render_taskboard_fire_prompt(route.role, latest_task)
-            requested_session_id = _build_session_id(
-                task_id=task_id,
-                fire_generation=fire_generation,
-                agent_id=route.agent_id,
+                LOGGER.info(
+                    "taskboard_fire_spawned task_id=%d fire_generation=%d role=%s session_id=%s",
+                    task_id,
+                    fire_generation,
+                    route.role,
+                    session_id,
+                )
+
+            if not session_results:
+                status = "duplicate" if duplicate_count else "no_op_transition"
+                self._store.mark_processed(row, status)
+                return status
+
+            session_ids = [session_id for _, session_id in session_results]
+            row_session_id = (
+                session_ids[0] if len(session_ids) == 1 else ",".join(session_ids)
             )
-            spawn_result = self.session_manager.spawn(
-                session_id=requested_session_id,
-                task_id=task_id,
-                fire_generation=fire_generation,
-                role=route.role,
-                agent_id=route.agent_id,
-                model=route.model,
-                profile=route.profile,
-                prompt=prompt,
-                task=latest_task,
-            )
-            if inspect.isawaitable(spawn_result):
-                spawn_result = await spawn_result
-            session_id = _normalize_spawn_session_id(
-                spawn_result,
-                default=requested_session_id,
-            )
-            self._store.finalize_session(
-                task_id=task_id,
-                fire_generation=fire_generation,
-                agent_id=route.agent_id,
-                session_id=session_id,
-            )
-            self._store.mark_processed(row, "spawned", session_id=session_id)
-            reserved_key = None
-            LOGGER.info(
-                "taskboard_fire_spawned task_id=%d fire_generation=%d role=%s session_id=%s",
-                task_id,
-                fire_generation,
-                route.role,
-                session_id,
-            )
+            self._store.mark_processed(row, "spawned", session_id=row_session_id)
+            all_audits_posted = True
+            for route, session_id in session_results:
+                posted = await self._post_audit_comment(
+                    task_id,
+                    _spawn_success_comment(
+                        task_id=task_id,
+                        role=route.agent_id,
+                        session_id=session_id,
+                        model=route.model,
+                        profile=route.profile,
+                    ),
+                )
+                all_audits_posted = all_audits_posted and posted
+            if all_audits_posted:
+                self._store.mark_audit_posted(row)
             return "spawned"
         except Exception as exc:  # noqa: BLE001
+            error_message = _redact_known_secrets(str(exc))
             LOGGER.exception(
                 "taskboard_fire_rejected row_id=%s error=%s",
                 row.row_id,
-                exc,
+                error_message,
             )
             if reserved_key is not None:
                 self._store.mark_session_failed(*reserved_key)
-            self._store.mark_processed(row, "rejected", error=str(exc))
+            self._store.mark_processed(row, "rejected", error=error_message)
             return "rejected"
 
     async def _fetch_latest_task(self, task_id: int) -> dict[str, Any]:
@@ -549,6 +701,140 @@ class TaskboardDispatcher:
         if inspect.isawaitable(result):
             result = await result
         return _extract_task(result)
+
+    async def _post_audit_for_row(self, row: PendingWebhookRow) -> bool:
+        status = row.dispatch_status or ""
+        payload_task = _extract_task(row.payload)
+        task_id = _extract_task_id(row.payload, payload_task)
+        fire_generation = _extract_fire_generation(row.payload, payload_task) or 0
+        role_text = str(payload_task.get("agent") or "")
+        try:
+            route = resolve_taskboard_role(role_text)
+            role = route.agent_id
+            model = route.model
+            profile = route.profile
+        except ValueError:
+            role = _normalize_role(role_text) or "unknown"
+            model = "unknown"
+            profile = "unknown"
+
+        if status == "spawned":
+            sessions = self._store.sessions_for_row(row.row_id)
+            if not sessions:
+                fallback_session_id = row.session_id or self._store.session_id_for_row(
+                    row.row_id
+                )
+                if fallback_session_id:
+                    sessions = [(fallback_session_id, role, model, profile)]
+            if not sessions:
+                LOGGER.warning(
+                    "taskboard_audit_comment_missing_session row_id=%s",
+                    row.row_id,
+                )
+                return False
+            all_posted = True
+            for session_id, session_role, session_model, session_profile in sessions:
+                posted = await self._post_audit_comment(
+                    task_id,
+                    _spawn_success_comment(
+                        task_id=task_id,
+                        role=session_role,
+                        session_id=session_id,
+                        model=session_model,
+                        profile=session_profile,
+                    ),
+                )
+                all_posted = all_posted and posted
+            return all_posted
+        if status == "spawn_failed":
+            error_message = row.last_error or "unknown error"
+            return await self._post_audit_comment(
+                task_id,
+                _spawn_failure_comment(
+                    task_id=task_id,
+                    error_message=error_message,
+                ),
+            )
+        if status == "stuck_aborted":
+            session_id = row.session_id or self._store.session_id_for_row(row.row_id)
+            if not session_id:
+                LOGGER.warning(
+                    "taskboard_audit_comment_missing_session row_id=%s",
+                    row.row_id,
+                )
+                return False
+            return await self._post_audit_comment(
+                task_id,
+                _stuck_session_comment(task_id=task_id, session_id=session_id),
+            )
+        LOGGER.debug(
+            "taskboard_audit_comment_skip_status row_id=%s status=%s generation=%s",
+            row.row_id,
+            status,
+            fire_generation,
+        )
+        return False
+
+    async def _post_spawn_failure_audit(
+        self,
+        *,
+        row: PendingWebhookRow,
+        task_id: int,
+        fire_generation: int,
+        role: str,
+        error: Exception,
+    ) -> None:
+        error_message = _redact_known_secrets(str(error))
+        posted = await self._post_audit_comment(
+            task_id,
+            _spawn_failure_comment(task_id=task_id, error_message=error_message),
+        )
+        if posted:
+            self._store.mark_audit_posted(row)
+        await self._publish_spawn_failed_alert(
+            task_id=task_id,
+            fire_generation=fire_generation,
+            role=role,
+            error=error,
+        )
+
+    async def _post_audit_comment(self, task_id: int, content: str) -> bool:
+        try:
+            result = self.task_client.post_audit_comment(task_id, content)
+            if inspect.isawaitable(result):
+                await result
+            return True
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "taskboard_audit_comment_failed task_id=%s error=%s",
+                task_id,
+                _redact_known_secrets(str(exc)),
+            )
+            return False
+
+    async def _publish_spawn_failed_alert(
+        self,
+        *,
+        task_id: int,
+        fire_generation: int,
+        role: str,
+        error: Exception,
+    ) -> None:
+        payload = {
+            "task_id": task_id,
+            "fire_generation": fire_generation,
+            "role": role,
+            "error_class": error.__class__.__name__,
+            "error_message": _redact_known_secrets(str(error)),
+            "ts": _utc_iso(self.clock()),
+        }
+        try:
+            if self.nats_bus is not None and hasattr(self.nats_bus, "publish"):
+                result = self.nats_bus.publish(SPAWN_FAILED_SUBJECT, payload)
+                if inspect.isawaitable(result):
+                    await result
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("taskboard_dispatcher_spawn_failed_alert_failed error=%s", exc)
 
     async def _publish_backpressure_alarm_if_needed(self) -> None:
         depth = self._store.stale_pending_count(older_than_seconds=60)
@@ -600,6 +886,84 @@ class _TaskboardQueueStore:
                     received_at=(
                         str(row[schema.received_column])
                         if schema.received_column
+                        else None
+                    ),
+                    dispatch_status=(
+                        str(row[schema.status_column])
+                        if schema.status_column and row[schema.status_column] is not None
+                        else None
+                    ),
+                    session_id=(
+                        str(row[schema.session_column])
+                        if schema.session_column and row[schema.session_column] is not None
+                        else None
+                    ),
+                    last_error=(
+                        str(row[schema.error_column])
+                        if schema.error_column and row[schema.error_column] is not None
+                        else None
+                    ),
+                    audit_posted_at=(
+                        str(row[schema.audit_posted_column])
+                        if schema.audit_posted_column
+                        and row[schema.audit_posted_column] is not None
+                        else None
+                    ),
+                )
+                for row in rows
+            ]
+
+    def pending_audit_rows(self) -> list[PendingWebhookRow]:
+        if not self.db_path.exists():
+            return []
+        with self._connect(create=False) as conn:
+            self._ensure_audit_columns(conn)
+            schema = self._queue_schema(conn)
+            if (
+                schema is None
+                or schema.status_column is None
+                or schema.audit_posted_column is None
+            ):
+                return []
+            placeholders = ",".join("?" for _ in AUDIT_PENDING_STATUSES)
+            order = (
+                f"ORDER BY {schema.received_column} ASC, {schema.id_column} ASC"
+                if schema.received_column
+                else f"ORDER BY {schema.id_column} ASC"
+            )
+            rows = conn.execute(
+                f"SELECT * FROM {schema.table}"
+                f" WHERE {schema.status_column} IN ({placeholders})"
+                f" AND {schema.audit_posted_column} IS NULL {order}",
+                AUDIT_PENDING_STATUSES,
+            ).fetchall()
+            return [
+                PendingWebhookRow(
+                    row_id=row[schema.id_column],
+                    payload=_parse_payload(row[schema.payload_column]),
+                    received_at=(
+                        str(row[schema.received_column])
+                        if schema.received_column
+                        else None
+                    ),
+                    dispatch_status=(
+                        str(row[schema.status_column])
+                        if row[schema.status_column] is not None
+                        else None
+                    ),
+                    session_id=(
+                        str(row[schema.session_column])
+                        if schema.session_column and row[schema.session_column] is not None
+                        else None
+                    ),
+                    last_error=(
+                        str(row[schema.error_column])
+                        if schema.error_column and row[schema.error_column] is not None
+                        else None
+                    ),
+                    audit_posted_at=(
+                        str(row[schema.audit_posted_column])
+                        if row[schema.audit_posted_column] is not None
                         else None
                     ),
                 )
@@ -678,6 +1042,102 @@ class _TaskboardQueueStore:
                 f" WHERE {schema.id_column} = ?",
                 tuple(params),
             )
+
+    def mark_audit_posted(self, row: PendingWebhookRow) -> None:
+        self.mark_audit_posted_by_id(row.row_id)
+
+    def mark_audit_posted_by_id(self, row_id: Any) -> None:
+        if not self.db_path.exists():
+            return
+        with self._connect(create=False) as conn:
+            self._ensure_audit_columns(conn)
+            schema = self._queue_schema(conn)
+            if schema is None or schema.audit_posted_column is None:
+                return
+            conn.execute(
+                f"UPDATE {schema.table} SET {schema.audit_posted_column} = ?"
+                f" WHERE {schema.id_column} = ?",
+                (_utc_iso(self.clock()), row_id),
+            )
+
+    def session_id_for_row(self, row_id: Any) -> str | None:
+        if not self.db_path.exists():
+            return None
+        with self._connect(create=False) as conn:
+            if not self._table_exists(conn, "sessions"):
+                return None
+            row = conn.execute(
+                "SELECT session_id FROM sessions"
+                " WHERE webhook_pending_id = ?"
+                " AND session_id IS NOT NULL"
+                " ORDER BY updated_at DESC LIMIT 1",
+                (str(row_id),),
+            ).fetchone()
+            if row is None or row["session_id"] is None:
+                return None
+            return str(row["session_id"])
+
+    def sessions_for_row(self, row_id: Any) -> list[tuple[str, str, str, str]]:
+        if not self.db_path.exists():
+            return []
+        with self._connect(create=False) as conn:
+            if not self._table_exists(conn, "sessions"):
+                return []
+            rows = conn.execute(
+                "SELECT session_id, agent_id FROM sessions"
+                " WHERE webhook_pending_id = ?"
+                " AND session_id IS NOT NULL"
+                " ORDER BY agent_id ASC",
+                (str(row_id),),
+            ).fetchall()
+        sessions: list[tuple[str, str, str, str]] = []
+        for row in rows:
+            session_id = str(row["session_id"])
+            agent_id = str(row["agent_id"] or "unknown")
+            try:
+                route = resolve_taskboard_role(agent_id)
+                role = route.agent_id
+                model = route.model
+                profile = route.profile
+            except ValueError:
+                role = _normalize_role(agent_id) or "unknown"
+                model = "unknown"
+                profile = "unknown"
+            sessions.append((session_id, role, model, profile))
+        return sessions
+
+    def session_for_key(
+        self,
+        *,
+        task_id: int,
+        fire_generation: int,
+        agent_id: str,
+    ) -> dict[str, str | None] | None:
+        if not self.db_path.exists():
+            return None
+        with self._connect(create=False) as conn:
+            if not self._table_exists(conn, "sessions"):
+                return None
+            row = conn.execute(
+                "SELECT session_id, webhook_pending_id FROM sessions"
+                " WHERE taskboard_task_id = ?"
+                " AND fire_generation = ?"
+                " AND agent_id = ?"
+                " ORDER BY updated_at DESC LIMIT 1",
+                (task_id, fire_generation, agent_id),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "session_id": (
+                    str(row["session_id"]) if row["session_id"] is not None else None
+                ),
+                "webhook_pending_id": (
+                    str(row["webhook_pending_id"])
+                    if row["webhook_pending_id"] is not None
+                    else None
+                ),
+            }
 
     def active_session_count(self) -> int:
         if not self.db_path.exists():
@@ -774,7 +1234,8 @@ class _TaskboardQueueStore:
                 return []
             placeholders = ",".join("?" for _ in ACTIVE_SESSION_STATUSES)
             rows = conn.execute(
-                "SELECT session_id, webhook_pending_id FROM sessions"
+                "SELECT session_id, webhook_pending_id, taskboard_task_id,"
+                " fire_generation, agent_id FROM sessions"
                 " WHERE source = ?"
                 f" AND status IN ({placeholders})"
                 " AND created_at < ?"
@@ -788,6 +1249,19 @@ class _TaskboardQueueStore:
                         str(row["webhook_pending_id"])
                         if row["webhook_pending_id"] is not None
                         else None
+                    ),
+                    task_id=(
+                        int(row["taskboard_task_id"])
+                        if row["taskboard_task_id"] is not None
+                        else None
+                    ),
+                    fire_generation=(
+                        int(row["fire_generation"])
+                        if row["fire_generation"] is not None
+                        else None
+                    ),
+                    agent_id=(
+                        str(row["agent_id"]) if row["agent_id"] is not None else None
                     ),
                 )
                 for row in rows
@@ -904,8 +1378,25 @@ class _TaskboardQueueStore:
                 received_column="received_at" if "received_at" in columns else None,
                 session_column="session_id" if "session_id" in columns else None,
                 error_column="last_error" if "last_error" in columns else None,
+                audit_posted_column=(
+                    "audit_posted_at" if "audit_posted_at" in columns else None
+                ),
             )
         return None
+
+    def _ensure_audit_columns(self, conn: sqlite3.Connection) -> None:
+        for table in ("webhook_pending", "webhook_deliveries"):
+            if not self._table_exists(conn, table):
+                continue
+            columns = self._columns(conn, table)
+            if "audit_posted_at" not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN audit_posted_at TIMESTAMPTZ")
+            refreshed = self._columns(conn, table)
+            if "dispatch_status" in refreshed:
+                conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table}_audit_pending"
+                    f" ON {table} (dispatch_status, audit_posted_at)"
+                )
 
     @staticmethod
     def _pending_where(schema: _QueueSchema) -> str:
@@ -931,6 +1422,50 @@ class _TaskboardQueueStore:
 def _normalize_role(role: str) -> str:
     text = re.sub(r"[-_]+", " ", str(role or "").strip().lower())
     return re.sub(r"\s+", " ", text)
+
+
+def _audit_actor_for_content(content: str) -> str:
+    if content.startswith("[System]"):
+        return "System"
+    return "Orchestrator"
+
+
+def _spawn_success_comment(
+    *,
+    task_id: int,
+    role: str,
+    session_id: str,
+    model: str,
+    profile: str,
+) -> str:
+    return (
+        f"[Orchestrator] Fired {role} agent for #{task_id} "
+        f"(session_id={session_id}, model={model}, profile={profile})"
+    )
+
+
+def _spawn_failure_comment(*, task_id: int, error_message: str) -> str:
+    safe_error = _redact_known_secrets(error_message).replace("\n", " ")[:500]
+    return (
+        f"[System] spawn failed for #{task_id}: {safe_error}; "
+        f"retry with agent-ops fire {task_id}"
+    )
+
+
+def _stuck_session_comment(*, task_id: int, session_id: str) -> str:
+    return (
+        f"[System] sweeper aborted stuck session for #{task_id} after 60min "
+        f"(session_id={session_id})"
+    )
+
+
+def _redact_known_secrets(message: str) -> str:
+    redacted = str(message)
+    for env_name in SECRET_ENV_VARS:
+        secret = os.getenv(env_name, "").strip()
+        if secret:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted
 
 
 def _resolve_max_concurrent(value: int | None) -> int:
