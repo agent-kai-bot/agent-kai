@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Added Forgejo PR auto-fire prompt templates and renderer support for
+  code-reviewer, security-auditor, and qa-agent reviewer prompts.
+
 ## 2026-04-09
 
 ### Fixed — cloud agent-k.ai endpoints now support tool calling
