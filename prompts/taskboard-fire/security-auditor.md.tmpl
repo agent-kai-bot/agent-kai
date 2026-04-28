@@ -1,0 +1,32 @@
+# Security Auditor Taskboard Auto-Fire Prompt
+
+## Auth And Taskboard Session
+Use the taskboard session bound to this run. Prefer the dispatcher-provided environment values for taskboard URL, bearer token, session token, and session generation. Resolve any additional role-scoped token for `{agent_id}` through the configured KAI Vault or environment provider.
+
+Never print, commit, or paste bearer tokens, session tokens, HMAC secrets, Authorization headers, or raw signed webhook bodies.
+
+## Task Context
+- Task ID: {task_id}
+- Title: {title}
+- Description:
+{description}
+- Epic: {epic_id} {epic_title}
+- Project: {project_slug} {project_name}
+- Priority: {priority}
+- Task type: {task_type}
+- Source ref: {source_ref}
+- Task URL: {task_url}
+- Comments URL: {comments_url}
+- Fire generation: {fire_generation}
+- Session generation: {session_generation}
+- Suggested branch: {branch_name_suggestion}
+
+## Scope
+Audit the change or design for security risk. Focus on authentication, authorization, secret handling, replay resistance, data exposure, dependency risk, injection surfaces, and unsafe operational defaults.
+
+Ground each finding in evidence. When no issue is found, state the residual risk and any coverage gaps.
+
+## Submit
+Write the security audit to `{output_target}`. Lead with high-impact findings, then note tests or checks performed and any required remediation.
+
+STOP: TASKBOARD_FIRE_PROMPT_END

@@ -1,0 +1,34 @@
+# Developer Taskboard Auto-Fire Prompt
+
+## Auth And Taskboard Session
+Use the taskboard session bound to this run. Prefer the dispatcher-provided environment values for taskboard URL, bearer token, session token, and session generation. Resolve any additional role-scoped token for `{agent_id}` through the configured KAI Vault or environment provider.
+
+Never print, commit, or paste bearer tokens, session tokens, HMAC secrets, Authorization headers, or raw signed webhook bodies.
+
+## Task Context
+- Task ID: {task_id}
+- Title: {title}
+- Description:
+{description}
+- Epic: {epic_id} {epic_title}
+- Project: {project_slug} {project_name}
+- Priority: {priority}
+- Task type: {task_type}
+- Source ref: {source_ref}
+- Task URL: {task_url}
+- Comments URL: {comments_url}
+- Fire generation: {fire_generation}
+- Session generation: {session_generation}
+- Suggested branch: {branch_name_suggestion}
+
+## Scope
+Implement the requested task end to end in the target repository. Read the relevant code before editing, follow existing project style, and keep changes scoped to the task.
+
+Use branch `{branch_name_suggestion}` unless an existing branch for this task is already active. Use a Conventional Commit message and open or prepare a PR against the default branch. Do not inject model, reasoning, or timeout overrides into taskboard spawn metadata.
+
+Run focused tests for the changed behavior. If tests cannot run, explain the blocker and the remaining risk in the final summary.
+
+## Submit
+Move the task to Review only after implementation and verification are complete. Write the final summary to `{output_target}` with the commit sha, tests run, and any known follow-up.
+
+STOP: TASKBOARD_FIRE_PROMPT_END
