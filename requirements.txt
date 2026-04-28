@@ -12,5 +12,6 @@ websockets>=15.0,<16.0
 APScheduler==3.10.4
 croniter==2.0.5
 jsonschema==4.23.0
+PyYAML>=6.0,<7.0
 pandas-ta>=0.3.14b
 pandas>=2.2,<3.0

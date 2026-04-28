@@ -2,9 +2,33 @@
 
 import json
 import os
+import re
 import sys
 
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
+
+import yaml
+
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "agent-config.json")
+AGENTS_YAML_PATH = os.path.join(os.path.dirname(__file__), "agents.yaml")
+
+DEFAULT_HEALTH_PROBE_COMMAND = "echo healthy"
+DEFAULT_HEALTH_PROBE_INTERVAL_SECONDS = 60
+DEFAULT_HEALTH_PROBE_TIMEOUT_SECONDS = 10
+DEFAULT_CAPACITY_FEEDBACK_CODES = [429, 503]
+DEFAULT_COOLDOWN_SECONDS = 300
+DEFAULT_EXECUTOR = "codex"
+DEFAULT_OVERFLOW_EXECUTOR = "claude"
+VALID_EXECUTORS: tuple[str, ...] = ("codex", "claude", "local-llm")
+
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 
 
 def load_config(path=CONFIG_PATH):
@@ -84,6 +108,233 @@ ENDPOINTS = _config.get("endpoints", {})
 
 # Agents registry: name -> {endpoint, fallback_endpoint, system_prompt, max_iterations, description}
 AGENTS = _config.get("agents", {})
+
+
+class HealthProbeConfig(BaseModel):
+    """Health probe command metadata for an agent or executor."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command: str = DEFAULT_HEALTH_PROBE_COMMAND
+    interval_seconds: int = Field(
+        default=DEFAULT_HEALTH_PROBE_INTERVAL_SECONDS,
+        ge=10,
+        le=3600,
+    )
+    timeout_seconds: int = Field(default=DEFAULT_HEALTH_PROBE_TIMEOUT_SECONDS, ge=1)
+
+    @field_validator("command")
+    @classmethod
+    def validate_command(cls, value: str) -> str:
+        """Validate the command string shape without executing it."""
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("health_probe.command must be a non-empty string")
+        if any(ch in value for ch in ("\x00", "\n", "\r")):
+            raise ValueError("health_probe.command must be a single-line string")
+        return value
+
+    @model_validator(mode="after")
+    def validate_timeout(self) -> "HealthProbeConfig":
+        """Ensure probe timeouts cannot exceed the probe interval."""
+        if self.timeout_seconds > self.interval_seconds:
+            raise ValueError(
+                "health_probe.timeout_seconds must be less than or equal to "
+                "health_probe.interval_seconds"
+            )
+        return self
+
+
+class AgentConfig(BaseModel):
+    """Health and capacity metadata for a logical agent entry."""
+
+    model_config = ConfigDict(extra="allow")
+
+    health_probe: HealthProbeConfig = Field(default_factory=HealthProbeConfig)
+    capacity_feedback_codes: list[StrictInt] = Field(
+        default_factory=lambda: list(DEFAULT_CAPACITY_FEEDBACK_CODES)
+    )
+    cooldown_seconds: int = Field(default=DEFAULT_COOLDOWN_SECONDS, ge=60, le=86400)
+    default_executor: str = DEFAULT_EXECUTOR
+    overflow_executor: str | None = DEFAULT_OVERFLOW_EXECUTOR
+
+    @field_validator("capacity_feedback_codes")
+    @classmethod
+    def validate_capacity_codes(cls, value: list[int]) -> list[int]:
+        """Validate configured HTTP status codes that signal capacity exhaustion."""
+        if not value:
+            raise ValueError("capacity_feedback_codes must not be empty")
+        invalid = [code for code in value if code < 400 or code > 599]
+        if invalid:
+            raise ValueError(
+                "capacity_feedback_codes values must be integers in the 400-599 range"
+            )
+        return value
+
+    @field_validator("default_executor", "overflow_executor")
+    @classmethod
+    def validate_executor_shape(cls, value: str | None) -> str | None:
+        """Validate executor reference shape before root-level existence checks."""
+        if value is None:
+            return value
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("executor references must be non-empty strings")
+        if not _SLUG_RE.fullmatch(value):
+            raise ValueError("executor references must be slug-safe")
+        return value
+
+
+class ExecutorConfig(BaseModel):
+    """Health and capacity metadata for a physical executor backend."""
+
+    model_config = ConfigDict(extra="allow")
+
+    provider: str | None = None
+    endpoint: str | None = None
+    model: str | None = None
+    reasoning_effort: str | None = None
+    health_probe: HealthProbeConfig = Field(default_factory=HealthProbeConfig)
+    capacity_feedback_codes: list[StrictInt] = Field(
+        default_factory=lambda: list(DEFAULT_CAPACITY_FEEDBACK_CODES)
+    )
+    cooldown_seconds: int = Field(default=DEFAULT_COOLDOWN_SECONDS, ge=60, le=86400)
+    overflow_executor: str | None = None
+
+    @field_validator("capacity_feedback_codes")
+    @classmethod
+    def validate_capacity_codes(cls, value: list[int]) -> list[int]:
+        """Validate configured HTTP status codes that signal capacity exhaustion."""
+        return AgentConfig.validate_capacity_codes(value)
+
+    @field_validator("overflow_executor")
+    @classmethod
+    def validate_overflow_executor_shape(cls, value: str | None) -> str | None:
+        """Validate executor references before root-level existence checks."""
+        return AgentConfig.validate_executor_shape(value)
+
+
+class AgentsYamlConfig(BaseModel):
+    """Parsed `agents.yaml` health and capacity registry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = 1
+    executors: dict[str, ExecutorConfig] = Field(default_factory=dict)
+    agents: dict[str, AgentConfig] = Field(default_factory=dict)
+
+    @field_validator("version")
+    @classmethod
+    def validate_version(cls, value: int) -> int:
+        """Validate the supported agents.yaml schema version."""
+        if value != 1:
+            raise ValueError("agents.yaml version must be 1")
+        return value
+
+    @field_validator("executors", "agents")
+    @classmethod
+    def validate_registry_keys(cls, value: dict[str, object]) -> dict[str, object]:
+        """Validate registry IDs are stable slug-safe strings."""
+        for key in value:
+            if not _SLUG_RE.fullmatch(key):
+                raise ValueError(f"registry id '{key}' must be slug-safe")
+        return value
+
+    @model_validator(mode="after")
+    def validate_executor_references(self) -> "AgentsYamlConfig":
+        """Validate agent and executor references resolve to known executor IDs."""
+        allowed = set(VALID_EXECUTORS) | set(self.executors)
+
+        for executor_id, executor in self.executors.items():
+            overflow = executor.overflow_executor
+            if overflow is not None and overflow not in allowed:
+                raise ValueError(
+                    f"executors.{executor_id}.overflow_executor must be one of "
+                    f"{', '.join(sorted(allowed))}"
+                )
+
+        for agent_id, agent in self.agents.items():
+            if agent.default_executor not in allowed:
+                raise ValueError(
+                    f"agents.{agent_id}.default_executor must be one of "
+                    f"{', '.join(sorted(allowed))}"
+                )
+            overflow = agent.overflow_executor
+            if overflow is not None and overflow not in allowed:
+                raise ValueError(
+                    f"agents.{agent_id}.overflow_executor must be one of "
+                    f"{', '.join(sorted(allowed))}"
+                )
+        return self
+
+
+def _normalize_agents_yaml(raw: dict) -> dict:
+    """Normalize supported agents.yaml layouts into the versioned schema shape."""
+    known_top_level = {"version", "executors", "agents"}
+    if "agents" in raw:
+        return raw
+
+    flat_agents = {
+        key: value for key, value in raw.items() if key not in known_top_level
+    }
+    if not flat_agents:
+        return raw
+
+    normalized = {key: value for key, value in raw.items() if key in known_top_level}
+    normalized.setdefault("version", 1)
+    normalized["agents"] = flat_agents
+    return normalized
+
+
+def load_agents_yaml(
+    path: str = AGENTS_YAML_PATH,
+    base_agent_names: dict | list | tuple | set | None = None,
+) -> AgentsYamlConfig:
+    """Load and validate agents.yaml, applying default health metadata.
+
+    Args:
+        path: Filesystem path to the `agents.yaml` registry.
+        base_agent_names: Existing logical agent names to merge into the health
+            registry. Missing entries receive the schema defaults at load time.
+
+    Returns:
+        A validated `AgentsYamlConfig` with defaults applied.
+
+    Raises:
+        ValueError: If the YAML document is not a mapping or violates the schema.
+        pydantic.ValidationError: If typed field validation fails.
+    """
+    raw: dict = {"version": 1}
+    if path and os.path.exists(path):
+        with open(path) as f:
+            loaded = yaml.safe_load(f) or {}
+        if not isinstance(loaded, dict):
+            raise ValueError("agents.yaml must contain a mapping at the document root")
+        raw = _normalize_agents_yaml(loaded)
+
+    parsed = AgentsYamlConfig.model_validate(raw)
+
+    names = tuple(base_agent_names or ())
+    if not names:
+        return parsed
+
+    merged_agents = dict(parsed.agents)
+    for name in names:
+        merged_agents.setdefault(name, AgentConfig())
+    if merged_agents == parsed.agents:
+        return parsed
+
+    return AgentsYamlConfig(
+        version=parsed.version,
+        executors=parsed.executors,
+        agents=merged_agents,
+    )
+
+
+AGENT_HEALTH = load_agents_yaml(base_agent_names=AGENTS)
+
+
+def get_agent_health_config(agent_name: str) -> AgentConfig:
+    """Return health and capacity metadata for a logical agent."""
+    return AGENT_HEALTH.agents.get(agent_name, AgentConfig())
 
 # Signal handlers — declarative rules for what to do when a signal
 # arrives via NATS (signals.{strategy}.{symbol}). Loaded as raw list
@@ -402,6 +653,7 @@ def get_agent_config(agent_name):
             (preserves backward compat with code that reads the singular)
     """
     agent_cfg = AGENTS.get(agent_name, {})
+    health_cfg = get_agent_health_config(agent_name)
     endpoint_ref = agent_cfg.get("endpoint")
     explicit_model = agent_cfg.get("model")
 
@@ -467,4 +719,9 @@ def get_agent_config(agent_name):
         "description": agent_cfg.get("description", ""),
         "workspace": get_workspace_path(agent_name),
         "reasoning_effort": agent_cfg.get("reasoning_effort"),
+        "health_probe": health_cfg.health_probe.model_dump(),
+        "capacity_feedback_codes": list(health_cfg.capacity_feedback_codes),
+        "cooldown_seconds": health_cfg.cooldown_seconds,
+        "default_executor": health_cfg.default_executor,
+        "overflow_executor": health_cfg.overflow_executor,
     }

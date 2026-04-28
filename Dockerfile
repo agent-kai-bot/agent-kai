@@ -39,6 +39,7 @@ COPY --from=web-builder /build/build web/build/
 # Copy application code
 COPY main.py .
 COPY agent-config.json .
+COPY agents.yaml .
 COPY agent/ agent/
 COPY daemon/ daemon/
 COPY taskboard_gateway/ taskboard_gateway/
