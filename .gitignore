@@ -28,6 +28,10 @@ ANTHROPIC-API-KEY.txt
 workspaces/terminal/
 workspaces/kaid.pid
 workspaces/daemon-token.txt
+workspaces/daemon-state.sqlite3
+workspaces/daemon-state.sqlite3-journal
+workspaces/daemon-state.sqlite3-wal
+workspaces/daemon-state.sqlite3-shm
 workspaces/**/__pycache__/
 workspaces/**/memories/
 workspaces/**/*.db

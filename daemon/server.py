@@ -52,6 +52,23 @@ from daemon.auth import (
     is_local_client_host,
     parse_bearer_token,
 )
+from daemon.db import DEFAULT_DB_PATH as DEFAULT_DAEMON_DB_PATH, apply_migrations
+from daemon.secrets import (
+    WebhookSecretError,
+    WebhookSecretProvider,
+    default_webhook_secret_provider,
+)
+from daemon.webhook_auth import (
+    HEADER_DELIVERY,
+    HEADER_EVENT,
+    HEADER_SIGNATURE,
+    HEADER_TIMESTAMP,
+    WebhookHeaderError,
+    WebhookSignatureError,
+    WebhookTimestampError,
+    parse_headers,
+    verify_signature,
+)
 from daemon.core import (
     DEFAULT_AUTO_MAX_ITERATIONS,
     MAX_AUTO_ITERATIONS,
@@ -476,6 +493,8 @@ class DaemonServer:
         scheduler_factory: Callable[..., Scheduler] | None = None,
         token_path: str | Path | None = None,
         allow_unauthenticated_local: bool = True,
+        db_path: str | Path | None = None,
+        webhook_secret_provider: WebhookSecretProvider | None = None,
     ) -> None:
         self.agent_name = agent_name
         self.nats_url = nats_url
@@ -483,6 +502,8 @@ class DaemonServer:
         self.scheduler_factory = scheduler_factory or Scheduler
         self.token_path = Path(token_path) if token_path is not None else DAEMON_TOKEN_PATH
         self.allow_unauthenticated_local = allow_unauthenticated_local
+        self.db_path = Path(db_path) if db_path is not None else DEFAULT_DAEMON_DB_PATH
+        self.webhook_secret_provider = webhook_secret_provider
         self.bus: Any | None = None
         self.sessions: dict[str, ManagedSession] = {}
         self.event_bus = DaemonEventBus()
@@ -500,6 +521,18 @@ class DaemonServer:
         """Connect shared resources used by daemon-backed sessions."""
         self.daemon_token = ensure_daemon_token(self.token_path)
         self.started_at_monotonic = time.monotonic()
+        try:
+            apply_migrations(self.db_path)
+        except Exception as exc:  # noqa: BLE001
+            self.log.error("daemon migrations failed: %s", exc)
+            raise
+        if self.webhook_secret_provider is None:
+            try:
+                self.webhook_secret_provider = default_webhook_secret_provider()
+            except WebhookSecretError as exc:
+                self.log.warning(
+                    "taskboard webhook secret provider not configured: %s", exc
+                )
         self.signal_consumer.on_signal = self._handle_signal
         if self.bus_factory is None:
             self.bus = None
@@ -1706,6 +1739,157 @@ async def _send_error(websocket: WebSocket, code: str, message: str) -> None:
     )
 
 
+def _handle_taskboard_webhook(
+    daemon_server: "DaemonServer",
+    request: Request,
+    body_bytes: bytes,
+) -> dict[str, Any]:
+    """Validate and persist a single taskboard webhook delivery.
+
+    The handler is split out from the route function so it can be unit
+    tested without spinning up the full FastAPI app, and so the route
+    body stays compact.
+
+    Args:
+        daemon_server: The daemon runtime exposing the active database
+            path and the resolved webhook secret provider.
+        request: FastAPI request, used for header access only.
+        body_bytes: Raw HTTP request body. The JSON parser receives the
+            same byte string that contributed to the HMAC signature.
+
+    Returns:
+        The response payload returned to a successful caller.
+
+    Raises:
+        HTTPException: With the appropriate status code for each
+            failure mode documented on the route handler.
+    """
+
+    import hashlib  # local import to keep top-level imports stable
+    import json
+    import sqlite3 as _sqlite3
+
+    provider = daemon_server.webhook_secret_provider
+    if provider is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="taskboard webhook secret is not configured",
+        )
+
+    try:
+        secret = provider.get_secret()
+    except WebhookSecretError as exc:
+        daemon_server.log.error(
+            "taskboard webhook secret unavailable: %s", exc
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="taskboard webhook secret is not available",
+        ) from None
+
+    try:
+        verified = parse_headers(
+            event_header=request.headers.get(HEADER_EVENT),
+            delivery_header=request.headers.get(HEADER_DELIVERY),
+            timestamp_header=request.headers.get(HEADER_TIMESTAMP),
+            signature_header=request.headers.get(HEADER_SIGNATURE),
+        )
+    except WebhookHeaderError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from None
+
+    try:
+        verify_signature(secret=secret, body=body_bytes, headers=verified)
+    except WebhookTimestampError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+        ) from None
+    except WebhookSignatureError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+        ) from None
+
+    try:
+        payload_text = body_bytes.decode("utf-8")
+        payload = json.loads(payload_text) if payload_text else {}
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a JSON object")
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"invalid JSON body: {exc}",
+        ) from None
+
+    raw_event_id = payload.get("event_id") or payload.get("id")
+    event_id = str(raw_event_id) if raw_event_id else verified.delivery_id
+    received_at = datetime.now(timezone.utc).isoformat()
+
+    from daemon.db import connect as _db_connect  # local import for test injection
+
+    conn = _db_connect(daemon_server.db_path)
+    try:
+        existing = conn.execute(
+            "SELECT delivery_id FROM webhook_deliveries WHERE delivery_id = ?",
+            (verified.delivery_id,),
+        ).fetchone()
+        if existing is not None:
+            conn.execute(
+                "UPDATE webhook_deliveries"
+                " SET duplicate_count = duplicate_count + 1"
+                " WHERE delivery_id = ?",
+                (verified.delivery_id,),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="delivery_id already received",
+                headers={"X-Taskboard-Delivery-Status": "duplicate"},
+            )
+        try:
+            conn.execute(
+                "INSERT INTO webhook_deliveries ("
+                "delivery_id, event_id, event_type, received_at,"
+                " event_timestamp, signature_sha256, payload_json,"
+                " hmac_status, dispatch_status"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    verified.delivery_id,
+                    event_id,
+                    verified.event_type,
+                    received_at,
+                    verified.timestamp,
+                    verified.signature_hex,
+                    payload_text,
+                    "verified",
+                    "accepted",
+                ),
+            )
+        except _sqlite3.IntegrityError as exc:
+            # event_id collision indicates the upstream taskboard already
+            # delivered this logical event, even with a different
+            # delivery_id. Treat it as a replay rather than a server
+            # error so the upstream worker can mark it delivered.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"duplicate event_id: {exc}",
+                headers={"X-Taskboard-Delivery-Status": "duplicate"},
+            ) from None
+    finally:
+        conn.close()
+
+    body_hash = hashlib.sha256(body_bytes).hexdigest()
+    daemon_server.log.info(
+        "taskboard webhook accepted: delivery_id=%s event=%s body_sha256=%s",
+        verified.delivery_id,
+        verified.event_type,
+        body_hash,
+    )
+    return {"status": "accepted", "delivery_id": verified.delivery_id}
+
+
 def create_app(
     *,
     agent_name: str = DEFAULT_AGENT,
@@ -1716,6 +1900,8 @@ def create_app(
     token_path: str | Path | None = None,
     allow_unauthenticated_local: bool = True,
     include_taskboard_gateway: bool = True,
+    db_path: str | Path | None = None,
+    webhook_secret_provider: WebhookSecretProvider | None = None,
 ) -> FastAPI:
     """Build the FastAPI app that exposes the daemon WebSocket server.
 
@@ -1728,6 +1914,11 @@ def create_app(
         token_path: Optional daemon bearer token path.
         allow_unauthenticated_local: Whether local daemon calls bypass auth.
         include_taskboard_gateway: Whether to register taskboard gateway routes.
+        db_path: Optional override for the daemon SQLite state database.
+        webhook_secret_provider: Optional pre-built provider that resolves
+            the shared HMAC secret for taskboard webhook ingress. When
+            omitted, the daemon constructs the default environment- or
+            Vault-backed provider during startup.
 
     Returns:
         Configured FastAPI application.
@@ -1739,6 +1930,8 @@ def create_app(
         scheduler_factory=scheduler_factory,
         token_path=token_path,
         allow_unauthenticated_local=allow_unauthenticated_local,
+        db_path=db_path,
+        webhook_secret_provider=webhook_secret_provider,
     )
 
     @asynccontextmanager
@@ -1761,6 +1954,30 @@ def create_app(
     async def health_endpoint(request: Request) -> dict[str, Any]:
         daemon_server.require_http_auth(request)
         return daemon_server.health_snapshot()
+
+    @app.post("/api/webhooks/taskboard")
+    async def taskboard_webhook_endpoint(request: Request) -> dict[str, Any]:
+        """Receive a signed taskboard webhook delivery.
+
+        This route deliberately bypasses :meth:`DaemonServer.require_http_auth`.
+        Authentication is performed by HMAC-SHA256 verification of the
+        request body against a Vault-managed shared secret, as documented
+        in :mod:`daemon.webhook_auth`. Phase 1 only validates, persists,
+        and de-duplicates: agent spawning is delegated to a future
+        dispatcher worker that consumes ``webhook_deliveries`` rows.
+
+        Returns:
+            ``{"status": "accepted", "delivery_id": "<uuid>"}`` on a
+            fresh, well-formed delivery.
+
+        Raises:
+            HTTPException: 401 on bad HMAC or excessive timestamp skew,
+                409 on a duplicate ``delivery_id`` already on file,
+                422 on missing/malformed headers or body.
+        """
+
+        body_bytes = await request.body()
+        return _handle_taskboard_webhook(daemon_server, request, body_bytes)
 
     @app.get("/api/metrics")
     async def metrics_endpoint(request: Request) -> dict[str, Any]:

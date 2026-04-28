@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Added `POST /api/webhooks/taskboard` ingress on the daemon with HMAC-SHA256
+  signature verification, ±5 minute timestamp skew enforcement, and
+  SQLite-backed replay protection keyed by `X-Taskboard-Delivery`.
+- Added `daemon/db.py` with a numbered SQL migration runner and the
+  `webhook_deliveries` schema. Migrations run during daemon startup
+  before webhook routes accept traffic.
+- Added `daemon/secrets.py` with environment- and Vault-backed providers
+  for resolving the shared HMAC secret. The secret source is selected by
+  `KAI_TASKBOARD_WEBHOOK_SECRET` or `VAULT_ADDR` / `VAULT_TOKEN` plus the
+  optional `KAI_TASKBOARD_WEBHOOK_SECRET_VAULT_PATH` override.
+- Added `tests/test_taskboard_webhook_auth.py` covering happy path, bad
+  HMAC, timestamp skew, replay, malformed body, missing headers, bearer
+  bypass for the new route, and migration idempotency.
+
+### Changed
+
+- The daemon FastAPI app now applies migrations and provisions the
+  webhook secret provider on startup. Local sessions are unaffected.
+
 ## 2026-04-09
 
 ### Fixed — cloud agent-k.ai endpoints now support tool calling
