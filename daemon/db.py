@@ -1,14 +1,13 @@
 """SQLite state store for the daemon.
 
 This module owns the ``daemon-state.sqlite3`` database used by webhook
-ingress, dispatcher de-dup, and other daemon-internal persistence. It
-provides a thin connection helper and a numbered SQL migration runner.
+ingress, dispatcher de-dup, and other daemon-internal persistence. The
+same migration runner owns both taskboard delivery tables and Forgejo PR
+delivery tables, so daemon startup has one database initialization path.
 
 The runner reads ``daemon/migrations/*.sql`` files in lexical order and
 applies any that are not already recorded in the ``schema_migrations``
-table. Migrations run inside a single transaction with foreign keys
-enabled, and the runner is idempotent so it can run on every daemon
-boot.
+table. The runner is idempotent so it can run on every daemon boot.
 
 Example:
     Apply migrations during daemon startup::

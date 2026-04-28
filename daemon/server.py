@@ -53,10 +53,22 @@ from daemon.auth import (
     parse_bearer_token,
 )
 from daemon.db import DEFAULT_DB_PATH as DEFAULT_DAEMON_DB_PATH, apply_migrations
+from daemon.forgejo_webhook_auth import (
+    HEADER_DELIVERY as FORGEJO_HEADER_DELIVERY,
+    HEADER_EVENT as FORGEJO_HEADER_EVENT,
+    HEADER_GITEA_EVENT as FORGEJO_HEADER_GITEA_EVENT,
+    HEADER_SIGNATURE as FORGEJO_HEADER_SIGNATURE,
+    SUPPORTED_EVENTS as FORGEJO_SUPPORTED_EVENTS,
+    WebhookHeaderError as ForgejoWebhookHeaderError,
+    WebhookSignatureError as ForgejoWebhookSignatureError,
+    parse_headers as parse_forgejo_headers,
+    verify_signature as verify_forgejo_signature,
+)
 from daemon.secrets import (
     WebhookSecretError,
     WebhookSecretProvider,
-    default_webhook_secret_provider,
+    default_forgejo_webhook_secret_provider,
+    default_taskboard_webhook_secret_provider,
 )
 from daemon.webhook_auth import (
     HEADER_DELIVERY,
@@ -495,6 +507,7 @@ class DaemonServer:
         allow_unauthenticated_local: bool = True,
         db_path: str | Path | None = None,
         webhook_secret_provider: WebhookSecretProvider | None = None,
+        forgejo_webhook_secret_provider: WebhookSecretProvider | None = None,
     ) -> None:
         self.agent_name = agent_name
         self.nats_url = nats_url
@@ -504,6 +517,7 @@ class DaemonServer:
         self.allow_unauthenticated_local = allow_unauthenticated_local
         self.db_path = Path(db_path) if db_path is not None else DEFAULT_DAEMON_DB_PATH
         self.webhook_secret_provider = webhook_secret_provider
+        self.forgejo_webhook_secret_provider = forgejo_webhook_secret_provider
         self.bus: Any | None = None
         self.sessions: dict[str, ManagedSession] = {}
         self.event_bus = DaemonEventBus()
@@ -528,10 +542,21 @@ class DaemonServer:
             raise
         if self.webhook_secret_provider is None:
             try:
-                self.webhook_secret_provider = default_webhook_secret_provider()
+                self.webhook_secret_provider = (
+                    default_taskboard_webhook_secret_provider()
+                )
             except WebhookSecretError as exc:
                 self.log.warning(
                     "taskboard webhook secret provider not configured: %s", exc
+                )
+        if self.forgejo_webhook_secret_provider is None:
+            try:
+                self.forgejo_webhook_secret_provider = (
+                    default_forgejo_webhook_secret_provider()
+                )
+            except WebhookSecretError as exc:
+                self.log.warning(
+                    "forgejo webhook secret provider not configured: %s", exc
                 )
         self.signal_consumer.on_signal = self._handle_signal
         if self.bus_factory is None:
@@ -1890,6 +1915,272 @@ def _handle_taskboard_webhook(
     return {"status": "accepted", "delivery_id": verified.delivery_id}
 
 
+def _decode_forgejo_payload(body_bytes: bytes) -> tuple[str, dict[str, Any]]:
+    """Decode a Forgejo JSON webhook body.
+
+    Args:
+        body_bytes: Raw request body bytes.
+
+    Returns:
+        A tuple containing the UTF-8 body text and decoded JSON object.
+
+    Raises:
+        HTTPException: If the body is not UTF-8 JSON object content.
+    """
+
+    import json
+
+    try:
+        payload_text = body_bytes.decode("utf-8")
+        payload = json.loads(payload_text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"invalid JSON body: {exc}",
+        ) from None
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="invalid JSON body: payload must be an object",
+        )
+    return payload_text, payload
+
+
+def _required_payload_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"missing required body field: {field_name}",
+        )
+    return value.strip()
+
+
+def _extract_forgejo_pull_request_fields(
+    payload: dict[str, Any],
+) -> tuple[str, str, int, str]:
+    """Extract normalized PR identity fields from a Forgejo payload.
+
+    Args:
+        payload: Decoded Forgejo webhook payload.
+
+    Returns:
+        ``(action, repo, pr_number, head_sha)`` for persistence.
+
+    Raises:
+        HTTPException: If a required PR field is missing or malformed.
+    """
+
+    action = _required_payload_string(payload.get("action"), "action")
+    repository = payload.get("repository")
+    if not isinstance(repository, dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="missing required body field: repository",
+        )
+    repo = _required_payload_string(repository.get("full_name"), "repository.full_name")
+
+    pull_request = payload.get("pull_request")
+    if not isinstance(pull_request, dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="missing required body field: pull_request",
+        )
+    raw_number = pull_request.get("number") or payload.get("number")
+    try:
+        pr_number = int(raw_number)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="missing required body field: pull_request.number",
+        ) from exc
+    if pr_number <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="pull_request.number must be positive",
+        )
+
+    head = pull_request.get("head")
+    if not isinstance(head, dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="missing required body field: pull_request.head",
+        )
+    head_sha = _required_payload_string(head.get("sha"), "pull_request.head.sha")
+    return action, repo, pr_number, head_sha
+
+
+def _handle_forgejo_webhook(
+    daemon_server: "DaemonServer",
+    request: Request,
+    body_bytes: bytes,
+) -> dict[str, Any]:
+    """Validate, de-duplicate, and queue one Forgejo webhook delivery.
+
+    Phase 1 only persists accepted deliveries; it does not spawn reviewer
+    sessions. Forgejo uses its own HMAC header names and secret provider,
+    separate from the taskboard route.
+
+    Args:
+        daemon_server: Runtime object that owns the database path and
+            Forgejo webhook secret provider.
+        request: FastAPI request used for header access.
+        body_bytes: Raw request body bytes used for HMAC verification.
+
+    Returns:
+        Response payload for a newly accepted delivery.
+
+    Raises:
+        HTTPException: 401 for invalid HMAC, 409 for replay, 422 for
+            malformed headers/body/unsupported event, and 503 when the
+            HMAC secret is unavailable.
+    """
+
+    import hashlib
+    import sqlite3 as _sqlite3
+
+    try:
+        verified = parse_forgejo_headers(
+            event_header=request.headers.get(FORGEJO_HEADER_EVENT),
+            gitea_event_header=request.headers.get(FORGEJO_HEADER_GITEA_EVENT),
+            delivery_header=request.headers.get(FORGEJO_HEADER_DELIVERY),
+            signature_header=request.headers.get(FORGEJO_HEADER_SIGNATURE),
+        )
+    except ForgejoWebhookHeaderError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from None
+
+    provider = daemon_server.forgejo_webhook_secret_provider
+    if provider is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="forgejo webhook secret is not configured",
+        )
+
+    try:
+        secret = provider.get_secret()
+    except WebhookSecretError as exc:
+        daemon_server.log.error("forgejo webhook secret unavailable: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="forgejo webhook secret is not available",
+        ) from None
+
+    try:
+        verify_forgejo_signature(secret=secret, body=body_bytes, headers=verified)
+    except ForgejoWebhookSignatureError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+        ) from None
+
+    if verified.event_type not in FORGEJO_SUPPORTED_EVENTS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"unsupported forgejo event: {verified.event_type}",
+        )
+
+    payload_text, payload = _decode_forgejo_payload(body_bytes)
+    action, repo, pr_number, head_sha = _extract_forgejo_pull_request_fields(payload)
+
+    received_at_dt = datetime.now(timezone.utc).replace(microsecond=0)
+    expires_at_dt = received_at_dt + timedelta(hours=24)
+    received_at = received_at_dt.isoformat()
+    expires_at = expires_at_dt.isoformat()
+
+    from daemon.db import connect as _db_connect
+
+    conn = _db_connect(daemon_server.db_path)
+    try:
+        conn.execute(
+            "DELETE FROM forgejo_deliveries WHERE expires_at <= ?",
+            (received_at,),
+        )
+        existing = conn.execute(
+            "SELECT delivery_id FROM forgejo_deliveries WHERE delivery_id = ?",
+            (verified.delivery_id,),
+        ).fetchone()
+        if existing is not None:
+            conn.execute(
+                "UPDATE forgejo_deliveries"
+                " SET duplicate_count = duplicate_count + 1"
+                " WHERE delivery_id = ?",
+                (verified.delivery_id,),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="delivery_id already received within replay window",
+                headers={"X-Forgejo-Delivery-Status": "duplicate"},
+            )
+
+        try:
+            conn.execute("BEGIN")
+            conn.execute(
+                "INSERT INTO forgejo_deliveries ("
+                "delivery_id, event_type, action, repo, pr_number, head_sha,"
+                " received_at, expires_at, signature_sha256, payload_json,"
+                " hmac_status, dispatch_status"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    verified.delivery_id,
+                    verified.event_type,
+                    action,
+                    repo,
+                    pr_number,
+                    head_sha,
+                    received_at,
+                    expires_at,
+                    verified.signature_hex,
+                    payload_text,
+                    "verified",
+                    "pending",
+                ),
+            )
+            conn.execute(
+                "INSERT INTO forgejo_pending ("
+                "delivery_id, event_type, action, repo, pr_number, head_sha,"
+                " received_at, payload_json, status"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    verified.delivery_id,
+                    verified.event_type,
+                    action,
+                    repo,
+                    pr_number,
+                    head_sha,
+                    received_at,
+                    payload_text,
+                    "pending",
+                ),
+            )
+            conn.execute("COMMIT")
+        except _sqlite3.IntegrityError as exc:
+            conn.execute("ROLLBACK")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"duplicate forgejo delivery: {exc}",
+                headers={"X-Forgejo-Delivery-Status": "duplicate"},
+            ) from None
+    finally:
+        conn.close()
+
+    body_hash = hashlib.sha256(body_bytes).hexdigest()
+    daemon_server.log.info(
+        "forgejo webhook accepted: delivery_id=%s event=%s repo=%s pr=%s body_sha256=%s",
+        verified.delivery_id,
+        verified.event_type,
+        repo,
+        pr_number,
+        body_hash,
+    )
+    return {
+        "status": "accepted",
+        "delivery_id": verified.delivery_id,
+        "event_type": verified.event_type,
+    }
+
+
 def create_app(
     *,
     agent_name: str = DEFAULT_AGENT,
@@ -1902,6 +2193,7 @@ def create_app(
     include_taskboard_gateway: bool = True,
     db_path: str | Path | None = None,
     webhook_secret_provider: WebhookSecretProvider | None = None,
+    forgejo_webhook_secret_provider: WebhookSecretProvider | None = None,
 ) -> FastAPI:
     """Build the FastAPI app that exposes the daemon WebSocket server.
 
@@ -1919,6 +2211,10 @@ def create_app(
             the shared HMAC secret for taskboard webhook ingress. When
             omitted, the daemon constructs the default environment- or
             Vault-backed provider during startup.
+        forgejo_webhook_secret_provider: Optional pre-built provider that
+            resolves the shared HMAC secret for Forgejo webhook ingress.
+            When omitted, the daemon constructs the default environment-
+            or Vault-backed provider during startup.
 
     Returns:
         Configured FastAPI application.
@@ -1932,6 +2228,7 @@ def create_app(
         allow_unauthenticated_local=allow_unauthenticated_local,
         db_path=db_path,
         webhook_secret_provider=webhook_secret_provider,
+        forgejo_webhook_secret_provider=forgejo_webhook_secret_provider,
     )
 
     @asynccontextmanager
@@ -1978,6 +2275,28 @@ def create_app(
 
         body_bytes = await request.body()
         return _handle_taskboard_webhook(daemon_server, request, body_bytes)
+
+    @app.post("/api/webhooks/forgejo")
+    async def forgejo_webhook_endpoint(request: Request) -> dict[str, Any]:
+        """Receive a signed Forgejo webhook delivery.
+
+        This route deliberately bypasses bearer-token authorization.
+        Authentication is performed by HMAC-SHA256 verification of the
+        raw request body against the Forgejo webhook secret. Phase 1 only
+        validates, de-duplicates, and queues the delivery in SQLite.
+
+        Returns:
+            ``{"status": "accepted", "delivery_id": "<uuid>"}`` on a
+            fresh, well-formed delivery.
+
+        Raises:
+            HTTPException: 401 on bad HMAC, 409 on replay within the
+                delivery window, 422 on malformed input or unsupported
+                events, and 503 when no HMAC secret is available.
+        """
+
+        body_bytes = await request.body()
+        return _handle_forgejo_webhook(daemon_server, request, body_bytes)
 
     @app.get("/api/metrics")
     async def metrics_endpoint(request: Request) -> dict[str, Any]:

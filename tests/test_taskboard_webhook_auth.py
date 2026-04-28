@@ -395,7 +395,7 @@ class WebhookMigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "daemon-state.sqlite3"
             applied = apply_migrations(db_path)
-            self.assertEqual(applied, [1])
+            self.assertIn(1, applied)
             conn = connect(db_path)
             try:
                 row = conn.execute(
