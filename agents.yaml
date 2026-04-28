@@ -1,0 +1,39 @@
+version: 1
+
+executors:
+  codex:
+    provider: codex-cli
+    endpoint: codex-cli
+    model: gpt-5.4
+    health_probe:
+      command: "echo healthy"
+      interval_seconds: 60
+      timeout_seconds: 10
+    capacity_feedback_codes: [429, 503]
+    cooldown_seconds: 300
+    overflow_executor: claude
+
+  claude:
+    provider: claude-cli
+    model: sonnet
+    health_probe:
+      command: "echo healthy"
+      interval_seconds: 60
+      timeout_seconds: 10
+    capacity_feedback_codes: [429, 503]
+    cooldown_seconds: 300
+    overflow_executor: codex
+
+  local-llm:
+    provider: openai
+    endpoint: kai-local
+    model: qwen35-gptq
+    health_probe:
+      command: "echo healthy"
+      interval_seconds: 60
+      timeout_seconds: 10
+    capacity_feedback_codes: [429, 503]
+    cooldown_seconds: 300
+    overflow_executor: codex
+
+agents: {}
