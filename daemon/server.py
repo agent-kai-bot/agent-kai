@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_logger import get_logger, log_slash_command
+from agent.taskboard_dispatcher import DaemonTaskboardSpawner, TaskboardDispatcher
 from agent.signal_consumer import Signal, SignalConsumer
 from agent.strategy_agent_tools import (
     InProcessStrategyRuntime,
@@ -138,6 +139,13 @@ SNAPSHOT_CHAT_HISTORY_MAX_MESSAGES = 200
 SNAPSHOT_CHAT_HISTORY_MAX_CHARS = 180_000
 TOKEN_FLUSH_INTERVAL_SECONDS = 0.04
 TOKEN_FLUSH_CHARS = 48
+
+
+def _taskboard_dispatcher_enabled(value: bool | None) -> bool:
+    if value is not None:
+        return bool(value)
+    raw = os.getenv("TASKBOARD_DISPATCHER_ENABLED", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 
 def _utc_now() -> datetime:
@@ -495,6 +503,8 @@ class DaemonServer:
         allow_unauthenticated_local: bool = True,
         db_path: str | Path | None = None,
         webhook_secret_provider: WebhookSecretProvider | None = None,
+        taskboard_client: Any | None = None,
+        taskboard_dispatcher_enabled: bool | None = None,
     ) -> None:
         self.agent_name = agent_name
         self.nats_url = nats_url
@@ -502,8 +512,16 @@ class DaemonServer:
         self.scheduler_factory = scheduler_factory or Scheduler
         self.token_path = Path(token_path) if token_path is not None else DAEMON_TOKEN_PATH
         self.allow_unauthenticated_local = allow_unauthenticated_local
-        self.db_path = Path(db_path) if db_path is not None else DEFAULT_DAEMON_DB_PATH
+        env_db_path = os.getenv("KAI_DAEMON_DB_PATH", "").strip()
+        self.db_path = Path(db_path or env_db_path or DEFAULT_DAEMON_DB_PATH)
+        self.db_path_explicit = db_path is not None or bool(env_db_path)
         self.webhook_secret_provider = webhook_secret_provider
+        self.taskboard_client = taskboard_client
+        self.taskboard_dispatcher_enabled = _taskboard_dispatcher_enabled(
+            taskboard_dispatcher_enabled
+        )
+        self.taskboard_dispatcher: TaskboardDispatcher | None = None
+        self.taskboard_dispatcher_task: asyncio.Task[None] | None = None
         self.bus: Any | None = None
         self.sessions: dict[str, ManagedSession] = {}
         self.event_bus = DaemonEventBus()
@@ -556,9 +574,11 @@ class DaemonServer:
             event_callback=self._handle_scheduler_event,
         )
         await self.scheduler.start()
+        await self._start_taskboard_dispatcher()
 
     async def shutdown(self) -> None:
         """Stop all managed runtime resources."""
+        await self._stop_taskboard_dispatcher()
         for managed in self.sessions.values():
             with suppress(Exception):
                 await managed.session.sub_agent_registry.stop_all()
@@ -572,6 +592,35 @@ class DaemonServer:
             with suppress(Exception):
                 await self.bus.disconnect()
             self.bus = None
+
+    async def _start_taskboard_dispatcher(self) -> None:
+        if not self.taskboard_dispatcher_enabled:
+            return
+        if self.db_path_explicit or self.db_path.exists():
+            try:
+                await asyncio.to_thread(apply_migrations, self.db_path)
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("taskboard dispatcher migrations failed: %s", exc)
+        self.taskboard_dispatcher = TaskboardDispatcher(
+            db_path=self.db_path,
+            task_client=self.taskboard_client,
+            session_manager=DaemonTaskboardSpawner(self),
+            nats_bus=self.bus,
+        )
+        self.taskboard_dispatcher_task = asyncio.create_task(
+            self.taskboard_dispatcher.run()
+        )
+
+    async def _stop_taskboard_dispatcher(self) -> None:
+        if self.taskboard_dispatcher is not None:
+            self.taskboard_dispatcher.stop()
+        task = self.taskboard_dispatcher_task
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        self.taskboard_dispatcher_task = None
+        self.taskboard_dispatcher = None
 
     def uptime_seconds(self) -> float:
         """Return daemon uptime in seconds since the current process booted."""
@@ -1902,6 +1951,8 @@ def create_app(
     include_taskboard_gateway: bool = True,
     db_path: str | Path | None = None,
     webhook_secret_provider: WebhookSecretProvider | None = None,
+    taskboard_client: Any | None = None,
+    taskboard_dispatcher_enabled: bool | None = None,
 ) -> FastAPI:
     """Build the FastAPI app that exposes the daemon WebSocket server.
 
@@ -1919,6 +1970,8 @@ def create_app(
             the shared HMAC secret for taskboard webhook ingress. When
             omitted, the daemon constructs the default environment- or
             Vault-backed provider during startup.
+        taskboard_client: Optional taskboard fetch client for dispatcher tests.
+        taskboard_dispatcher_enabled: Optional dispatcher lifecycle override.
 
     Returns:
         Configured FastAPI application.
@@ -1932,6 +1985,8 @@ def create_app(
         allow_unauthenticated_local=allow_unauthenticated_local,
         db_path=db_path,
         webhook_secret_provider=webhook_secret_provider,
+        taskboard_client=taskboard_client,
+        taskboard_dispatcher_enabled=taskboard_dispatcher_enabled,
     )
 
     @asynccontextmanager

@@ -109,6 +109,29 @@ def _slow_attach_runtime(
 class DaemonServerTests(unittest.TestCase):
     """Validate attach/input flow and event relay over WebSocket."""
 
+    def setUp(self) -> None:
+        """Use an isolated session index for websocket server tests."""
+
+        self._session_tmp = tempfile.TemporaryDirectory()
+        sessions_root = Path(self._session_tmp.name) / "sessions"
+        self._sessions_root_patch = mock.patch(
+            "daemon.core.SESSIONS_ROOT_DIR",
+            sessions_root,
+        )
+        self._session_index_patch = mock.patch(
+            "daemon.core.SESSION_INDEX_PATH",
+            sessions_root / "index.json",
+        )
+        self._sessions_root_patch.start()
+        self._session_index_patch.start()
+
+    def tearDown(self) -> None:
+        """Restore the default session index after each test."""
+
+        self._session_index_patch.stop()
+        self._sessions_root_patch.stop()
+        self._session_tmp.cleanup()
+
     def _make_client(self) -> TestClient:
         app = create_app(
             agent_name="kai",
