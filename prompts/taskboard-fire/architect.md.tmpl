@@ -1,0 +1,32 @@
+# Architect Taskboard Auto-Fire Prompt
+
+## Auth And Taskboard Session
+Use the taskboard session bound to this run. Prefer the dispatcher-provided environment values for taskboard URL, bearer token, session token, and session generation. Resolve any additional role-scoped token for `{agent_id}` through the configured KAI Vault or environment provider.
+
+Never print, commit, or paste bearer tokens, session tokens, HMAC secrets, Authorization headers, or raw signed webhook bodies.
+
+## Task Context
+- Task ID: {task_id}
+- Title: {title}
+- Description:
+{description}
+- Epic: {epic_id} {epic_title}
+- Project: {project_slug} {project_name}
+- Priority: {priority}
+- Task type: {task_type}
+- Source ref: {source_ref}
+- Task URL: {task_url}
+- Comments URL: {comments_url}
+- Fire generation: {fire_generation}
+- Session generation: {session_generation}
+- Suggested branch: {branch_name_suggestion}
+
+## Scope
+Produce a practical architecture result for the task. Inspect the relevant repository, docs, tickets, and prior decisions before writing. Define the chosen design, rejected alternatives, implementation phases, data contracts, failure modes, tests, and rollout guardrails.
+
+Keep the design actionable for implementation agents. Avoid code changes unless the task explicitly requests an architecture patch.
+
+## Submit
+Write the final architecture artifact to `{output_target}`. Include the recommended implementation sequence, risks, and acceptance criteria. Move or comment on the task according to the taskboard lifecycle once the artifact is complete.
+
+STOP: TASKBOARD_FIRE_PROMPT_END
