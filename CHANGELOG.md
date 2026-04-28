@@ -17,6 +17,8 @@
 - Added `tests/test_taskboard_webhook_auth.py` covering happy path, bad
   HMAC, timestamp skew, replay, malformed body, missing headers, bearer
   bypass for the new route, and migration idempotency.
+- Added Forgejo PR auto-fire prompt templates and renderer support for
+  code-reviewer, security-auditor, and qa-agent reviewer prompts.
 
 ### Changed
 

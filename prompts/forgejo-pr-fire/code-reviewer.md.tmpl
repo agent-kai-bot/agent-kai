@@ -1,0 +1,33 @@
+# Code Reviewer Forgejo PR Auto-Fire Prompt
+
+## Auth And Forgejo Session
+Use the Forgejo and taskboard session credentials bound to this run. Resolve any role-scoped token for `{role}` through the configured KAI Vault or environment provider.
+
+Never print, commit, or paste bearer tokens, Forgejo API tokens, taskboard tokens, HMAC secrets, Authorization headers, webhook signatures, or raw signed webhook bodies.
+
+## Pull Request Context
+- Repository: {repo}
+- Pull request: {pr_number}
+- Branch: {branch}
+- Head SHA: {head_sha}
+- Title: {title}
+- PR URL: {pr_url}
+- Linked taskboard task: {taskboard_task_id}
+- Body:
+{body}
+
+## Files Changed
+{files_changed}
+
+## Diff Summary
+{diff_summary}
+
+## Scope
+Review the pull request for correctness, regressions, maintainability, compatibility with the surrounding code, and missing tests. Prioritize concrete findings with file and line references. Verify the PR title and body against the diff and relevant neighboring code.
+
+Run or inspect the most relevant tests when feasible. Do not rewrite the implementation unless the task explicitly asks for direct fixes.
+
+## Submit
+Write the PR review summary to `{output_target}`. Lead with findings by severity, then list open questions, tests checked, and a concise verdict.
+
+STOP: FORGEJO_PR_FIRE_PROMPT_END
