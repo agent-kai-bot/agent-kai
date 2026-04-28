@@ -13,6 +13,7 @@ from unittest import mock
 from agent.taskboard_dispatcher import (
     BACKPRESSURE_SUBJECT,
     DISPATCHER_SOURCE,
+    SPAWN_FAILED_SUBJECT,
     TaskboardDispatcher,
     resolve_taskboard_role,
 )
@@ -24,9 +25,11 @@ NOW = datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc)
 class _FakeTaskClient:
     """In-memory taskboard client for dispatcher tests."""
 
-    def __init__(self, tasks: dict[int, dict]) -> None:
+    def __init__(self, tasks: dict[int, dict], *, fail_comments: bool = False) -> None:
         self.tasks = tasks
         self.fetches: list[int] = []
+        self.comments: list[tuple[int, str]] = []
+        self.fail_comments = fail_comments
 
     async def fetch_task(self, task_id: int) -> dict:
         """Return the configured task for ``task_id``."""
@@ -34,17 +37,27 @@ class _FakeTaskClient:
         self.fetches.append(task_id)
         return dict(self.tasks[task_id])
 
+    async def post_audit_comment(self, task_id: int, content: str) -> None:
+        """Record or reject a taskboard audit comment."""
+
+        if self.fail_comments:
+            raise RuntimeError("taskboard comment endpoint failed")
+        self.comments.append((task_id, content))
+
 
 class _FakeSessionManager:
     """Record spawn and abort calls without starting agents."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, spawn_error: Exception | None = None) -> None:
         self.spawn_calls: list[dict] = []
         self.abort_calls: list[str] = []
+        self.spawn_error = spawn_error
 
     async def spawn(self, **kwargs):
         """Record spawn arguments and return the requested session id."""
 
+        if self.spawn_error is not None:
+            raise self.spawn_error
         self.spawn_calls.append(kwargs)
         return kwargs["session_id"]
 
@@ -126,6 +139,82 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session["fire_generation"], 7)
         self.assertEqual(session["agent_id"], "developer")
         self.assertIn("fire_generation", self._session_columns())
+
+    async def test_happy_path_posts_success_audit_comment_once(self) -> None:
+        """A successful spawn records the orchestrator audit comment."""
+
+        row_id = self._insert_pending(10154, 4, "Developer")
+        task = {
+            "id": 10154,
+            "title": "Audit callbacks",
+            "agent": "Developer",
+            "fire_generation": 4,
+        }
+        task_client = _FakeTaskClient({10154: task})
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawned": 1})
+        self.assertEqual(
+            task_client.comments,
+            [
+                (
+                    10154,
+                    "[Orchestrator] Fired developer agent for #10154 "
+                    "(session_id=taskboard-10154-4-developer, "
+                    "model=codex, profile=xhigh)",
+                )
+            ],
+        )
+        self.assertIsNotNone(self._pending_row(row_id)["audit_posted_at"])
+
+    async def test_spawn_failure_posts_system_comment_and_nats_alert(self) -> None:
+        """A spawn exception posts the failure audit and emits an alert."""
+
+        row_id = self._insert_pending(10155, 5, "Developer")
+        task = {"id": 10155, "agent": "Developer", "fire_generation": 5}
+        task_client = _FakeTaskClient({10155: task})
+        bus = _FakeBus()
+        session_manager = _FakeSessionManager(
+            spawn_error=RuntimeError("executor unavailable")
+        )
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+            nats_bus=bus,
+        )
+
+        counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawn_failed": 1})
+        self.assertEqual(
+            task_client.comments,
+            [
+                (
+                    10155,
+                    "[System] spawn failed for #10155: executor unavailable; "
+                    "retry with agent-ops fire 10155",
+                )
+            ],
+        )
+        self.assertEqual(self._pending_row(row_id)["dispatch_status"], "spawn_failed")
+        self.assertIsNotNone(self._pending_row(row_id)["audit_posted_at"])
+        self.assertEqual(len(bus.published), 1)
+        subject, payload = bus.published[0]
+        self.assertEqual(subject, SPAWN_FAILED_SUBJECT)
+        self.assertEqual(payload["task_id"], 10155)
+        self.assertEqual(payload["fire_generation"], 5)
+        self.assertEqual(payload["role"], "developer")
+        self.assertEqual(payload["error_class"], "RuntimeError")
+        self.assertEqual(payload["error_message"], "executor unavailable")
+        self.assertEqual(payload["ts"], "2026-04-28T12:00:00Z")
 
     async def test_dedup_marks_second_row_duplicate(self) -> None:
         """Two rows with the same task/fire/agent key spawn only once."""
@@ -288,6 +377,125 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._pending_row(row_id)["dispatch_status"], "stuck_aborted")
         self.assertEqual(self._session_row()["status"], "aborted")
 
+    async def test_stuck_session_sweep_posts_abort_audit_comment(self) -> None:
+        """The stuck-session sweeper comments on the source task."""
+
+        row_id = self._insert_pending(10156, 6, "Developer")
+        self._create_full_sessions_table()
+        stale_created_at = self._iso(NOW - timedelta(minutes=61))
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE webhook_pending
+                SET processed_at = ?, dispatch_status = ?, session_id = ?
+                WHERE id = ?
+                """,
+                (self._iso(NOW), "spawned", "session-stuck-audit", row_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO sessions (
+                    session_id, taskboard_task_id, fire_generation, agent_id,
+                    source, status, webhook_pending_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "session-stuck-audit",
+                    10156,
+                    6,
+                    "developer",
+                    DISPATCHER_SOURCE,
+                    "running",
+                    str(row_id),
+                    stale_created_at,
+                    stale_created_at,
+                ),
+            )
+        task_client = _FakeTaskClient({})
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=_FakeSessionManager(),
+        )
+
+        count = await dispatcher.sweep_stuck_sessions()
+
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            task_client.comments,
+            [
+                (
+                    10156,
+                    "[System] sweeper aborted stuck session for #10156 "
+                    "after 60min (session_id=session-stuck-audit)",
+                )
+            ],
+        )
+        self.assertIsNotNone(self._pending_row(row_id)["audit_posted_at"])
+
+    async def test_comment_post_failure_is_non_fatal_and_retryable(self) -> None:
+        """Comment failures leave the spawned session intact for retry."""
+
+        row_id = self._insert_pending(10157, 7, "Developer")
+        task = {"id": 10157, "agent": "Developer", "fire_generation": 7}
+        task_client = _FakeTaskClient({10157: task}, fail_comments=True)
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        with self.assertLogs("agent.taskboard_dispatcher", level="WARNING") as logs:
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawned": 1})
+        self.assertEqual(len(session_manager.spawn_calls), 1)
+        row = self._pending_row(row_id)
+        self.assertEqual(row["dispatch_status"], "spawned")
+        self.assertIsNone(row["audit_posted_at"])
+        self.assertIn("taskboard_audit_comment_failed", "\n".join(logs.output))
+
+    async def test_restart_retries_missing_audit_without_respawning(self) -> None:
+        """A spawned row with no audit timestamp retries only the comment."""
+
+        row_id = self._insert_pending(10158, 8, "Developer")
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE webhook_pending
+                SET processed_at = ?, dispatch_status = ?, session_id = ?
+                WHERE id = ?
+                """,
+                (self._iso(NOW), "spawned", "session-already-running", row_id),
+            )
+        task = {"id": 10158, "agent": "Developer", "fire_generation": 8}
+        task_client = _FakeTaskClient({10158: task})
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"audit_posted": 1})
+        self.assertEqual(session_manager.spawn_calls, [])
+        self.assertEqual(
+            task_client.comments,
+            [
+                (
+                    10158,
+                    "[Orchestrator] Fired developer agent for #10158 "
+                    "(session_id=session-already-running, "
+                    "model=codex, profile=xhigh)",
+                )
+            ],
+        )
+        self.assertIsNotNone(self._pending_row(row_id)["audit_posted_at"])
+
     async def test_renderer_integration_passes_prompt_verbatim(self) -> None:
         """The renderer output is the exact prompt sent to spawn."""
 
@@ -329,13 +537,14 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self,
         *,
         tasks: dict[int, dict],
+        task_client: _FakeTaskClient | None = None,
         session_manager: _FakeSessionManager,
         nats_bus=None,
         max_concurrent_spawns: int = 6,
     ) -> TaskboardDispatcher:
         return TaskboardDispatcher(
             db_path=self.db_path,
-            task_client=_FakeTaskClient(tasks),
+            task_client=task_client or _FakeTaskClient(tasks),
             session_manager=session_manager,
             nats_bus=nats_bus,
             max_concurrent_spawns=max_concurrent_spawns,
@@ -353,7 +562,8 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
                     processed_at TEXT,
                     dispatch_status TEXT,
                     session_id TEXT,
-                    last_error TEXT
+                    last_error TEXT,
+                    audit_posted_at TEXT
                 )
                 """
             )
