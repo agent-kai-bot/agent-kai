@@ -48,10 +48,16 @@ class _FakeTaskClient:
 class _FakeSessionManager:
     """Record spawn and abort calls without starting agents."""
 
-    def __init__(self, *, spawn_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        spawn_error: Exception | None = None,
+        runtime: dict | None = None,
+    ) -> None:
         self.spawn_calls: list[dict] = []
         self.abort_calls: list[str] = []
         self.spawn_error = spawn_error
+        self.runtime = runtime or {}
 
     async def spawn(self, **kwargs):
         """Record spawn arguments and return the requested session id."""
@@ -59,6 +65,8 @@ class _FakeSessionManager:
         if self.spawn_error is not None:
             raise self.spawn_error
         self.spawn_calls.append(kwargs)
+        if self.runtime:
+            return {"session_id": kwargs["session_id"], "runtime": dict(self.runtime)}
         return kwargs["session_id"]
 
     async def abort(self, session_id: str) -> None:
@@ -151,7 +159,14 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
             "fire_generation": 4,
         }
         task_client = _FakeTaskClient({10154: task})
-        session_manager = _FakeSessionManager()
+        session_manager = _FakeSessionManager(
+            runtime={
+                "provider": "codex-cli",
+                "model": "gpt-5.5",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "reasoning_effort": "medium",
+            }
+        )
         dispatcher = self._dispatcher(
             tasks={},
             task_client=task_client,
@@ -161,17 +176,19 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         counts = await dispatcher.run_once()
 
         self.assertEqual(counts, {"spawned": 1})
-        self.assertEqual(
-            task_client.comments,
-            [
-                (
-                    10154,
-                    "[Orchestrator] Fired developer agent for #10154 "
-                    "(session_id=taskboard-10154-4-developer, "
-                    "model=codex, profile=xhigh)",
-                )
-            ],
-        )
+        self.assertEqual(len(task_client.comments), 1)
+        task_id, comment = task_client.comments[0]
+        self.assertEqual(task_id, 10154)
+        self.assertIn("[Orchestrator] Fired developer agent for #10154", comment)
+        self.assertIn("session_id=taskboard-10154-4-developer", comment)
+        self.assertIn("fire_generation=4", comment)
+        self.assertIn("provider=codex-cli", comment)
+        self.assertIn("model=gpt-5.5", comment)
+        self.assertIn("base_url=https://chatgpt.com/backend-api/codex", comment)
+        self.assertIn("reasoning_effort=medium", comment)
+        self.assertIn("profile=xhigh", comment)
+        self.assertIn("prompt_template_path=", comment)
+        self.assertIn("start_time=2026-04-28T12:00:00Z", comment)
         self.assertIsNotNone(self._pending_row(row_id)["audit_posted_at"])
 
     async def test_spawn_failure_posts_system_comment_and_nats_alert(self) -> None:
@@ -488,17 +505,16 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(counts, {"audit_posted": 1})
         self.assertEqual(session_manager.spawn_calls, [])
-        self.assertEqual(
-            task_client.comments,
-            [
-                (
-                    10158,
-                    "[Orchestrator] Fired developer agent for #10158 "
-                    "(session_id=session-already-running, "
-                    "model=codex, profile=xhigh)",
-                )
-            ],
-        )
+        self.assertEqual(len(task_client.comments), 1)
+        task_id, comment = task_client.comments[0]
+        self.assertEqual(task_id, 10158)
+        self.assertIn("[Orchestrator] Fired developer agent for #10158", comment)
+        self.assertIn("session_id=session-already-running", comment)
+        self.assertIn("fire_generation=8", comment)
+        self.assertIn("provider=unknown", comment)
+        self.assertIn("model=codex", comment)
+        self.assertIn("profile=xhigh", comment)
+        self.assertIn("prompt_template_path=", comment)
         self.assertIsNotNone(self._pending_row(row_id)["audit_posted_at"])
 
     async def test_renderer_integration_passes_prompt_verbatim(self) -> None:

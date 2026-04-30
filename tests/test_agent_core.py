@@ -32,6 +32,7 @@ class AgentRunnerStreamTests(unittest.IsolatedAsyncioTestCase):
         runner.log = _DummyLogger()
         runner.executor = object()
         runner.fallback_executor = None
+        runner.fallback_executors = []
 
         async def fake_stream(_executor, _user_input):
             yield {"type": "final", "data": ""}
@@ -43,6 +44,32 @@ class AgentRunnerStreamTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(final_events)
         self.assertEqual(final_events[-1]["data"], EMPTY_RESPONSE_ERROR)
+
+    async def test_run_falls_back_after_primary_429(self):
+        """Capacity-style primary errors trigger the fallback executor chain."""
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.bus = None
+        runner.tools = []
+        runner.chat_history = []
+        runner.agent_name = "nano"
+        runner.log = _DummyLogger()
+        runner.executor = "primary"
+        runner.fallback_executor = "fallback"
+        runner.fallback_executors = ["fallback"]
+
+        async def fake_stream(executor, _user_input):
+            if executor == "primary":
+                raise RuntimeError("429 Too Many Requests")
+            yield {"type": "final", "data": "fallback ok"}
+
+        runner._stream_executor = fake_stream
+
+        events = [event async for event in runner.run("hello")]
+        self.assertIn(
+            {"type": "status", "data": "Falling back to endpoint #1 of 1..."},
+            events,
+        )
+        self.assertEqual(events[-1], {"type": "final", "data": "fallback ok"})
 
 
 if __name__ == "__main__":

@@ -15,7 +15,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-from agent.prompt_renderer import render_taskboard_fire_prompt
+from agent.prompt_renderer import (
+    TASKBOARD_PROMPT_ROOT,
+    _resolve_template_path,
+    render_taskboard_fire_prompt,
+)
 from agent.taskboard_status_router import roles_to_fire
 
 LOGGER = logging.getLogger(__name__)
@@ -369,18 +373,22 @@ class DaemonTaskboardSpawner:
             session_id,
             create_if_missing=True,
         )
-        managed.session.attach_runtime(
+        runner = managed.session.attach_runtime(
             bus=self.daemon_server.bus,
             agent_name=agent_id,
             signal_consumer=self.daemon_server.signal_consumer,
             scheduler=self.daemon_server.scheduler,
         )
+        runtime_payload = {}
+        if runner is not None and hasattr(runner, "_endpoint_log_payload"):
+            runtime_payload = dict(runner._endpoint_log_payload())
         managed.session.taskboard_dispatcher = {
             "role": kwargs.get("role"),
             "model": kwargs.get("model"),
             "profile": kwargs.get("profile"),
             "task_id": kwargs.get("task_id"),
             "fire_generation": kwargs.get("fire_generation"),
+            "runtime": runtime_payload,
         }
         if hasattr(managed.session, "start_auto_mode"):
             managed.session.start_auto_mode(max_iterations=20, readonly=False)
@@ -394,7 +402,7 @@ class DaemonTaskboardSpawner:
         )
         managed.current_input_task = task
         task.add_done_callback(_consume_task_exception)
-        return session_id
+        return {"session_id": session_id, "runtime": runtime_payload}
 
     async def abort(self, session_id: str) -> None:
         """Abort a live daemon session if it is still running.
@@ -567,7 +575,7 @@ class TaskboardDispatcher:
                 raise ValueError("taskboard payload is missing fire_generation")
             latest_task = await self._fetch_latest_task(task_id)
 
-            session_results: list[tuple[TaskboardRoleRoute, str]] = []
+            session_results: list[tuple[TaskboardRoleRoute, str, dict[str, Any]]] = []
             duplicate_count = 0
             for role_text in role_names:
                 try:
@@ -598,7 +606,7 @@ class TaskboardDispatcher:
                         and existing_session.get("webhook_pending_id") == str(row.row_id)
                         and existing_session.get("session_id")
                     ):
-                        session_results.append((route, str(existing_session["session_id"])))
+                        session_results.append((route, str(existing_session["session_id"]), {}))
                         continue
                     duplicate_count += 1
                     continue
@@ -621,6 +629,8 @@ class TaskboardDispatcher:
                         profile=route.profile,
                         prompt=prompt,
                         task=latest_task,
+                        prompt_template_path=_prompt_template_path(route.role),
+                        start_time=_utc_iso(self.clock()),
                     )
                     if inspect.isawaitable(spawn_result):
                         spawn_result = await spawn_result
@@ -641,13 +651,14 @@ class TaskboardDispatcher:
                     spawn_result,
                     default=requested_session_id,
                 )
+                runtime_payload = _extract_runtime_payload(spawn_result)
                 self._store.finalize_session(
                     task_id=task_id,
                     fire_generation=fire_generation,
                     agent_id=route.agent_id,
                     session_id=session_id,
                 )
-                session_results.append((route, session_id))
+                session_results.append((route, session_id, runtime_payload))
                 reserved_key = None
 
                 LOGGER.info(
@@ -663,21 +674,24 @@ class TaskboardDispatcher:
                 self._store.mark_processed(row, status)
                 return status
 
-            session_ids = [session_id for _, session_id in session_results]
+            session_ids = [session_id for _, session_id, _ in session_results]
             row_session_id = (
                 session_ids[0] if len(session_ids) == 1 else ",".join(session_ids)
             )
             self._store.mark_processed(row, "spawned", session_id=row_session_id)
             all_audits_posted = True
-            for route, session_id in session_results:
+            for route, session_id, runtime_payload in session_results:
                 posted = await self._post_audit_comment(
                     task_id,
                     _spawn_success_comment(
                         task_id=task_id,
                         role=route.agent_id,
                         session_id=session_id,
-                        model=route.model,
                         profile=route.profile,
+                        fire_generation=fire_generation,
+                        prompt_template_path=_prompt_template_path(route.role),
+                        start_time=_utc_iso(self.clock()),
+                        runtime=runtime_payload,
                     ),
                 )
                 all_audits_posted = all_audits_posted and posted
@@ -740,8 +754,11 @@ class TaskboardDispatcher:
                         task_id=task_id,
                         role=session_role,
                         session_id=session_id,
-                        model=session_model,
                         profile=session_profile,
+                        fire_generation=fire_generation,
+                        prompt_template_path=_prompt_template_path(session_role),
+                        start_time=_utc_iso(self.clock()),
+                        runtime={"model": session_model},
                     ),
                 )
                 all_posted = all_posted and posted
@@ -1430,17 +1447,44 @@ def _audit_actor_for_content(content: str) -> str:
     return "Orchestrator"
 
 
+def _extract_runtime_payload(spawn_result: Any) -> dict[str, Any]:
+    """Return live runtime metadata from a session-manager spawn result."""
+
+    if isinstance(spawn_result, dict):
+        runtime = spawn_result.get("runtime") or spawn_result.get("endpoint")
+        if isinstance(runtime, dict):
+            return dict(runtime)
+    return {}
+
+
+def _prompt_template_path(role: str) -> str:
+    """Return the prompt template path used for a taskboard fire role."""
+
+    return str(_resolve_template_path(TASKBOARD_PROMPT_ROOT, role))
+
+
 def _spawn_success_comment(
     *,
     task_id: int,
     role: str,
     session_id: str,
-    model: str,
     profile: str,
+    fire_generation: int,
+    prompt_template_path: str,
+    start_time: str,
+    runtime: dict[str, Any] | None = None,
 ) -> str:
+    runtime = runtime or {}
+    provider = runtime.get("provider") or "unknown"
+    model = runtime.get("model") or "unknown"
+    base_url = runtime.get("base_url") or "unknown"
+    reasoning_effort = runtime.get("reasoning_effort") or "unknown"
     return (
         f"[Orchestrator] Fired {role} agent for #{task_id} "
-        f"(session_id={session_id}, model={model}, profile={profile})"
+        f"(session_id={session_id}, fire_generation={fire_generation}, "
+        f"provider={provider}, model={model}, base_url={base_url}, "
+        f"reasoning_effort={reasoning_effort}, profile={profile}, "
+        f"prompt_template_path={prompt_template_path}, start_time={start_time})"
     )
 
 

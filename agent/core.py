@@ -11,6 +11,11 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
 
+try:  # Optional dependency: only required when provider=claude-cli.
+    from langchain_anthropic import ChatAnthropic
+except ImportError:  # pragma: no cover - exercised by environments without Claude deps.
+    ChatAnthropic = None
+
 from agent.auto_prompt import build_auto_suffix, parse_auto_state
 from agent.memory_store import MemoryStore
 from agent.memory_tool import create_memory_tool
@@ -79,6 +84,11 @@ def create_llm(endpoint_cfg=None):
       OAuth credentials from ``~/.codex/auth.json`` and routes any
       system message into the Responses API ``instructions`` field.
 
+    - ``claude-cli``: uses ``ChatClaude``, a ``ChatAnthropic`` wrapper
+      that loads credentials from ``ANTHROPIC_API_KEY`` or
+      ``~/.anthropic/auth.json`` and raises a clean ``RuntimeError``
+      when Claude auth is unavailable.
+
     - everything else: standard ``ChatOpenAI`` against an
       OpenAI-compatible endpoint (the existing path for vLLM, the
       cloud kai-* endpoints, OpenAI direct, OpenRouter, etc.).
@@ -91,6 +101,8 @@ def create_llm(endpoint_cfg=None):
     base_url = endpoint_cfg.get("base_url") or ""
     if provider == "codex-cli" or "chatgpt.com" in base_url:
         return _create_codex_chat_model(endpoint_cfg)
+    if provider == "claude-cli":
+        return _create_claude_chat_model(endpoint_cfg)
 
     return ChatOpenAI(
         base_url=endpoint_cfg["base_url"],
@@ -154,6 +166,96 @@ def _create_codex_chat_model(endpoint_cfg: dict):
         streaming=True,  # Codex Responses requires stream=true
         extra_body=extra_body,
     )
+
+
+def _create_claude_chat_model(endpoint_cfg: dict):
+    """Build a Claude chat model backed by Anthropic credentials.
+
+    Args:
+        endpoint_cfg: Flat endpoint config returned by ``config.get_endpoint``.
+
+    Returns:
+        Configured ``ChatClaude`` instance.
+
+    Raises:
+        RuntimeError: If ``langchain-anthropic`` or Anthropic credentials are
+            unavailable.
+    """
+
+    if ChatAnthropic is None:
+        raise RuntimeError(
+            "Claude endpoint requires the optional langchain-anthropic package. "
+            "Install it with `pip install langchain-anthropic`."
+        )
+
+    api_key = _load_anthropic_api_key(endpoint_cfg)
+    model = endpoint_cfg.get("model") or "sonnet"
+    return ChatClaude(
+        api_key=api_key,
+        model=model,
+        temperature=endpoint_cfg.get("temperature", 0.6),
+        top_p=endpoint_cfg.get("top_p", 0.95),
+        max_tokens=endpoint_cfg.get("max_tokens", 4096),
+        streaming=True,
+    )
+
+
+def _load_anthropic_api_key(endpoint_cfg: dict) -> str:
+    """Load an Anthropic API key from config, env, or Claude CLI auth JSON.
+
+    Args:
+        endpoint_cfg: Flat endpoint configuration.
+
+    Returns:
+        Non-empty Anthropic API key.
+
+    Raises:
+        RuntimeError: If no usable credential can be found.
+    """
+
+    env_name = str(endpoint_cfg.get("api_key_env") or "ANTHROPIC_API_KEY")
+    candidates = [os.getenv(env_name, "").strip()]
+    configured = str(endpoint_cfg.get("api_key") or "").strip()
+    if configured and configured not in {"not-needed", "missing-anthropic-api-key"}:
+        candidates.append(configured)
+
+    auth_path = Path(
+        os.path.expanduser(
+            str(endpoint_cfg.get("auth_path") or "~/.anthropic/auth.json")
+        )
+    )
+    if auth_path.is_file():
+        try:
+            import json
+
+            auth = json.loads(auth_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"Claude endpoint could not read Anthropic credentials at {auth_path}: {exc}"
+            ) from exc
+        for key in ("api_key", "anthropic_api_key", "ANTHROPIC_API_KEY"):
+            value = str(auth.get(key) or "").strip()
+            if value:
+                candidates.append(value)
+
+    for candidate in candidates:
+        if candidate:
+            return candidate
+
+    raise RuntimeError(
+        "Claude endpoint requires Anthropic credentials. Set "
+        f"{env_name} or create ~/.anthropic/auth.json with an api_key field."
+    )
+
+
+if ChatAnthropic is not None:
+    _ClaudeBase = ChatAnthropic
+else:
+    _ClaudeBase = object
+
+
+class ChatClaude(_ClaudeBase):
+    """Anthropic chat model wrapper for the ``claude-cli`` endpoint."""
 
 
 class ChatCodex(ChatOpenAI):

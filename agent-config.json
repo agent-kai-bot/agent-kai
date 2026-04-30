@@ -4,7 +4,6 @@
   "workspaces_dir": "workspaces",
   "log_level": "DEBUG",
   "log_dir": "logs",
-
   "endpoints": {
     "kai-fast": {
       "provider": "openai",
@@ -101,173 +100,208 @@
           "max_tokens": 4096
         }
       }
+    },
+    "claude-cli": {
+      "provider": "claude-cli",
+      "base_url": "https://api.anthropic.com",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "auth_path": "~/.anthropic/auth.json",
+      "default_model": "sonnet",
+      "models": {
+        "sonnet": {
+          "context_window": 200000,
+          "max_tokens": 8192,
+          "temperature": 0.6,
+          "top_p": 0.95
+        },
+        "claude-sonnet-4-5": {
+          "context_window": 200000,
+          "max_tokens": 8192,
+          "temperature": 0.6,
+          "top_p": 0.95
+        }
+      }
     }
   },
-
   "agents": {
     "kai": {
-      "description": "KAI — primary trading assistant, the user's main interface",
+      "description": "KAI \u2014 primary trading assistant, the user's main interface",
       "endpoint": "codex-cli",
       "fallback_endpoints": [
-        {"endpoint": "kai-local", "model": "qwen35-gptq"}
+        {
+          "endpoint": "kai-local",
+          "model": "qwen35-gptq"
+        }
       ],
       "max_iterations": 2000
     },
     "ceo": {
-      "description": "Strategic leader — sets vision, makes priority decisions, aligns all agents",
+      "description": "Strategic leader \u2014 sets vision, makes priority decisions, aligns all agents",
       "endpoint": "kai-smart",
       "fallback_endpoint": null,
       "workspace": "ceo",
       "max_iterations": 2000
     },
     "cto": {
-      "description": "Technical leader — architecture decisions, engineering standards, tech strategy",
+      "description": "Technical leader \u2014 architecture decisions, engineering standards, tech strategy",
       "endpoint": "kai-smart",
       "fallback_endpoint": null,
       "workspace": "cto",
       "max_iterations": 2000
     },
     "architect": {
-      "description": "System designer — blueprints, API contracts, data models, design docs",
+      "description": "System designer \u2014 blueprints, API contracts, data models, design docs",
       "endpoint": "kai-smart",
       "fallback_endpoint": null,
       "workspace": "architect",
       "max_iterations": 2000
     },
     "developer": {
-      "description": "Builder — writes, edits, debugs, and ships code",
+      "description": "Builder \u2014 writes, edits, debugs, and ships code",
       "endpoint": "kai-smart",
       "fallback_endpoint": null,
       "workspace": "developer",
       "max_iterations": 200
     },
     "qa": {
-      "description": "Quality gatekeeper — tests, bug reports, code review, coverage",
+      "description": "Quality gatekeeper \u2014 tests, bug reports, code review, coverage",
       "endpoint": "kai-smart",
       "fallback_endpoint": null,
       "workspace": "qa",
       "max_iterations": 2000
     },
     "qa-agent": {
-      "description": "Taskboard QA verifier — functional testing, regression checks, evidence capture",
+      "description": "Taskboard QA verifier \u2014 functional testing, regression checks, evidence capture",
       "endpoint": "kai-smart",
       "fallback_endpoint": null,
       "workspace": "qa-agent",
       "max_iterations": 2000
     },
     "code-reviewer": {
-      "description": "Taskboard Code Reviewer — code quality, maintainability, tests, and review verdicts",
+      "description": "Taskboard Code Reviewer \u2014 code quality, maintainability, tests, and review verdicts",
       "endpoint": "kai-smart",
       "fallback_endpoint": null,
       "workspace": "code-reviewer",
       "max_iterations": 2000
     },
     "security-auditor": {
-      "description": "Taskboard Security Auditor — vulnerability review, secret handling, tenant isolation, and security verdicts",
+      "description": "Taskboard Security Auditor \u2014 vulnerability review, secret handling, tenant isolation, and security verdicts",
       "endpoint": "kai-smart",
       "fallback_endpoint": null,
       "workspace": "security-auditor",
       "max_iterations": 2000
     },
     "deep-research": {
-      "description": "Taskboard Deep Research — source-grounded investigation, options analysis, and research handoffs",
+      "description": "Taskboard Deep Research \u2014 source-grounded investigation, options analysis, and research handoffs",
       "endpoint": "kai-smart",
       "fallback_endpoint": null,
       "workspace": "deep-research",
       "max_iterations": 2000
     },
     "ux-manager": {
-      "description": "UX champion — user flows, usability, accessibility, design system",
+      "description": "UX champion \u2014 user flows, usability, accessibility, design system",
       "endpoint": "kai-smart",
       "fallback_endpoint": null,
       "workspace": "ux-manager",
       "max_iterations": 2000
     },
     "project-manager": {
-      "description": "Coordinator — task tracking, priorities, schedules, cross-agent communication",
+      "description": "Coordinator \u2014 task tracking, priorities, schedules, cross-agent communication",
       "endpoint": "kai-smart",
       "fallback_endpoint": null,
       "workspace": "project-manager",
       "max_iterations": 2000
     },
     "seo": {
-      "description": "Search optimizer — keywords, meta tags, technical SEO, content strategy",
+      "description": "Search optimizer \u2014 keywords, meta tags, technical SEO, content strategy",
       "endpoint": "kai-smart",
       "fallback_endpoint": null,
       "workspace": "seo",
       "max_iterations": 2000
     },
     "sales-marketing": {
-      "description": "Growth driver — messaging, copy, go-to-market, campaigns, lead gen",
+      "description": "Growth driver \u2014 messaging, copy, go-to-market, campaigns, lead gen",
       "endpoint": "kai-smart",
       "fallback_endpoint": null,
       "workspace": "sales-marketing",
       "max_iterations": 2000
     },
     "trader": {
-      "description": "Execution specialist — places trades, manages positions, order lifecycle",
+      "description": "Execution specialist \u2014 places trades, manages positions, order lifecycle",
       "endpoint": "codex-cli",
       "fallback_endpoints": [
-        {"endpoint": "kai-local", "model": "qwen35-gptq"}
+        {
+          "endpoint": "kai-local",
+          "model": "qwen35-gptq"
+        }
       ],
       "workspace": "trader",
       "max_iterations": 200
     },
     "analyst": {
-      "description": "Technical analysis — indicators, patterns, chart reading, trading signals",
+      "description": "Technical analysis \u2014 indicators, patterns, chart reading, trading signals",
       "endpoint": "codex-cli",
       "fallback_endpoints": [
-        {"endpoint": "kai-local", "model": "qwen35-gptq"}
+        {
+          "endpoint": "kai-local",
+          "model": "qwen35-gptq"
+        }
       ],
       "workspace": "analyst",
       "max_iterations": 200
     },
     "risk-manager": {
-      "description": "Capital guardian — position sizing, stop losses, exposure limits, drawdown monitoring",
+      "description": "Capital guardian \u2014 position sizing, stop losses, exposure limits, drawdown monitoring",
       "endpoint": "codex-cli",
       "fallback_endpoints": [
-        {"endpoint": "kai-local", "model": "qwen35-gptq"}
+        {
+          "endpoint": "kai-local",
+          "model": "qwen35-gptq"
+        }
       ],
       "workspace": "risk-manager",
       "max_iterations": 200
     },
     "scanner": {
-      "description": "Market radar — pump.fun monitoring, new token alerts, breakout detection",
+      "description": "Market radar \u2014 pump.fun monitoring, new token alerts, breakout detection",
       "endpoint": "kai-fast",
       "fallback_endpoint": null,
       "workspace": "scanner",
       "max_iterations": 200
     },
     "onchain": {
-      "description": "Blockchain investigator — wallet tracking, contract analysis, liquidity checks",
+      "description": "Blockchain investigator \u2014 wallet tracking, contract analysis, liquidity checks",
       "endpoint": "kai-smart",
       "fallback_endpoint": null,
       "workspace": "onchain",
       "max_iterations": 200
     },
     "mentor": {
-      "description": "Reflection coach — reads other agents' sessions and authors reusable skills for them",
+      "description": "Reflection coach \u2014 reads other agents' sessions and authors reusable skills for them",
       "endpoint": "kai-smart",
       "fallback_endpoints": [
-        {"endpoint": "codex-cli", "model": "gpt-5.4"},
-        {"endpoint": "kai-local", "model": "qwen35-gptq"}
+        {
+          "endpoint": "codex-cli",
+          "model": "gpt-5.4"
+        },
+        {
+          "endpoint": "kai-local",
+          "model": "qwen35-gptq"
+        }
       ],
       "workspace": "mentor",
       "max_iterations": 200
     }
   },
-
   "memory": {
     "enabled": true,
     "user_profile_enabled": true,
     "memory_char_limit": 11000,
     "user_char_limit": 6875
   },
-
   "skills": {
     "enabled": true
   },
-
   "signal_handlers": [
     {
       "name": "any-buy-to-analyst",
@@ -277,7 +311,7 @@
       },
       "action": "dispatch_agent",
       "agent": "analyst",
-      "task_template": "A {strategy} BUY signal just fired for {symbol} at ${price}. Run a multi-timeframe TA (1h + 4h + 1d) and tell me whether you'd validate this — what's your independent technical read? Be honest if it looks like noise.",
+      "task_template": "A {strategy} BUY signal just fired for {symbol} at ${price}. Run a multi-timeframe TA (1h + 4h + 1d) and tell me whether you'd validate this \u2014 what's your independent technical read? Be honest if it looks like noise.",
       "cooldown_seconds": 600
     },
     {
@@ -309,7 +343,11 @@
       "match": {
         "strategy": "clucmay02",
         "signal_type": "BUY",
-        "symbol": ["BTC", "ETH", "SOL"]
+        "symbol": [
+          "BTC",
+          "ETH",
+          "SOL"
+        ]
       },
       "action": "dispatch_agent",
       "agent": "trader",
@@ -324,21 +362,22 @@
         "source": "ai-token-analyzer"
       },
       "action": "chat_message",
-      "template": "[bold magenta][ai-analyzer][/] {symbol} — see eval_results for the full report"
+      "template": "[bold magenta][ai-analyzer][/] {symbol} \u2014 see eval_results for the full report"
     }
   ],
-
   "tool_safety": {
     "shell_timeout_seconds": 30,
     "max_file_read_chars": 10000,
     "max_output_chars": 5000,
-
     "docker_sandbox": {
       "default_image": "python:3.12-slim",
       "default_timeout_seconds": 60,
       "max_timeout_seconds": 600,
       "default_network": "none",
-      "allowed_networks": ["none", "bridge"],
+      "allowed_networks": [
+        "none",
+        "bridge"
+      ],
       "memory_limit": "512m",
       "cpu_limit": "1.0",
       "pids_limit": 512,
