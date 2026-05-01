@@ -122,9 +122,30 @@ def _resolve_terminal_session_name(args: argparse.Namespace) -> str:
 
 async def _run_daemon(args: argparse.Namespace) -> None:
     """Serve the websocket daemon in the foreground."""
+    import os
+    import sys
+
     import uvicorn
 
     from daemon.server import DEFAULT_DAEMON_HOST, DEFAULT_DAEMON_PORT, create_app
+
+    # Phase 2 (#10221): preflight blocks startup if config is stale, has
+    # placeholder API keys, or any active endpoint can't smoke-test. Skip
+    # the preflight only when KAI_SKIP_PREFLIGHT=1 is explicitly set, so
+    # break-glass restarts during outage triage are still possible.
+    if os.environ.get("KAI_SKIP_PREFLIGHT", "").strip() not in ("1", "true", "yes"):
+        from agent.preflight import PreflightFailure, run_preflight_or_exit
+        from config import _config as loaded_config
+
+        try:
+            run_preflight_or_exit(loaded_config=loaded_config)
+        except PreflightFailure as exc:
+            sys.stderr.write(f"\n{exc}\n\n")
+            sys.stderr.write(
+                "kai daemon refused to start. Fix the failures above OR set "
+                "KAI_SKIP_PREFLIGHT=1 to bypass for outage triage.\n"
+            )
+            sys.exit(2)
 
     app = create_app(agent_name=args.name, nats_url=args.nats_url)
     config = uvicorn.Config(
