@@ -481,6 +481,13 @@ class TaskboardDispatcher:
             if (now - self._last_sweep_at).total_seconds() >= self.sweep_interval_seconds:
                 await self.sweep_stuck_sessions()
                 self._last_sweep_at = now
+            # Phase 1 (#10223): close the agent_runs ledger loop. The reaper
+            # scans run_*.json artifacts written by completed sessions, derives
+            # terminal status via agent.run_outcome, PATCHes the matching
+            # ledger row, and posts the [KAI] FAILED/COMPLETED audit comment.
+            # Same cadence as queue polling — cheap (file scan + best-effort
+            # HTTP) and keeps the ledger fresh without a separate process.
+            await self._reap_run_outcomes()
             try:
                 await asyncio.wait_for(
                     self._stop_event.wait(),
@@ -488,6 +495,23 @@ class TaskboardDispatcher:
                 )
             except TimeoutError:
                 continue
+
+    async def _reap_run_outcomes(self) -> None:
+        """Run one sweep of the run-outcome reaper. Best-effort; never raises.
+
+        The reaper has its own SQLite-backed state store so per-run id is
+        only acted on once even across dispatcher restarts. Failures here
+        cannot be allowed to wedge the queue-poll loop.
+        """
+        try:
+            from agent.run_outcome_reaper import reap_directory
+
+            reap_directory(client=self._agent_runs_client)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "run_outcome_reaper sweep failed: %s",
+                _redact_known_secrets(str(exc)),
+            )
 
     def stop(self) -> None:
         """Request the background polling loop to stop.
