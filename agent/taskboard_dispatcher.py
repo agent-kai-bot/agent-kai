@@ -29,6 +29,75 @@ DEFAULT_MAX_CONCURRENT_SPAWNS = 6
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_SWEEP_INTERVAL_SECONDS = 60.0
 DEFAULT_STUCK_AFTER_SECONDS = 60 * 60
+
+# Phase 0 (#10247) — fleet hardening. Per-role max_iterations cascade:
+#   1. env  KAI_MAX_ITERATIONS_<ROLE_UPPER>   (escape hatch per role)
+#   2. agent-config.json  agents.{role}.max_iterations
+#   3. env  KAI_MAX_ITERATIONS_DEFAULT       (fleet-wide override)
+#   4. hardcoded fallback                     (FLEET_MAX_ITERATIONS_FLOOR)
+FLEET_MAX_ITERATIONS_FLOOR = 200
+_MAX_ITERATIONS_DEFAULT_ENV = "KAI_MAX_ITERATIONS_DEFAULT"
+_MAX_ITERATIONS_PER_ROLE_PREFIX = "KAI_MAX_ITERATIONS_"
+
+
+def _coerce_positive_int(raw: Any) -> int | None:
+    """Return ``raw`` as a positive int, else ``None``.
+
+    Used to validate env-var / config max_iterations overrides. Anything
+    that doesn't parse to a positive integer is rejected and the cascade
+    falls through to the next layer — operators get a usable value rather
+    than a dispatcher crash on a typo.
+    """
+    if raw is None:
+        return None
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _resolve_max_iterations_for_role(role: str | None) -> int:
+    """Resolve per-role max_iterations using the Phase 0 cascade.
+
+    Args:
+        role: Agent role, e.g. ``"code-reviewer"``. ``None``/empty falls
+            through to the default + hardcoded floor only.
+
+    Returns:
+        Positive integer max_iterations to pass to
+        :meth:`Session.start_auto_mode`.
+    """
+    if role:
+        env_key = (
+            _MAX_ITERATIONS_PER_ROLE_PREFIX
+            + re.sub(r"[^A-Z0-9]+", "_", role.upper()).strip("_")
+        )
+        per_role_env = _coerce_positive_int(os.environ.get(env_key))
+        if per_role_env is not None:
+            return per_role_env
+
+        try:
+            from config import get_agent_config
+
+            cfg = get_agent_config(role)
+            per_role_cfg = _coerce_positive_int(
+                (cfg or {}).get("max_iterations")
+            )
+            if per_role_cfg is not None:
+                return per_role_cfg
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "max_iterations cascade: get_agent_config(%r) failed: %s",
+                role,
+                exc,
+            )
+
+    default_env = _coerce_positive_int(os.environ.get(_MAX_ITERATIONS_DEFAULT_ENV))
+    if default_env is not None:
+        return default_env
+
+    return FLEET_MAX_ITERATIONS_FLOOR
 SECRET_ENV_VARS = (
     "TASKBOARD_BEARER_TOKEN",
     "TASKBOARD_SESSION_TOKEN",
@@ -383,7 +452,14 @@ class DaemonTaskboardSpawner:
             "fire_generation": kwargs.get("fire_generation"),
         }
         if hasattr(managed.session, "start_auto_mode"):
-            managed.session.start_auto_mode(max_iterations=20, readonly=False)
+            # Phase 0 (#10247): per-role iteration budget instead of a
+            # hardcoded 20. CR/SA finish in 8-15; QA/Dev/Architect need
+            # 80-200. See _resolve_max_iterations_for_role for the cascade.
+            max_iters = _resolve_max_iterations_for_role(agent_id)
+            managed.session.start_auto_mode(
+                max_iterations=max_iters,
+                readonly=False,
+            )
         task = asyncio.create_task(
             self.daemon_server.run_input(
                 managed,
@@ -395,20 +471,17 @@ class DaemonTaskboardSpawner:
         managed.current_input_task = task
         task.add_done_callback(_consume_task_exception)
 
-        # Phase 1+5 cutover (#10223 / #10224): when the dispatcher spawns
-        # the in-process session for CR/SA/QA fan-out, the openclaw-gateway
-        # run-JSON path doesn't fire (those artifacts only exist when the
-        # gateway runs the agent). The reaper can't see in-process completions,
-        # so the ledger rows would stay stuck at `spawning` forever. Hook
-        # the asyncio task's done-callback to walk the ledger row through
-        # `running` → `succeeded` (best-effort; final-event mapping happens
-        # elsewhere and a future PR can refine the success vs failure split
-        # via session.events introspection). The callback is bound to the
-        # session_id so the ledger row can be located in the next sweep.
+        # Phase 0 (#10247) — fleet hardening: dispatcher in-process runs
+        # don't produce gateway run_*.json artifacts, so the reaper can't
+        # finalize their ledger rows. Hook the asyncio task's done-callback
+        # to walk the row through `running` → terminal using the *real*
+        # task outcome (exception + InputRunResult.error / .final_text),
+        # routed through `agent.run_outcome.derive_outcome_from_agent_events`
+        # so failure_class/detail land correctly.
         task.add_done_callback(
-            lambda _t, sid=session_id, tid=kwargs.get("task_id"),
+            lambda t, sid=session_id, tid=kwargs.get("task_id"),
             role=kwargs.get("agent_id"): _finalize_dispatcher_inprocess_run(
-                self.daemon_server, sid, tid, role
+                t, self.daemon_server, sid, tid, role
             )
         )
         return session_id
@@ -564,15 +637,33 @@ class TaskboardDispatcher:
                 counts["audit_posted"] = counts.get("audit_posted", 0) + 1
         await self._publish_backpressure_alarm_if_needed()
         pending_rows = self._store.pending_rows()
-        active_count = self._store.active_session_count()
+        active_count = self._effective_active_count()
         for row in pending_rows:
             if active_count >= self.max_concurrent_spawns:
                 break
             status = await self._process_row(row)
             counts[status] = counts.get(status, 0) + 1
             if status == "spawned":
-                active_count = self._store.active_session_count()
+                active_count = self._effective_active_count()
         return counts
+
+    def _effective_active_count(self) -> int:
+        """Phase 0 (#10247): canonical active-run count.
+
+        Prefer the taskboard ``agent_runs`` ledger (which gets PATCHed
+        terminal when in-process runs finish) over the dispatcher's local
+        ``sessions`` table (which never moves out of ``running`` for
+        in-process spawns and wedges capacity).
+
+        Falls back to the legacy local count when the ledger is unreachable
+        — better to over-report than block forever.
+        """
+        ledger_count = self._store.active_run_count_from_ledger(
+            agent_runs_client=self._agent_runs_client
+        )
+        if ledger_count is not None:
+            return ledger_count
+        return self._store.active_session_count()
 
     async def sweep_stuck_sessions(self) -> int:
         """Abort stale dispatcher sessions and mark their queue rows.
@@ -1345,6 +1436,66 @@ class _TaskboardQueueStore:
             ).fetchone()
             return int(row["count"] if row is not None else 0)
 
+    # Phase 0 (#10247): the local `sessions` table never gets marked
+    # terminal when in-process runs complete, so its count grows monotonically
+    # and the dispatcher wedges at max_concurrent_spawns. The taskboard's
+    # agent_runs ledger IS the canonical source — query that instead.
+    # Cache for 5s so the poll loop doesn't hammer the API every tick.
+    _LEDGER_CAPACITY_CACHE_TTL_SECONDS = 5.0
+    _LEDGER_ACTIVE_STATUSES = ("queued", "dispatching", "spawning", "running")
+
+    def active_run_count_from_ledger(
+        self, *, agent_runs_client: Any | None = None
+    ) -> int | None:
+        """Return active in-flight count from the taskboard ``agent_runs`` ledger.
+
+        Returns ``None`` when the ledger client is unavailable or every status
+        query fails — the caller should fall back to the local
+        ``active_session_count()`` in that case rather than block forever.
+
+        Args:
+            agent_runs_client: Optional pre-built client. When omitted, a
+                fresh ``AgentRunsClient.from_env()`` is used.
+        """
+        from time import monotonic
+
+        if not hasattr(self, "_ledger_capacity_cache"):
+            self._ledger_capacity_cache: tuple[float, int] | None = None
+
+        cached = self._ledger_capacity_cache
+        if cached is not None:
+            cached_at, cached_count = cached
+            if monotonic() - cached_at < self._LEDGER_CAPACITY_CACHE_TTL_SECONDS:
+                return cached_count
+
+        if agent_runs_client is None:
+            try:
+                from agent.agent_runs_client import AgentRunsClient
+
+                agent_runs_client = AgentRunsClient.from_env()
+            except Exception:  # noqa: BLE001
+                return None
+        if not getattr(agent_runs_client, "enabled", False):
+            return None
+
+        total = 0
+        any_query_succeeded = False
+        for status in self._LEDGER_ACTIVE_STATUSES:
+            try:
+                rows = agent_runs_client.list_by_status(status, limit=200)
+            except Exception:  # noqa: BLE001
+                rows = None
+            if rows is None:
+                continue
+            any_query_succeeded = True
+            total += len(rows)
+
+        if not any_query_succeeded:
+            return None
+
+        self._ledger_capacity_cache = (monotonic(), total)
+        return total
+
     def reserve_session(
         self,
         *,
@@ -1759,6 +1910,7 @@ def _normalize_spawn_session_id(result: Any, *, default: str) -> str:
 
 
 def _finalize_dispatcher_inprocess_run(
+    task: asyncio.Task[Any],
     daemon_server: Any,
     session_id: str,
     task_id: int | None,
@@ -1770,17 +1922,32 @@ def _finalize_dispatcher_inprocess_run(
     via the daemon's get_or_create_session + run_input pair. Those don't
     produce the ``run_*.json`` artifacts the run-outcome reaper watches for,
     so without this callback the ledger row stays stuck at ``spawning``
-    forever. We hook the asyncio task's done callback to PATCH the ledger
-    row through ``running → succeeded`` (or ``failed`` on exception) when
-    the in-process run terminates. Best-effort: failures here cannot be
-    allowed to wedge the dispatcher's poll loop.
+    forever. Phase 0 (#10247) replaced the original coarse succeed/fail
+    inference with a real outcome derivation:
 
-    A future PR can introspect ``managed.session.events`` for finer-grained
-    failure_class derivation; for now success/failure based on whether the
-    asyncio task raised is sufficient for the user-facing audit trail.
+    1. ``task.cancelled()`` → ``cancelled`` / ``manual_cancellation``.
+    2. ``task.exception()`` is set → ``failed`` / ``tool_unknown_failure``
+       with the exception's repr in the detail.
+    3. Otherwise the task's :class:`InputRunResult` (final_text + error) is
+       projected into a synthetic event stream and routed through
+       :func:`agent.run_outcome.derive_outcome_from_agent_events`, so
+       failure_class / detail are populated by the canonical classifier.
+       Sessions don't retain a full event log on this code path; the
+       runtime collapses the stream into ``InputRunResult`` while running
+       (see :meth:`daemon.server.DaemonServer.run_input`). When that
+       collapse loses information (no final + no error), we record
+       ``succeeded`` and emit a WARNING so operators know the inference
+       was shallow.
+
+    Best-effort: this callback cannot be allowed to raise into the
+    asyncio loop or wedge the dispatcher's poll loop.
     """
     try:
         from agent.agent_runs_client import AgentRunsClient
+        from agent.run_outcome import (
+            derive_outcome_from_agent_events,
+            derive_outcome_from_manual_cancel,
+        )
 
         client = AgentRunsClient.from_env()
         if not client.enabled or task_id is None or role is None:
@@ -1798,24 +1965,59 @@ def _finalize_dispatcher_inprocess_run(
         # spawning → running → terminal
         client.patch(ledger_run_id, {"status": "running"})
 
-        # Success unless the asyncio task raised. We don't have the events
-        # here without reaching into managed.session, so use a coarse
-        # success / failure split.
-        terminal = "succeeded"
-        failure_class: str | None = None
-        failure_detail: str | None = None
-        try:
-            exc = task_id and None  # placeholder (no access to task here)
-        except Exception:  # noqa: BLE001
-            terminal = "failed"
-            failure_class = "tool_unknown_failure"
-            failure_detail = "in-process run raised"
+        # ---- derive the real terminal outcome --------------------------------
+        if task.cancelled():
+            outcome = derive_outcome_from_manual_cancel(
+                f"in-process run cancelled session_id={session_id}"
+            )
+        else:
+            exc = task.exception()
+            if exc is not None:
+                from agent.run_outcome import RunOutcome
 
-        body: dict[str, Any] = {"status": terminal}
-        if failure_class is not None:
-            body["failure_class"] = failure_class
-        if failure_detail is not None:
-            body["failure_detail"] = failure_detail
+                outcome = RunOutcome(
+                    status="failed",
+                    failure_class="tool_unknown_failure",
+                    failure_detail=f"{type(exc).__name__}: {exc}",
+                )
+            else:
+                # task.result() is an InputRunResult (final_text + error).
+                # The session itself doesn't retain a full event log on this
+                # path, so synthesize the minimum events derive_outcome
+                # needs to classify; fall back to 'succeeded' + WARNING when
+                # neither field is populated.
+                result = task.result()
+                final_text = getattr(result, "final_text", None)
+                error_text = getattr(result, "error", None)
+                events: list[dict[str, Any]] = []
+                if error_text:
+                    events.append({"type": "error", "data": error_text})
+                if final_text:
+                    events.append({"type": "final", "data": final_text})
+                if not events:
+                    LOGGER.warning(
+                        "finalize: shallow-inferred succeeded for session_id=%s "
+                        "(no final/error captured by run_input)",
+                        session_id,
+                    )
+                    from agent.run_outcome import RunOutcome
+
+                    outcome = RunOutcome(
+                        status="succeeded",
+                        failure_class=None,
+                        failure_detail=None,
+                    )
+                else:
+                    outcome = derive_outcome_from_agent_events(
+                        events,
+                        final_text=final_text,
+                    )
+
+        body: dict[str, Any] = {"status": outcome.status}
+        if outcome.failure_class is not None:
+            body["failure_class"] = outcome.failure_class
+        if outcome.failure_detail is not None:
+            body["failure_detail"] = outcome.failure_detail
         client.patch(ledger_run_id, body)
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning(
