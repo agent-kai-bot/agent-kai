@@ -644,6 +644,10 @@ class TaskboardDispatcher:
             status = await self._process_row(row)
             counts[status] = counts.get(status, 0) + 1
             if status == "spawned":
+                # Phase 0 fix (codex CR): drop the cached ledger count so the
+                # next read reflects the row we just spawned. Otherwise the
+                # 5s TTL lets us burn through the whole queue in one batch.
+                self._store.invalidate_capacity_cache()
                 active_count = self._effective_active_count()
         return counts
 
@@ -1449,9 +1453,12 @@ class _TaskboardQueueStore:
     ) -> int | None:
         """Return active in-flight count from the taskboard ``agent_runs`` ledger.
 
-        Returns ``None`` when the ledger client is unavailable or every status
-        query fails — the caller should fall back to the local
-        ``active_session_count()`` in that case rather than block forever.
+        Returns ``None`` when the ledger client is unavailable OR ANY of the
+        per-status queries fails — the caller falls back to the local
+        ``active_session_count()`` in that case. The local count over-reports
+        but never undercounts, which is the safe direction for a capacity
+        gate. Returning a partial sum here would let us oversubscribe under
+        a partial taskboard outage.
 
         Args:
             agent_runs_client: Optional pre-built client. When omitted, a
@@ -1478,23 +1485,32 @@ class _TaskboardQueueStore:
         if not getattr(agent_runs_client, "enabled", False):
             return None
 
+        # Phase 0 fix (codex CR): a partial failure (e.g. `running` 5xxs while
+        # `queued` returns) is as dangerous as a total failure — the partial
+        # sum looks small and lets the caller spawn over capacity. Bail out
+        # to the conservative local fallback whenever any status is missing.
         total = 0
-        any_query_succeeded = False
         for status in self._LEDGER_ACTIVE_STATUSES:
             try:
                 rows = agent_runs_client.list_by_status(status, limit=200)
             except Exception:  # noqa: BLE001
                 rows = None
             if rows is None:
-                continue
-            any_query_succeeded = True
+                return None
             total += len(rows)
-
-        if not any_query_succeeded:
-            return None
 
         self._ledger_capacity_cache = (monotonic(), total)
         return total
+
+    def invalidate_capacity_cache(self) -> None:
+        """Drop the cached ledger count so the next read goes back to the API.
+
+        Called by :class:`TaskboardDispatcher` after every successful spawn.
+        Without this the 5s TTL lets a single ``run_once`` batch burn through
+        the entire pending queue in one go: read cap=0 (cache hit), spawn,
+        read cap=0 (still cache hit), ...
+        """
+        self._ledger_capacity_cache = None
 
     def reserve_session(
         self,
@@ -1981,15 +1997,28 @@ def _finalize_dispatcher_inprocess_run(
                     failure_detail=f"{type(exc).__name__}: {exc}",
                 )
             else:
-                # task.result() is an InputRunResult (final_text + error).
-                # The session itself doesn't retain a full event log on this
-                # path, so synthesize the minimum events derive_outcome
-                # needs to classify; fall back to 'succeeded' + WARNING when
-                # neither field is populated.
+                # task.result() is an InputRunResult (final_text + error +
+                # auto_stopped_reason). The session itself doesn't retain a
+                # full event log on this path, so synthesize the minimum
+                # events derive_outcome needs to classify; fall back to
+                # 'succeeded' + WARNING when none of the three fields are
+                # populated.
                 result = task.result()
                 final_text = getattr(result, "final_text", None)
                 error_text = getattr(result, "error", None)
+                auto_stopped_reason = getattr(result, "auto_stopped_reason", None)
                 events: list[dict[str, Any]] = []
+                if auto_stopped_reason is not None:
+                    # auto_stopped beats error/final in derive_outcome
+                    # precedence (iteration_budget, requires_approval,
+                    # malformed AUTO_STATE all surface here). The empty
+                    # string is a valid 'auto_stopped (no reason)' signal.
+                    events.append(
+                        {
+                            "type": "auto_stopped",
+                            "data": {"reason": auto_stopped_reason},
+                        }
+                    )
                 if error_text:
                     events.append({"type": "error", "data": error_text})
                 if final_text:

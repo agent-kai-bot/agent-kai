@@ -132,6 +132,33 @@ class ResolveMaxIterationsTests(unittest.TestCase):
                     200,
                 )
 
+    def test_agent_config_zero_or_negative_falls_through(self) -> None:
+        """codex CR follow-up: agent-config max_iterations of 0 or negative
+        must fall through to the next layer instead of being trusted.
+        """
+        with patch.dict("os.environ", {"KAI_MAX_ITERATIONS_DEFAULT": "75"}):
+            with patch("config.get_agent_config", return_value={"max_iterations": 0}):
+                self.assertEqual(
+                    td._resolve_max_iterations_for_role("code-reviewer"),
+                    75,
+                )
+            with patch("config.get_agent_config", return_value={"max_iterations": -10}):
+                self.assertEqual(
+                    td._resolve_max_iterations_for_role("code-reviewer"),
+                    75,
+                )
+
+    def test_agent_config_non_integer_falls_through(self) -> None:
+        with patch.dict("os.environ", {"KAI_MAX_ITERATIONS_DEFAULT": "75"}):
+            with patch(
+                "config.get_agent_config",
+                return_value={"max_iterations": "lots"},
+            ):
+                self.assertEqual(
+                    td._resolve_max_iterations_for_role("code-reviewer"),
+                    75,
+                )
+
     def test_get_agent_config_failure_does_not_crash_cascade(self) -> None:
         # If config lookup blows up, we still return a usable value.
         with patch.dict("os.environ", {"KAI_MAX_ITERATIONS_DEFAULT": "75"}):

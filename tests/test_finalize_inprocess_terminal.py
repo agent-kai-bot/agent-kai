@@ -25,6 +25,7 @@ from agent import taskboard_dispatcher as td
 class _StubInputRunResult:
     final_text: str = ""
     error: str | None = None
+    auto_stopped_reason: str | None = None
 
 
 @dataclass
@@ -159,6 +160,70 @@ class FinalizeInprocessRunTests(unittest.TestCase):
         # cancelled has no failure_class
         self.assertNotIn("failure_class", body)
         self.assertIn("session_id=sess-x", body["failure_detail"])
+
+    # ------------------------------------------------------------------
+    # auto_stopped — codex CR follow-up
+    # ------------------------------------------------------------------
+
+    def test_auto_stopped_iteration_budget_maps_to_timeout(self) -> None:
+        """run_outcome routes 'iteration_budget exhausted' → status=timeout."""
+        task = _make_task(
+            result=_StubInputRunResult(
+                final_text="task complete",  # final present but auto_stopped wins
+                auto_stopped_reason="iteration_budget exhausted; iterations_remaining=0",
+            )
+        )
+        td._finalize_dispatcher_inprocess_run(
+            task, daemon_server=None, session_id="sess-x", task_id=10247, role="cr"
+        )
+        body = self._terminal()
+        self.assertEqual(body["status"], "timeout")
+        self.assertEqual(body["failure_class"], "session_exceeded_iterations")
+
+    def test_auto_stopped_requires_approval_blocks(self) -> None:
+        task = _make_task(
+            result=_StubInputRunResult(
+                auto_stopped_reason="requires approval for write_file: /etc/hosts",
+            )
+        )
+        td._finalize_dispatcher_inprocess_run(
+            task, daemon_server=None, session_id="sess-x", task_id=10247, role="dev"
+        )
+        body = self._terminal()
+        self.assertEqual(body["status"], "requires_approval_blocked")
+        self.assertEqual(body["failure_class"], "tool_approval_blocked")
+
+    def test_auto_stopped_task_complete_maps_to_succeeded(self) -> None:
+        """The agent's positive AUTO_STATE: done signal must NOT misrecord as failed."""
+        task = _make_task(
+            result=_StubInputRunResult(
+                auto_stopped_reason="AUTO_STATE: done — task complete",
+            )
+        )
+        td._finalize_dispatcher_inprocess_run(
+            task, daemon_server=None, session_id="sess-x", task_id=10247, role="cr"
+        )
+        body = self._terminal()
+        self.assertEqual(body, {"status": "succeeded"})
+
+    def test_both_final_and_error_picks_error(self) -> None:
+        """run_outcome precedence: error beats final when both present.
+
+        run_input can populate both fields if the stream errors after a final
+        event. The synthesized event order must respect that precedence.
+        """
+        task = _make_task(
+            result=_StubInputRunResult(
+                final_text="partial output before crash",
+                error="Primary endpoint failed: connection error",
+            )
+        )
+        td._finalize_dispatcher_inprocess_run(
+            task, daemon_server=None, session_id="sess-x", task_id=10247, role="cr"
+        )
+        body = self._terminal()
+        self.assertEqual(body["status"], "endpoint_failed")
+        self.assertEqual(body["failure_class"], "endpoint_unreachable")
 
     def test_shallow_succeeded_when_neither_final_nor_error(self) -> None:
         # Both fields empty — InputRunResult collapsed nothing useful.

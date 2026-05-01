@@ -70,19 +70,50 @@ class ActiveRunCountFromLedgerTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(client.calls, first_calls, "second call should be cached")
 
-    def test_partial_failure_uses_succeeded_queries(self) -> None:
-        """If queued is reachable but running 5xxs, return what we have rather than None."""
+    def test_partial_failure_returns_none_for_safe_fallback(self) -> None:
+        """Codex CR fix: a partial failure (running 5xxs but queued returns)
+        must return None so the caller falls back to the conservative local
+        sessions count. Returning a partial sum lets the dispatcher
+        oversubscribe under a partial taskboard outage.
+        """
         client = _StubAgentRunsClient(
             by_status={
                 "queued": [{"id": 1}, {"id": 2}],
-                "dispatching": None,  # query failure
+                "dispatching": None,
                 "spawning": [],
-                "running": None,  # query failure
+                "running": None,
             }
         )
         self.store._ledger_capacity_cache = None
-        # 2 queued + 0 spawning = 2; dispatching+running unavailable.
-        self.assertEqual(self.store.active_run_count_from_ledger(agent_runs_client=client), 2)
+        self.assertIsNone(
+            self.store.active_run_count_from_ledger(agent_runs_client=client)
+        )
+
+    def test_invalidate_capacity_cache_forces_refetch(self) -> None:
+        """Codex CR fix: after a spawn, invalidate_capacity_cache() must
+        force the next read back to the API so we don't burn through the
+        whole queue in one batch on a stale low count.
+        """
+        client = _StubAgentRunsClient(
+            by_status={
+                "queued": [{"id": 1}],
+                "dispatching": [],
+                "spawning": [],
+                "running": [],
+            }
+        )
+        self.store._ledger_capacity_cache = None
+        first = self.store.active_run_count_from_ledger(agent_runs_client=client)
+        self.assertEqual(first, 1)
+        first_calls = list(client.calls)
+
+        self.store.invalidate_capacity_cache()
+
+        # Add a row to simulate the freshly-spawned session showing up.
+        client._by_status["spawning"] = [{"id": 99}]
+        second = self.store.active_run_count_from_ledger(agent_runs_client=client)
+        self.assertEqual(second, 2, "post-invalidate read must hit the API again")
+        self.assertGreater(len(client.calls), len(first_calls))
 
 
 if __name__ == "__main__":

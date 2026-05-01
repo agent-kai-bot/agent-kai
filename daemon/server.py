@@ -456,10 +456,18 @@ class ManagedSession:
 
 @dataclass
 class InputRunResult:
-    """Outcome of running one input turn through a session."""
+    """Outcome of running one input turn through a session.
+
+    ``auto_stopped_reason`` carries the *last* ``auto_stopped`` event's
+    reason payload (from auto-mode policy halts: iteration budget,
+    requires-approval, malformed AUTO_STATE, etc.) when present. The
+    dispatcher uses this to derive the correct terminal RunOutcome
+    instead of misrecording auto_stopped runs as ``succeeded``.
+    """
 
     final_text: str = ""
     error: str | None = None
+    auto_stopped_reason: str | None = None
 
 
 class SessionCreateRequest(BaseModel):
@@ -813,10 +821,27 @@ class DaemonServer:
                     job_id=job_id,
                     tool_budget=tool_budget,
                 ):
-                    if event.get("type") == "final":
+                    etype = event.get("type")
+                    if etype == "final":
                         result.final_text = str(event.get("data") or "")
-                    elif event.get("type") == "error":
+                    elif etype == "error":
                         result.error = str(event.get("data") or "agent stream failed")
+                    elif etype == "auto_stopped":
+                        # Phase 0 (#10247): capture the auto-mode halt reason so
+                        # the dispatcher's finalize callback can route it through
+                        # derive_outcome_from_agent_events instead of defaulting
+                        # to 'succeeded'. Last event wins (matches run_outcome's
+                        # last_auto_stopped precedence).
+                        data = event.get("data")
+                        if isinstance(data, dict):
+                            reason = data.get("reason")
+                            result.auto_stopped_reason = (
+                                str(reason) if reason is not None else ""
+                            )
+                        else:
+                            result.auto_stopped_reason = (
+                                str(data) if data is not None else ""
+                            )
             except asyncio.CancelledError:
                 result.error = "current LLM stream stopped"
                 managed.session.publish_event("agent.error", {"value": result.error})
