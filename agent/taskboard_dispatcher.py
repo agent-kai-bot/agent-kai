@@ -443,6 +443,7 @@ class TaskboardDispatcher:
         sweep_interval_seconds: float = DEFAULT_SWEEP_INTERVAL_SECONDS,
         stuck_after_seconds: int = DEFAULT_STUCK_AFTER_SECONDS,
         clock: Callable[[], datetime] | None = None,
+        agent_runs_client: Any | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.task_client = task_client or DefaultTaskboardTaskClient()
@@ -458,6 +459,14 @@ class TaskboardDispatcher:
         self._store = _TaskboardQueueStore(self.db_path, clock=self.clock)
         self._stop_event = asyncio.Event()
         self._last_sweep_at = datetime.min.replace(tzinfo=timezone.utc)
+        # agent_runs ledger client (Phase 1 of epic #10028, taskboard task #10223).
+        # When None, the dispatcher initialises one from env at first use.
+        # Best-effort: ledger writes never raise into the spawn flow.
+        if agent_runs_client is None:
+            from agent.agent_runs_client import AgentRunsClient
+
+            agent_runs_client = AgentRunsClient.from_env()
+        self._agent_runs_client = agent_runs_client
 
     async def run(self) -> None:
         """Run the polling loop until :meth:`stop` is called.
@@ -610,6 +619,21 @@ class TaskboardDispatcher:
                     fire_generation=fire_generation,
                     agent_id=route.agent_id,
                 )
+
+                # Phase 1 (#10223): record `queued` row in the agent_runs
+                # ledger before spawn. Best-effort; ledger errors don't block
+                # the dispatch flow. We pass the run_id through to the spawn
+                # so a future reaper can PATCH terminal status using it.
+                ledger_run_id = self._record_agent_run_queued(
+                    task_id=task_id,
+                    fire_generation=fire_generation,
+                    role=route.agent_id,
+                    session_id=requested_session_id,
+                    trigger_event_id=str(row.row_id),
+                    model=route.model,
+                    profile=route.profile,
+                )
+
                 try:
                     spawn_result = self.session_manager.spawn(
                         session_id=requested_session_id,
@@ -628,6 +652,15 @@ class TaskboardDispatcher:
                     self._store.mark_session_failed(*reserved_key)
                     error_message = _redact_known_secrets(str(exc))
                     self._store.mark_processed(row, "spawn_failed", error=error_message)
+                    # Phase 1 (#10223): mark the ledger row failed so the
+                    # operator UX shows a terminal outcome instead of a
+                    # forever-queued ghost.
+                    self._record_agent_run_terminal(
+                        run_id=ledger_run_id,
+                        status="failed",
+                        failure_class="tool_unknown_failure",
+                        failure_detail=f"spawn raised: {error_message}",
+                    )
                     await self._post_spawn_failure_audit(
                         row=row,
                         task_id=task_id,
@@ -646,6 +679,13 @@ class TaskboardDispatcher:
                     fire_generation=fire_generation,
                     agent_id=route.agent_id,
                     session_id=session_id,
+                )
+                # Phase 1 (#10223): PATCH the ledger row to `spawning` and
+                # capture the resolved session_id. Terminal status is written
+                # later by the run-outcome reaper (#10229 follow-up) once the
+                # run JSON is observable.
+                self._record_agent_run_spawning(
+                    run_id=ledger_run_id, session_id=session_id
                 )
                 session_results.append((route, session_id))
                 reserved_key = None
@@ -797,6 +837,104 @@ class TaskboardDispatcher:
             role=role,
             error=error,
         )
+
+    def _record_agent_run_queued(
+        self,
+        *,
+        task_id: int,
+        fire_generation: int,
+        role: str,
+        session_id: str,
+        trigger_event_id: str,
+        model: str | None = None,
+        profile: str | None = None,
+    ) -> int | None:
+        """Write a ``queued`` row to the taskboard ``agent_runs`` ledger.
+
+        Best-effort: returns the new run_id on success, ``None`` on failure
+        (network, ledger disabled, validation). Never raises.
+        """
+        client = self._agent_runs_client
+        if client is None or not getattr(client, "enabled", False):
+            return None
+        try:
+            return client.create(
+                {
+                    "task_id": int(task_id),
+                    "role": str(role),
+                    "source_component": "kai-dispatcher",
+                    "status": "queued",
+                    "session_id": str(session_id),
+                    "fire_generation": int(fire_generation),
+                    "trigger_event_id": str(trigger_event_id),
+                    "model": model,
+                    "profile": profile,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "agent_runs_queued_failed task_id=%s role=%s error=%s",
+                task_id,
+                role,
+                _redact_known_secrets(str(exc)),
+            )
+            return None
+
+    def _record_agent_run_spawning(
+        self, *, run_id: int | None, session_id: str
+    ) -> None:
+        """PATCH the ledger row to ``spawning`` once the daemon accepts the spawn.
+
+        Best-effort: silently no-ops when the client is disabled or the row
+        couldn't be created earlier. Status drift is recoverable later via the
+        terminal-status reaper.
+        """
+        client = self._agent_runs_client
+        if client is None or run_id is None or not getattr(client, "enabled", False):
+            return
+        try:
+            client.patch(
+                run_id,
+                {"status": "spawning", "session_id": str(session_id)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "agent_runs_spawning_failed run_id=%s error=%s",
+                run_id,
+                _redact_known_secrets(str(exc)),
+            )
+
+    def _record_agent_run_terminal(
+        self,
+        *,
+        run_id: int | None,
+        status: str,
+        failure_class: str | None,
+        failure_detail: str | None,
+    ) -> None:
+        """PATCH the ledger row to a terminal status.
+
+        Used today by the dispatcher only for spawn-time exceptions; the
+        general-case terminal write lives in the run-outcome reaper
+        (follow-up #10229) which derives outcomes from agent run JSONs.
+        """
+        client = self._agent_runs_client
+        if client is None or run_id is None or not getattr(client, "enabled", False):
+            return
+        body: dict[str, Any] = {"status": status}
+        if failure_class is not None:
+            body["failure_class"] = failure_class
+        if failure_detail is not None:
+            body["failure_detail"] = failure_detail
+        try:
+            client.patch(run_id, body)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "agent_runs_terminal_failed run_id=%s status=%s error=%s",
+                run_id,
+                status,
+                _redact_known_secrets(str(exc)),
+            )
 
     async def _post_audit_comment(self, task_id: int, content: str) -> bool:
         try:

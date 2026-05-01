@@ -414,6 +414,37 @@ def build_cli_parser() -> argparse.ArgumentParser:
     logs = subcommands.add_parser("logs", help="Print the daemon log tail")
     logs.add_argument("-n", "--lines", type=int, default=100, help="Lines of log history to print")
 
+    # Phase 1 (#10223): list agent runs from the taskboard agent_runs ledger.
+    # Reads /api/tasks/{id}/agent-runs and /api/agent-runs?status=...; the
+    # auth comes from TASKBOARD_BEARER_TOKEN env, the host from TASKBOARD_URL.
+    runs = subcommands.add_parser(
+        "runs",
+        help="List agent_runs ledger entries (taskboard-side)",
+    )
+    runs_group = runs.add_mutually_exclusive_group(required=True)
+    runs_group.add_argument(
+        "--task",
+        type=int,
+        help="Show runs for a single task id",
+    )
+    runs_group.add_argument(
+        "--status",
+        type=str,
+        help="Cross-task list filtered by status (e.g. running, endpoint_failed)",
+    )
+    runs.add_argument(
+        "--role",
+        type=str,
+        default=None,
+        help="Optional role filter (developer, code-reviewer, security-auditor, qa-agent, architect, orchestrator)",
+    )
+    runs.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Limit (1..200, default 50)",
+    )
+
     return parser
 
 
@@ -447,8 +478,91 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "logs":
         return _print_log_stream(log_path=DAEMON_LOG_PATH, lines=args.lines)
 
+    if args.command == "runs":
+        return _print_agent_runs(
+            task=args.task,
+            status=args.status,
+            role=args.role,
+            limit=args.limit,
+        )
+
     parser.error(f"unknown command: {args.command}")
     return 2
+
+
+# ---------------------------------------------------------------------------
+# `kaictl runs` — Phase 1 of epic #10028 (taskboard task #10223)
+# ---------------------------------------------------------------------------
+
+
+def _print_agent_runs(
+    *,
+    task: int | None,
+    status: str | None,
+    role: str | None,
+    limit: int,
+) -> int:
+    """Render a table of agent_runs rows fetched from the taskboard."""
+    from agent.agent_runs_client import AgentRunsClient
+
+    client = AgentRunsClient.from_env()
+    if not client.enabled:
+        print(
+            "kaictl runs requires TASKBOARD_URL + TASKBOARD_BEARER_TOKEN env "
+            "vars (taskboard agent_runs ledger). See epic #10028."
+        )
+        return 1
+
+    try:
+        if task is not None:
+            rows = client.list_for_task(task, role=role, status=status, limit=limit)
+        else:
+            rows = client.list_by_status(status, limit=limit) if status else None
+    except ValueError as exc:
+        print(f"invalid argument: {exc}")
+        return 2
+
+    if rows is None:
+        print(
+            "kaictl runs: failed to query the taskboard ledger "
+            "(check TASKBOARD_URL and TASKBOARD_BEARER_TOKEN)"
+        )
+        return 1
+    if not rows:
+        print("(no runs)")
+        return 0
+
+    # Compact table for terminal use; switch to JSON if --json is added later.
+    headers = (
+        "id",
+        "task",
+        "role",
+        "status",
+        "fail",
+        "started",
+        "session",
+    )
+    widths = {h: len(h) for h in headers}
+    formatted: list[dict[str, str]] = []
+    for row in rows:
+        cells = {
+            "id": str(row.get("id", "")),
+            "task": str(row.get("task_id", "")),
+            "role": str(row.get("role", "")),
+            "status": str(row.get("status", "")),
+            "fail": str(row.get("failure_class") or "-"),
+            "started": str(row.get("started_at") or row.get("created_at") or "")[:19],
+            "session": str(row.get("session_id") or "-")[:48],
+        }
+        formatted.append(cells)
+        for h in headers:
+            widths[h] = max(widths[h], len(cells[h]))
+    line = "  ".join(h.ljust(widths[h]) for h in headers)
+    print(line)
+    print("  ".join("-" * widths[h] for h in headers))
+    for cells in formatted:
+        print("  ".join(cells[h].ljust(widths[h]) for h in headers))
+    return 0
 
 
 if __name__ == "__main__":
