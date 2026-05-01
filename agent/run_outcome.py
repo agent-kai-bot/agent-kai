@@ -412,6 +412,16 @@ def _outcome_from_error(event: Mapping[str, Any]) -> RunOutcome:
     )
 
 
+_AUTO_STOPPED_SUCCESS_REASONS = (
+    "task complete",
+    "task completed",
+    "completed",
+    "done",
+    "finished",
+    "auto_state: done",
+)
+
+
 def _outcome_from_auto_stopped(event: Mapping[str, Any]) -> RunOutcome:
     data = event.get("data")
     if isinstance(data, Mapping):
@@ -420,6 +430,19 @@ def _outcome_from_auto_stopped(event: Mapping[str, Any]) -> RunOutcome:
     else:
         reason = _normalize_data_for_match(data)
         detail = str(data or "auto_stopped").strip() or "auto_stopped"
+
+    # Phase 1 fix (#10229 follow-up): an auto_stopped with a "task complete"
+    # / "done" / "finished" reason is the agent runtime's *positive* signal
+    # — the agent self-reported successful task completion via the AUTO_STATE
+    # footer. Earlier versions of this matcher fell through to
+    # tool_unknown_failure, mis-recording successful runs as failures and
+    # spamming the audit trail. Map success reasons to succeeded explicitly.
+    if any(needle in reason for needle in _AUTO_STOPPED_SUCCESS_REASONS):
+        return RunOutcome(
+            status="succeeded",
+            failure_class=None,
+            failure_detail=None,
+        )
 
     if "requires approval for" in reason:
         return RunOutcome(

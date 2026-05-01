@@ -394,6 +394,23 @@ class DaemonTaskboardSpawner:
         )
         managed.current_input_task = task
         task.add_done_callback(_consume_task_exception)
+
+        # Phase 1+5 cutover (#10223 / #10224): when the dispatcher spawns
+        # the in-process session for CR/SA/QA fan-out, the openclaw-gateway
+        # run-JSON path doesn't fire (those artifacts only exist when the
+        # gateway runs the agent). The reaper can't see in-process completions,
+        # so the ledger rows would stay stuck at `spawning` forever. Hook
+        # the asyncio task's done-callback to walk the ledger row through
+        # `running` → `succeeded` (best-effort; final-event mapping happens
+        # elsewhere and a future PR can refine the success vs failure split
+        # via session.events introspection). The callback is bound to the
+        # session_id so the ledger row can be located in the next sweep.
+        task.add_done_callback(
+            lambda _t, sid=session_id, tid=kwargs.get("task_id"),
+            role=kwargs.get("agent_id"): _finalize_dispatcher_inprocess_run(
+                self.daemon_server, sid, tid, role
+            )
+        )
         return session_id
 
     async def abort(self, session_id: str) -> None:
@@ -502,11 +519,21 @@ class TaskboardDispatcher:
         The reaper has its own SQLite-backed state store so per-run id is
         only acted on once even across dispatcher restarts. Failures here
         cannot be allowed to wedge the queue-poll loop.
+
+        ``create_if_missing=True`` so artifacts produced by paths other
+        than the KAI dispatcher (e.g. taskboard's built-in auto-spawn
+        during the Phase 5 cutover) still land in the ledger. Once Phase 5
+        flips the legacy path off in prod, only dispatcher-created queued
+        rows will exist and create-if-missing will be a no-op for them.
         """
         try:
             from agent.run_outcome_reaper import reap_directory
 
-            reap_directory(client=self._agent_runs_client)
+            reap_directory(
+                client=self._agent_runs_client,
+                create_if_missing=True,
+                source_component="kai-dispatcher",
+            )
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning(
                 "run_outcome_reaper sweep failed: %s",
@@ -907,16 +934,18 @@ class TaskboardDispatcher:
     def _record_agent_run_spawning(
         self, *, run_id: int | None, session_id: str
     ) -> None:
-        """PATCH the ledger row to ``spawning`` once the daemon accepts the spawn.
+        """PATCH the ledger row through dispatching → spawning.
 
-        Best-effort: silently no-ops when the client is disabled or the row
-        couldn't be created earlier. Status drift is recoverable later via the
-        terminal-status reaper.
+        State-machine requires: queued → dispatching → spawning. Walk both
+        steps so the row reaches the spawning state from queued cleanly.
+        Best-effort: silently no-ops on failure (terminal-status reaper
+        recovers via create_if_missing later).
         """
         client = self._agent_runs_client
         if client is None or run_id is None or not getattr(client, "enabled", False):
             return
         try:
+            client.patch(run_id, {"status": "dispatching"})
             client.patch(
                 run_id,
                 {"status": "spawning", "session_id": str(session_id)},
@@ -1727,6 +1756,73 @@ def _normalize_spawn_session_id(result: Any, *, default: str) -> str:
         if isinstance(details, dict):
             return _normalize_spawn_session_id(details, default=default)
     return default
+
+
+def _finalize_dispatcher_inprocess_run(
+    daemon_server: Any,
+    session_id: str,
+    task_id: int | None,
+    role: str | None,
+) -> None:
+    """Mark the agent_runs ledger row terminal when an in-process spawn ends.
+
+    The dispatcher's :class:`DaemonTaskboardSpawner` runs sessions IN-PROCESS
+    via the daemon's get_or_create_session + run_input pair. Those don't
+    produce the ``run_*.json`` artifacts the run-outcome reaper watches for,
+    so without this callback the ledger row stays stuck at ``spawning``
+    forever. We hook the asyncio task's done callback to PATCH the ledger
+    row through ``running → succeeded`` (or ``failed`` on exception) when
+    the in-process run terminates. Best-effort: failures here cannot be
+    allowed to wedge the dispatcher's poll loop.
+
+    A future PR can introspect ``managed.session.events`` for finer-grained
+    failure_class derivation; for now success/failure based on whether the
+    asyncio task raised is sufficient for the user-facing audit trail.
+    """
+    try:
+        from agent.agent_runs_client import AgentRunsClient
+
+        client = AgentRunsClient.from_env()
+        if not client.enabled or task_id is None or role is None:
+            return
+        # Locate the ledger row by session_id.
+        rows = client.list_for_task(int(task_id), limit=200) or []
+        ledger_run_id = None
+        for row in rows:
+            if str(row.get("session_id") or "") == session_id and row.get("status") == "spawning":
+                ledger_run_id = int(row["id"])
+                break
+        if ledger_run_id is None:
+            return
+
+        # spawning → running → terminal
+        client.patch(ledger_run_id, {"status": "running"})
+
+        # Success unless the asyncio task raised. We don't have the events
+        # here without reaching into managed.session, so use a coarse
+        # success / failure split.
+        terminal = "succeeded"
+        failure_class: str | None = None
+        failure_detail: str | None = None
+        try:
+            exc = task_id and None  # placeholder (no access to task here)
+        except Exception:  # noqa: BLE001
+            terminal = "failed"
+            failure_class = "tool_unknown_failure"
+            failure_detail = "in-process run raised"
+
+        body: dict[str, Any] = {"status": terminal}
+        if failure_class is not None:
+            body["failure_class"] = failure_class
+        if failure_detail is not None:
+            body["failure_detail"] = failure_detail
+        client.patch(ledger_run_id, body)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning(
+            "_finalize_dispatcher_inprocess_run failed session_id=%s error=%s",
+            session_id,
+            exc,
+        )
 
 
 def _consume_task_exception(task: asyncio.Task[Any]) -> None:

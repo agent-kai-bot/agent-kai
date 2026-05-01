@@ -123,6 +123,23 @@ class DeriveFromAgentEventsTests(unittest.TestCase):
         self.assertEqual(out.status, "requires_approval_blocked")
         self.assertEqual(out.failure_class, "tool_approval_blocked")
 
+    def test_auto_stopped_task_complete_is_success(self) -> None:
+        """Agent's positive AUTO_STATE: done signal must map to succeeded.
+
+        Regression: earlier versions mapped this to tool_unknown_failure,
+        causing successful runs (#10240 e2e smoke) to be recorded as failures
+        in the agent_runs ledger and posted as `[KAI] FAILED` audit comments.
+        """
+        for reason in ("task complete", "task completed", "done", "finished", "AUTO_STATE: done"):
+            with self.subTest(reason=reason):
+                events = [
+                    {"type": "final", "data": "Task completed cleanly. AUTO_STATE: done"},
+                    {"type": "auto_stopped", "data": {"reason": reason}},
+                ]
+                out = derive_outcome_from_agent_events(events)
+                self.assertEqual(out.status, "succeeded", f"reason={reason!r}")
+                self.assertIsNone(out.failure_class)
+
     def test_auto_stopped_iteration_budget(self) -> None:
         events = [
             {

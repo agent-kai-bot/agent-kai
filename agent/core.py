@@ -620,14 +620,29 @@ class AgentRunner:
         logger = getattr(self, "log", get_logger(getattr(self, "agent_name", "kai")))
         allowed = True
         reason: str | None = None
+        # Phase 4/5 cutover (epic #10028): when KAI_TRUSTED_AUTONOMOUS=1 is
+        # set in the runtime env, bypass the auto-mode approval gate for
+        # non-readonly tools. Required for autonomous SDLC fires where the
+        # agent is the workforce principal — the operator's approval is the
+        # ticket assignment + the SOC2 review chain downstream, not a
+        # per-tool prompt that no human is there to grant.
+        trusted_autonomous = (
+            os.environ.get("KAI_TRUSTED_AUTONOMOUS", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
         if self._auto_mode:
             if self._auto_readonly and not policy.read_only:
                 allowed = False
                 reason = f"auto readonly blocks non-read-only tool: {tool_name}"
-            elif policy.requires_approval_in_auto:
+            elif policy.requires_approval_in_auto and not trusted_autonomous:
                 allowed = False
                 reason = f"requires approval for {tool_name}"
-        logger.info("TOOL_POLICY tool=%s allowed=%s", tool_name, allowed)
+        logger.info(
+            "TOOL_POLICY tool=%s allowed=%s trusted_autonomous=%s",
+            tool_name,
+            allowed,
+            trusted_autonomous,
+        )
         if not allowed and reason is not None:
             raise RuntimeError(reason)
 

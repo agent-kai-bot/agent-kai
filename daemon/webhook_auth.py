@@ -102,13 +102,20 @@ def _parse_timestamp(raw: str) -> int:
 
 
 def _parse_delivery_id(raw: str) -> str:
+    """Validate the delivery_id is UUID-shaped but preserve the raw form.
+
+    The taskboard signs with the literal header value (which may or may not
+    contain dashes). Normalizing to dashed form here would produce a
+    different signed_string and break signature verification. We validate
+    the shape via uuid.UUID() but always return the operator-supplied bytes.
+    """
     try:
-        parsed = uuid.UUID(raw)
+        uuid.UUID(raw)  # validate shape only; ignore the parsed object
     except (TypeError, ValueError) as exc:
         raise WebhookHeaderError(
             "X-Taskboard-Delivery must be a UUID"
         ) from exc
-    return str(parsed)
+    return raw
 
 
 def _parse_signature(raw: str) -> str:
