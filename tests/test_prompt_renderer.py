@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import unittest
 
+from unittest import mock
+
 from agent.prompt_renderer import _extract_substitutions, render_taskboard_fire_prompt
 
 
@@ -81,7 +83,43 @@ class PromptRendererTests(unittest.TestCase):
 
         self.assertIn("Sparse task", rendered)
         self.assertIn("- Epic: ", rendered)
+        self.assertIn("- Workspace path: ", rendered)
+        self.assertIn("- Worktree path: ", rendered)
+        self.assertIn("- Primary repo path: ", rendered)
+        self.assertIn("- Workspace manifest path: ", rendered)
         self.assertNotIn("{epic_title}", rendered)
+        self.assertNotIn("{workspace_path}", rendered)
+        self.assertNotIn("{worktree_path}", rendered)
+        self.assertNotIn("{primary_repo_path}", rendered)
+        self.assertNotIn("{workspace_manifest_path}", rendered)
+
+    def test_workspace_fields_render_when_present(self) -> None:
+        """Workspace-enabled dispatcher fields render as concrete paths."""
+
+        rendered = render_taskboard_fire_prompt(
+            "developer",
+            {
+                **self._sample_task(),
+                "workspace_path": "/tmp/kai/task-10153",
+                "worktree_path": "/tmp/kai/task-10153/developer/repos/main",
+                "primary_repo_path": "/tmp/kai/task-10153/developer/repos/main",
+                "workspace_manifest_path": "/tmp/kai/task-10153/shared/workspace.json",
+            },
+        )
+
+        self.assertIn("- Workspace path: /tmp/kai/task-10153", rendered)
+        self.assertIn(
+            "- Worktree path: /tmp/kai/task-10153/developer/repos/main",
+            rendered,
+        )
+        self.assertIn(
+            "- Primary repo path: /tmp/kai/task-10153/developer/repos/main",
+            rendered,
+        )
+        self.assertIn(
+            "- Workspace manifest path: /tmp/kai/task-10153/shared/workspace.json",
+            rendered,
+        )
 
     def test_all_role_templates_are_loadable(self) -> None:
         """All taskboard fire templates render successfully."""
@@ -98,6 +136,31 @@ class PromptRendererTests(unittest.TestCase):
                 rendered = render_taskboard_fire_prompt(role, self._sample_task())
                 self.assertIn("STOP: TASKBOARD_FIRE_PROMPT_END", rendered)
                 self.assertIn("Task ID: 10153", rendered)
+                self.assertIn("- Workspace path: ", rendered)
+                self.assertIn("- Worktree path: ", rendered)
+                self.assertIn("- Primary repo path: ", rendered)
+                self.assertIn("- Workspace manifest path: ", rendered)
+
+    def test_prompt_cap_behavior_unchanged_with_workspace_context(self) -> None:
+        """Oversized prompts are still capped and keep the stop marker."""
+
+        long_description = "x" * 1_000
+        with mock.patch("agent.prompt_renderer.MAX_RENDERED_PROMPT_CHARS", 800):
+            rendered = render_taskboard_fire_prompt(
+                "developer",
+                {
+                    **self._sample_task(),
+                    "description": long_description,
+                    "workspace_path": "/tmp/kai/task-10153",
+                    "worktree_path": "/tmp/kai/task-10153/developer/repos/main",
+                    "primary_repo_path": "/tmp/kai/task-10153/developer/repos/main",
+                    "workspace_manifest_path": "/tmp/kai/task-10153/shared/workspace.json",
+                },
+            )
+
+        self.assertLessEqual(len(rendered), 800)
+        self.assertIn("[Prompt truncated by renderer]", rendered)
+        self.assertTrue(rendered.endswith("\nSTOP: TASKBOARD_FIRE_PROMPT_END"))
 
     def test_task_id_is_populated_for_non_empty_task(self) -> None:
         """Any non-empty task payload receives a task_id substitution."""

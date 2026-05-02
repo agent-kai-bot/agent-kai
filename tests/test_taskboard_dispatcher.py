@@ -629,6 +629,59 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(session_manager.spawn_calls[0]["prompt"], "known prompt body")
 
+    async def test_workspace_enabled_dispatcher_renders_concrete_paths(self) -> None:
+        """Workspace-enabled dispatcher enriches prompt input with path context."""
+
+        self._insert_pending(10282, 4, "Developer")
+        task = {
+            "id": 10282,
+            "title": "Workspace prompt context",
+            "agent": "Developer",
+            "fire_generation": 4,
+            "project": {
+                "slug": "agent-kai",
+                "repoUrl": "https://github.com/agent-kai-bot/agent-kai.git",
+                "defaultBranch": "main",
+            },
+            "epic": {"id": 10032, "title": "Router Architecture v2"},
+        }
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={10282: task},
+            session_manager=session_manager,
+        )
+
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "KAI_TICKET_WORKSPACE_ENABLED": "1",
+                "KAI_TICKET_WORKSPACE_ROOT": str(Path(self.temp_dir.name) / "tickets"),
+            },
+        ):
+            await dispatcher.run_once()
+
+        prompt = session_manager.spawn_calls[0]["prompt"]
+        expected_task_dir = (
+            Path(self.temp_dir.name)
+            / "tickets"
+            / "agent-kai"
+            / "epic-10032"
+            / "task-10282"
+        ).resolve(strict=False)
+        expected_repo = (
+            expected_task_dir
+            / "developer"
+            / "repos"
+            / "github.com__agent-kai-bot__agent-kai"
+        )
+        self.assertIn(f"- Workspace path: {expected_task_dir}", prompt)
+        self.assertIn(f"- Worktree path: {expected_repo}", prompt)
+        self.assertIn(f"- Primary repo path: {expected_repo}", prompt)
+        self.assertIn(
+            f"- Workspace manifest path: {expected_task_dir / 'shared' / 'workspace-manifest.json'}",
+            prompt,
+        )
+
     async def test_tier_mapping_table(self) -> None:
         """Every supported taskboard role maps to the required model tier."""
 

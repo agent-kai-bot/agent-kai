@@ -264,6 +264,22 @@ def _extract_taskboard_substitutions(
         ),
         "branch_name": branch_name_suggestion,
         "branch_name_suggestion": branch_name_suggestion,
+        "workspace_path": _stringify(
+            _field(task_mapping, "workspace_path", "workspacePath")
+        ),
+        "worktree_path": _stringify(
+            _field(task_mapping, "worktree_path", "worktreePath")
+        ),
+        "primary_repo_path": _stringify(
+            _field(task_mapping, "primary_repo_path", "primaryRepoPath")
+        ),
+        "workspace_manifest_path": _stringify(
+            _field(
+                task_mapping,
+                "workspace_manifest_path",
+                "workspaceManifestPath",
+            )
+        ),
         "task_url": _stringify(_field(task_mapping, "task_url", "taskUrl", "url")),
         "comments_url": _stringify(
             _field(task_mapping, "comments_url", "commentsUrl")

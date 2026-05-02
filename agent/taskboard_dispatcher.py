@@ -785,9 +785,13 @@ class TaskboardDispatcher:
                     role=route.role,
                 )
 
+                prompt_task = _workspace_prompt_context(
+                    latest_task,
+                    role=route.agent_id,
+                )
                 prompt = render_taskboard_fire_prompt(
                     route.role,
-                    latest_task,
+                    prompt_task,
                     session_token=session_token,
                     session_generation=session_generation_value,
                 )
@@ -2279,6 +2283,66 @@ def _push_policy_for_repo(*, repo_url: str = "", owner: str = "", repo: str = ""
 def _ticket_workspace_enabled() -> bool:
     value = os.getenv(WORKSPACE_ENABLED_ENV, "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _workspace_prompt_context(task: Mapping[str, Any], *, role: str) -> dict[str, Any]:
+    """Return task metadata enriched with workspace path context when enabled."""
+
+    prompt_task = dict(task) if isinstance(task, Mapping) else {}
+    if not _ticket_workspace_enabled():
+        return prompt_task
+
+    task_id = int(_first_non_empty(prompt_task, "task_id", "taskId", "id"))
+    project_slug = str(_first_non_empty(prompt_task, "project_slug", "projectSlug"))
+    epic_value = _first_non_empty(prompt_task, "epic_id", "epicId")
+    epic_id = int(epic_value) if epic_value not in (None, "") else None
+
+    from agent.taskboard_workspace import (
+        RepoRef,
+        TaskboardWorkspaceConfig,
+        TicketWorkspacePaths,
+    )
+
+    paths = TicketWorkspacePaths(
+        root=TaskboardWorkspaceConfig.from_sources().root,
+        project_slug=project_slug,
+        task_id=task_id,
+        epic_id=epic_id,
+    )
+    prompt_task.setdefault("workspace_path", str(paths.task_dir))
+    prompt_task.setdefault(
+        "workspace_manifest_path",
+        str(paths.shared_dir / "workspace-manifest.json"),
+    )
+
+    primary_repo = _mapping_value(prompt_task, "primary_repository")
+    repo_url = str(
+        _first_non_empty(
+            primary_repo,
+            "repo_url",
+            "repoUrl",
+            fallback=prompt_task.get("repo_url") or "",
+        )
+    )
+    default_branch = str(
+        _first_non_empty(
+            primary_repo,
+            "default_branch",
+            "defaultBranch",
+            fallback=prompt_task.get("default_branch") or "",
+        )
+    )
+    repo_key_value = str(_first_non_empty(primary_repo, "repo_key", "repoKey"))
+    if repo_url:
+        try:
+            repo_key_value = RepoRef.from_url(repo_url, default_branch=default_branch).key
+        except Exception:  # noqa: BLE001 - keep prompt rendering best-effort.
+            pass
+    if repo_key_value:
+        primary_repo_path = paths.repo_dir(role, repo_key_value)
+        prompt_task.setdefault("primary_repo_path", str(primary_repo_path))
+        prompt_task.setdefault("worktree_path", str(primary_repo_path))
+    return prompt_task
 
 
 def _mapping_value(mapping: Mapping[str, Any], key: str) -> Mapping[str, Any]:
