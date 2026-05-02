@@ -9,7 +9,7 @@ import logging
 import os
 import re
 import sqlite3
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -104,6 +104,7 @@ SECRET_ENV_VARS = (
     "OPENCLAW_GATEWAY_TOKEN",
     "OPENCLAW_TOKEN",
 )
+WORKSPACE_ENABLED_ENV = "KAI_TICKET_WORKSPACE_ENABLED"
 
 
 class TaskboardTaskClient(Protocol):
@@ -910,7 +911,12 @@ class TaskboardDispatcher:
         result = self.task_client.fetch_task(task_id)
         if inspect.isawaitable(result):
             result = await result
-        return _extract_task(result)
+        task = _normalize_task_metadata(_extract_task(result))
+        if _ticket_workspace_enabled() and not task.get("project_slug"):
+            raise ValueError(
+                "taskboard task is missing project.slug required for ticket workspace"
+            )
+        return task
 
     async def _post_audit_for_row(self, row: PendingWebhookRow) -> bool:
         status = row.dispatch_status or ""
@@ -2040,6 +2046,256 @@ def _extract_task(payload: Any) -> dict[str, Any]:
         task["id"] = payload["task_id"]
         return task
     raise ValueError("task payload does not contain a task id")
+
+
+def _normalize_task_metadata(task: dict[str, Any]) -> dict[str, Any]:
+    """Flatten project/epic fields and build the ordered repo manifest."""
+
+    normalized = dict(task)
+    project = _mapping_value(normalized, "project")
+    epic = _mapping_value(normalized, "epic")
+
+    project_slug = _first_non_empty(
+        normalized,
+        "project_slug",
+        "projectSlug",
+        fallback=_first_non_empty(project, "slug"),
+    )
+    if project_slug:
+        normalized["project_slug"] = str(project_slug)
+
+    repo_url = _first_non_empty(
+        normalized,
+        "repo_url",
+        "repoUrl",
+        "repository_url",
+        "repositoryUrl",
+        fallback=_first_non_empty(
+            project,
+            "repo_url",
+            "repoUrl",
+            "repository_url",
+            "repositoryUrl",
+        ),
+    )
+    if repo_url:
+        normalized["repo_url"] = str(repo_url)
+
+    default_branch = _first_non_empty(
+        normalized,
+        "default_branch",
+        "defaultBranch",
+        fallback=_first_non_empty(project, "default_branch", "defaultBranch"),
+    )
+    if default_branch:
+        normalized["default_branch"] = str(default_branch)
+
+    epic_id = _first_non_empty(
+        normalized,
+        "epic_id",
+        "epicId",
+        fallback=_first_non_empty(epic, "id"),
+    )
+    if epic_id not in (None, ""):
+        normalized["epic_id"] = epic_id
+
+    repositories = _normalize_repo_manifest(
+        normalized,
+        project=project,
+        default_branch=str(default_branch or ""),
+    )
+    if repositories:
+        normalized["repositories"] = repositories
+        primary_repo = next(
+            (repo for repo in repositories if repo.get("primary")), repositories[0]
+        )
+        normalized["primary_repository"] = primary_repo
+        normalized.setdefault("repo_url", primary_repo.get("repo_url") or "")
+        normalized.setdefault(
+            "default_branch", primary_repo.get("default_branch") or ""
+        )
+
+    return normalized
+
+
+def _normalize_repo_manifest(
+    task: Mapping[str, Any],
+    *,
+    project: Mapping[str, Any],
+    default_branch: str = "",
+) -> list[dict[str, Any]]:
+    raw_repositories = _sequence_value(task, "repositories") or _sequence_value(
+        project,
+        "repositories",
+    )
+    manifest: list[dict[str, Any]] = []
+    for index, raw_repo in enumerate(raw_repositories):
+        if not isinstance(raw_repo, Mapping):
+            continue
+        entry = _normalize_repo_entry(
+            raw_repo,
+            default_branch=default_branch,
+            index=index,
+        )
+        if entry:
+            manifest.append(entry)
+
+    if not manifest:
+        repo_url = _first_non_empty(
+            task,
+            "repo_url",
+            "repoUrl",
+            "repository_url",
+            "repositoryUrl",
+            fallback=_first_non_empty(
+                project,
+                "repo_url",
+                "repoUrl",
+                "repository_url",
+                "repositoryUrl",
+            ),
+        )
+        if repo_url:
+            manifest.append(
+                _repo_manifest_entry(
+                    repo_url=str(repo_url),
+                    default_branch=default_branch,
+                    index=0,
+                    primary=True,
+                )
+            )
+
+    if manifest and not any(repo.get("primary") for repo in manifest):
+        manifest[0]["primary"] = True
+    return manifest
+
+
+def _normalize_repo_entry(
+    raw_repo: Mapping[str, Any],
+    *,
+    default_branch: str,
+    index: int,
+) -> dict[str, Any]:
+    repo_url = _first_non_empty(
+        raw_repo,
+        "repo_url",
+        "repoUrl",
+        "repository_url",
+        "repositoryUrl",
+        "url",
+        "clone_url",
+        "cloneUrl",
+        "ssh_url",
+        "sshUrl",
+    )
+    branch = (
+        _first_non_empty(raw_repo, "default_branch", "defaultBranch")
+        or default_branch
+    )
+    primary_value = _first_non_empty(raw_repo, "primary", "is_primary", "isPrimary")
+    return _repo_manifest_entry(
+        repo_url=str(repo_url or ""),
+        default_branch=str(branch or ""),
+        index=index,
+        primary=bool(primary_value) if isinstance(primary_value, bool) else False,
+        raw=raw_repo,
+    )
+
+
+def _repo_manifest_entry(
+    *,
+    repo_url: str,
+    default_branch: str,
+    index: int,
+    primary: bool,
+    raw: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    raw = raw or {}
+    repo_ref = None
+    repo_key = _first_non_empty(raw, "repo_key", "repoKey", "key")
+    if repo_url:
+        try:
+            from agent.taskboard_workspace import RepoRef
+
+            repo_ref = RepoRef.from_url(repo_url, default_branch=default_branch)
+            repo_key = repo_key or repo_ref.key
+        except Exception:  # noqa: BLE001 - tolerate incomplete taskboard metadata.
+            repo_ref = None
+
+    owner = _first_non_empty(raw, "owner", "org", "organization")
+    repo_name = _first_non_empty(raw, "repo", "name", "repository")
+    host = _first_non_empty(raw, "host")
+    if repo_ref is not None:
+        host = host or repo_ref.host
+        owner = owner or repo_ref.owner
+        repo_name = repo_name or repo_ref.repo
+
+    entry = {
+        "order": index,
+        "repo_key": str(repo_key or ""),
+        "repo_url": repo_url,
+        "default_branch": default_branch,
+        "primary": primary,
+        "push_policy": _push_policy_for_repo(
+            repo_url=repo_url,
+            owner=str(owner or ""),
+            repo=str(repo_name or ""),
+        ),
+    }
+    if host:
+        entry["host"] = str(host)
+    if owner:
+        entry["owner"] = str(owner)
+    if repo_name:
+        entry["repo"] = str(repo_name)
+    return entry
+
+
+def _push_policy_for_repo(*, repo_url: str = "", owner: str = "", repo: str = "") -> str:
+    owner_l = owner.strip().lower()
+    repo_l = repo.strip().lower().removesuffix(".git")
+    if (owner_l, repo_l) == ("agent-kai-bot", "agent-kai"):
+        return "never"
+    if repo_url:
+        try:
+            from agent.taskboard_workspace import parse_repo_url
+
+            _host, parsed_owner, parsed_repo = parse_repo_url(repo_url)
+            if (parsed_owner, parsed_repo) == ("agent-kai-bot", "agent-kai"):
+                return "never"
+        except Exception:  # noqa: BLE001
+            pass
+    return "allowed"
+
+
+def _ticket_workspace_enabled() -> bool:
+    value = os.getenv(WORKSPACE_ENABLED_ENV, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _mapping_value(mapping: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    value = mapping.get(key) if isinstance(mapping, Mapping) else None
+    return value if isinstance(value, Mapping) else {}
+
+
+def _sequence_value(mapping: Mapping[str, Any], key: str) -> Sequence[Any]:
+    value = mapping.get(key) if isinstance(mapping, Mapping) else None
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return value
+    return ()
+
+
+def _first_non_empty(
+    mapping: Mapping[str, Any],
+    *names: str,
+    fallback: Any = "",
+) -> Any:
+    if isinstance(mapping, Mapping):
+        for name in names:
+            value = mapping.get(name)
+            if value not in (None, ""):
+                return value
+    return fallback
 
 
 def _extract_task_id(payload: dict[str, Any], task: dict[str, Any]) -> int:

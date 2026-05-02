@@ -15,6 +15,7 @@ from agent.taskboard_dispatcher import (
     DISPATCHER_SOURCE,
     SPAWN_FAILED_SUBJECT,
     TaskboardDispatcher,
+    _normalize_task_metadata,
     resolve_taskboard_role,
 )
 
@@ -65,6 +66,12 @@ class _FakeSessionManager:
         """Record an abort request."""
 
         self.abort_calls.append(session_id)
+
+
+class _DisabledAgentRunsClient:
+    """Disable live agent_runs capacity checks in dispatcher unit tests."""
+
+    enabled = False
 
 
 class _FakeBus:
@@ -139,6 +146,98 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session["fire_generation"], 7)
         self.assertEqual(session["agent_id"], "developer")
         self.assertIn("fire_generation", self._session_columns())
+
+    async def test_fetch_latest_task_flattens_nested_project_epic_and_repo(self) -> None:
+        """Latest task fetch returns structured project, epic, and repo metadata."""
+
+        task = {
+            "id": 10281,
+            "title": "Workspace metadata",
+            "project": {
+                "slug": "agent-kai",
+                "repoUrl": "https://github.com/agent-kai-bot/agent-kai.git",
+                "defaultBranch": "main",
+            },
+            "epic": {"id": 10032, "title": "Router Architecture v2"},
+        }
+        dispatcher = self._dispatcher(
+            tasks={10281: {"body": {"task": task}}},
+            session_manager=_FakeSessionManager(),
+        )
+
+        latest = await dispatcher._fetch_latest_task(10281)
+
+        self.assertEqual(latest["project_slug"], "agent-kai")
+        self.assertEqual(
+            latest["repo_url"],
+            "https://github.com/agent-kai-bot/agent-kai.git",
+        )
+        self.assertEqual(latest["default_branch"], "main")
+        self.assertEqual(latest["epic_id"], 10032)
+        self.assertEqual(len(latest["repositories"]), 1)
+        repo = latest["repositories"][0]
+        self.assertEqual(repo["repo_key"], "github.com__agent-kai-bot__agent-kai")
+        self.assertTrue(repo["primary"])
+        self.assertEqual(repo["push_policy"], "never")
+
+    async def test_missing_project_slug_fails_only_when_workspace_enabled(self) -> None:
+        """Legacy task payloads remain usable until ticket workspaces are enabled."""
+
+        task = {
+            "id": 10282,
+            "title": "Legacy payload",
+            "project": {"name": "Agent KAI"},
+        }
+        dispatcher = self._dispatcher(
+            tasks={10282: task},
+            session_manager=_FakeSessionManager(),
+        )
+
+        with mock.patch.dict("os.environ", {}, clear=False):
+            latest = await dispatcher._fetch_latest_task(10282)
+        self.assertNotIn("project_slug", latest)
+
+        with mock.patch.dict("os.environ", {"KAI_TICKET_WORKSPACE_ENABLED": "1"}):
+            with self.assertRaisesRegex(ValueError, "missing project.slug"):
+                await dispatcher._fetch_latest_task(10282)
+
+    def test_multi_repo_payload_produces_ordered_repo_manifest(self) -> None:
+        """Structured repositories[] are preserved in taskboard order."""
+
+        normalized = _normalize_task_metadata(
+            {
+                "id": 10283,
+                "project": {"slug": "multi", "defaultBranch": "main"},
+                "repositories": [
+                    {
+                        "repoUrl": (
+                            "https://forgejo.local/atcsecure/"
+                            "openclawdev-taskboard.git"
+                        ),
+                        "defaultBranch": "main",
+                    },
+                    {
+                        "repoUrl": "git@github.com:agent-kai-bot/agent-kai.git",
+                        "defaultBranch": "feat/workspaces",
+                    },
+                ],
+            }
+        )
+
+        repos = normalized["repositories"]
+        self.assertEqual(
+            [repo["repo_key"] for repo in repos],
+            [
+                "forgejo.local__atcsecure__openclawdev-taskboard",
+                "github.com__agent-kai-bot__agent-kai",
+            ],
+        )
+        self.assertEqual([repo["order"] for repo in repos], [0, 1])
+        self.assertTrue(repos[0]["primary"])
+        self.assertFalse(repos[1]["primary"])
+        self.assertEqual(repos[0]["push_policy"], "allowed")
+        self.assertEqual(repos[1]["push_policy"], "never")
+        self.assertEqual(normalized["primary_repository"], repos[0])
 
     async def test_happy_path_posts_success_audit_comment_once(self) -> None:
         """A successful spawn records the orchestrator audit comment."""
@@ -563,6 +662,7 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
             nats_bus=nats_bus,
             max_concurrent_spawns=max_concurrent_spawns,
             clock=lambda: NOW,
+            agent_runs_client=_DisabledAgentRunsClient(),
         )
 
     def _create_pending_table(self) -> None:
