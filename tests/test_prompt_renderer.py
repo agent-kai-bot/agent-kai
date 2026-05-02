@@ -113,6 +113,16 @@ class PromptRendererTests(unittest.TestCase):
         self.assertIn("live smoke check", qa_rendered)
         self.assertIn("observed output from the running service", qa_rendered)
 
+    def test_prompts_include_cross_host_verification_preamble(self) -> None:
+        """Default and developer task prompts require hostname/getent verification."""
+
+        default_rendered = render_taskboard_fire_prompt("default", self._sample_task())
+        developer_rendered = render_taskboard_fire_prompt("developer", self._sample_task())
+
+        self.assertIn("hostname; getent hosts <target>", default_rendered)
+        self.assertIn("hostname; getent hosts <target>", developer_rendered)
+        self.assertIn("action's audit log", developer_rendered)
+
     def test_task_id_is_populated_for_non_empty_task(self) -> None:
         """Any non-empty task payload receives a task_id substitution."""
 

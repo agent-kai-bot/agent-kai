@@ -5,6 +5,8 @@ import argparse
 import asyncio
 import sys
 
+from agent.host_guard import parse_forbidden_hosts, verify_command_targets
+
 from config import DEFAULT_AGENT, NATS_URL
 from daemon.control import ensure_local_daemon_started
 from daemon.core import Session
@@ -57,6 +59,14 @@ async def run_headless(bus, agent_runner):
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI parser for local, remote, and daemon modes."""
     parser = argparse.ArgumentParser(description="Local AI Agent")
+    subparsers = parser.add_subparsers(dest="command")
+    agent_ops = subparsers.add_parser("agent-ops", help="Guarded remote host verification helpers")
+    agent_ops_subparsers = agent_ops.add_subparsers(dest="agent_ops_command")
+    fire_parser = agent_ops_subparsers.add_parser("fire", help="Verify and print remote task fire command")
+    fire_parser.add_argument("task_id", type=int, help="Task id to fire")
+    fire_parser.add_argument("--target-host", required=True, help="Non-local target host to verify before cross-host actions")
+    fire_parser.add_argument("--transport", default="ssh", choices=["ssh", "scp", "docker", "curl"], help="Cross-host transport being verified")
+    fire_parser.add_argument("--print-command", default="", help="Optional command preview to echo after verification")
     parser.add_argument("--no-tui", action="store_true", help="Run headless (NATS only)")
     parser.add_argument("--terminal", action="store_true", help="Launch KAI trading terminal")
     parser.add_argument("--daemon", action="store_true", help="Run the daemon foreground server")
@@ -99,6 +109,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Reject unsupported flag combinations before runtime setup starts."""
+    if getattr(args, "command", None) == "agent-ops":
+        if getattr(args, "agent_ops_command", None) != "fire":
+            parser.error("agent-ops requires a subcommand")
+        target_host = getattr(args, "target_host", "")
+        guard = verify_command_targets(f"{args.transport} {target_host}")
+        if guard.blocked:
+            parser.error(guard.output or "cross-host target blocked")
+        return
     if args.daemon and args.remote:
         parser.error("--daemon cannot be combined with --remote")
     if args.daemon and args.standalone:
@@ -118,6 +136,24 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
 def _resolve_terminal_session_name(args: argparse.Namespace) -> str:
     """Return the target session name for terminal mode."""
     return args.session or "terminal"
+
+
+def _run_agent_ops_fire(args: argparse.Namespace) -> int:
+    """Verify a cross-host fire target and print the intended command preview."""
+
+    forbidden = ", ".join(sorted(parse_forbidden_hosts())) or "(none)"
+    guard = verify_command_targets(f"{args.transport} {args.target_host}")
+    if guard.blocked:
+        print(guard.output or "cross-host target blocked", file=sys.stderr)
+        return 2
+    if guard.output:
+        print(guard.output)
+    print(f"[host-verify] forbidden_hosts={forbidden}")
+    if args.print_command:
+        print(args.print_command)
+    else:
+        print(f"agent-ops fire {args.task_id} via {args.transport} {args.target_host}")
+    return 0
 
 
 async def _run_daemon(args: argparse.Namespace) -> None:
@@ -261,6 +297,9 @@ async def main(argv: list[str] | None = None):
     parser = build_parser()
     args = parser.parse_args(argv)
     validate_args(parser, args)
+
+    if getattr(args, "command", None) == "agent-ops":
+        raise SystemExit(_run_agent_ops_fire(args))
 
     # Apply log level override if specified
     if args.log_level:

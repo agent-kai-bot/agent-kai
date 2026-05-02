@@ -90,6 +90,8 @@ Supported tool invocations:
 - `sessions_send`
 - `sessions_list`
 
+Cross-host operator actions must verify the target first. Use `scripts/verify-host-target.sh <host>` to emit the required `hostname; getent hosts <target>` audit preamble, and set `KAI_FORBIDDEN_HOSTS` (comma or space separated, for example `devlab`) to hard-block forbidden destinations at the `agent-ops fire` CLI layer and in guarded shell commands.
+
 The embedded compatibility gateway also supports `POST /api/cron/wake` for taskboard
 comment notifications and `POST /api/sessions/{session_key}/abort` for stop
 requests. `sessions_send` returns `result.details.reply` for synchronous

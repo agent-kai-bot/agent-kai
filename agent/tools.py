@@ -12,6 +12,8 @@ from html.parser import HTMLParser
 import requests
 from langchain_core.tools import StructuredTool
 
+from agent.host_guard import verify_command_targets
+
 from config import (
     DOCKER_SANDBOX_ALLOWED_NETWORKS,
     DOCKER_SANDBOX_CPUS,
@@ -116,6 +118,10 @@ file_edit = StructuredTool.from_function(
 def _shell_exec(command: str) -> str:
     """Execute a shell command and return stdout + stderr."""
     try:
+        guard = verify_command_targets(command)
+        if guard.blocked:
+            return guard.output or "Error: cross-host command blocked."
+
         result = subprocess.run(
             command,
             shell=True,
@@ -123,11 +129,15 @@ def _shell_exec(command: str) -> str:
             text=True,
             timeout=SHELL_TIMEOUT_SECONDS,
         )
-        output = ""
+        output = guard.output.strip()
         if result.stdout:
+            if output:
+                output += "\n"
             output += result.stdout
         if result.stderr:
-            output += f"\n[stderr]\n{result.stderr}"
+            if output:
+                output += "\n"
+            output += f"[stderr]\n{result.stderr}"
         if result.returncode != 0:
             output += f"\n[exit code: {result.returncode}]"
         if not output.strip():

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import io
 import unittest
 from unittest import mock
 
 from main import (
     _resolve_terminal_session_name,
+    _run_agent_ops_fire,
     _run_local_terminal,
     _run_remote_terminal,
     _run_terminal_mode,
@@ -120,6 +122,42 @@ class MainCliTests(unittest.TestCase):
 
         with self.assertRaises(SystemExit):
             validate_args(parser, args)
+
+    def test_agent_ops_fire_rejects_forbidden_host(self):
+        parser = build_parser()
+        args = parser.parse_args(["agent-ops", "fire", "101", "--target-host", "devlab"])
+
+        with mock.patch.dict("os.environ", {"KAI_FORBIDDEN_HOSTS": "devlab"}, clear=False):
+            with self.assertRaises(SystemExit):
+                validate_args(parser, args)
+
+    def test_agent_ops_fire_allows_verified_host(self):
+        parser = build_parser()
+        args = parser.parse_args(["agent-ops", "fire", "101", "--target-host", "localhost"])
+
+        validate_args(parser, args)
+
+    def test_run_agent_ops_fire_prints_verification_and_preview(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "agent-ops",
+                "fire",
+                "101",
+                "--target-host",
+                "localhost",
+                "--print-command",
+                "ssh builder@example 'echo ok'",
+            ]
+        )
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            rc = _run_agent_ops_fire(args)
+
+        self.assertEqual(rc, 0)
+        rendered = stdout.getvalue()
+        self.assertIn("[host-verify]", rendered)
+        self.assertIn("ssh builder@example 'echo ok'", rendered)
 
     def test_terminal_session_is_valid_and_resolved(self):
         parser = build_parser()

@@ -25,6 +25,8 @@ Never print, commit, or paste bearer tokens, session tokens, HMAC secrets, Autho
 ## Scope
 Implement the requested task end to end in the target repository. Read the relevant code before editing, follow existing project style, and keep changes scoped to the task.
 
+For any ssh/docker/scp/curl action that targets a non-localhost host, first run the host-context preamble `hostname; getent hosts <target>` and include the verification result in the action's audit log before crossing hosts.
+
 Use branch `{branch_name_suggestion}` unless an existing branch for this task is already active. Use a Conventional Commit message and open or prepare a PR against the default branch. Do not inject model, reasoning, or timeout overrides into taskboard spawn metadata.
 
 Run focused tests for the changed behavior. For any service-touching change, include a live smoke step with the exact curl/script command and the observed output from the running service. If tests or live smoke cannot run, explain the blocker and the remaining risk in the final summary.
