@@ -1,6 +1,6 @@
 Task 10279 final summary
 
-Commit: f579e93f1443acd484e466a58356d59e93fe0416
+Commit: 0a39c5c00551df877a434ddf5f5f4c46ffdd3819
 Branch: task-10279-ws-1-workspace-config-path-model-no-git-yet
 
 Changes:
