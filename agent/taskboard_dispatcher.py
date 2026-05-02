@@ -759,7 +759,25 @@ class TaskboardDispatcher:
                     continue
                 reserved_key = (task_id, fire_generation, route.agent_id)
 
-                prompt = render_taskboard_fire_prompt(route.role, latest_task)
+                # Phase 0 follow-up (#10247): mint a taskboard agent_session
+                # token + generation so the spawned agent can authenticate
+                # its taskboard writes (start-work, comment, move-status,
+                # stop-work). Without this the agent gets `409 Missing
+                # session token` on every callback. Best-effort: failures
+                # leave the token blank and the prompt template renders
+                # the placeholder empty — the agent then 409s on writes
+                # but the spawn itself still happens.
+                session_token, session_generation_value = self._mint_taskboard_session_token(
+                    task_id=task_id,
+                    role=route.agent_id,
+                )
+
+                prompt = render_taskboard_fire_prompt(
+                    route.role,
+                    latest_task,
+                    session_token=session_token,
+                    session_generation=session_generation_value,
+                )
                 requested_session_id = _build_session_id(
                     task_id=task_id,
                     fire_generation=fire_generation,
@@ -983,6 +1001,78 @@ class TaskboardDispatcher:
             role=role,
             error=error,
         )
+
+    def _mint_taskboard_session_token(
+        self,
+        *,
+        task_id: int,
+        role: str,
+    ) -> tuple[str, int | None]:
+        """Mint a taskboard agent_session token for a fresh spawn.
+
+        Phase 0 follow-up (#10247) — the legacy in-process IP-spawn path
+        used to mint these via :meth:`SessionManager.create_session`. Now
+        that path is gated off, the dispatcher must mint via HTTP against
+        the new ``POST /api/tasks/{task_id}/sessions`` endpoint.
+
+        Returns:
+            ``(token, generation)`` on success. Empty string + ``None`` on
+            any failure (ledger client disabled, taskboard 5xx, transport
+            error). Best-effort: callers feed the result into the prompt
+            renderer; an empty token degrades gracefully (agent can't write
+            back to the taskboard but the spawn itself still happens).
+        """
+        base = self._taskboard_base_url()
+        bearer = self._taskboard_bearer_token()
+        if not base or not bearer:
+            return "", None
+
+        url = f"{base}/api/tasks/{int(task_id)}/sessions"
+        body = {"agent": role, "reason": "kai dispatcher spawn", "allow_parallel_review": True}
+        try:
+            import httpx
+
+            with httpx.Client(timeout=5.0) as http:
+                resp = http.post(
+                    url,
+                    json=body,
+                    headers={"Authorization": f"Bearer {bearer}"},
+                )
+            if resp.status_code != 200:
+                LOGGER.warning(
+                    "taskboard_session_token_mint_failed task_id=%s role=%s status=%s body=%s",
+                    task_id,
+                    role,
+                    resp.status_code,
+                    resp.text[:200],
+                )
+                return "", None
+            data = resp.json()
+            token = str(data.get("token") or "")
+            gen_raw = data.get("generation")
+            try:
+                generation = int(gen_raw) if gen_raw is not None else None
+            except (TypeError, ValueError):
+                generation = None
+            return token, generation
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "taskboard_session_token_mint_error task_id=%s role=%s error=%s",
+                task_id,
+                role,
+                _redact_known_secrets(str(exc)),
+            )
+            return "", None
+
+    def _taskboard_base_url(self) -> str:
+        """Resolve the taskboard base URL from the agent_runs client config or env."""
+        client = self._agent_runs_client
+        url = getattr(client, "base_url", None) if client is not None else None
+        return str(url or os.environ.get("TASKBOARD_URL", "")).rstrip("/")
+
+    def _taskboard_bearer_token(self) -> str:
+        """Resolve the taskboard bearer token (used for ledger + session-token mint)."""
+        return os.environ.get("TASKBOARD_BEARER_TOKEN", "").strip()
 
     def _record_agent_run_queued(
         self,

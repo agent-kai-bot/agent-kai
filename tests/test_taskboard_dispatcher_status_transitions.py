@@ -354,7 +354,10 @@ class TaskboardDispatcherStatusTransitionTests(unittest.IsolatedAsyncioTestCase)
     def _patched_renderer():
         return mock.patch(
             "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
-            side_effect=lambda role, task: f"prompt for {role} #{task['id']}",
+            # Phase 0 follow-up (#10247) — accept session_token /
+            # session_generation kwargs from the dispatcher's mint flow
+            # (empty in tests since no real taskboard is reachable).
+            side_effect=lambda role, task, **_: f"prompt for {role} #{task['id']}",
         )
 
 

@@ -43,7 +43,13 @@ class _SafeFormatDict(dict[str, str]):
         return ""
 
 
-def render_taskboard_fire_prompt(role: str, task: dict[str, Any]) -> str:
+def render_taskboard_fire_prompt(
+    role: str,
+    task: dict[str, Any],
+    *,
+    session_token: str = "",
+    session_generation: int | None = None,
+) -> str:
     """Render a role-specific taskboard auto-fire prompt.
 
     Args:
@@ -52,6 +58,13 @@ def render_taskboard_fire_prompt(role: str, task: dict[str, Any]) -> str:
         task: Task payload from the taskboard API or dispatcher. Nested
             ``project`` and ``epic`` dictionaries are flattened into template
             substitutions.
+        session_token: Phase 0 follow-up (#10247): bound agent_session token
+            the spawned agent must use for taskboard writes (start-work,
+            comment, move-status, stop-work). Empty string when none was
+            minted (degraded mode — agent will 409 on writes).
+        session_generation: Phase 0 follow-up (#10247): session generation
+            paired with ``session_token``. Required by the taskboard's
+            session-token validator alongside the token.
 
     Returns:
         Rendered prompt string ready for the KAI session spawn surface.
@@ -69,6 +82,10 @@ def render_taskboard_fire_prompt(role: str, task: dict[str, Any]) -> str:
 
     substitutions = _SafeFormatDict(_extract_taskboard_substitutions(task, role=role))
     substitutions["role"] = _normalize_role(role) or "default"
+    if session_token:
+        substitutions["session_token"] = session_token
+    if session_generation is not None:
+        substitutions["session_generation"] = str(session_generation)
     return _render_prompt(
         TASKBOARD_PROMPT_ROOT,
         role,

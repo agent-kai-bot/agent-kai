@@ -518,7 +518,16 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         ) as renderer:
             await dispatcher.run_once()
 
-        renderer.assert_called_once_with("Developer", task)
+        # Phase 0 follow-up (#10247) — dispatcher now passes session_token +
+        # session_generation kwargs (empty in tests when the mint endpoint
+        # is unreachable, which is the case here since there's no real
+        # taskboard).
+        renderer.assert_called_once_with(
+            "Developer",
+            task,
+            session_token="",
+            session_generation=None,
+        )
         self.assertEqual(session_manager.spawn_calls[0]["prompt"], "known prompt body")
 
     async def test_tier_mapping_table(self) -> None:
