@@ -169,6 +169,7 @@ class RepoWorkspaceManifest:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "repo_key", safe_repo_key(self.repo_key))
+        object.__setattr__(self, "path", str(safe_manifest_repo_path(self.path, "repo path")))
         if self.role:
             object.__setattr__(self, "role", role_slug(self.role))
 
@@ -193,6 +194,20 @@ class TicketWorkspaceManifest:
         object.__setattr__(self, "task_id", positive_int(self.task_id, "task_id"))
         if self.epic_id is not None:
             object.__setattr__(self, "epic_id", positive_int(self.epic_id, "epic_id"))
+        root = safe_root_path(self.root)
+        task_dir = safe_manifest_path_under(root, self.task_dir, "task_dir")
+        shared_dir = safe_manifest_path_under(root, self.shared_dir, "shared_dir")
+        canonical_shared_dir = safe_join(task_dir, "shared")
+        if shared_dir != canonical_shared_dir and task_dir not in shared_dir.parents:
+            raise WorkspacePathError("shared_dir must be under task_dir or the canonical shared path")
+        object.__setattr__(self, "root", str(root))
+        object.__setattr__(self, "task_dir", str(task_dir))
+        object.__setattr__(self, "shared_dir", str(shared_dir))
+        object.__setattr__(
+            self,
+            "repos",
+            [_validate_repo_manifest_under_task(repo, task_dir) for repo in self.repos],
+        )
 
     @classmethod
     def from_paths(
@@ -250,6 +265,67 @@ def safe_root_path(path: str | Path) -> Path:
     if any(part in ("", ".", "..") for part in candidate.parts[1:]):
         raise WorkspacePathError("workspace root must not contain traversal segments")
     return candidate.resolve(strict=False)
+
+
+def safe_manifest_path(path: str | Path, field_name: str = "manifest path") -> Path:
+    """Normalize an absolute manifest path and reject traversal inputs."""
+
+    if path is None:
+        raise WorkspacePathError(f"{field_name} is required")
+    raw = str(path).strip()
+    if not raw:
+        raise WorkspacePathError(f"{field_name} is required")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise WorkspacePathError(f"{field_name} must be absolute")
+    if any(part in ("", ".", "..") for part in candidate.parts[1:]):
+        raise WorkspacePathError(f"{field_name} must not contain traversal segments")
+    return candidate.resolve(strict=False)
+
+
+def safe_manifest_path_under(root: str | Path, path: str | Path, field_name: str) -> Path:
+    """Normalize an absolute manifest path and require it below ``root``."""
+
+    safe_root = safe_root_path(root)
+    candidate = safe_manifest_path(path, field_name)
+    if candidate != safe_root and safe_root not in candidate.parents:
+        raise WorkspacePathError(f"{field_name} escapes manifest root")
+    return candidate
+
+
+def safe_manifest_repo_path(path: str | Path, field_name: str = "repo path") -> Path:
+    """Normalize a repo manifest path, rejecting relative traversal."""
+
+    if path is None:
+        raise WorkspacePathError(f"{field_name} is required")
+    raw = str(path).strip()
+    if not raw:
+        raise WorkspacePathError(f"{field_name} is required")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute() and any(part in ("", ".", "..") for part in candidate.parts):
+        raise WorkspacePathError(f"{field_name} must not contain traversal segments")
+    return candidate.resolve(strict=False) if candidate.is_absolute() else candidate
+
+
+def _validate_repo_manifest_under_task(
+    repo: RepoWorkspaceManifest,
+    task_dir: Path,
+) -> RepoWorkspaceManifest:
+    """Require repo manifest paths to stay below the ticket task directory."""
+
+    repo_path = safe_manifest_path_under(task_dir, repo.path, "repo path")
+    if repo.role:
+        role_repo_root = safe_join(task_dir, repo.role, "repos")
+        if role_repo_root not in repo_path.parents:
+            raise WorkspacePathError("repo path must be under role repos directory")
+    return RepoWorkspaceManifest(
+        repo_key=repo.repo_key,
+        path=str(repo_path),
+        repo_url=repo.repo_url,
+        default_branch=repo.default_branch,
+        branch=repo.branch,
+        role=repo.role,
+    )
 
 
 def safe_slug(value: str, field_name: str = "slug") -> str:
