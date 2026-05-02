@@ -127,7 +127,7 @@ def _create_codex_chat_model(endpoint_cfg: dict):
         )
 
     base_url = endpoint_cfg.get("base_url") or "https://chatgpt.com/backend-api/codex"
-    model = endpoint_cfg.get("model") or "gpt-5.4"
+    model = endpoint_cfg.get("model") or "gpt-5.5"
     reasoning_effort = endpoint_cfg.get("reasoning_effort", "medium")
     text_verbosity = endpoint_cfg.get("text_verbosity", "medium")
 

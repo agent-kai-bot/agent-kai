@@ -4,7 +4,7 @@ executors:
   codex:
     provider: codex-cli
     endpoint: codex-cli
-    model: gpt-5.4
+    model: gpt-5.5
     health_probe:
       command: "echo healthy"
       interval_seconds: 60
