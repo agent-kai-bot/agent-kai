@@ -1,0 +1,20 @@
+Security audit final summary for task 10279
+
+Decision: APPROVED
+
+What changed (reviewed):
+- TicketWorkspaceManifest.__post_init__ now canonicalizes root via safe_root_path and validates task_dir/shared_dir as absolute paths under the resolved root.
+- shared_dir is constrained to the task directory subtree or the canonical task_dir/shared path.
+- RepoWorkspaceManifest now rejects relative traversal paths, and TicketWorkspaceManifest validates embedded repo manifest paths under the ticket task_dir, including role repo directory containment when role is set.
+- Unit tests were added for relative traversal rejection, outside-root rejection, shared_dir escape rejection, and repo path escape rejection while preserving valid manifest construction.
+
+Tests run:
+- git diff --check
+- python3 -m pytest tests/test_taskboard_workspace.py -q (29 passed)
+- python3 -m pytest tests/test_taskboard_workspace.py tests/test_taskboard_dispatcher.py tests/test_config.py -q (47 passed)
+
+Findings:
+- No blocking security findings remain for the WS-1 workspace config/path model scope.
+
+Residual risk and assumptions:
+- This ticket intentionally performs no git operations or filesystem mutation beyond path modeling. Later workspace lifecycle/clone tickets should still enforce scheme allowlists for clone URLs, validate actual filesystem operations against the same canonical roots, and avoid trusting serialized manifests without revalidation.
