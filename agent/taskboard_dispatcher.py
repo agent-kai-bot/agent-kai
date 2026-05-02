@@ -1673,6 +1673,64 @@ class _TaskboardQueueStore:
                 ),
             )
 
+    # Phase 0 follow-up (#10247) — eliminate orphan-sweep false positives.
+    # The remote agent_runs ledger gets PATCHed terminal by Phase 0 fix #3
+    # (`_finalize_dispatcher_inprocess_run`); the local `sessions` table
+    # never did, so its `status` stayed at 'running' and the sweeper
+    # eventually marked otherwise-finished sessions stuck_aborted ~60min
+    # later, posting misleading [System] audit comments. This method
+    # closes the loop by writing the matching terminal status locally.
+    _DISPATCHER_TERMINAL_STATUSES = {
+        "succeeded": "completed",
+        "failed": "failed",
+        "endpoint_failed": "failed",
+        "config_invalid": "failed",
+        "preflight_failed": "failed",
+        "taskboard_write_failed": "failed",
+        "forgejo_failed": "failed",
+        "timeout": "failed",
+        "stuck_aborted": "aborted",
+        "requires_approval_blocked": "completed",
+        "cancelled": "cancelled",
+        "duplicate_suppressed": "cancelled",
+    }
+
+    def mark_session_terminal(
+        self,
+        *,
+        session_id: str,
+        outcome_status: str,
+    ) -> None:
+        """Walk the local `sessions` row to a terminal status.
+
+        Args:
+            session_id: Local session id matching ``sessions.session_id``.
+            outcome_status: ``RunOutcome.status`` from the dispatcher's
+                in-process finalize callback. Mapped via
+                :data:`_DISPATCHER_TERMINAL_STATUSES` to a local-table
+                terminal value (``completed`` / ``failed`` / ``cancelled``
+                / ``aborted``). Unknown statuses fall back to ``completed``
+                so the sweeper at least stops re-aborting the row.
+        """
+        if not self.db_path.exists():
+            return
+        local_status = self._DISPATCHER_TERMINAL_STATUSES.get(
+            outcome_status, "completed"
+        )
+        now = _utc_iso(self.clock())
+        with self._connect(create=False) as conn:
+            if not self._table_exists(conn, "sessions"):
+                return
+            conn.execute(
+                """
+                UPDATE sessions
+                SET status = ?, updated_at = ?
+                WHERE session_id = ?
+                  AND status = 'running'
+                """,
+                (local_status, now, session_id),
+            )
+
     def stuck_sessions(self, older_than_seconds: int) -> list[StuckSession]:
         if not self.db_path.exists():
             return []
@@ -2138,6 +2196,27 @@ def _finalize_dispatcher_inprocess_run(
         if outcome.failure_detail is not None:
             body["failure_detail"] = outcome.failure_detail
         client.patch(ledger_run_id, body)
+
+        # Phase 0 follow-up (#10247) — close the dual-ledger lifecycle.
+        # Without this, the remote agent_runs row goes terminal but the
+        # local sessions.status stays 'running' until the stuck-session
+        # sweeper aborts it ~60min later and posts a misleading
+        # [System] sweeper-aborted comment to the parent task. See
+        # 2026-05-01T23-25_rca_orphan_sessions_local_sessions_table_never_marked_terminal.md
+        try:
+            dispatcher = getattr(daemon_server, "taskboard_dispatcher", None)
+            store = getattr(dispatcher, "_store", None) if dispatcher else None
+            if store is not None and hasattr(store, "mark_session_terminal"):
+                store.mark_session_terminal(
+                    session_id=session_id,
+                    outcome_status=outcome.status,
+                )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "mark_session_terminal failed session_id=%s error=%s",
+                session_id,
+                exc,
+            )
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning(
             "_finalize_dispatcher_inprocess_run failed session_id=%s error=%s",
