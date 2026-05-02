@@ -1,0 +1,17 @@
+Task 10279 final summary
+
+Commit: ad9aaeabfa02d8f2e698ec57fbbb4510d2c18df4
+Branch: task-10279-ws-1-workspace-config-path-model-no-git-yet
+
+Changes:
+- Added manifest path validation helpers for absolute path canonicalization and root containment checks.
+- TicketWorkspaceManifest now canonicalizes root/task_dir/shared_dir, rejects relative/traversal/outside-root paths, requires shared_dir under task_dir or the canonical shared path, and validates embedded repo paths under the task directory.
+- RepoWorkspaceManifest now normalizes repo path input and rejects relative traversal paths before ticket-manifest load-time containment validation.
+- Added focused unit tests for relative traversal rejection, outside-root rejection, shared-dir escape rejection, and repo path escape rejection while preserving valid manifest construction.
+
+Tests run:
+- git diff --check
+- pytest -q tests/test_taskboard_workspace.py (29 passed)
+
+Known follow-up:
+- None.
