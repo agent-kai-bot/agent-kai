@@ -34,7 +34,17 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 DEFAULT_SESSION_NAME = "terminal"
 DEFAULT_WATCHLIST_SYMBOLS = ("BTC", "ETH", "SOL")
 DEFAULT_AUTO_MAX_ITERATIONS = 20
-MAX_AUTO_ITERATIONS = 100
+# Phase 0 follow-up (#10247): the dispatcher cascades a per-role floor of
+# 200 iterations (FLEET_MAX_ITERATIONS_FLOOR) for substantive dev work.
+# This cap was previously 100, which silently clamped the cascade and
+# caused agents to hit langchain's `Stopping agent prematurely` mid-work
+# when writing files / running tests / opening PRs. Raise to 10000 — well
+# above any legitimate working ceiling — and surface as env-tunable so
+# operators can lower it if a runaway loop becomes a concern.
+import os as _os
+MAX_AUTO_ITERATIONS = max(
+    1, int(_os.environ.get("KAI_AUTO_ITERATIONS_CAP", "10000") or "10000")
+)
 DEFAULT_AUTO_MAX_DURATION_SECONDS = 180.0
 SUPPORTED_CHART_TIMEFRAMES = frozenset({"1m", "5m", "15m", "1h", "4h", "1d", "1w"})
 SUPPORTED_CHART_SOURCES = frozenset({"kai-api", "coinbase"})
