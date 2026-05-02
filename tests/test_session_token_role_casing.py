@@ -24,6 +24,13 @@ from unittest import mock
 from agent.taskboard_dispatcher import TaskboardDispatcher, resolve_taskboard_role
 
 
+class _DisabledAgentRunsClient:
+    enabled = False
+
+    def list_by_status(self, status: str, limit: int = 200):
+        raise AssertionError(f"should not query agent_runs ledger for {status}")
+
+
 class _CaptureSpawner:
     def __init__(self) -> None:
         self.spawn_calls: list[dict] = []
@@ -105,6 +112,7 @@ class SessionTokenRoleCasingTests(unittest.IsolatedAsyncioTestCase):
             task_client=_FakeTaskClient({901: task}),
             session_manager=spawner,
             nats_bus=None,
+            agent_runs_client=_DisabledAgentRunsClient(),
         )
 
         mint_calls: list[tuple[int, str]] = []
@@ -157,6 +165,7 @@ class SessionTokenRoleCasingTests(unittest.IsolatedAsyncioTestCase):
             task_client=_FakeTaskClient({902: task}),
             session_manager=spawner,
             nats_bus=None,
+            agent_runs_client=_DisabledAgentRunsClient(),
         )
 
         mint_calls: list[tuple[int, str]] = []
