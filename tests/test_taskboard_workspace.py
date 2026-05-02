@@ -17,6 +17,7 @@ from agent.taskboard_workspace import (
     parse_repo_url,
     repo_key,
     role_slug,
+    safe_manifest_path_under,
     safe_slug,
 )
 
@@ -180,7 +181,7 @@ def test_unsafe_repo_urls_are_rejected(url: str) -> None:
 
 
 def test_manifest_dataclasses_validate_and_serialize_paths(tmp_path: Path) -> None:
-    """Manifest dataclasses capture ticket and repo workspace metadata."""
+    """Manifest dataclasses capture and canonicalize safe workspace metadata."""
 
     paths = TicketWorkspacePaths(
         root=tmp_path,
@@ -207,4 +208,86 @@ def test_manifest_dataclasses_validate_and_serialize_paths(tmp_path: Path) -> No
     assert manifest.shared_dir == str(paths.shared_dir)
     assert manifest.repos == [repo_manifest]
     assert repo_manifest.repo_key == "github.com__agent-kai-bot__agent-kai"
+    assert repo_manifest.path == str(paths.repo_dir("developer", "github.com__agent-kai-bot__agent-kai"))
     assert repo_manifest.role == "developer"
+
+
+@pytest.mark.parametrize("bad_path", ["../etc/passwd", "../../escape"])
+def test_repo_manifest_rejects_relative_traversal_paths(bad_path: str) -> None:
+    """Repo manifests reject relative paths containing traversal up front."""
+
+    with pytest.raises(WorkspacePathError):
+        RepoWorkspaceManifest(
+            repo_key="github.com__agent-kai-bot__agent-kai",
+            path=bad_path,
+            role="developer",
+        )
+
+
+def test_ticket_manifest_rejects_relative_task_dir(tmp_path: Path) -> None:
+    """Ticket manifest task_dir must be absolute under the resolved root."""
+
+    with pytest.raises(WorkspacePathError):
+        TicketWorkspaceManifest(
+            version=1,
+            project_slug="agent-kai",
+            task_id=10279,
+            epic_id=None,
+            root=str(tmp_path),
+            task_dir="../etc/passwd",
+            shared_dir=str(tmp_path / "agent-kai" / "no-epic" / "task-10279" / "shared"),
+        )
+
+
+def test_ticket_manifest_rejects_paths_outside_root(tmp_path: Path) -> None:
+    """Ticket manifests cannot trust root/task/shared paths that escape root."""
+
+    with pytest.raises(WorkspacePathError):
+        TicketWorkspaceManifest(
+            version=1,
+            project_slug="agent-kai",
+            task_id=10279,
+            epic_id=None,
+            root=str(tmp_path),
+            task_dir="/etc",
+            shared_dir=str(tmp_path / "agent-kai" / "no-epic" / "task-10279" / "shared"),
+        )
+
+
+def test_ticket_manifest_rejects_shared_dir_outside_task_dir(tmp_path: Path) -> None:
+    """shared_dir must stay inside the ticket task directory or be canonical shared."""
+
+    task_dir = tmp_path / "agent-kai" / "no-epic" / "task-10279"
+    with pytest.raises(WorkspacePathError):
+        TicketWorkspaceManifest(
+            version=1,
+            project_slug="agent-kai",
+            task_id=10279,
+            epic_id=None,
+            root=str(tmp_path),
+            task_dir=str(task_dir),
+            shared_dir=str(tmp_path / "agent-kai" / "no-epic" / "shared"),
+        )
+
+
+def test_ticket_manifest_rejects_repo_paths_outside_task_dir(tmp_path: Path) -> None:
+    """Repo paths embedded in a ticket manifest must stay under the task dir."""
+
+    paths = TicketWorkspacePaths(root=tmp_path, project_slug="agent-kai", task_id=10279)
+    repo_manifest = RepoWorkspaceManifest(
+        repo_key="github.com__agent-kai-bot__agent-kai",
+        path="/etc",
+        role="developer",
+    )
+
+    with pytest.raises(WorkspacePathError):
+        TicketWorkspaceManifest.from_paths(paths, repos=[repo_manifest])
+
+
+def test_safe_manifest_path_under_rejects_traversal_and_escape(tmp_path: Path) -> None:
+    """The manifest path helper rejects ../../escape and absolute escapes."""
+
+    with pytest.raises(WorkspacePathError):
+        safe_manifest_path_under(tmp_path, "../../escape", "repo path")
+    with pytest.raises(WorkspacePathError):
+        safe_manifest_path_under(tmp_path, "/etc", "repo path")
