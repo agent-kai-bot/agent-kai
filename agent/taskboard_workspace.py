@@ -1,17 +1,18 @@
 """Path-safe taskboard ticket workspace model.
 
-This module intentionally performs no git operations.  It only resolves the
-configured workspace root, validates filesystem-safe path components, derives
-repo keys, and describes the on-disk layout used by later workspace lifecycle
-code.
+This module resolves the configured workspace root, validates filesystem-safe
+path components, derives repo keys, describes the on-disk layout, and prepares
+git-cache backed role worktrees for taskboard tickets.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+import fcntl
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -27,6 +28,51 @@ _REPO_URL_SUFFIX_RE = re.compile(r"\.git/?$")
 
 class WorkspacePathError(ValueError):
     """Raised when workspace configuration or path input is unsafe."""
+
+
+class WorkspaceGitError(RuntimeError):
+    """Raised when git-backed workspace preparation fails."""
+
+
+class WorkspaceGitCommandError(WorkspaceGitError):
+    """Raised when an invoked git command fails."""
+
+    def __init__(self, command: list[str], cwd: Path | None, stderr: str) -> None:
+        self.command = command
+        self.cwd = cwd
+        self.stderr = stderr.strip()
+        location = f" in {cwd}" if cwd else ""
+        message = f"git command failed{location}: {' '.join(command)}: {self.stderr}"
+        super().__init__(message)
+
+
+class WorkspaceDirtyWrongBranchError(WorkspaceGitError):
+    """Raised when an existing developer worktree is dirty on an unexpected branch."""
+
+    def __init__(self, path: Path, expected_branch: str, actual_branch: str) -> None:
+        self.path = path
+        self.expected_branch = expected_branch
+        self.actual_branch = actual_branch
+        super().__init__(
+            f"dirty developer worktree at {path} is on {actual_branch!r}; "
+            f"expected {expected_branch!r}"
+        )
+
+
+@dataclass(frozen=True)
+class PreparedRoleWorkspace:
+    """Result returned by ``TicketWorkspaceManager.prepare_role_workspace``."""
+
+    role: str
+    repo: RepoRef
+    repo_key: str
+    cache_path: Path
+    worktree_path: Path
+    branch: str
+    commit: str
+    detached: bool
+    reused: bool
+    manifest: TicketWorkspaceManifest
 
 
 @dataclass(frozen=True)
@@ -228,6 +274,248 @@ class TicketWorkspaceManifest:
             shared_dir=str(paths.shared_dir),
             repos=list(repos or []),
         )
+
+
+class TicketWorkspaceManager:
+    """Prepare git-backed, role-scoped taskboard workspaces.
+
+    The manager uses one bare cache per repository under
+    ``<root>/_git-cache/<repo-key>.git`` and role worktrees under
+    ``<task>/<role>/repos/<repo-key>``.  Repository operations are serialized by
+    an OS ``flock`` at ``<root>/_locks/repo/<repo-key>.lock``.
+    """
+
+    def __init__(self, paths: TicketWorkspacePaths) -> None:
+        self.paths = paths
+
+    def prepare_role_workspace(
+        self,
+        *,
+        role: str,
+        repo: RepoRef,
+        branch: str,
+        developer_commit: str | None = None,
+        base_ref: str | None = None,
+    ) -> PreparedRoleWorkspace:
+        """Create or reuse a role worktree for ``repo``.
+
+        Developer roles get a normal branch worktree and own ``branch``.
+        Non-developer roles get a detached worktree at ``developer_commit``;
+        when no explicit commit is provided they detach at the current branch
+        tip from the shared cache.  Existing developer worktrees are idempotently
+        reused if already on ``branch``.  A dirty existing developer worktree on
+        any other branch fails with ``WorkspaceDirtyWrongBranchError``.
+        """
+
+        role_name = role_slug(role)
+        if not repo.url:
+            raise WorkspaceGitError("repo.url is required to prepare a git workspace")
+        branch_name = _safe_git_ref_name(branch, "branch")
+        repo_key_value = repo.key
+        cache_path = safe_join(
+            self.paths.root, "_git-cache", f"{repo_key_value}.git"
+        )
+        lock_path = safe_join(
+            self.paths.root, "_locks", "repo", f"{repo_key_value}.lock"
+        )
+        worktree_path = self.paths.repo_dir(role_name, repo)
+        is_developer = role_name == "developer"
+
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            self.paths.shared_dir.mkdir(parents=True, exist_ok=True)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._ensure_cache(repo, cache_path)
+
+            if is_developer:
+                reused = self._prepare_developer_worktree(
+                    cache_path=cache_path,
+                    worktree_path=worktree_path,
+                    branch=branch_name,
+                    base_ref=base_ref or repo.default_branch or "main",
+                )
+                detached = False
+            else:
+                checkout_ref = developer_commit or branch_name
+                _safe_git_ref_name(checkout_ref, "developer commit")
+                reused = self._prepare_detached_worktree(
+                    cache_path=cache_path,
+                    worktree_path=worktree_path,
+                    checkout_ref=checkout_ref,
+                )
+                detached = True
+
+            commit = _git_stdout(["rev-parse", "HEAD"], cwd=worktree_path)
+            manifest = self._write_manifest(
+                RepoWorkspaceManifest(
+                    repo_key=repo_key_value,
+                    path=str(worktree_path),
+                    repo_url=repo.url,
+                    default_branch=repo.default_branch,
+                    branch=branch_name,
+                    role=role_name,
+                )
+            )
+            return PreparedRoleWorkspace(
+                role=role_name,
+                repo=repo,
+                repo_key=repo_key_value,
+                cache_path=cache_path,
+                worktree_path=worktree_path,
+                branch=branch_name,
+                commit=commit,
+                detached=detached,
+                reused=reused,
+                manifest=manifest,
+            )
+
+    def _ensure_cache(self, repo: RepoRef, cache_path: Path) -> None:
+        if (cache_path / "HEAD").exists():
+            _git(
+                ["fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*"],
+                cwd=cache_path,
+            )
+            return
+        if cache_path.exists() and any(cache_path.iterdir()):
+            raise WorkspaceGitError(
+                f"git cache path exists but is not a bare repository: {cache_path}"
+            )
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        _git(["clone", "--bare", repo.url, str(cache_path)], cwd=None)
+        _git(
+            ["fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*"],
+            cwd=cache_path,
+        )
+
+    def _prepare_developer_worktree(
+        self,
+        *,
+        cache_path: Path,
+        worktree_path: Path,
+        branch: str,
+        base_ref: str,
+    ) -> bool:
+        if (worktree_path / ".git").exists():
+            actual_branch = _git_stdout(
+                ["rev-parse", "--abbrev-ref", "HEAD"], cwd=worktree_path
+            )
+            if actual_branch == branch:
+                return True
+            if _is_dirty(worktree_path):
+                raise WorkspaceDirtyWrongBranchError(worktree_path, branch, actual_branch)
+            _git(["checkout", branch], cwd=worktree_path)
+            return True
+
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        start_ref = _resolve_cache_ref(cache_path, branch) or _resolve_cache_ref(
+            cache_path, base_ref
+        )
+        if start_ref is None:
+            start_ref = (
+                _resolve_cache_ref(cache_path, f"origin/{base_ref}") or "HEAD"
+            )
+        _git(
+            ["worktree", "add", "-B", branch, str(worktree_path), start_ref],
+            cwd=cache_path,
+        )
+        return False
+
+    def _prepare_detached_worktree(
+        self,
+        *,
+        cache_path: Path,
+        worktree_path: Path,
+        checkout_ref: str,
+    ) -> bool:
+        resolved = _resolve_cache_ref(cache_path, checkout_ref) or checkout_ref
+        if (worktree_path / ".git").exists():
+            current = _git_stdout(["rev-parse", "HEAD"], cwd=worktree_path)
+            target = _git_stdout(["rev-parse", resolved], cwd=cache_path)
+            if current == target and not _is_dirty(worktree_path):
+                return True
+            if _is_dirty(worktree_path):
+                raise WorkspaceGitError(
+                    f"existing reviewer worktree is dirty: {worktree_path}"
+                )
+            _git(["checkout", "--detach", target], cwd=worktree_path)
+            return True
+
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        _git(
+            ["worktree", "add", "--detach", str(worktree_path), resolved],
+            cwd=cache_path,
+        )
+        return False
+
+    def _write_manifest(self, repo_manifest: RepoWorkspaceManifest) -> TicketWorkspaceManifest:
+        manifest = TicketWorkspaceManifest.from_paths(self.paths, repos=[repo_manifest])
+        manifest_path = safe_join(self.paths.shared_dir, "workspace-manifest.json")
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        data = asdict(manifest)
+        manifest_path.write_text(
+            json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return manifest
+
+
+def _git(command: list[str], *, cwd: Path | None) -> None:
+    full_command = ["git", *command]
+    result = subprocess.run(
+        full_command,
+        cwd=str(cwd) if cwd else None,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise WorkspaceGitCommandError(full_command, cwd, result.stderr or result.stdout)
+
+
+def _git_stdout(command: list[str], *, cwd: Path | None) -> str:
+    full_command = ["git", *command]
+    result = subprocess.run(
+        full_command,
+        cwd=str(cwd) if cwd else None,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise WorkspaceGitCommandError(full_command, cwd, result.stderr or result.stdout)
+    return result.stdout.strip()
+
+
+def _is_dirty(worktree_path: Path) -> bool:
+    return bool(_git_stdout(["status", "--porcelain"], cwd=worktree_path))
+
+
+def _resolve_cache_ref(cache_path: Path, ref: str) -> str | None:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", ref],
+        cwd=str(cache_path),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _safe_git_ref_name(value: str, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise WorkspaceGitError(f"{field_name} is required")
+    ref = value.strip()
+    if (
+        ref.startswith("-")
+        or ".." in ref
+        or "\x00" in ref
+        or any(ch.isspace() for ch in ref)
+    ):
+        raise WorkspaceGitError(f"unsafe {field_name}: {value!r}")
+    return ref
 
 
 def _load_json_config(config_path: str | Path | None) -> dict[str, Any]:

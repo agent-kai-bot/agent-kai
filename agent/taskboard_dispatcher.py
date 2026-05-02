@@ -434,6 +434,8 @@ class DaemonTaskboardSpawner:
 
         session_id = str(kwargs["session_id"])
         agent_id = str(kwargs["agent_id"])
+        task = kwargs.get("task") if isinstance(kwargs.get("task"), Mapping) else {}
+        workspace_context = _workspace_prompt_context(task, role=agent_id)
         prompt = str(kwargs["prompt"])
         managed = await self.daemon_server.get_or_create_session(
             session_id,
@@ -451,6 +453,10 @@ class DaemonTaskboardSpawner:
             "profile": kwargs.get("profile"),
             "task_id": kwargs.get("task_id"),
             "fire_generation": kwargs.get("fire_generation"),
+            "workspace_path": workspace_context.get("workspace_path"),
+            "worktree_path": workspace_context.get("worktree_path"),
+            "primary_repo_path": workspace_context.get("primary_repo_path"),
+            "workspace_manifest_path": workspace_context.get("workspace_manifest_path"),
         }
         if hasattr(managed.session, "start_auto_mode"):
             # Phase 0 (#10247): per-role iteration budget instead of a
@@ -816,6 +822,8 @@ class TaskboardDispatcher:
                         profile=route.profile,
                         prompt=prompt,
                         task=latest_task,
+                        session_token=session_token,
+                        session_generation=session_generation_value,
                     )
                     if inspect.isawaitable(spawn_result):
                         spawn_result = await spawn_result
