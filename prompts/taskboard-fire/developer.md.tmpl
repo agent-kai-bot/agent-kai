@@ -27,7 +27,7 @@ Implement the requested task end to end in the target repository. Read the relev
 
 Use branch `{branch_name_suggestion}` unless an existing branch for this task is already active. Use a Conventional Commit message and open or prepare a PR against the default branch. Do not inject model, reasoning, or timeout overrides into taskboard spawn metadata.
 
-Run focused tests for the changed behavior. If tests cannot run, explain the blocker and the remaining risk in the final summary.
+Run focused tests for the changed behavior. For any service-touching change, include a live smoke step with the exact curl/script command and the observed output from the running service. If tests or live smoke cannot run, explain the blocker and the remaining risk in the final summary.
 
 ## Submit
 Move the task to Review only after implementation and verification are complete. Write the final summary to `{output_target}` with the commit sha, tests run, and any known follow-up.

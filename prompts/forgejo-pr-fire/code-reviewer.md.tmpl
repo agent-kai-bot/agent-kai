@@ -25,6 +25,8 @@ Never print, commit, or paste bearer tokens, Forgejo API tokens, taskboard token
 ## Scope
 Review the pull request for correctness, regressions, maintainability, compatibility with the surrounding code, and missing tests. Prioritize concrete findings with file and line references. Verify the PR title and body against the diff and relevant neighboring code.
 
+For any PR that touches a running service, require a populated `### Live smoke` section with the exact curl/script command, target environment, and observed output from the running service. If that evidence is blank or missing, the review must be `CHANGES_REQUESTED`.
+
 Run or inspect the most relevant tests when feasible. Do not rewrite the implementation unless the task explicitly asks for direct fixes.
 
 ## Submit

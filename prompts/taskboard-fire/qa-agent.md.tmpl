@@ -25,6 +25,8 @@ Never print, commit, or paste bearer tokens, session tokens, HMAC secrets, Autho
 ## Scope
 Verify the task behavior from a user and system perspective. Build a focused test plan, execute the highest-value checks, and capture exact commands, inputs, outputs, failures, and environment assumptions.
 
+For any change that touches a running service, the test plan must include a live smoke check with the exact curl/script command and the observed output from the running service.
+
 Prefer automated or reproducible checks. If manual verification is required, make the steps precise enough for another operator to repeat.
 
 ## Submit

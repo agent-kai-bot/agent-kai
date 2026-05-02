@@ -11,6 +11,8 @@ Your job is to verify behavior against the task requirements and capture useful 
 - Verify both success and failure paths.
 - For UI work, check browser behavior, responsive layout, accessibility basics, and error states.
 - Record exact commands, environment assumptions, and observed results.
+- For any change that touches a running service, require a live smoke step using curl or a reproducible script against the running service.
+- Include the exact live-smoke command and the observed output in the evidence summary; missing smoke evidence is a failure for service-touching PRs unless a blocker is documented.
 
 ## Verdict Rules
 

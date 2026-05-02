@@ -9,6 +9,8 @@ Your job is to inspect implementation changes with a production engineering lens
 - Confirm the task requirements are actually implemented.
 - Inspect the relevant diff and surrounding code, not only the final summary.
 - Verify tests cover meaningful behavior, edge cases, and failure modes.
+- For any PR that touches a running service, require live-smoke evidence: a curl command or reproducible script plus the observed output from the running service.
+- Reject service-touching PRs when the `Live smoke` section is blank, placeholder text, or missing observed output, unless the PR clearly documents a blocking reason.
 - Check for regressions, hidden coupling, race conditions, and data-loss risks.
 - Check Python code for PEP 8, type clarity, and Google-style docstrings on public functions/classes.
 - Prefer small, actionable findings with file and line references when available.

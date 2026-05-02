@@ -99,6 +99,20 @@ class PromptRendererTests(unittest.TestCase):
                 self.assertIn("STOP: TASKBOARD_FIRE_PROMPT_END", rendered)
                 self.assertIn("Task ID: 10153", rendered)
 
+    def test_service_roles_require_live_smoke_in_task_prompts(self) -> None:
+        """Service-touching task roles mention live smoke evidence."""
+
+        developer_rendered = render_taskboard_fire_prompt("developer", self._sample_task())
+        architect_rendered = render_taskboard_fire_prompt("architect", self._sample_task())
+        qa_rendered = render_taskboard_fire_prompt("qa-agent", self._sample_task())
+
+        self.assertIn("live smoke step", developer_rendered)
+        self.assertIn("observed output from the running service", developer_rendered)
+        self.assertIn("live smoke step", architect_rendered)
+        self.assertIn("observed output from the running service", architect_rendered)
+        self.assertIn("live smoke check", qa_rendered)
+        self.assertIn("observed output from the running service", qa_rendered)
+
     def test_task_id_is_populated_for_non_empty_task(self) -> None:
         """Any non-empty task payload receives a task_id substitution."""
 

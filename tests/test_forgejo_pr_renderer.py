@@ -109,6 +109,18 @@ class ForgejoPrRendererTests(unittest.TestCase):
                 self.assertIn("STOP: FORGEJO_PR_FIRE_PROMPT_END", rendered)
                 self.assertIn("Repository: Praxis/agent-kai", rendered)
 
+    def test_service_roles_require_live_smoke_in_pr_prompts(self) -> None:
+        """Service-touching PR roles mention live smoke evidence."""
+
+        code_review_rendered = render_forgejo_pr_fire_prompt("code-reviewer", self._sample_pr())
+        qa_rendered = render_forgejo_pr_fire_prompt("qa-agent", self._sample_pr())
+
+        self.assertIn("### Live smoke", code_review_rendered)
+        self.assertIn("observed output from the running service", code_review_rendered)
+        self.assertIn("review must be `CHANGES_REQUESTED`", code_review_rendered)
+        self.assertIn("live smoke check", qa_rendered)
+        self.assertIn("observed output from the running service", qa_rendered)
+
     def test_diff_summary_is_derived_from_files_changed(self) -> None:
         """Diff summary is derived from the files_changed array."""
 

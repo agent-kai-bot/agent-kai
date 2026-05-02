@@ -25,6 +25,8 @@ Never print, commit, or paste bearer tokens, Forgejo API tokens, taskboard token
 ## Scope
 Verify the pull request from a user and system behavior perspective. Build a focused test plan from the PR body, changed files, and nearby code paths. Execute the highest-value checks that fit the environment, and make any manual verification steps reproducible.
 
+For any PR that touches a running service, require a live smoke check with the exact curl/script command and the observed output from the running service.
+
 Capture exact commands, inputs, outputs, failures, and environment assumptions. Call out untested risk explicitly.
 
 ## Submit
