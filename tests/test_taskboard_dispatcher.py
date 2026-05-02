@@ -125,6 +125,7 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spawn["model"], "codex")
         self.assertEqual(spawn["profile"], "xhigh")
         self.assertEqual(spawn["prompt"], "rendered prompt")
+        self.assertEqual(spawn["session_token"], "")
         self.assertIn(
             "taskboard_fire_spawned task_id=10152 fire_generation=7 "
             "role=Developer session_id=taskboard-10152-7-developer",
@@ -563,6 +564,7 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
             nats_bus=nats_bus,
             max_concurrent_spawns=max_concurrent_spawns,
             clock=lambda: NOW,
+            agent_runs_client=mock.Mock(enabled=False),
         )
 
     def _create_pending_table(self) -> None:

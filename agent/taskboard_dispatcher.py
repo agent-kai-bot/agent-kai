@@ -11,12 +11,14 @@ import re
 import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
 from agent.prompt_renderer import render_taskboard_fire_prompt
 from agent.taskboard_status_router import roles_to_fire
+from agent.worktree_manager import WorktreeManager
 
 LOGGER = logging.getLogger(__name__)
 
@@ -29,6 +31,7 @@ DEFAULT_MAX_CONCURRENT_SPAWNS = 6
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_SWEEP_INTERVAL_SECONDS = 60.0
 DEFAULT_STUCK_AFTER_SECONDS = 60 * 60
+WORKTREE_ISOLATION_ENV = "KAI_WORKTREE_ISOLATION_ENABLED"
 
 # Phase 0 (#10247) — fleet hardening. Per-role max_iterations cascade:
 #   1. env  KAI_MAX_ITERATIONS_<ROLE_UPPER>   (escape hatch per role)
@@ -38,6 +41,11 @@ DEFAULT_STUCK_AFTER_SECONDS = 60 * 60
 FLEET_MAX_ITERATIONS_FLOOR = 200
 _MAX_ITERATIONS_DEFAULT_ENV = "KAI_MAX_ITERATIONS_DEFAULT"
 _MAX_ITERATIONS_PER_ROLE_PREFIX = "KAI_MAX_ITERATIONS_"
+
+
+def _worktree_isolation_enabled() -> bool:
+    raw = os.getenv(WORKTREE_ISOLATION_ENV, "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _coerce_positive_int(raw: Any) -> int | None:
@@ -418,8 +426,10 @@ class DaemonTaskboardSpawner:
         :class:`TaskboardDispatcher`.
     """
 
-    def __init__(self, daemon_server: Any) -> None:
+    def __init__(self, daemon_server: Any, repo_root: Path | None = None) -> None:
         self.daemon_server = daemon_server
+        self.repo_root = Path(repo_root or Path(__file__).resolve().parents[1])
+        self.worktree_manager = WorktreeManager(self.repo_root)
 
     async def spawn(self, **kwargs: Any) -> str:
         """Create a live daemon session and submit the rendered prompt.
@@ -434,6 +444,25 @@ class DaemonTaskboardSpawner:
         session_id = str(kwargs["session_id"])
         agent_id = str(kwargs["agent_id"])
         prompt = str(kwargs["prompt"])
+        task_payload = kwargs.get("task") if isinstance(kwargs.get("task"), dict) else {}
+        worktree_path = ""
+        if _worktree_isolation_enabled():
+            task_id = kwargs.get("task_id") or task_payload.get("id") or "unknown"
+            fire_generation = kwargs.get("fire_generation")
+            branch_name = f"task-{task_id}-{agent_id}-{fire_generation}"
+            worktree = self.worktree_manager.create(
+                session_id=session_id,
+                branch_name=branch_name,
+                base_branch=str(task_payload.get("default_branch") or "main"),
+            )
+            worktree_path = str(worktree)
+            prompt = render_taskboard_fire_prompt(
+                str(kwargs.get("role") or agent_id),
+                task_payload,
+                session_token=str(kwargs.get("session_token") or ""),
+                session_generation=kwargs.get("session_generation"),
+                worktree_path=worktree_path,
+            )
         managed = await self.daemon_server.get_or_create_session(
             session_id,
             create_if_missing=True,
@@ -450,7 +479,20 @@ class DaemonTaskboardSpawner:
             "profile": kwargs.get("profile"),
             "task_id": kwargs.get("task_id"),
             "fire_generation": kwargs.get("fire_generation"),
+            "worktree_path": worktree_path,
         }
+        managed.session.taskboard_context = SimpleNamespace(
+            base_url=str(kwargs.get("taskboard_base_url") or os.getenv("TASKBOARD_URL", "http://localhost:8080")),
+            bearer_token=(
+                str(kwargs.get("taskboard_bearer_token") or "").strip()
+                or os.getenv("TASKBOARD_BEARER_TOKEN", "").strip()
+                or os.getenv("OPENCLAW_GATEWAY_TOKEN", "").strip()
+                or os.getenv("OPENCLAW_TOKEN", "").strip()
+            ),
+            session_token=str(kwargs.get("session_token") or "").strip(),
+            session_generation=_coerce_positive_int(kwargs.get("session_generation")),
+            agent_name=agent_id,
+        )
         if hasattr(managed.session, "start_auto_mode"):
             # Phase 0 (#10247): per-role iteration budget instead of a
             # hardcoded 20. CR/SA finish in 8-15; QA/Dev/Architect need
@@ -809,6 +851,10 @@ class TaskboardDispatcher:
                         profile=route.profile,
                         prompt=prompt,
                         task=latest_task,
+                        session_token=session_token,
+                        session_generation=session_generation_value,
+                        taskboard_base_url=self._taskboard_base_url(),
+                        taskboard_bearer_token=self._taskboard_bearer_token(),
                     )
                     if inspect.isawaitable(spawn_result):
                         spawn_result = await spawn_result
@@ -2073,6 +2119,18 @@ def _normalize_spawn_session_id(result: Any, *, default: str) -> str:
     return default
 
 
+def _cleanup_dispatcher_worktree(daemon_server: Any, session_id: str) -> None:
+    """Best-effort session worktree cleanup after terminal ledger updates."""
+    del daemon_server
+    if not _worktree_isolation_enabled():
+        return
+    try:
+        manager = WorktreeManager(Path(__file__).resolve().parents[1])
+        manager.cleanup(session_id)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("worktree cleanup failed session_id=%s error=%s", session_id, exc)
+
+
 def _finalize_dispatcher_inprocess_run(
     task: asyncio.Task[Any],
     daemon_server: Any,
@@ -2217,6 +2275,7 @@ def _finalize_dispatcher_inprocess_run(
                 session_id,
                 exc,
             )
+        _cleanup_dispatcher_worktree(daemon_server, session_id)
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning(
             "_finalize_dispatcher_inprocess_run failed session_id=%s error=%s",

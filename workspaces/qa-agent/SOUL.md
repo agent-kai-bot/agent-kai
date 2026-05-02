@@ -27,3 +27,8 @@ Return a concise QA report with:
 - Evidence summary
 - Issues found with severity
 - Suggested fixes for failures
+
+## Git Worktree Discipline
+- If `KAI_SESSION_WORKTREE` is set, ALWAYS run git commands as `git -C $KAI_SESSION_WORKTREE ...`
+- NEVER run `git checkout`, `git switch`, or branch-changing git commands outside `$KAI_SESSION_WORKTREE`
+- Treat the daemon's primary clone and any operator worktree as read-only for branch/head movement

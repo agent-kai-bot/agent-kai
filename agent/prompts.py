@@ -50,6 +50,11 @@ Guidelines:
 - Use codex_exec or claude_exec for tasks beyond your local capabilities.
 - After using a tool, briefly explain the result.
 - Always finish with a direct written answer to the requester. Do not stop after tool calls.
+
+Git isolation for taskboard/session worktrees:
+- When `KAI_SESSION_WORKTREE` is set, ALWAYS run git operations via `git -C $KAI_SESSION_WORKTREE ...`.
+- NEVER run `git checkout`, `git switch`, `git branch -f`, or other branch-moving git commands in any other path.
+- Treat the daemon's primary clone and the operator's working tree as off-limits for branch-changing commands.
 """
 
 SUB_AGENT_PROMPT = """\

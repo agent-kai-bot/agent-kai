@@ -6,7 +6,8 @@ import os
 import shutil
 import subprocess
 import sys
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
+from contextvars import ContextVar
 from html.parser import HTMLParser
 
 import requests
@@ -28,6 +29,19 @@ from config import (
     MAX_OUTPUT_CHARS,
     SHELL_TIMEOUT_SECONDS,
 )
+
+
+_SESSION_WORKTREE: ContextVar[str | None] = ContextVar("kai_session_worktree", default=None)
+
+
+@contextmanager
+def session_worktree_context(path: str | None):
+    """Temporarily bind a session worktree for tool execution."""
+    token = _SESSION_WORKTREE.set(path if path else None)
+    try:
+        yield
+    finally:
+        _SESSION_WORKTREE.reset(token)
 
 
 # ── File Read ────────────────────────────────────────────────
@@ -116,12 +130,18 @@ file_edit = StructuredTool.from_function(
 def _shell_exec(command: str) -> str:
     """Execute a shell command and return stdout + stderr."""
     try:
+        cwd = _SESSION_WORKTREE.get() or None
+        env = os.environ.copy()
+        if cwd:
+            env["KAI_SESSION_WORKTREE"] = cwd
         result = subprocess.run(
             command,
             shell=True,
             capture_output=True,
             text=True,
             timeout=SHELL_TIMEOUT_SECONDS,
+            cwd=cwd,
+            env=env,
         )
         output = ""
         if result.stdout:

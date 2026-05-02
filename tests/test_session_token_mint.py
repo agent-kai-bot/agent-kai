@@ -56,9 +56,11 @@ class PromptRendererSessionTokenTests(unittest.TestCase):
             {"id": 999, "title": "smoke", "description": "x"},
             session_token="tok-abc-123",
             session_generation=7,
+            worktree_path="/tmp/kai/sessions/taskboard-999-7-developer",
         )
         self.assertIn("tok-abc-123", rendered)
         self.assertIn("Session generation: 7", rendered)
+        self.assertIn("Worktree path: /tmp/kai/sessions/taskboard-999-7-developer", rendered)
 
     def test_missing_session_kwargs_render_empty(self) -> None:
         rendered = render_taskboard_fire_prompt(

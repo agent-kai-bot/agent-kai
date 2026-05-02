@@ -49,6 +49,7 @@ def render_taskboard_fire_prompt(
     *,
     session_token: str = "",
     session_generation: int | None = None,
+    worktree_path: str = "",
 ) -> str:
     """Render a role-specific taskboard auto-fire prompt.
 
@@ -86,6 +87,8 @@ def render_taskboard_fire_prompt(
         substitutions["session_token"] = session_token
     if session_generation is not None:
         substitutions["session_generation"] = str(session_generation)
+    if worktree_path:
+        substitutions["worktree_path"] = worktree_path
     return _render_prompt(
         TASKBOARD_PROMPT_ROOT,
         role,
@@ -276,6 +279,9 @@ def _extract_taskboard_substitutions(
         ),
         "session_generation": _stringify(
             _field(task_mapping, "session_generation", "sessionGeneration")
+        ),
+        "worktree_path": _stringify(
+            _field(task_mapping, "worktree_path", "worktreePath")
         ),
         "output_target": output_target,
         "comments_context": _stringify(

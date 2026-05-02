@@ -89,6 +89,7 @@ def _make_task(
 
 class FinalizeInprocessRunTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.cleanup_calls: list[str] = []
         self.client = _StubAgentRunsClient(
             rows=[
                 {"id": 7, "session_id": "sess-x", "status": "spawning"},
@@ -99,10 +100,16 @@ class FinalizeInprocessRunTests(unittest.TestCase):
             "agent.agent_runs_client.AgentRunsClient.from_env",
             return_value=self.client,
         )
+        self._cleanup_patcher = patch(
+            "agent.taskboard_dispatcher._cleanup_dispatcher_worktree",
+            side_effect=lambda daemon_server, session_id: self.cleanup_calls.append(session_id),
+        )
         self._patcher.start()
+        self._cleanup_patcher.start()
 
     def tearDown(self) -> None:
         self._patcher.stop()
+        self._cleanup_patcher.stop()
 
     def _terminal(self) -> dict[str, Any]:
         """Return the second PATCH body — the terminal write."""
@@ -124,6 +131,7 @@ class FinalizeInprocessRunTests(unittest.TestCase):
         )
         body = self._terminal()
         self.assertEqual(body, {"status": "succeeded"})
+        self.assertEqual(self.cleanup_calls, ["sess-x"])
 
     def test_endpoint_failed_on_primary_endpoint_error(self) -> None:
         task = _make_task(

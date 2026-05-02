@@ -48,6 +48,7 @@ class PromptRendererTests(unittest.TestCase):
         self.assertIn("agent-kai Agent KAI", rendered)
         self.assertIn("task-10153-kai-prompt-templates-for-taskboard-auto-fire", rendered)
         self.assertIn("developer/claude/artifacts/10153-final.txt", rendered)
+        self.assertIn("Worktree path: ", rendered)
         for placeholder in (
             "{title}",
             "{description}",
