@@ -1,0 +1,15 @@
+Task 10279 final summary
+
+Branch: task-10279-ws-1-workspace-config-path-model-no-git-yet
+Commit reviewed: 5447215 (includes implementation commit ad9aaeabfa02d8f2e698ec57fbbb4510d2c18df4)
+
+What changed:
+- TicketWorkspaceManifest.__post_init__ canonicalizes root with safe_root_path, validates task_dir/shared_dir as absolute paths under root, requires shared_dir to remain under task_dir or match the canonical shared path, and validates embedded repo manifest paths under the task directory.
+- RepoWorkspaceManifest.__post_init__ validates repo_key/role and rejects relative repo paths containing traversal while deferring absolute path containment to ticket-manifest load context.
+- Added focused unit tests covering relative traversal rejection, absolute outside-root rejection, shared-dir escape rejection, repo path escape rejection, and existing valid manifest construction.
+
+Tests run:
+- pytest tests/test_taskboard_workspace.py -q (29 passed)
+
+Remaining risk:
+- Low. Validation is scoped to manifest/path model behavior and no git lifecycle behavior is introduced in this task.
