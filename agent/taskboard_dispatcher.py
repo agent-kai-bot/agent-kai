@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agent.prompt_renderer import render_taskboard_fire_prompt
-from agent.taskboard_status_router import roles_to_fire
+from agent.taskboard_status_router import route_event
 from agent.worktree_manager import WorktreeManager
 
 LOGGER = logging.getLogger(__name__)
@@ -747,33 +747,30 @@ class TaskboardDispatcher:
     async def _process_row(self, row: PendingWebhookRow) -> str:
         reserved_key: tuple[int, int, str] | None = None
         try:
-            from_status = row.payload.get("from_status")
-            to_status = row.payload.get("to_status")
-            role_names = roles_to_fire(
-                str(from_status) if from_status is not None else None,
-                str(to_status) if to_status is not None else None,
-            )
-            if not role_names:
-                self._store.mark_processed(row, "no_op_transition")
-                return "no_op_transition"
-
             payload_task = _extract_task(row.payload)
             task_id = _extract_task_id(row.payload, payload_task)
             fire_generation = _extract_fire_generation(row.payload, payload_task)
             if fire_generation is None:
                 raise ValueError("taskboard payload is missing fire_generation")
             latest_task = await self._fetch_latest_task(task_id)
+            review_context = self._build_review_context(latest_task)
+            route_decisions = route_event(row.payload, latest_task, review_context)
+            if not route_decisions:
+                self._store.mark_processed(row, "no_op_transition")
+                return "no_op_transition"
 
             session_results: list[tuple[TaskboardRoleRoute, str]] = []
             duplicate_count = 0
-            for role_text in role_names:
+            for decision in route_decisions:
+                role_text = decision.role
                 try:
                     route = resolve_taskboard_role(role_text)
                 except ValueError:
                     LOGGER.warning(
-                        "taskboard_fire_unknown_role task_id=%s role=%s",
+                        "taskboard_fire_unknown_role task_id=%s role=%s route_reason=%s",
                         task_id,
                         role_text,
+                        decision.reason,
                     )
                     self._store.mark_processed(row, "unknown_role")
                     return "unknown_role"
@@ -901,10 +898,11 @@ class TaskboardDispatcher:
                 reserved_key = None
 
                 LOGGER.info(
-                    "taskboard_fire_spawned task_id=%d fire_generation=%d role=%s session_id=%s",
+                    "taskboard_fire_spawned task_id=%d fire_generation=%d role=%s route_reason=%s session_id=%s",
                     task_id,
                     fire_generation,
                     route.role,
+                    decision.reason,
                     session_id,
                 )
 
@@ -945,6 +943,21 @@ class TaskboardDispatcher:
                 self._store.mark_session_failed(*reserved_key)
             self._store.mark_processed(row, "rejected", error=error_message)
             return "rejected"
+
+    def _build_review_context(self, latest_task: dict[str, Any]) -> dict[str, Any]:
+        """Return review metadata bundle for router boundary inputs.
+
+        This is intentionally minimal in router v2 #1: the dispatcher threads
+        through the review-shaped task context without changing policy yet.
+        """
+
+        return {
+            "reviews": latest_task.get("reviews") or (),
+            "review_requests": latest_task.get("review_requests") or (),
+            "review_phase": latest_task.get("review_phase"),
+            "review_status": latest_task.get("review_status"),
+            "review_types": latest_task.get("review_types") or (),
+        }
 
     async def _fetch_latest_task(self, task_id: int) -> dict[str, Any]:
         result = self.task_client.fetch_task(task_id)

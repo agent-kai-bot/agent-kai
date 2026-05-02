@@ -17,6 +17,7 @@ from agent.taskboard_dispatcher import (
     TaskboardDispatcher,
     resolve_taskboard_role,
 )
+from agent.taskboard_status_router import route_event
 
 
 NOW = datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc)
@@ -128,7 +129,8 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spawn["session_token"], "")
         self.assertIn(
             "taskboard_fire_spawned task_id=10152 fire_generation=7 "
-            "role=Developer session_id=taskboard-10152-7-developer",
+            "role=Developer route_reason=status_to_in_progress "
+            "session_id=taskboard-10152-7-developer",
             "\n".join(logs.output),
         )
         row = self._pending_row(row_id)
@@ -275,6 +277,38 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(counts, {"no_op_transition": 1})
         self.assertEqual(session_manager.spawn_calls, [])
         self.assertEqual(self._pending_statuses(), ["no_op_transition"])
+
+    async def test_process_row_calls_route_event_with_payload_task_and_review_context(self) -> None:
+        """Dispatcher passes the new router boundary arguments through."""
+
+        self._insert_pending(401, 2, "Developer")
+        task = {
+            "id": 401,
+            "agent": "Developer",
+            "fire_generation": 2,
+            "reviews": [{"id": 1}],
+            "review_requests": [{"id": 2}],
+            "review_phase": "requested",
+            "review_status": "pending",
+            "review_types": ["code"],
+        }
+        dispatcher = self._dispatcher(tasks={401: task}, session_manager=_FakeSessionManager())
+
+        with mock.patch(
+            "agent.taskboard_dispatcher.route_event",
+            wraps=route_event,
+        ) as router_mock:
+            await dispatcher.run_once()
+
+        router_mock.assert_called_once()
+        payload, latest_task, review_context = router_mock.call_args.args
+        self.assertEqual(payload["to_status"], "In Progress")
+        self.assertEqual(latest_task["id"], 401)
+        self.assertEqual(review_context["reviews"], [{"id": 1}])
+        self.assertEqual(review_context["review_requests"], [{"id": 2}])
+        self.assertEqual(review_context["review_phase"], "requested")
+        self.assertEqual(review_context["review_status"], "pending")
+        self.assertEqual(review_context["review_types"], ["code"])
 
     async def test_backpressure_leaves_overflow_rows_pending(self) -> None:
         """The dispatcher respects the active spawn cap and drains later."""
