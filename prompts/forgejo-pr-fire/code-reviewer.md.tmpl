@@ -27,6 +27,14 @@ Review the pull request for correctness, regressions, maintainability, compatibi
 
 Run or inspect the most relevant tests when feasible. Do not rewrite the implementation unless the task explicitly asks for direct fixes.
 
+For orchestrator-managed PRs, reject the review if the PR lacks a complete **PM signoff** section. A complete PM signoff must include:
+- a live-smoke artifact,
+- a ledger / audit-trail check timestamp,
+- an observation window duration in minutes, and
+- an explicit end-state observed after the window.
+
+Also reject PRs that claim completion while the running system has not been observed exhibiting the new behavior.
+
 ## Submit
 Write the PR review summary to `{output_target}`. Lead with findings by severity, then list open questions, tests checked, and a concise verdict.
 

@@ -77,6 +77,17 @@ class ForgejoPrRendererTests(unittest.TestCase):
         ):
             self.assertNotIn(placeholder, rendered)
 
+    def test_code_reviewer_template_requires_pm_signoff_for_orchestrator_managed_prs(self) -> None:
+        """Code reviewer prompt must enforce PM signoff requirements."""
+
+        rendered = render_forgejo_pr_fire_prompt("code-reviewer", self._sample_pr())
+
+        self.assertIn("PM signoff", rendered)
+        self.assertIn("live-smoke artifact", rendered)
+        self.assertIn("ledger / audit-trail check timestamp", rendered)
+        self.assertIn("observation window duration", rendered)
+        self.assertIn("reject", rendered)
+
     def test_unknown_role_uses_default_template(self) -> None:
         """Unknown role names fall back to the default Forgejo PR template."""
 
@@ -85,6 +96,7 @@ class ForgejoPrRendererTests(unittest.TestCase):
         self.assertIn("# Forgejo PR Reviewer Prompt", rendered)
         self.assertNotIn("# Code Reviewer Forgejo PR Auto-Fire Prompt", rendered)
         self.assertIn("Add Forgejo PR prompts", rendered)
+        self.assertIn("PM signoff", rendered)
 
     def test_missing_pr_fields_render_empty_without_key_error(self) -> None:
         """Missing PR fields do not raise and render as empty strings."""

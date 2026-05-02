@@ -27,6 +27,8 @@ Review the submitted change for correctness, regressions, maintainability, and m
 
 Run or inspect the most relevant tests when feasible. Do not rewrite the implementation unless the task explicitly asks for direct fixes.
 
+If the task implements or updates orchestrator-managed PR workflow, reject the change unless it makes PM signoff mandatory and explicitly requires live-smoke evidence, ledger / audit-trail timestamping, and an observation window with a final observed state.
+
 ## Submit
 Write the review summary to `{output_target}`. Lead with findings by severity, then list open questions, tests checked, and a concise verdict.
 
