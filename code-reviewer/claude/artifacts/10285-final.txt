@@ -1,0 +1,21 @@
+Task 10285 code review final summary
+
+Decision: APPROVED
+
+Reviewed implementation commit c9f02acdf82350a15cc85a52645c2a657806f0ff on branch task-10285-ws-7-workspace-aware-docker-sandbox-work-mount.
+
+What was reviewed:
+- agent/tools.py create_tools workspace_host_path plumbing and taskboard_dispatcher metadata fallback.
+- Existing docker_sandbox mount/cwd behavior in agent/tools.py.
+- tests/test_docker_sandbox_tools.py coverage for mounted /work cwd, file persistence, human no-mount behavior, worker primary_repo_path selection, and missing workspace path failure.
+- Worker session setup in daemon/agent_worker.py and DaemonTaskboardSpawner workspace subprocess test context.
+
+Tests run:
+- /home/atc/git/claude-local-ai-agent/.venv/bin/pytest -q tests/test_docker_sandbox_tools.py tests/test_daemon_core.py::SessionTests::test_attach_runtime_builds_session_runtime tests/test_taskboard_dispatcher.py::TaskboardDispatcherTests::test_daemon_spawner_workspace_enabled_starts_worker_subprocess tests/test_taskboard_workspace.py::test_disk_watermark_guard_rejects_when_threshold_exceeded
+- Result: 7 passed, 1 existing pytest asyncio_mode warning.
+
+Findings:
+- No blocking findings.
+
+Remaining risk:
+- Tests mock docker execution, so host/container bind behavior is validated by command construction rather than a live Docker integration run. This is acceptable for the scoped feature but an end-to-end sandbox smoke remains useful later.
