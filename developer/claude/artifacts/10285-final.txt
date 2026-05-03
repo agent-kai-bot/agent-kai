@@ -1,0 +1,17 @@
+Task 10285 final summary
+
+Implementation commit: c9f02acdf82350a15cc85a52645c2a657806f0ff
+Branch: task-10285-ws-7-workspace-aware-docker-sandbox-work-mount
+
+Changes:
+- create_tools now accepts an optional workspace_host_path and derives the docker_sandbox bind mount from worker session taskboard_dispatcher metadata.
+- Worker sessions prefer primary_repo_path/worktree_path for the /work bind mount, with workspace_path as a fallback.
+- Non-workspace human sessions still create docker_sandbox with no workspace mount and default to /tmp.
+- Added focused docker_sandbox tests for /work cwd, bind-mounted file persistence, human no-mount behavior, and missing workspace path failure.
+
+Tests run:
+- .venv/bin/pytest -q tests/test_docker_sandbox_tools.py tests/test_taskboard_dispatcher.py::TaskboardDispatcherTests::test_daemon_spawner_workspace_enabled_starts_worker_subprocess tests/test_daemon_core.py::SessionTests::test_attach_runtime_builds_session_runtime tests/test_taskboard_workspace.py::test_disk_watermark_guard_rejects_when_threshold_exceeded
+  Result: 7 passed, 1 warning (existing pytest asyncio_mode config warning)
+
+Known follow-up:
+- Pull request was prepared by pushing the task branch; GitHub CLI is not installed in this environment, so PR creation could not be completed locally.
