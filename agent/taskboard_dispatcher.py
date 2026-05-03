@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
 import os
 import re
 import sqlite3
+import sys
+import tempfile
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -411,26 +414,26 @@ class DefaultTaskboardTaskClient:
 class DaemonTaskboardSpawner:
     """Session spawn adapter backed by :class:`daemon.server.DaemonServer`.
 
-    Args:
-        daemon_server: Running daemon server instance.
-
-    Example:
-        The daemon app builds this adapter during startup and gives it to
-        :class:`TaskboardDispatcher`.
+    Workspace-enabled taskboard sessions run in a child Python process so
+    process-wide cwd, git, and shell tools are isolated to the prepared repo.
+    Human sessions and flag-off taskboard sessions keep the historic
+    in-process ``run_input`` path.
     """
 
     def __init__(self, daemon_server: Any) -> None:
         self.daemon_server = daemon_server
+        self._worker_processes: dict[str, asyncio.subprocess.Process] = {}
 
     async def spawn(self, **kwargs: Any) -> str:
-        """Create a live daemon session and submit the rendered prompt.
+        """Create a live daemon session and submit the rendered prompt."""
 
-        Args:
-            **kwargs: Spawn metadata produced by :class:`TaskboardDispatcher`.
+        workspace_metadata = kwargs.get("workspace_metadata")
+        if _ticket_workspace_enabled() and isinstance(workspace_metadata, Mapping):
+            return await self._spawn_workspace_worker(kwargs, workspace_metadata)
+        return await self._spawn_inprocess(kwargs)
 
-        Returns:
-            Session id used by the daemon runtime.
-        """
+    async def _spawn_inprocess(self, kwargs: Mapping[str, Any]) -> str:
+        """Run the legacy daemon ``run_input`` path for non-workspace sessions."""
 
         session_id = str(kwargs["session_id"])
         agent_id = str(kwargs["agent_id"])
@@ -471,9 +474,6 @@ class DaemonTaskboardSpawner:
             ),
         }
         if hasattr(managed.session, "start_auto_mode"):
-            # Phase 0 (#10247): per-role iteration budget instead of a
-            # hardcoded 20. CR/SA finish in 8-15; QA/Dev/Architect need
-            # 80-200. See _resolve_max_iterations_for_role for the cascade.
             max_iters = _resolve_max_iterations_for_role(agent_id)
             managed.session.start_auto_mode(
                 max_iterations=max_iters,
@@ -489,14 +489,6 @@ class DaemonTaskboardSpawner:
         )
         managed.current_input_task = task
         task.add_done_callback(_consume_task_exception)
-
-        # Phase 0 (#10247) — fleet hardening: dispatcher in-process runs
-        # don't produce gateway run_*.json artifacts, so the reaper can't
-        # finalize their ledger rows. Hook the asyncio task's done-callback
-        # to walk the row through `running` → terminal using the *real*
-        # task outcome (exception + InputRunResult.error / .final_text),
-        # routed through `agent.run_outcome.derive_outcome_from_agent_events`
-        # so failure_class/detail land correctly.
         task.add_done_callback(
             lambda t, sid=session_id, tid=kwargs.get("task_id"),
             role=kwargs.get("agent_id"): _finalize_dispatcher_inprocess_run(
@@ -505,20 +497,202 @@ class DaemonTaskboardSpawner:
         )
         return session_id
 
+    async def _spawn_workspace_worker(
+        self,
+        kwargs: Mapping[str, Any],
+        workspace_metadata: Mapping[str, Any],
+    ) -> str:
+        """Start ``daemon.agent_worker`` with workspace cwd/env isolation."""
+
+        session_id = str(kwargs["session_id"])
+        agent_id = str(kwargs["agent_id"])
+        task_id = str(kwargs.get("task_id") or "")
+        primary_repo = str(workspace_metadata.get("primary_repo_path") or "")
+        workspace_path = str(workspace_metadata.get("workspace_path") or "")
+        manifest_path = str(workspace_metadata.get("workspace_manifest_path") or "")
+        if not primary_repo or not workspace_path or not manifest_path:
+            raise ValueError("workspace metadata missing required worker paths")
+
+        managed = await self.daemon_server.get_or_create_session(
+            session_id,
+            create_if_missing=True,
+        )
+        managed.session.taskboard_dispatcher = {
+            "role": kwargs.get("role"),
+            "model": kwargs.get("model"),
+            "profile": kwargs.get("profile"),
+            "task_id": kwargs.get("task_id"),
+            "fire_generation": kwargs.get("fire_generation"),
+            "workspace_path": workspace_path,
+            "worktree_path": workspace_metadata.get("worktree_path"),
+            "primary_repo_path": primary_repo,
+            "workspace_manifest_path": manifest_path,
+            "workspace_metadata": dict(workspace_metadata),
+        }
+        managed.session.set_activity_status("starting...")
+        event_task = asyncio.create_task(
+            self._relay_worker_events(managed.session, session_id)
+        )
+
+        prompt_file = _write_worker_prompt(session_id, str(kwargs["prompt"]))
+        with contextlib.suppress(FileNotFoundError):
+            _worker_event_path(session_id).unlink()
+        env = os.environ.copy()
+        code_root = str(Path(__file__).resolve().parents[1])
+        pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            code_root if not pythonpath else f"{code_root}{os.pathsep}{pythonpath}"
+        )
+        env.update(
+            {
+                "KAI_TICKET_WORKSPACE": workspace_path,
+                "KAI_PRIMARY_REPO": primary_repo,
+                "KAI_WORKSPACE_MANIFEST": manifest_path,
+                "KAI_TASK_ID": task_id,
+                "KAI_ROLE": agent_id,
+                "TASKBOARD_SESSION_TOKEN": str(kwargs.get("session_token") or ""),
+                "TASKBOARD_SESSION_GENERATION": str(
+                    kwargs.get("session_generation") or ""
+                ),
+            }
+        )
+        cmd = [
+            sys.executable,
+            "-m",
+            "daemon.agent_worker",
+            "--session-id",
+            session_id,
+            "--agent-id",
+            agent_id,
+            "--role",
+            str(kwargs.get("role") or ""),
+            "--model",
+            str(kwargs.get("model") or ""),
+            "--profile",
+            str(kwargs.get("profile") or ""),
+            "--task-id",
+            task_id,
+            "--fire-generation",
+            str(kwargs.get("fire_generation") or ""),
+            "--max-iterations",
+            str(_resolve_max_iterations_for_role(agent_id)),
+            "--nats-url",
+            str(getattr(self.daemon_server, "nats_url", "")),
+            "--prompt-file",
+            str(prompt_file),
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=primary_repo,
+            env=env,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        self._worker_processes[session_id] = process
+        managed.current_input_task = event_task
+        waiter = asyncio.create_task(
+            self._watch_worker_process(session_id, process, managed.session, event_task)
+        )
+        waiter.add_done_callback(_consume_task_exception)
+        return session_id
+
+    async def _relay_worker_events(self, session: Any, session_id: str) -> None:
+        """Forward child-published NATS session events into local session bus."""
+
+        bus = getattr(self.daemon_server, "bus", None)
+        subscription = None
+
+        async def _handler(_subject: str, payload: dict[str, Any]) -> None:
+            if str(payload.get("session") or "") != session_id:
+                return
+            topic = str(payload.get("topic") or "")
+            event_payload = payload.get("payload")
+            if topic:
+                session.publish_event(
+                    topic,
+                    event_payload if isinstance(event_payload, dict) else {},
+                )
+
+        if bus is not None and getattr(bus, "is_connected", False):
+            subscription = await bus.subscribe("daemon.session.event", _handler)
+        try:
+            while True:
+                if subscription is None:
+                    event_path = _worker_event_path(session_id)
+                    if event_path.is_file():
+                        lines = await asyncio.to_thread(
+                            event_path.read_text, encoding="utf-8"
+                        )
+                        with contextlib.suppress(FileNotFoundError):
+                            await asyncio.to_thread(event_path.unlink)
+                        for line in lines.splitlines():
+                            try:
+                                payload = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            await _handler("worker-file", payload)
+                await asyncio.sleep(0.25)
+        finally:
+            with contextlib.suppress(Exception):
+                if subscription is not None and hasattr(subscription, "unsubscribe"):
+                    await subscription.unsubscribe()
+
+    async def _watch_worker_process(
+        self,
+        session_id: str,
+        process: asyncio.subprocess.Process,
+        session: Any,
+        event_task: asyncio.Task[Any],
+    ) -> None:
+        returncode = await process.wait()
+        self._worker_processes.pop(session_id, None)
+        if not event_task.done():
+            event_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await event_task
+        session.set_activity_status("idle")
+        if returncode:
+            session.publish_event(
+                "agent.error",
+                {"value": f"taskboard worker exited with code {returncode}"},
+            )
+
     async def abort(self, session_id: str) -> None:
-        """Abort a live daemon session if it is still running.
+        """Abort a live daemon or worker-backed session if it is still running."""
 
-        Args:
-            session_id: Session identifier to abort.
-
-        Returns:
-            None.
-        """
-
+        process = self._worker_processes.get(session_id)
+        if process is not None and process.returncode is None:
+            process.terminate()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=5)
+            if process.returncode is None:
+                process.kill()
+            self._worker_processes.pop(session_id, None)
+            return
         try:
             await self.daemon_server.stop_session_run(session_id)
         except KeyError:
             return
+
+
+def _worker_event_path(session_id: str) -> Path:
+    """Return the best-effort file relay path for worker session events."""
+
+    safe = re.sub(r"[^a-zA-Z0-9_.-]", "-", session_id)
+    return Path(tempfile.gettempdir()) / "kai-taskboard-worker-events" / f"{safe}.jsonl"
+
+
+def _write_worker_prompt(session_id: str, prompt: str) -> Path:
+    """Persist a prompt for a child worker without exposing it on argv."""
+
+    root = Path(tempfile.gettempdir()) / "kai-taskboard-worker-prompts"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    safe = re.sub(r"[^a-zA-Z0-9_.-]", "-", session_id)
+    path = root / f"{safe}.prompt"
+    path.write_text(prompt, encoding="utf-8")
+    with contextlib.suppress(OSError):
+        path.chmod(0o600)
+    return path
 
 
 class TaskboardDispatcher:

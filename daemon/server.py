@@ -544,6 +544,7 @@ class DaemonServer:
         )
         self.taskboard_dispatcher: TaskboardDispatcher | None = None
         self.taskboard_dispatcher_task: asyncio.Task[None] | None = None
+        self.taskboard_spawner: DaemonTaskboardSpawner | None = None
         self.bus: Any | None = None
         self.sessions: dict[str, ManagedSession] = {}
         self.event_bus = DaemonEventBus()
@@ -634,12 +635,14 @@ class DaemonServer:
                 await asyncio.to_thread(apply_migrations, self.db_path)
             except Exception as exc:  # noqa: BLE001
                 self.log.warning("taskboard dispatcher migrations failed: %s", exc)
+        taskboard_spawner = DaemonTaskboardSpawner(self)
         self.taskboard_dispatcher = TaskboardDispatcher(
             db_path=self.db_path,
             task_client=self.taskboard_client,
-            session_manager=DaemonTaskboardSpawner(self),
+            session_manager=taskboard_spawner,
             nats_bus=self.bus,
         )
+        self.taskboard_spawner = taskboard_spawner
         self.taskboard_dispatcher_task = asyncio.create_task(
             self.taskboard_dispatcher.run()
         )
@@ -654,6 +657,7 @@ class DaemonServer:
                 await task
         self.taskboard_dispatcher_task = None
         self.taskboard_dispatcher = None
+        self.taskboard_spawner = None
 
     def uptime_seconds(self) -> float:
         """Return daemon uptime in seconds since the current process booted."""
