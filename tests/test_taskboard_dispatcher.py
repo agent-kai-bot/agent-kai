@@ -17,6 +17,7 @@ from agent.taskboard_dispatcher import (
     DaemonTaskboardSpawner,
     TaskboardDispatcher,
     _normalize_task_metadata,
+    _redact_known_secrets,
     resolve_taskboard_role,
 )
 
@@ -306,6 +307,21 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertIsNotNone(self._pending_row(row_id)["audit_posted_at"])
+
+    def test_redact_known_secrets_removes_url_userinfo(self) -> None:
+        """Dispatcher audit/NATS errors must not expose repo URL credentials."""
+
+        message = (
+            "git clone https://user:super-secret@example.com/owner/repo.git "
+            "Authorization: Bearer live-token"
+        )
+
+        redacted = _redact_known_secrets(message)
+
+        self.assertNotIn("super-secret", redacted)
+        self.assertNotIn("live-token", redacted)
+        self.assertIn("https://[REDACTED]@example.com/owner/repo.git", redacted)
+        self.assertIn("Authorization: Bearer [REDACTED]", redacted)
 
     async def test_workspace_enabled_prepares_before_render_and_passes_spawn_metadata(
         self,

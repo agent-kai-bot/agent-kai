@@ -40,9 +40,10 @@ class WorkspaceGitCommandError(WorkspaceGitError):
     def __init__(self, command: list[str], cwd: Path | None, stderr: str) -> None:
         self.command = command
         self.cwd = cwd
-        self.stderr = stderr.strip()
+        self.stderr = redact_url_userinfo(stderr.strip())
+        safe_command = [redact_url_userinfo(part) for part in command]
         location = f" in {cwd}" if cwd else ""
-        message = f"git command failed{location}: {' '.join(command)}: {self.stderr}"
+        message = f"git command failed{location}: {' '.join(safe_command)}: {self.stderr}"
         super().__init__(message)
 
 
@@ -141,7 +142,7 @@ class RepoRef:
             host=host,
             owner=owner,
             repo=repo,
-            url=url,
+            url=redact_url_userinfo(url.strip()),
             default_branch=default_branch,
         )
 
@@ -660,6 +661,18 @@ def safe_repo_key(value: str) -> str:
     if len(parts) != 3:
         raise WorkspacePathError("repo key must use host__owner__repo format")
     return repo_key(parts[0], parts[1], parts[2])
+
+
+def redact_url_userinfo(value: str) -> str:
+    """Return ``value`` with URL username/password userinfo removed."""
+
+    text = str(value)
+    return re.sub(
+        r"(?P<scheme>\b[a-z][a-z0-9+.-]*://)(?P<userinfo>[^\s/@]+@)",
+        r"\g<scheme>[REDACTED]@",
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
 def parse_repo_url(url: str) -> tuple[str, str, str]:

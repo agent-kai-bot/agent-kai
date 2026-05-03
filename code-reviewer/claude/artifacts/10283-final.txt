@@ -1,0 +1,27 @@
+Task 10283 code review final summary
+
+Decision: CHANGES_REQUESTED pending developer incorporation of review fixes.
+
+Reviewed:
+- Commit 44e8042b47a3e975d44e386d4ab9e32a00f37b4d on branch task-10283-ws-5-dispatcher-workspace-prepare-path-between-reserve-session-render-prompt.
+- Dispatcher workspace prepare flow between reserve_session and render_taskboard_fire_prompt.
+- DaemonTaskboardSpawner workspace_metadata persistence.
+- Added dispatcher/workspace/prompt/session-token tests.
+
+Findings:
+- Blocking security concern found during review/audit: credential-bearing repo URLs can leak through WorkspaceGitCommandError and dispatcher failure audit/NATS/last_error paths because git command strings may include full remote URLs and existing redaction only replaced exact env secret values.
+
+Reviewer-applied fix in working tree:
+- Added URL userinfo redaction helper in agent.taskboard_workspace.
+- RepoRef.from_url now stores credential-redacted URL userinfo before git use/manifest metadata.
+- WorkspaceGitCommandError redacts URL userinfo in command/stderr message text.
+- Dispatcher _redact_known_secrets now redacts URL userinfo plus Authorization/Bearer token patterns before env-secret substitution.
+- Added regression tests for dispatcher redaction, RepoRef stored URL redaction, and WorkspaceGitCommandError message redaction.
+
+Tests run:
+- env -u TASKBOARD_BEARER_TOKEN -u TASKBOARD_AGENT_TOKEN_DEVELOPER -u TASKBOARD_AGENT_TOKEN_CODE_REVIEWER -u TASKBOARD_AGENT_TOKEN_SECURITY_AUDITOR -u TASKBOARD_AGENT_TOKEN_QA_AGENT pytest -q tests/test_taskboard_dispatcher.py tests/test_taskboard_dispatcher_status_transitions.py tests/test_ticket_workspace_manager.py tests/test_prompt_renderer.py tests/test_session_token_mint.py tests/test_session_token_role_casing.py -q
+- git diff --check
+
+Remaining risk:
+- Redacting URL userinfo before git use may break workflows that intentionally embed credentials in repository URLs; prefer configured git credentials/tokens instead of credentialed taskboard metadata.
+- Formal taskboard/Forgejo review submission still needs to be posted once branch changes are committed/pushed by the implementation owner.

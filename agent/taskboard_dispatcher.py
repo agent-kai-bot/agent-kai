@@ -2109,6 +2109,27 @@ def _stuck_session_comment(*, task_id: int, session_id: str) -> str:
 
 def _redact_known_secrets(message: str) -> str:
     redacted = str(message)
+    try:
+        from agent.taskboard_workspace import redact_url_userinfo
+
+        redacted = redact_url_userinfo(redacted)
+    except Exception:  # noqa: BLE001 - redaction must remain best-effort.
+        redacted = re.sub(
+            r"(?P<scheme>\b[a-z][a-z0-9+.-]*://)(?P<userinfo>[^\s/@]+@)",
+            r"\g<scheme>[REDACTED]@",
+            redacted,
+            flags=re.IGNORECASE,
+        )
+    redacted = re.sub(
+        r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+",
+        r"\1[REDACTED]",
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)(bearer\s+)[^\s,;]+",
+        r"\1[REDACTED]",
+        redacted,
+    )
     for env_name in SECRET_ENV_VARS:
         secret = os.getenv(env_name, "").strip()
         if secret:

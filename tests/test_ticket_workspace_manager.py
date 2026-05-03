@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from agent.taskboard_workspace import (
+    WorkspaceGitCommandError,
     RepoRef,
     WorkspaceDirtyWrongBranchError,
     TicketWorkspaceManager,
@@ -157,3 +158,28 @@ def test_reviewer_gets_detached_worktree_at_developer_commit(tmp_path: Path, sou
     assert reviewer.detached is True
     assert _git(reviewer.worktree_path, "branch", "--show-current") == ""
     assert reviewer.commit == developer.commit
+
+
+def test_repo_ref_strips_url_userinfo_from_stored_url() -> None:
+    repo = RepoRef.from_url(
+        "https://user:super-secret@example.com/owner/repo.git",
+        default_branch="main",
+    )
+
+    assert repo.url == "https://[REDACTED]@example.com/owner/repo.git"
+    assert "super-secret" not in repo.url
+
+
+def test_git_command_error_redacts_url_userinfo() -> None:
+    error = WorkspaceGitCommandError(
+        ["clone", "https://user:super-secret@example.com/owner/repo.git"],
+        cwd=None,
+        stderr=(
+            "fatal: could not read from "
+            "https://user:super-secret@example.com/owner/repo.git"
+        ),
+    )
+
+    message = str(error)
+    assert "super-secret" not in message
+    assert "https://[REDACTED]@example.com/owner/repo.git" in message
