@@ -1079,8 +1079,16 @@ def create_tools(
     signal_consumer=None,
     scheduler=None,
     session=None,
+    workspace_host_path: str | None = None,
 ):
-    """Create and return all agent tools."""
+    """Create and return all agent tools.
+
+    Args:
+        workspace_host_path: Optional host workspace path to bind into
+            ``docker_sandbox`` as ``/work``. If omitted, taskboard worker
+            sessions derive it from ``session.taskboard_dispatcher``. Human
+            sessions keep the default isolated sandbox with no workspace mount.
+    """
     from agent.forgejo_tools import create_forgejo_tools
     from agent.sdlc_results import create_sdlc_result_tools
     from agent.strategy_agent_tools import create_strategy_tools
@@ -1096,8 +1104,17 @@ def create_tools(
         codex_exec,
         claude_exec,
     ]
-    # Main agent ("kai") has no workspace, so the sandbox is fully isolated.
-    tools.append(create_docker_sandbox_tool(workspace_host_path=None))
+    if workspace_host_path is None and session is not None:
+        dispatcher_context = getattr(session, "taskboard_dispatcher", None)
+        if isinstance(dispatcher_context, dict):
+            workspace_host_path = (
+                dispatcher_context.get("primary_repo_path")
+                or dispatcher_context.get("worktree_path")
+                or dispatcher_context.get("workspace_path")
+                or None
+            )
+
+    tools.append(create_docker_sandbox_tool(workspace_host_path=workspace_host_path))
     tools.extend(_get_crypto_tools(signal_consumer=signal_consumer))
     if session is not None:
         tools.extend(create_strategy_tools(session))
