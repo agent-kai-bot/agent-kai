@@ -14,6 +14,7 @@ from agent.taskboard_dispatcher import (
     BACKPRESSURE_SUBJECT,
     DISPATCHER_SOURCE,
     SPAWN_FAILED_SUBJECT,
+    DaemonTaskboardSpawner,
     TaskboardDispatcher,
     _normalize_task_metadata,
     resolve_taskboard_role,
@@ -84,6 +85,39 @@ class _FakeBus:
         """Record the publish request."""
 
         self.published.append((subject, payload))
+
+
+class _FakeDaemonSession:
+    def __init__(self) -> None:
+        self.taskboard_dispatcher = None
+        self.auto_mode_calls: list[dict] = []
+
+    def attach_runtime(self, **_kwargs) -> None:
+        return None
+
+    def start_auto_mode(self, **kwargs) -> None:
+        self.auto_mode_calls.append(kwargs)
+
+
+class _FakeManagedSession:
+    def __init__(self) -> None:
+        self.session = _FakeDaemonSession()
+        self.current_input_task = None
+
+
+class _FakeDaemonServer:
+    def __init__(self) -> None:
+        self.bus = None
+        self.signal_consumer = None
+        self.scheduler = None
+        self.managed = _FakeManagedSession()
+        self.run_inputs: list[tuple[object, str, str, str]] = []
+
+    async def get_or_create_session(self, *_args, **_kwargs):
+        return self.managed
+
+    async def run_input(self, managed, prompt, *, source, job_id):
+        self.run_inputs.append((managed, prompt, source, job_id))
 
 
 class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
@@ -272,6 +306,206 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertIsNotNone(self._pending_row(row_id)["audit_posted_at"])
+
+    async def test_workspace_enabled_prepares_before_render_and_passes_spawn_metadata(
+        self,
+    ) -> None:
+        """Reserved sessions prepare workspaces before rendering and spawning."""
+
+        row_id = self._insert_pending(10283, 1, "Developer")
+        task = {
+            "id": 10283,
+            "title": "Workspace spawn",
+            "agent": "Developer",
+            "fire_generation": 1,
+            "project_slug": "agent-kai",
+            "epic_id": 10032,
+            "repo_url": "https://forgejo.local/agent/agent-kai.git",
+            "default_branch": "main",
+        }
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={10283: task},
+            session_manager=session_manager,
+        )
+        metadata = {
+            "workspace_path": "/tmp/kai/task-10283",
+            "worktree_path": "/tmp/kai/task-10283/developer/repos/repo",
+            "primary_repo_path": "/tmp/kai/task-10283/developer/repos/repo",
+            "workspace_manifest_path": (
+                "/tmp/kai/task-10283/shared/workspace-manifest.json"
+            ),
+        }
+        observed_prompt_tasks: list[dict] = []
+
+        def _render(_role, prompt_task, **_kwargs):
+            observed_prompt_tasks.append(dict(prompt_task))
+            return "rendered prompt"
+
+        with mock.patch.dict(
+            "os.environ", {"KAI_TICKET_WORKSPACE_ENABLED": "1"}
+        ), mock.patch.object(
+            dispatcher,
+            "_prepare_role_workspace",
+            return_value=metadata,
+        ) as prepare, mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            side_effect=_render,
+        ):
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawned": 1})
+        prepare.assert_called_once()
+        self.assertEqual(self._pending_row(row_id)["dispatch_status"], "spawned")
+        self.assertEqual(
+            observed_prompt_tasks[0]["workspace_path"], metadata["workspace_path"]
+        )
+        spawn = session_manager.spawn_calls[0]
+        self.assertEqual(spawn["workspace_metadata"], metadata)
+        self.assertEqual(spawn["prompt"], "rendered prompt")
+
+    async def test_workspace_prepare_failure_marks_failed_and_posts_audit(
+        self,
+    ) -> None:
+        """Workspace errors fail the reserved session without spawning."""
+
+        row_id = self._insert_pending(10284, 1, "Developer")
+        task = {
+            "id": 10284,
+            "agent": "Developer",
+            "fire_generation": 1,
+            "project_slug": "agent-kai",
+            "repo_url": "https://forgejo.local/agent/agent-kai.git",
+        }
+        task_client = _FakeTaskClient({10284: task})
+        bus = _FakeBus()
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+            nats_bus=bus,
+        )
+
+        with mock.patch.dict(
+            "os.environ", {"KAI_TICKET_WORKSPACE_ENABLED": "1"}
+        ), mock.patch.object(
+            dispatcher,
+            "_prepare_role_workspace",
+            side_effect=RuntimeError("disk full"),
+        ):
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawn_failed": 1})
+        self.assertEqual(session_manager.spawn_calls, [])
+        self.assertEqual(self._pending_row(row_id)["dispatch_status"], "spawn_failed")
+        session = self._session_row()
+        self.assertEqual(session["status"], "failed")
+        self.assertEqual(
+            task_client.comments,
+            [
+                (
+                    10284,
+                    "[System] spawn failed for #10284: disk full; "
+                    "retry with agent-ops fire 10284",
+                )
+            ],
+        )
+        self.assertEqual(len(bus.published), 1)
+
+    async def test_duplicate_row_does_not_prepare_workspace(self) -> None:
+        """Duplicate webhook rows are rejected before workspace creation."""
+
+        self._insert_pending(10285, 1, "Developer")
+        self._insert_pending(10285, 1, "Developer")
+        task = {
+            "id": 10285,
+            "agent": "Developer",
+            "fire_generation": 1,
+            "project_slug": "agent-kai",
+            "repo_url": "https://forgejo.local/agent/agent-kai.git",
+        }
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={10285: task},
+            session_manager=session_manager,
+        )
+
+        with mock.patch.dict(
+            "os.environ", {"KAI_TICKET_WORKSPACE_ENABLED": "1"}
+        ), mock.patch.object(
+            dispatcher,
+            "_prepare_role_workspace",
+            return_value={"workspace_path": "/tmp/task-10285"},
+        ) as prepare:
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawned": 1, "duplicate": 1})
+        self.assertEqual(prepare.call_count, 1)
+        self.assertEqual(len(session_manager.spawn_calls), 1)
+
+    async def test_workspace_flag_off_does_not_prepare_or_pass_workspace_metadata(self) -> None:
+        """Default flag-off path preserves legacy spawn arguments."""
+
+        self._insert_pending(10286, 1, "Developer")
+        task = {
+            "id": 10286,
+            "agent": "Developer",
+            "fire_generation": 1,
+            "project_slug": "agent-kai",
+            "repo_url": "https://forgejo.local/agent/agent-kai.git",
+        }
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={10286: task},
+            session_manager=session_manager,
+        )
+
+        with mock.patch.dict("os.environ", {}, clear=True), mock.patch.object(
+            dispatcher,
+            "_prepare_role_workspace",
+            wraps=dispatcher._prepare_role_workspace,
+        ) as prepare:
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawned": 1})
+        prepare.assert_called_once()
+        self.assertIsNone(session_manager.spawn_calls[0]["workspace_metadata"])
+
+    async def test_daemon_spawner_stores_workspace_metadata_on_session(self) -> None:
+        """Daemon spawn persists workspace metadata for agent tools."""
+
+        server = _FakeDaemonServer()
+        spawner = DaemonTaskboardSpawner(server)
+        metadata = {
+            "workspace_path": "/tmp/kai/task-10283",
+            "worktree_path": "/tmp/kai/task-10283/developer/repos/repo",
+            "primary_repo_path": "/tmp/kai/task-10283/developer/repos/repo",
+            "workspace_manifest_path": (
+                "/tmp/kai/task-10283/shared/workspace-manifest.json"
+            ),
+            "branch": "task-10283",
+        }
+
+        session_id = await spawner.spawn(
+            session_id="taskboard-10283-1-developer",
+            task_id=10283,
+            fire_generation=1,
+            role="Developer",
+            agent_id="developer",
+            model="codex",
+            profile="xhigh",
+            prompt="rendered prompt",
+            task={"id": 10283},
+            workspace_metadata=metadata,
+        )
+
+        self.assertEqual(session_id, "taskboard-10283-1-developer")
+        stored = server.managed.session.taskboard_dispatcher
+        self.assertEqual(stored["workspace_path"], metadata["workspace_path"])
+        self.assertEqual(stored["worktree_path"], metadata["worktree_path"])
+        self.assertEqual(stored["primary_repo_path"], metadata["primary_repo_path"])
+        self.assertEqual(stored["workspace_metadata"], metadata)
 
     async def test_spawn_failure_posts_system_comment_and_nats_alert(self) -> None:
         """A spawn exception posts the failure audit and emits an alert."""

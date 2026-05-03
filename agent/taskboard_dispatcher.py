@@ -10,7 +10,7 @@ import os
 import re
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -435,7 +435,14 @@ class DaemonTaskboardSpawner:
         session_id = str(kwargs["session_id"])
         agent_id = str(kwargs["agent_id"])
         task = kwargs.get("task") if isinstance(kwargs.get("task"), Mapping) else {}
-        workspace_context = _workspace_prompt_context(task, role=agent_id)
+        workspace_metadata = kwargs.get("workspace_metadata")
+        workspace_context = _workspace_prompt_context(
+            task,
+            role=agent_id,
+            workspace_metadata=(
+                workspace_metadata if isinstance(workspace_metadata, Mapping) else None
+            ),
+        )
         prompt = str(kwargs["prompt"])
         managed = await self.daemon_server.get_or_create_session(
             session_id,
@@ -457,6 +464,11 @@ class DaemonTaskboardSpawner:
             "worktree_path": workspace_context.get("worktree_path"),
             "primary_repo_path": workspace_context.get("primary_repo_path"),
             "workspace_manifest_path": workspace_context.get("workspace_manifest_path"),
+            "workspace_metadata": (
+                dict(workspace_metadata)
+                if isinstance(workspace_metadata, Mapping)
+                else None
+            ),
         }
         if hasattr(managed.session, "start_auto_mode"):
             # Phase 0 (#10247): per-role iteration budget instead of a
@@ -785,9 +797,41 @@ class TaskboardDispatcher:
                     role=route.role,
                 )
 
+                requested_session_id = _build_session_id(
+                    task_id=task_id,
+                    fire_generation=fire_generation,
+                    agent_id=route.agent_id,
+                )
+
+                try:
+                    workspace_metadata = self._prepare_role_workspace(
+                        latest_task,
+                        role=route.agent_id,
+                        branch=_branch_for_workspace(
+                            task=latest_task,
+                            task_id=task_id,
+                            fire_generation=fire_generation,
+                            agent_id=route.agent_id,
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._store.mark_session_failed(*reserved_key)
+                    error_message = _redact_known_secrets(str(exc))
+                    self._store.mark_processed(row, "spawn_failed", error=error_message)
+                    await self._post_spawn_failure_audit(
+                        row=row,
+                        task_id=task_id,
+                        fire_generation=fire_generation,
+                        role=route.agent_id,
+                        error=exc,
+                    )
+                    reserved_key = None
+                    return "spawn_failed"
+
                 prompt_task = _workspace_prompt_context(
                     latest_task,
                     role=route.agent_id,
+                    workspace_metadata=workspace_metadata,
                 )
                 prompt = render_taskboard_fire_prompt(
                     route.role,
@@ -795,27 +839,23 @@ class TaskboardDispatcher:
                     session_token=session_token,
                     session_generation=session_generation_value,
                 )
-                requested_session_id = _build_session_id(
-                    task_id=task_id,
-                    fire_generation=fire_generation,
-                    agent_id=route.agent_id,
-                )
 
-                # Phase 1 (#10223): record `queued` row in the agent_runs
-                # ledger before spawn. Best-effort; ledger errors don't block
-                # the dispatch flow. We pass the run_id through to the spawn
-                # so a future reaper can PATCH terminal status using it.
-                ledger_run_id = self._record_agent_run_queued(
-                    task_id=task_id,
-                    fire_generation=fire_generation,
-                    role=route.agent_id,
-                    session_id=requested_session_id,
-                    trigger_event_id=str(row.row_id),
-                    model=route.model,
-                    profile=route.profile,
-                )
+                ledger_run_id = None
 
                 try:
+                    # Phase 1 (#10223): record `queued` row in the agent_runs
+                    # ledger before spawn. Best-effort; ledger errors don't block
+                    # the dispatch flow. Placing this after workspace preparation
+                    # prevents workspace failures from creating queued ghosts.
+                    ledger_run_id = self._record_agent_run_queued(
+                        task_id=task_id,
+                        fire_generation=fire_generation,
+                        role=route.agent_id,
+                        session_id=requested_session_id,
+                        trigger_event_id=str(row.row_id),
+                        model=route.model,
+                        profile=route.profile,
+                    )
                     spawn_result = self.session_manager.spawn(
                         session_id=requested_session_id,
                         task_id=task_id,
@@ -826,6 +866,7 @@ class TaskboardDispatcher:
                         profile=route.profile,
                         prompt=prompt,
                         task=latest_task,
+                        workspace_metadata=workspace_metadata,
                         session_token=session_token,
                         session_generation=session_generation_value,
                     )
@@ -929,6 +970,83 @@ class TaskboardDispatcher:
                 "taskboard task is missing project.slug required for ticket workspace"
             )
         return task
+
+    def _prepare_role_workspace(
+        self,
+        task: Mapping[str, Any],
+        *,
+        role: str,
+        branch: str,
+    ) -> dict[str, Any] | None:
+        """Prepare the primary repo workspace for one reserved session."""
+
+        if not _ticket_workspace_enabled():
+            return None
+
+        project_slug = str(_first_non_empty(task, "project_slug", "projectSlug") or "")
+        if not project_slug:
+            raise ValueError(
+                "taskboard task is missing project.slug required for ticket workspace"
+            )
+        task_id = int(_first_non_empty(task, "task_id", "taskId", "id"))
+        epic_value = _first_non_empty(task, "epic_id", "epicId")
+        epic_id = int(epic_value) if epic_value not in (None, "") else None
+        primary_repo = _mapping_value(task, "primary_repository")
+        repo_url = str(
+            _first_non_empty(
+                primary_repo,
+                "repo_url",
+                "repoUrl",
+                fallback=task.get("repo_url") or "",
+            )
+            or ""
+        )
+        if not repo_url:
+            raise ValueError(
+                "taskboard task is missing primary repository URL required for ticket workspace"
+            )
+        default_branch = str(
+            _first_non_empty(
+                primary_repo,
+                "default_branch",
+                "defaultBranch",
+                fallback=task.get("default_branch") or "main",
+            )
+            or "main"
+        )
+
+        from agent.taskboard_workspace import (
+            RepoRef,
+            TaskboardWorkspaceConfig,
+            TicketWorkspaceManager,
+            TicketWorkspacePaths,
+        )
+
+        paths = TicketWorkspacePaths(
+            root=TaskboardWorkspaceConfig.from_sources().root,
+            project_slug=project_slug,
+            task_id=task_id,
+            epic_id=epic_id,
+        )
+        prepared = TicketWorkspaceManager(paths).prepare_role_workspace(
+            role=role,
+            repo=RepoRef.from_url(repo_url, default_branch=default_branch),
+            branch=branch,
+            base_ref=default_branch,
+        )
+        manifest_path = str(paths.shared_dir / "workspace-manifest.json")
+        return {
+            "workspace_path": str(paths.task_dir),
+            "worktree_path": str(prepared.worktree_path),
+            "primary_repo_path": str(prepared.worktree_path),
+            "workspace_manifest_path": manifest_path,
+            "workspace_manifest": asdict(prepared.manifest),
+            "repo_key": prepared.repo_key,
+            "branch": prepared.branch,
+            "commit": prepared.commit,
+            "detached": prepared.detached,
+            "reused": prepared.reused,
+        }
 
     async def _post_audit_for_row(self, row: PendingWebhookRow) -> bool:
         status = row.dispatch_status or ""
@@ -2285,10 +2403,46 @@ def _ticket_workspace_enabled() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _workspace_prompt_context(task: Mapping[str, Any], *, role: str) -> dict[str, Any]:
+def _branch_for_workspace(
+    *,
+    task: Mapping[str, Any],
+    task_id: int,
+    fire_generation: int,
+    agent_id: str,
+) -> str:
+    branch = _first_non_empty(
+        task,
+        "branch",
+        "branch_name",
+        "branchName",
+        "suggested_branch",
+        "suggestedBranch",
+    )
+    if branch:
+        return str(branch)
+    return f"task-{task_id}-fire-{fire_generation}-{agent_id}"
+
+
+def _workspace_prompt_context(
+    task: Mapping[str, Any],
+    *,
+    role: str,
+    workspace_metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return task metadata enriched with workspace path context when enabled."""
 
     prompt_task = dict(task) if isinstance(task, Mapping) else {}
+    if workspace_metadata:
+        for key in (
+            "workspace_path",
+            "worktree_path",
+            "primary_repo_path",
+            "workspace_manifest_path",
+        ):
+            value = workspace_metadata.get(key)
+            if value:
+                prompt_task[key] = str(value)
+        return prompt_task
     if not _ticket_workspace_enabled():
         return prompt_task
 
