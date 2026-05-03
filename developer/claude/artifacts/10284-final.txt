@@ -1,0 +1,18 @@
+Task 10284 final summary
+
+Commit: 3afa1b41e465e84da817122069c5e24a3fd43ee3
+
+Changes:
+- Added daemon/agent_worker.py, an out-of-process taskboard worker that requires KAI_TICKET_WORKSPACE, KAI_PRIMARY_REPO, KAI_WORKSPACE_MANIFEST, KAI_TASK_ID, and KAI_ROLE, then chdirs to KAI_PRIMARY_REPO before attaching session tools/runtime.
+- Updated DaemonTaskboardSpawner to keep legacy in-process run_input behavior for non-workspace sessions, but launch daemon.agent_worker as a subprocess for workspace-enabled taskboard sessions.
+- Worker events are relayed back into the daemon session bus via NATS when available, with a file relay fallback for local delivery.
+- Worker writes taskboard run_*.json artifacts compatible with the existing run-outcome reaper and preserves dispatcher session_id for ledger matching.
+- Added focused tests for workspace subprocess launch env/cwd behavior and preservation of legacy in-process behavior.
+
+Tests run:
+- env -u TASKBOARD_BEARER_TOKEN .venv/bin/python -m pytest -q tests/test_taskboard_dispatcher.py tests/test_taskboard_dispatcher_status_transitions.py tests/test_session_token_role_casing.py tests/test_session_token_mint.py tests/test_run_outcome_reaper.py tests/test_finalize_inprocess_terminal.py tests/test_orphan_session_terminal.py -q
+  Result: passed (74 tests). Pytest warning remains: Unknown config option asyncio_mode.
+
+Known follow-up / risk:
+- Worker stop/abort currently terminates the child process; graceful in-worker cancellation can be improved later if needed.
+- Event relay is best-effort over the daemon bus with file fallback; integration should be observed in a live daemon/NATS environment.
