@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -92,12 +94,20 @@ class _FakeDaemonSession:
     def __init__(self) -> None:
         self.taskboard_dispatcher = None
         self.auto_mode_calls: list[dict] = []
+        self.events: list[tuple[str, dict]] = []
+        self.activity_status = "idle"
 
     def attach_runtime(self, **_kwargs) -> None:
         return None
 
     def start_auto_mode(self, **kwargs) -> None:
         self.auto_mode_calls.append(kwargs)
+
+    def set_activity_status(self, status: str) -> None:
+        self.activity_status = status
+
+    def publish_event(self, topic: str, payload: dict | None = None) -> None:
+        self.events.append((topic, payload or {}))
 
 
 class _FakeManagedSession:
@@ -113,6 +123,7 @@ class _FakeDaemonServer:
         self.scheduler = None
         self.managed = _FakeManagedSession()
         self.run_inputs: list[tuple[object, str, str, str]] = []
+        self.nats_url = "nats://test"
 
     async def get_or_create_session(self, *_args, **_kwargs):
         return self.managed
@@ -522,6 +533,74 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored["worktree_path"], metadata["worktree_path"])
         self.assertEqual(stored["primary_repo_path"], metadata["primary_repo_path"])
         self.assertEqual(stored["workspace_metadata"], metadata)
+
+    async def test_daemon_spawner_workspace_enabled_starts_worker_subprocess(self) -> None:
+        """Workspace-enabled daemon spawn uses child worker cwd/env isolation."""
+
+        server = _FakeDaemonServer()
+        spawner = DaemonTaskboardSpawner(server)
+        metadata = {
+            "workspace_path": "/tmp/kai/task-10284",
+            "worktree_path": "/tmp/kai/task-10284/developer/repos/repo",
+            "primary_repo_path": "/tmp/kai/task-10284/developer/repos/repo",
+            "workspace_manifest_path": "/tmp/kai/task-10284/shared/workspace-manifest.json",
+        }
+
+        created: dict[str, object] = {}
+
+        async def fake_create_subprocess_exec(*cmd, **kwargs):
+            created["cmd"] = cmd
+            created["kwargs"] = kwargs
+
+            class _Proc:
+                returncode = None
+
+                async def wait(self):
+                    self.returncode = 0
+                    return 0
+
+                def terminate(self):
+                    self.returncode = -15
+
+                def kill(self):
+                    self.returncode = -9
+
+            return _Proc()
+
+        with mock.patch.dict(os.environ, {"KAI_TICKET_WORKSPACE_ENABLED": "1"}), mock.patch(
+            "asyncio.create_subprocess_exec",
+            side_effect=fake_create_subprocess_exec,
+        ), mock.patch.object(
+            spawner, "_relay_worker_events", side_effect=asyncio.CancelledError
+        ) as relay:
+            session_id = await spawner.spawn(
+                session_id="taskboard-10284-1-developer",
+                task_id=10284,
+                fire_generation=1,
+                role="Developer",
+                agent_id="developer",
+                model="codex",
+                profile="xhigh",
+                prompt="rendered prompt",
+                task={"id": 10284},
+                workspace_metadata=metadata,
+                session_token="tok",
+                session_generation=17,
+            )
+
+        self.assertEqual(session_id, "taskboard-10284-1-developer")
+        self.assertEqual(server.run_inputs, [])
+        self.assertEqual(created["kwargs"]["cwd"], metadata["primary_repo_path"])
+        env = created["kwargs"]["env"]
+        self.assertEqual(env["KAI_TICKET_WORKSPACE"], metadata["workspace_path"])
+        self.assertEqual(env["KAI_PRIMARY_REPO"], metadata["primary_repo_path"])
+        self.assertEqual(env["KAI_WORKSPACE_MANIFEST"], metadata["workspace_manifest_path"])
+        self.assertEqual(env["KAI_TASK_ID"], "10284")
+        self.assertEqual(env["KAI_ROLE"], "developer")
+        self.assertEqual(env["TASKBOARD_SESSION_TOKEN"], "tok")
+        self.assertIn("PYTHONPATH", env)
+        self.assertIn("daemon.agent_worker", created["cmd"])
+        relay.assert_called_once()
 
     async def test_spawn_failure_posts_system_comment_and_nats_alert(self) -> None:
         """A spawn exception posts the failure audit and emits an alert."""
