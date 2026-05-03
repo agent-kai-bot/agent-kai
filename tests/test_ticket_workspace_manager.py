@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import subprocess
 import threading
 from pathlib import Path
@@ -183,3 +184,44 @@ def test_git_command_error_redacts_url_userinfo() -> None:
     message = str(error)
     assert "super-secret" not in message
     assert "https://[REDACTED]@example.com/owner/repo.git" in message
+
+
+def test_done_workspace_archives_without_deleting(tmp_path: Path, source_repo: RepoRef) -> None:
+    manager = TicketWorkspaceManager(TicketWorkspacePaths(root=tmp_path / "tickets", project_slug="agent-kai", task_id=10286))
+    prepared = manager.prepare_role_workspace(role="developer", repo=source_repo, branch="task-10286")
+    (prepared.worktree_path / "note.txt").write_text("done\n", encoding="utf-8")
+
+    result = manager.archive_done_workspace(now=datetime(2026, 5, 3, tzinfo=timezone.utc))
+
+    assert result.archived is True
+    assert result.deleted is False
+    assert result.archive_path is not None
+    assert result.archive_path.parent == tmp_path / "tickets" / "_archive" / "2026" / "05" / "agent-kai"
+    assert prepared.worktree_path.exists()
+
+
+def test_cancelled_clean_workspace_deletes_without_archive(tmp_path: Path, source_repo: RepoRef) -> None:
+    manager = TicketWorkspaceManager(TicketWorkspacePaths(root=tmp_path / "tickets", project_slug="agent-kai", task_id=10286))
+    prepared = manager.prepare_role_workspace(role="developer", repo=source_repo, branch="task-10286")
+
+    result = manager.cleanup_cancelled_workspace(now=datetime(2026, 5, 3, tzinfo=timezone.utc))
+
+    assert result.archived is False
+    assert result.deleted is True
+    assert not prepared.worktree_path.exists()
+    assert manager.paths.task_dir.exists() is False
+    assert source_repo.key in result.pruned_repo_keys
+
+
+def test_cancelled_dirty_workspace_archives_then_deletes(tmp_path: Path, source_repo: RepoRef) -> None:
+    manager = TicketWorkspaceManager(TicketWorkspacePaths(root=tmp_path / "tickets", project_slug="agent-kai", task_id=10286))
+    prepared = manager.prepare_role_workspace(role="developer", repo=source_repo, branch="task-10286")
+    (prepared.worktree_path / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+    result = manager.cleanup_cancelled_workspace(now=datetime(2026, 5, 3, tzinfo=timezone.utc))
+
+    assert result.archived is True
+    assert result.dirty is True
+    assert result.archive_path is not None and result.archive_path.exists()
+    assert result.deleted is True
+    assert not manager.paths.task_dir.exists()

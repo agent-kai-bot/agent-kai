@@ -8,11 +8,15 @@ git-cache backed role worktrees for taskboard tickets.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+import contextlib
 import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
+import tarfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -20,6 +24,17 @@ from urllib.parse import urlparse
 
 DEFAULT_TICKET_WORKSPACE_ROOT = Path("/home/atc/workspaces/kai-tickets")
 WORKSPACE_ROOT_ENV = "KAI_TICKET_WORKSPACE_ROOT"
+DISK_WATERMARK_ENV = "KAI_TICKET_WORKSPACE_DISK_WATERMARK_PERCENT"
+DEFAULT_DISK_WATERMARK_PERCENT = 85.0
+ARCHIVE_EXCLUDES = (
+    "node_modules",
+    ".venv",
+    "dist",
+    "build",
+    ".next",
+    ".pytest_cache",
+    "__pycache__",
+)
 
 _SAFE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _HOST_PART_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
@@ -32,6 +47,10 @@ class WorkspacePathError(ValueError):
 
 class WorkspaceGitError(RuntimeError):
     """Raised when git-backed workspace preparation fails."""
+
+
+class WorkspaceDiskWatermarkError(WorkspaceGitError):
+    """Raised when workspace creation is blocked by high disk usage."""
 
 
 class WorkspaceGitCommandError(WorkspaceGitError):
@@ -74,6 +93,19 @@ class PreparedRoleWorkspace:
     detached: bool
     reused: bool
     manifest: TicketWorkspaceManifest
+
+
+@dataclass(frozen=True)
+class WorkspaceLifecycleResult:
+    """Result of archiving/deleting a task workspace."""
+
+    task_dir: Path
+    archived: bool
+    deleted: bool
+    archive_path: Path | None = None
+    dirty: bool = False
+    local_commits: bool = False
+    pruned_repo_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -311,6 +343,7 @@ class TicketWorkspaceManager:
         role_name = role_slug(role)
         if not repo.url:
             raise WorkspaceGitError("repo.url is required to prepare a git workspace")
+        ensure_disk_below_watermark(self.paths.root)
         branch_name = _safe_git_ref_name(branch, "branch")
         repo_key_value = repo.key
         cache_path = safe_join(
@@ -453,11 +486,59 @@ class TicketWorkspaceManager:
         manifest = TicketWorkspaceManifest.from_paths(self.paths, repos=[repo_manifest])
         manifest_path = safe_join(self.paths.shared_dir, "workspace-manifest.json")
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = _read_manifest(manifest_path)
+        repos = {repo.repo_key: repo for repo in (existing.repos if existing else [])}
+        repos[repo_manifest.repo_key] = repo_manifest
+        manifest = TicketWorkspaceManifest.from_paths(
+            self.paths, repos=list(repos.values())
+        )
         data = asdict(manifest)
         manifest_path.write_text(
             json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         return manifest
+
+    def archive_done_workspace(
+        self, *, now: datetime | None = None
+    ) -> WorkspaceLifecycleResult:
+        """Archive a Done task workspace without deleting the live task directory."""
+
+        archive_path = archive_task_workspace(self.paths, now=now)
+        return WorkspaceLifecycleResult(
+            task_dir=self.paths.task_dir,
+            archived=True,
+            deleted=False,
+            archive_path=archive_path,
+            dirty=workspace_has_dirty_changes(self.paths.task_dir),
+            local_commits=workspace_has_local_commits(self.paths.task_dir),
+        )
+
+    def cleanup_cancelled_workspace(
+        self, *, now: datetime | None = None
+    ) -> WorkspaceLifecycleResult:
+        """Delete a Cancelled task workspace, archiving first when it has local state."""
+
+        task_dir = self.paths.task_dir
+        dirty = workspace_has_dirty_changes(task_dir)
+        local_commits = workspace_has_local_commits(task_dir)
+        archive_path = (
+            archive_task_workspace(self.paths, now=now)
+            if (dirty or local_commits) and task_dir.exists()
+            else None
+        )
+        repo_keys = tuple(sorted(discover_workspace_repo_keys(task_dir)))
+        if task_dir.exists():
+            shutil.rmtree(task_dir)
+        pruned = prune_workspace_repos(self.paths.root, repo_keys)
+        return WorkspaceLifecycleResult(
+            task_dir=task_dir,
+            archived=archive_path is not None,
+            deleted=True,
+            archive_path=archive_path,
+            dirty=dirty,
+            local_commits=local_commits,
+            pruned_repo_keys=tuple(sorted(pruned)),
+        )
 
 
 def _git(command: list[str], *, cwd: Path | None) -> None:
@@ -530,6 +611,185 @@ def _load_json_config(config_path: str | Path | None) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         raise WorkspacePathError("agent config must be a JSON object")
     return loaded
+
+
+def disk_watermark_percent(env: dict[str, str] | None = None) -> float:
+    env_map = os.environ if env is None else env
+    raw = str(env_map.get(DISK_WATERMARK_ENV, "")).strip()
+    if not raw:
+        return DEFAULT_DISK_WATERMARK_PERCENT
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_DISK_WATERMARK_PERCENT
+    return value if 0 < value <= 100 else DEFAULT_DISK_WATERMARK_PERCENT
+
+
+def ensure_disk_below_watermark(root: str | Path, *, threshold_percent: float | None = None) -> None:
+    safe_root = safe_root_path(root)
+    probe = safe_root
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    usage = shutil.disk_usage(probe)
+    used_percent = (usage.used / usage.total) * 100 if usage.total else 100.0
+    threshold = disk_watermark_percent() if threshold_percent is None else float(threshold_percent)
+    if used_percent >= threshold:
+        raise WorkspaceDiskWatermarkError(
+            f"ticket workspace disk usage {used_percent:.1f}% is at/above "
+            f"{threshold:.1f}% watermark for {safe_root}"
+        )
+
+
+def archive_task_workspace(paths: TicketWorkspacePaths, *, now: datetime | None = None) -> Path:
+    if not paths.task_dir.exists():
+        raise WorkspacePathError(f"task workspace does not exist: {paths.task_dir}")
+    timestamp = now or datetime.now(timezone.utc)
+    archive_dir = safe_join(paths.root, "_archive", f"{timestamp.year:04d}", f"{timestamp.month:02d}", paths.project_slug)
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    zstd_path = archive_dir / f"task-{paths.task_id}.tar.zst"
+    gzip_path = archive_dir / f"task-{paths.task_id}.tar.gz"
+    if shutil.which("zstd") and shutil.which("tar"):
+        _archive_with_tar_zstd(paths.task_dir, zstd_path)
+        return zstd_path
+    _archive_with_tarfile_gzip(paths.task_dir, gzip_path)
+    return gzip_path
+
+
+def _archive_with_tar_zstd(task_dir: Path, archive_path: Path) -> None:
+    excludes = [f"--exclude={name}" for name in ARCHIVE_EXCLUDES]
+    tmp_path = archive_path.with_suffix(archive_path.suffix + ".tmp")
+    command = [
+        "tar",
+        "--zstd",
+        *excludes,
+        "-cf",
+        str(tmp_path),
+        "-C",
+        str(task_dir.parent),
+        task_dir.name,
+    ]
+    result = subprocess.run(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        with contextlib.suppress(FileNotFoundError):
+            tmp_path.unlink()
+        raise WorkspaceGitError(f"archive command failed: {result.stderr or result.stdout}")
+    tmp_path.replace(archive_path)
+
+
+def _archive_with_tarfile_gzip(task_dir: Path, archive_path: Path) -> None:
+    tmp_path = archive_path.with_suffix(archive_path.suffix + ".tmp")
+    with tarfile.open(tmp_path, "w:gz") as tar:
+        tar.add(task_dir, arcname=task_dir.name, filter=_tar_exclude_filter)
+    tmp_path.replace(archive_path)
+
+
+def _tar_exclude_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    if any(part in ARCHIVE_EXCLUDES for part in Path(info.name).parts):
+        return None
+    return info
+
+
+def workspace_has_dirty_changes(task_dir: Path) -> bool:
+    return any(
+        _repo_dirty(repo_path) for repo_path in discover_workspace_repo_paths(task_dir)
+    )
+
+
+def workspace_has_local_commits(task_dir: Path) -> bool:
+    return any(
+        _repo_has_local_commits(repo_path)
+        for repo_path in discover_workspace_repo_paths(task_dir)
+    )
+
+
+def discover_workspace_repo_paths(task_dir: Path) -> list[Path]:
+    if not task_dir.exists():
+        return []
+    return sorted(path for path in task_dir.glob("*/repos/*") if (path / ".git").exists())
+
+
+def discover_workspace_repo_keys(task_dir: Path) -> set[str]:
+    keys: set[str] = set()
+    for repo_path in discover_workspace_repo_paths(task_dir):
+        try:
+            keys.add(safe_repo_key(repo_path.name))
+        except WorkspacePathError:
+            continue
+    manifest = _read_manifest(task_dir / "shared" / "workspace-manifest.json")
+    if manifest:
+        keys.update(repo.repo_key for repo in manifest.repos)
+    return keys
+
+
+def prune_workspace_repos(root: Path, repo_keys: tuple[str, ...]) -> set[str]:
+    pruned: set[str] = set()
+    for key in repo_keys:
+        lock_path = safe_join(root, "_locks", "repo", key + ".lock")
+        cache_path = safe_join(root, "_git-cache", key + ".git")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            if cache_path.exists():
+                _git(["worktree", "prune"], cwd=cache_path)
+                pruned.add(key)
+    return pruned
+
+
+def _repo_dirty(repo_path: Path) -> bool:
+    try:
+        return bool(_git_stdout(["status", "--porcelain"], cwd=repo_path))
+    except WorkspaceGitError:
+        return True
+
+
+def _repo_has_local_commits(repo_path: Path) -> bool:
+    try:
+        current = _git_stdout(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
+        if current == "HEAD":
+            return False
+        upstream = _git_stdout(
+            ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+            cwd=repo_path,
+        )
+        return bool(
+            _git_stdout(["log", "--format=%H", f"{upstream}..HEAD", "--"], cwd=repo_path)
+        )
+    except WorkspaceGitError:
+        try:
+            return bool(
+                _git_stdout(
+                    ["log", "--format=%H", "--branches", "--not", "--remotes", "--"],
+                    cwd=repo_path,
+                )
+            )
+        except WorkspaceGitError:
+            return False
+
+
+def _read_manifest(manifest_path: Path) -> TicketWorkspaceManifest | None:
+    if not manifest_path.exists():
+        return None
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        repos = [RepoWorkspaceManifest(**repo) for repo in data.get("repos", [])]
+        return TicketWorkspaceManifest(
+            version=int(data["version"]),
+            project_slug=str(data["project_slug"]),
+            task_id=int(data["task_id"]),
+            epic_id=data.get("epic_id"),
+            root=str(data["root"]),
+            task_dir=str(data["task_dir"]),
+            shared_dir=str(data["shared_dir"]),
+            repos=repos,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise WorkspacePathError(f"invalid workspace manifest: {manifest_path}: {exc}") from exc
 
 
 def positive_int(value: int, name: str) -> int:

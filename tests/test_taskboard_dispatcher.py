@@ -681,7 +681,7 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._pending_statuses(), ["spawned"])
 
     async def test_non_forward_transition_is_noop_without_spawn(self) -> None:
-        """Transitions outside the v1 forward path are marked as no-ops."""
+        """Legacy flag-off terminal transitions remain no-ops."""
 
         self._insert_pending(
             400,
@@ -697,7 +697,8 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
             session_manager=session_manager,
         )
 
-        counts = await dispatcher.run_once()
+        with mock.patch.dict("os.environ", {"KAI_TICKET_WORKSPACE_ENABLED": "0"}):
+            counts = await dispatcher.run_once()
 
         self.assertEqual(counts, {"no_op_transition": 1})
         self.assertEqual(session_manager.spawn_calls, [])
@@ -1010,6 +1011,94 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
             f"- Workspace manifest path: {expected_task_dir / 'shared' / 'workspace-manifest.json'}",
             prompt,
         )
+
+
+    async def test_done_transition_archives_workspace_without_spawn(self) -> None:
+        """Done terminal transition archives the ticket workspace and does not spawn."""
+
+        row_id = self._insert_pending(
+            10286, 1, "Developer", from_status="Review", to_status="Done"
+        )
+        task_dir = (
+            Path(self.temp_dir.name)
+            / "tickets"
+            / "agent-kai"
+            / "epic-10032"
+            / "task-10286"
+        )
+        task_dir.mkdir(parents=True)
+        (task_dir / "shared").mkdir()
+        (task_dir / "shared" / "note.txt").write_text("done\n", encoding="utf-8")
+        task = {
+            "id": 10286,
+            "project_slug": "agent-kai",
+            "epic_id": 10032,
+            "agent": "Developer",
+            "fire_generation": 1,
+        }
+        task_client = _FakeTaskClient({10286: task})
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={}, task_client=task_client, session_manager=session_manager
+        )
+
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "KAI_TICKET_WORKSPACE_ENABLED": "1",
+                "KAI_TICKET_WORKSPACE_ROOT": str(Path(self.temp_dir.name) / "tickets"),
+            },
+        ):
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"workspace_archived": 1})
+        self.assertEqual(session_manager.spawn_calls, [])
+        self.assertTrue(
+            (
+                Path(self.temp_dir.name)
+                / "tickets"
+                / "_archive"
+                / "2026"
+                / "04"
+                / "agent-kai"
+            ).exists()
+        )
+        self.assertTrue(task_dir.exists())
+        self.assertEqual(
+            self._pending_row(row_id)["dispatch_status"], "workspace_archived"
+        )
+        self.assertIn("workspace workspace_archived", task_client.comments[0][1])
+
+    async def test_cancelled_clean_transition_deletes_workspace_without_archive(self) -> None:
+        """Cancelled clean workspace is hard-deleted without an archive."""
+
+        self._insert_pending(
+            10287, 1, "Developer", from_status="In Progress", to_status="Cancelled"
+        )
+        root = Path(self.temp_dir.name) / "tickets"
+        task_dir = root / "agent-kai" / "no-epic" / "task-10287"
+        task_dir.mkdir(parents=True)
+        (task_dir / "shared").mkdir()
+        task = {
+            "id": 10287,
+            "project_slug": "agent-kai",
+            "agent": "Developer",
+            "fire_generation": 1,
+        }
+        task_client = _FakeTaskClient({10287: task})
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(tasks={}, task_client=task_client, session_manager=session_manager)
+
+        with mock.patch.dict(
+            "os.environ",
+            {"KAI_TICKET_WORKSPACE_ENABLED": "1", "KAI_TICKET_WORKSPACE_ROOT": str(root)},
+        ):
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"workspace_deleted": 1})
+        self.assertFalse(task_dir.exists())
+        self.assertFalse((root / "_archive").exists())
+        self.assertEqual(session_manager.spawn_calls, [])
 
     async def test_tier_mapping_table(self) -> None:
         """Every supported taskboard role maps to the required model tier."""

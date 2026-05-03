@@ -238,6 +238,7 @@ class TaskboardDispatcherStatusTransitionTests(unittest.IsolatedAsyncioTestCase)
             session_manager=spawner,
             max_concurrent_spawns=6,
             clock=lambda: NOW,
+            agent_runs_client=type("DisabledAgentRuns", (), {"enabled": False})(),
         )
 
     def _create_pending_table(self) -> None:

@@ -900,6 +900,18 @@ class TaskboardDispatcher:
         try:
             from_status = row.payload.get("from_status")
             to_status = row.payload.get("to_status")
+            payload_task = _extract_task(row.payload)
+            task_id = _extract_task_id(row.payload, payload_task)
+
+            if _ticket_workspace_enabled() and _is_workspace_lifecycle_transition(to_status):
+                latest_task = await self._fetch_latest_task(task_id)
+                return await self._handle_workspace_lifecycle_transition(
+                    row=row,
+                    task=latest_task,
+                    to_status=str(to_status or ""),
+                    task_id=task_id,
+                )
+
             role_names = roles_to_fire(
                 str(from_status) if from_status is not None else None,
                 str(to_status) if to_status is not None else None,
@@ -908,8 +920,6 @@ class TaskboardDispatcher:
                 self._store.mark_processed(row, "no_op_transition")
                 return "no_op_transition"
 
-            payload_task = _extract_task(row.payload)
-            task_id = _extract_task_id(row.payload, payload_task)
             fire_generation = _extract_fire_generation(row.payload, payload_task)
             if fire_generation is None:
                 raise ValueError("taskboard payload is missing fire_generation")
@@ -1144,6 +1154,73 @@ class TaskboardDispatcher:
                 "taskboard task is missing project.slug required for ticket workspace"
             )
         return task
+
+    async def _handle_workspace_lifecycle_transition(
+        self,
+        *,
+        row: PendingWebhookRow,
+        task: Mapping[str, Any],
+        to_status: str,
+        task_id: int,
+    ) -> str:
+        """Archive/delete ticket workspaces for terminal task statuses."""
+
+        status_key = _normalize_status_key(to_status)
+        manager = self._workspace_manager_for_task(task)
+        if status_key == "done":
+            result = manager.archive_done_workspace(now=self.clock())
+            dispatch_status = "workspace_archived"
+        elif status_key in {"cancelled", "canceled"}:
+            result = manager.cleanup_cancelled_workspace(now=self.clock())
+            dispatch_status = (
+                "workspace_archived_deleted" if result.archived else "workspace_deleted"
+            )
+        else:  # pragma: no cover - guarded by caller
+            self._store.mark_processed(row, "no_op_transition")
+            return "no_op_transition"
+
+        self._store.mark_processed(row, dispatch_status)
+        posted = await self._post_audit_comment(
+            task_id,
+            _workspace_lifecycle_comment(
+                task_id=task_id,
+                to_status=status_key,
+                dispatch_status=dispatch_status,
+                archive_path=result.archive_path,
+                task_dir=result.task_dir,
+                dirty=result.dirty,
+                local_commits=result.local_commits,
+            ),
+        )
+        if posted:
+            self._store.mark_audit_posted(row)
+        return dispatch_status
+
+    def _workspace_manager_for_task(self, task: Mapping[str, Any]):
+        """Build a TicketWorkspaceManager for an already-normalized task."""
+
+        project_slug = str(_first_non_empty(task, "project_slug", "projectSlug") or "")
+        if not project_slug:
+            raise ValueError(
+                "taskboard task is missing project.slug required for ticket workspace"
+            )
+        task_id = int(_first_non_empty(task, "task_id", "taskId", "id"))
+        epic_value = _first_non_empty(task, "epic_id", "epicId")
+        epic_id = int(epic_value) if epic_value not in (None, "") else None
+
+        from agent.taskboard_workspace import (
+            TaskboardWorkspaceConfig,
+            TicketWorkspaceManager,
+            TicketWorkspacePaths,
+        )
+
+        paths = TicketWorkspacePaths(
+            root=TaskboardWorkspaceConfig.from_sources().root,
+            project_slug=project_slug,
+            task_id=task_id,
+            epic_id=epic_id,
+        )
+        return TicketWorkspaceManager(paths)
 
     def _prepare_role_workspace(
         self,
@@ -2281,6 +2358,28 @@ def _stuck_session_comment(*, task_id: int, session_id: str) -> str:
     )
 
 
+def _workspace_lifecycle_comment(
+    *,
+    task_id: int,
+    to_status: str,
+    dispatch_status: str,
+    archive_path: Path | None,
+    task_dir: Path,
+    dirty: bool,
+    local_commits: bool,
+) -> str:
+    state = "dirty/local commits" if dirty or local_commits else "clean"
+    if archive_path is not None:
+        return (
+            f"[System] workspace {dispatch_status} for #{task_id} on {to_status}: "
+            f"archived {task_dir} to {archive_path} ({state})"
+        )
+    return (
+        f"[System] workspace {dispatch_status} for #{task_id} on {to_status}: "
+        f"deleted {task_dir} ({state})"
+    )
+
+
 def _redact_known_secrets(message: str) -> str:
     redacted = str(message)
     try:
@@ -2591,6 +2690,14 @@ def _push_policy_for_repo(*, repo_url: str = "", owner: str = "", repo: str = ""
         except Exception:  # noqa: BLE001
             pass
     return "allowed"
+
+
+def _normalize_status_key(status: Any) -> str:
+    return re.sub(r"[-_\s]+", "_", str(status or "").strip().lower()).strip("_")
+
+
+def _is_workspace_lifecycle_transition(status: Any) -> bool:
+    return _normalize_status_key(status) in {"done", "cancelled", "canceled"}
 
 
 def _ticket_workspace_enabled() -> bool:

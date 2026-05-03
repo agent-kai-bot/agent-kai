@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from agent.taskboard_workspace import (
     DEFAULT_TICKET_WORKSPACE_ROOT,
+    WorkspaceDiskWatermarkError,
+    archive_task_workspace,
+    ensure_disk_below_watermark,
     RepoRef,
     RepoWorkspaceManifest,
     TaskboardWorkspaceConfig,
@@ -291,3 +295,28 @@ def test_safe_manifest_path_under_rejects_traversal_and_escape(tmp_path: Path) -
         safe_manifest_path_under(tmp_path, "../../escape", "repo path")
     with pytest.raises(WorkspacePathError):
         safe_manifest_path_under(tmp_path, "/etc", "repo path")
+
+
+def test_archive_task_workspace_excludes_heavy_directories(tmp_path: Path) -> None:
+    paths = TicketWorkspacePaths(root=tmp_path, project_slug="agent-kai", task_id=10286)
+    paths.task_dir.mkdir(parents=True)
+    (paths.task_dir / "keep.txt").write_text("keep\n", encoding="utf-8")
+    excluded = paths.task_dir / "node_modules"
+    excluded.mkdir()
+    (excluded / "drop.txt").write_text("drop\n", encoding="utf-8")
+
+    archive = archive_task_workspace(paths, now=datetime(2026, 5, 3, tzinfo=timezone.utc))
+
+    assert archive.parent == tmp_path / "_archive" / "2026" / "05" / "agent-kai"
+    assert archive.name in {"task-10286.tar.zst", "task-10286.tar.gz"}
+    if archive.suffix == ".gz":
+        import tarfile
+        with tarfile.open(archive, "r:gz") as tar:
+            names = tar.getnames()
+        assert "task-10286/keep.txt" in names
+        assert all("node_modules" not in name for name in names)
+
+
+def test_disk_watermark_guard_rejects_when_threshold_exceeded(tmp_path: Path) -> None:
+    with pytest.raises(WorkspaceDiskWatermarkError):
+        ensure_disk_below_watermark(tmp_path, threshold_percent=0.01)
