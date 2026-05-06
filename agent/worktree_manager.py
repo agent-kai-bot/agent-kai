@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
 
 LOGGER = logging.getLogger(__name__)
 SESSIONS_ROOT = Path("/tmp/kai/sessions")
+REPO_CACHE_ROOT = Path("/tmp/kai/taskboard-repos")
 
 
 class WorktreeManager:
@@ -69,7 +74,104 @@ class WorktreeManager:
 
         return SESSIONS_ROOT / str(session_id)
 
+    @classmethod
+    def ensure_repo_clone(
+        cls,
+        repo_url: str,
+        *,
+        repo_key: str | None = None,
+        default_branch: str = "main",
+    ) -> Path:
+        """Ensure a dispatcher-managed primary clone exists for ``repo_url``."""
+
+        sanitized_key = cls.repo_key_for_url(repo_url, fallback=repo_key or "repo")
+        repo_path = REPO_CACHE_ROOT / sanitized_key
+        repo_path.parent.mkdir(parents=True, exist_ok=True)
+        if not (repo_path / ".git").exists():
+            if repo_path.exists():
+                shutil.rmtree(repo_path, ignore_errors=True)
+            cls._run_static(["git", "clone", repo_url, str(repo_path)])
+        else:
+            cls._run_static(["git", "-C", str(repo_path), "fetch", "--prune", "origin"])
+
+        base_branch = (default_branch or "main").strip() or "main"
+        cls._run_static([
+            "git",
+            "-C",
+            str(repo_path),
+            "fetch",
+            "origin",
+            base_branch,
+        ])
+        return repo_path
+
+    @classmethod
+    def write_workspace_manifest(
+        cls,
+        worktree_path: Path,
+        *,
+        task_id: int | str | None,
+        session_id: str,
+        fire_generation: int | None,
+        agent_id: str,
+        role: str,
+        primary_repo_path: Path,
+        repo_url: str,
+        default_branch: str,
+        repo_routing_mode: str,
+        source: str = "",
+        repo_key: str = "",
+    ) -> Path:
+        """Write a per-session workspace manifest and return its path."""
+
+        manifest_path = Path(worktree_path) / ".kai" / "workspace-manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        payload: dict[str, Any] = {
+            "task_id": task_id,
+            "session_id": session_id,
+            "fire_generation": fire_generation,
+            "agent_id": agent_id,
+            "role": role,
+            "repo": {
+                "repo_key": repo_key or cls.repo_key_for_url(repo_url, fallback="repo"),
+                "repo_url": repo_url,
+                "default_branch": default_branch,
+                "source": source,
+                "routing_mode": repo_routing_mode,
+            },
+            "paths": {
+                "primary_repo_path": str(primary_repo_path),
+                "worktree_path": str(worktree_path),
+            },
+        }
+        manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        return manifest_path
+
+    @staticmethod
+    def repo_key_for_url(repo_url: str, *, fallback: str = "repo") -> str:
+        """Derive a stable filesystem-safe key from a repository URL."""
+
+        value = (repo_url or "").strip()
+        if not value:
+            return fallback
+        normalized = value
+        if ":" in value and "://" not in value and "@" in value:
+            _, tail = value.split(":", 1)
+            normalized = tail
+        else:
+            split = urlsplit(value)
+            normalized = f"{split.netloc}{split.path}" if split.netloc else split.path or value
+        normalized = normalized.strip().rstrip("/")
+        if normalized.endswith(".git"):
+            normalized = normalized[:-4]
+        key = re.sub(r"[^A-Za-z0-9._-]+", "-", normalized).strip("-._").lower()
+        return key or fallback
+
     def _run(self, cmd: list[str]) -> None:
+        self._run_static(cmd)
+
+    @staticmethod
+    def _run_static(cmd: list[str]) -> None:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
 
     def _best_effort_run(self, cmd: list[str]) -> None:
