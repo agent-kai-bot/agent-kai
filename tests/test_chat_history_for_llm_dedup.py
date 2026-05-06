@@ -27,16 +27,28 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from agent.core import AgentRunner
 
 
+class _NullLogger:
+    """No-op logger. ``_chat_history_for_llm`` emits a truncation log
+    via ``self.log.info`` when it drops messages — the dedup logic
+    doesn't care, but the call must not raise."""
+
+    def info(self, *_args, **_kwargs):
+        return None
+
+
 class _ChatHistoryHolder:
-    """Minimal AgentRunner subclass that bypasses runtime config entirely.
+    """Minimal AgentRunner stand-in that bypasses runtime config entirely.
 
     We only exercise ``_chat_history_for_llm`` here, which reads
-    ``self.chat_history`` and a couple of env-driven limits. No LLM, no
-    tool registry, no logger — those aren't relevant for the dedup logic.
+    ``self.chat_history``, a couple of env-driven limits, and a logger.
+    No LLM, no tool registry, no real runtime — those aren't relevant
+    for the dedup contract.
     """
 
     def __init__(self, history):
         self.chat_history = list(history)
+        self.agent_name = "test-agent"
+        self.log = _NullLogger()
 
 
 def _render(history, *, exclude_trailing_user_input=False):
