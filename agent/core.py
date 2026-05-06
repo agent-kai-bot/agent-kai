@@ -513,13 +513,27 @@ class AgentRunner:
             ],
         }
 
-    def _chat_history_for_llm(self) -> list[Any]:
+    def _chat_history_for_llm(
+        self,
+        *,
+        exclude_trailing_user_input: bool = False,
+    ) -> list[Any]:
         """Return a bounded chat history for one LLM invocation.
 
         The session still persists complete chat history on disk, but sending
         megabytes of prior turns to every request makes short prompts slow and
         expensive. This keeps the most recent messages within configurable
         count and character limits.
+
+        Args:
+            exclude_trailing_user_input: When True, drop the most recent
+                ``HumanMessage`` from the rendered history. The
+                ``AgentExecutor`` prompt template re-injects ``{input}`` on
+                top of ``chat_history``; if the most recent stored entry is
+                that same user input the model sees it twice back-to-back
+                (real bug surfaced 2026-05-06 in scheduled-job BIO turns).
+                Caller passes True from the input-handling path where the
+                user message was just appended for persistence.
 
         Returns:
             Recent chat messages ordered oldest to newest.
@@ -532,9 +546,16 @@ class AgentRunner:
             "AGENT_LLM_HISTORY_MAX_CHARS",
             DEFAULT_LLM_HISTORY_MAX_CHARS,
         )
+        source_history: list[Any] = list(self.chat_history)
+        if (
+            exclude_trailing_user_input
+            and source_history
+            and isinstance(source_history[-1], HumanMessage)
+        ):
+            source_history = source_history[:-1]
         selected: list[Any] = []
         total_chars = 0
-        for message in reversed(self.chat_history):
+        for message in reversed(source_history):
             message_chars = _message_content_length(message)
             if selected and total_chars + message_chars > max_chars:
                 break
@@ -779,7 +800,19 @@ class AgentRunner:
         else:
             self.log.info("AUTO_HIDDEN_TURN")
         self.log.info("USER_INPUT agent=%s input=%s", self.agent_name, log_input[:200])
-        self._active_llm_chat_history = self._chat_history_for_llm()
+        # Render the LLM-bound history. The LangChain ``AgentExecutor`` prompt
+        # template re-injects ``{input}`` as a fresh HumanMessage on top of
+        # ``chat_history``, so we must NOT include the just-appended user
+        # message in what we hand to the executor — otherwise the model sees
+        # the same user turn twice back-to-back. We persist the message in
+        # ``self.chat_history`` (so the next turn's history has it) but
+        # render the LLM history from everything BEFORE the current append.
+        # Bug surfaced 2026-05-06 in scheduled-job BIO turns where Dan saw
+        # two identical user messages literally back-to-back before the
+        # AI's reply.
+        self._active_llm_chat_history = self._chat_history_for_llm(
+            exclude_trailing_user_input=visible_input,
+        )
 
         # Log the full prompt at DEBUG level
         log_llm_request(
