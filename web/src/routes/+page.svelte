@@ -1464,17 +1464,22 @@
         </form>
 
         <div class="session-panel">
-          <h2>Known Sessions</h2>
           {#if knownSessions.length}
-            <ul class="session-list">
-              {#each knownSessions as session (session.name)}
-                <li>
-                  <strong>{session.name}</strong>
-                  <span>{session.activity_status ?? "idle"}</span>
-                </li>
-              {/each}
-            </ul>
+            <details class="session-details">
+              <summary>
+                Known sessions ({knownSessions.length})
+              </summary>
+              <ul class="session-list">
+                {#each knownSessions as session (session.name)}
+                  <li>
+                    <strong>{session.name}</strong>
+                    <span>{session.activity_status ?? "idle"}</span>
+                  </li>
+                {/each}
+              </ul>
+            </details>
           {:else}
+            <h2>Known Sessions</h2>
             <p>No session attached yet.</p>
           {/if}
         </div>
