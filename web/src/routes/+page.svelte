@@ -44,6 +44,7 @@
   import ChatPanel from "$lib/components/ChatPanel.svelte";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import EventPanel, { type EventRow } from "$lib/components/EventPanel.svelte";
+  import OverviewPanel from "$lib/components/OverviewPanel.svelte";
   import PositionsPanel from "$lib/components/PositionsPanel.svelte";
   import SignalPanel from "$lib/components/SignalPanel.svelte";
   import WatchlistPanel from "$lib/components/WatchlistPanel.svelte";
@@ -1036,21 +1037,11 @@
 <section class="landing-shell" class:dashboard-mode={Boolean(daemonConnection)}>
   {#if daemonConnection}
     <div class="dashboard-shell">
-      <header class="dashboard-topbar">
-        <div class="dashboard-heading">
-          <div class="dashboard-brand">
-            <p class="eyebrow">KAI</p>
-            <strong>Web Terminal</strong>
-          </div>
-          <div class="dashboard-meta status-strip">
-            <span>session: <strong>{activeSession}</strong></span>
-            <span>status: <strong>{currentStatus}</strong></span>
-            <span>queue: <strong>{queueDepth}</strong></span>
-            <span>model: <strong>{selectedAgentLabel()}</strong></span>
-            <span>chart: <strong>{chartSymbol} {chartTimeframe}</strong></span>
-            <span>positions: <strong>{portfolio.positions.length}</strong></span>
-            <span>watchlist: <strong>{watchlist.length}</strong></span>
-          </div>
+      <header class="dashboard-commandbar">
+        <div class="dashboard-brand">
+          <p class="eyebrow">KAI</p>
+          <strong>Web Terminal</strong>
+          <span class="connection-pill">{currentStatus} · q{queueDepth}</span>
         </div>
 
         <section class="chart-toolbar" aria-label="Chart controls">
@@ -1245,12 +1236,6 @@
         </div>
       </header>
 
-      <p class="model-status">{modelStatus}</p>
-
-      {#if snapshotSummary}
-        <p class="dashboard-summary">{snapshotSummary}</p>
-      {/if}
-
       {#if attachError}
         <p class="dashboard-error">{attachError}</p>
       {/if}
@@ -1358,6 +1343,31 @@
         ></button>
 
         <div class="dashboard-column right">
+          <OverviewPanel
+            activeSession={activeSession}
+            currentStatus={currentStatus}
+            queueDepth={queueDepth}
+            selectedAgentLabel={selectedAgentLabel()}
+            modelStatus={modelStatus}
+            snapshotSummary={snapshotSummary}
+            chartSymbol={chartSymbol}
+            chartTimeframe={chartTimeframe}
+            chartSource={chartSource}
+            chartMode={chartMode}
+            chartUpdateLabel={chartUpdateLabel()}
+            chartPriceLabel={formatPrice(chartPrice())}
+            chartChangeLabel={formatChange(chartQuote?.price_change_24h_pct)}
+            streamLatencyLabel={streamLatencyLabel()}
+            streamThroughputLabel={streamThroughputLabel()}
+            positionsCount={portfolio.positions.length}
+            watchlistCount={watchlist.length}
+            signalCount={signalAlerts.length}
+            schedulerEventCount={schedulerEvents.length}
+            natsEventCount={natsEvents.length}
+            attachError={attachError}
+            initiallyOpen={false}
+            mobileCollapsible={true}
+          />
           <SignalPanel
             activeSymbol={chartSymbol}
             alerts={signalAlerts}
