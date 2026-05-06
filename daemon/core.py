@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -807,10 +808,15 @@ class Session:
 
     @staticmethod
     def _tool_input_key(value: Any) -> str:
-        try:
-            return json.dumps(value, sort_keys=True, default=str)
-        except TypeError:
-            return repr(value)
+        """Return a stable, non-reversible key for tool input correlation.
+
+        Tool inputs can contain credentials, prompts, file contents, or other
+        sensitive material.  The auto-response evaluator boundary only needs a
+        repeatable correlation key, never the raw arguments, so hash a canonical
+        representation and expose a short digest.
+        """
+        canonical = json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
     def auto_elapsed_seconds(self) -> float:
         if self.auto_start_time <= 0:

@@ -298,6 +298,43 @@ class SessionAutoModeTests(unittest.IsolatedAsyncioTestCase):
             "auto evaluator confidence below threshold",
         )
 
+    async def test_evaluator_tool_input_key_is_digest_not_raw_payload(self):
+        secret = "super-secret-token-123"
+        session, runner = self._make_session(
+            [
+                {
+                    "tools": [("file_read", {"path": "/tmp/data", "api_key": secret})],
+                    "final": "Done.\n[AUTO_STATE: done]",
+                }
+            ]
+        )
+        session.auto_evaluator_enabled = True
+        session.auto_evaluator_shadow = True
+        evaluator = _StaticEvaluator(
+            [
+                AutoEvaluationDecision(
+                    "ACCEPT_MAIN_STATE",
+                    1.0,
+                    "accepted",
+                    "main_done_accepted",
+                )
+            ]
+        )
+        session.auto_response_evaluator = evaluator
+        session.start_auto_mode(max_iterations=5)
+
+        await _collect_events(session, "Analyze")
+
+        self.assertEqual(runner.inputs, ["Analyze"])
+        self.assertEqual(len(evaluator.inputs), 1)
+        tool_call = evaluator.inputs[0].turn_tool_calls[0]
+        self.assertEqual(tool_call.name, "file_read")
+        self.assertRegex(tool_call.input_key, r"^[0-9a-f]{16}$")
+        self.assertNotIn(secret, tool_call.input_key)
+        self.assertNotIn("api_key", tool_call.input_key)
+        self.assertNotIn("path", tool_call.input_key)
+        self.assertNotIn("{", tool_call.input_key)
+
     async def test_budget_exhaustion_stops_autonomous_loop(self):
         session, runner = self._make_session(
             [
