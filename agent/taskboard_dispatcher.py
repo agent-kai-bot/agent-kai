@@ -486,6 +486,7 @@ class DaemonTaskboardSpawner:
             )
             repo_root = self.repo_root
             multi_repo_enabled = _multi_repo_routing_enabled()
+            normalized_role = _normalize_role(str(kwargs.get("role") or agent_id))
             if repo_target.routing_mode == "explicit" and multi_repo_enabled:
                 repo_root = WorktreeManager.ensure_repo_clone(
                     repo_target.repo_url,
@@ -493,6 +494,12 @@ class DaemonTaskboardSpawner:
                     default_branch=repo_target.default_branch,
                 )
             elif repo_target.routing_mode == "explicit" and not multi_repo_enabled:
+                if normalized_role == "developer":
+                    raise RepoRoutingError(
+                        "explicit repo routing metadata present for role="
+                        f"{kwargs.get('role') or agent_id} but "
+                        f"{MULTI_REPO_ROUTING_ENV}=0; refusing local-repo fallback"
+                    )
                 repo_target = RepoTarget(
                     repo_key=WorktreeManager.repo_key_for_url(
                         str(self.repo_root),

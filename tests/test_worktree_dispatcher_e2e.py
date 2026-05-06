@@ -7,7 +7,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agent.taskboard_dispatcher import DaemonTaskboardSpawner, _finalize_dispatcher_inprocess_run
+from agent.taskboard_dispatcher import (
+    DaemonTaskboardSpawner,
+    RepoRoutingError,
+    _finalize_dispatcher_inprocess_run,
+)
 
 
 class _FakeSession:
@@ -128,29 +132,23 @@ class WorktreeDispatcherE2ETests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("sess-e2e", cleanup_calls)
 
-    async def test_spawn_uses_local_repo_when_multi_repo_flag_disabled(self) -> None:
+    async def test_spawn_fails_closed_for_developer_when_multi_repo_flag_disabled(self) -> None:
         daemon = _FakeDaemon()
         spawner = DaemonTaskboardSpawner(daemon_server=daemon, repo_root=Path("/srv/local/kai"))
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            manifest_path = Path(temp_dir) / "workspace-manifest.json"
-
-            def write_manifest(*args, **kwargs):
-                manifest_path.write_text('{"repo":{"routing_mode":"fallback_local_flag_disabled"}}')
-                return manifest_path
-
-            with mock.patch("agent.taskboard_dispatcher._worktree_isolation_enabled", return_value=True), \
-                mock.patch("agent.taskboard_dispatcher._multi_repo_routing_enabled", return_value=False), \
-                mock.patch("agent.taskboard_dispatcher.WorktreeManager.ensure_repo_clone") as ensure_repo_clone, \
-                mock.patch("agent.taskboard_dispatcher.WorktreeManager.create", return_value=Path("/tmp/kai/sessions/sess-local")), \
-                mock.patch("agent.taskboard_dispatcher.WorktreeManager.write_workspace_manifest", side_effect=write_manifest), \
-                mock.patch("agent.taskboard_dispatcher._resolve_max_iterations_for_role", return_value=5), \
-                mock.patch("agent.agent_runs_client.AgentRunsClient.from_env") as from_env:
-                client = mock.Mock(enabled=True)
-                client.list_for_task.return_value = [{"id": 8, "session_id": "sess-local", "status": "spawning"}]
-                client.patch.return_value = None
-                from_env.return_value = client
-                session_id = await spawner.spawn(
+        with mock.patch("agent.taskboard_dispatcher._worktree_isolation_enabled", return_value=True), \
+            mock.patch("agent.taskboard_dispatcher._multi_repo_routing_enabled", return_value=False), \
+            mock.patch("agent.taskboard_dispatcher.WorktreeManager.ensure_repo_clone") as ensure_repo_clone, \
+            mock.patch("agent.taskboard_dispatcher.WorktreeManager.create") as create_worktree, \
+            mock.patch("agent.taskboard_dispatcher.WorktreeManager.write_workspace_manifest") as write_manifest, \
+            mock.patch("agent.taskboard_dispatcher._resolve_max_iterations_for_role", return_value=5), \
+            mock.patch("agent.agent_runs_client.AgentRunsClient.from_env") as from_env:
+            client = mock.Mock(enabled=True)
+            client.list_for_task.return_value = [{"id": 8, "session_id": "sess-local", "status": "spawning"}]
+            client.patch.return_value = None
+            from_env.return_value = client
+            with self.assertRaises(RepoRoutingError) as err:
+                await spawner.spawn(
                     session_id="sess-local",
                     task_id=10367,
                     fire_generation=2,
@@ -168,18 +166,8 @@ class WorktreeDispatcherE2ETests(unittest.IsolatedAsyncioTestCase):
                     session_generation=None,
                 )
 
-            self.assertEqual(session_id, "sess-local")
-            await daemon.managed.current_input_task
-            ensure_repo_clone.assert_not_called()
-            self.assertEqual(
-                daemon.managed.session.taskboard_dispatcher["primary_repo_path"],
-                "/srv/local/kai",
-            )
-            self.assertEqual(
-                daemon.managed.session.taskboard_dispatcher["repo_routing_mode"],
-                "fallback_local_flag_disabled",
-            )
-            started_prompt = daemon.last_prompt
-            self.assertIsNotNone(started_prompt)
-            self.assertIn("Target repo URL: /srv/local/kai", started_prompt)
-            self.assertIn("Repo routing mode: fallback_local_flag_disabled", started_prompt)
+        self.assertIn("TASKBOARD_MULTI_REPO_ROUTING=0", str(err.exception))
+        ensure_repo_clone.assert_not_called()
+        create_worktree.assert_not_called()
+        write_manifest.assert_not_called()
+        self.assertEqual(daemon.last_prompt, None)

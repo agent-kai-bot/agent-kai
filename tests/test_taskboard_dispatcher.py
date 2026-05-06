@@ -256,6 +256,49 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_explicit_repo_with_multi_repo_disabled_marks_spawn_failed(self) -> None:
+        """Developer dispatch fails closed when explicit repo routing cannot be honored."""
+
+        row_id = self._insert_pending(10367, 8, "Developer")
+        task = {
+            "id": 10367,
+            "agent": "Developer",
+            "fire_generation": 8,
+            "project": {"repoUrl": "https://forgejo.example/openclawdev/taskboard.git"},
+        }
+        task_client = _FakeTaskClient({10367: task})
+        session_manager = _FakeSessionManager(
+            spawn_error=RepoRoutingError(
+                "explicit repo routing metadata present for role=Developer but "
+                "TASKBOARD_MULTI_REPO_ROUTING=0; refusing local-repo fallback"
+            )
+        )
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="rendered prompt",
+        ):
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawn_failed": 1})
+        self.assertEqual(session_manager.spawn_calls, [])
+        self.assertEqual(self._pending_row(row_id)["dispatch_status"], "spawn_failed")
+        self.assertEqual(
+            task_client.comments,
+            [
+                (
+                    10367,
+                    "[System] spawn failed for #10367: explicit repo routing metadata present for role=Developer but "
+                    "TASKBOARD_MULTI_REPO_ROUTING=0; refusing local-repo fallback; retry with agent-ops fire 10367",
+                )
+            ],
+        )
+
     async def test_dedup_marks_second_row_duplicate(self) -> None:
         """Two rows with the same task/fire/agent key spawn only once."""
 
