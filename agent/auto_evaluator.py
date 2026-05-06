@@ -165,7 +165,7 @@ def parse_auto_evaluation_decision(raw: str | bytes | dict[str, Any]) -> AutoEva
 
         if decision not in DECISIONS:
             return stop_decision("auto evaluator returned invalid decision")
-        if not isinstance(confidence, int | float):
+        if isinstance(confidence, bool) or not isinstance(confidence, int | float):
             return stop_decision("auto evaluator returned invalid confidence")
         confidence_float = float(confidence)
         if confidence_float < 0.0 or confidence_float > 1.0:

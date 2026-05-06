@@ -54,6 +54,13 @@ class AutoEvaluationDecisionParserTests(unittest.TestCase):
                 "reason": "x",
                 "pattern": "unknown",
             },
+            {
+                "decision": "CONTINUE",
+                "confidence": True,
+                "reason": "x",
+                "pattern": "unknown",
+                "auto_reply_template": "continue_next_safe_step",
+            },
         ]
 
         for payload in cases:
