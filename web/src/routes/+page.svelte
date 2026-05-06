@@ -1412,14 +1412,23 @@
         <form class="connect-panel" onsubmit={onConnectSubmit}>
           <label>
             <span>Session</span>
-            <input
-              bind:value={sessionName}
-              list="known-sessions"
-              name="session"
-              placeholder="terminal"
-              required
-              type="text"
-            />
+            {#if knownSessions.length}
+              <select bind:value={sessionName} name="session" required>
+                {#each knownSessions as session (session.name)}
+                  <option value={session.name}>
+                    {session.name}{session.activity_status ? ` — ${session.activity_status}` : ""}
+                  </option>
+                {/each}
+              </select>
+            {:else}
+              <input
+                bind:value={sessionName}
+                name="session"
+                placeholder="terminal"
+                required
+                type="text"
+              />
+            {/if}
           </label>
 
           <label>
@@ -1433,12 +1442,6 @@
               type="password"
             />
           </label>
-
-          <datalist id="known-sessions">
-            {#each knownSessions as session (session.name)}
-              <option value={session.name}></option>
-            {/each}
-          </datalist>
 
           <div class="button-row">
             <button disabled={isConnecting} type="submit">
