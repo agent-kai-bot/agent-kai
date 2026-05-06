@@ -258,7 +258,9 @@ class TaskboardClient:
 
         Args:
             task_id: Taskboard task id.
-            status: New task status.
+            status: New task status. Accepts legacy values plus SPEC v23
+                canonical statuses such as ``Code Review``,
+                ``Security Audit``, ``QA``, and ``Ready to Merge``.
             reason: Optional transition reason.
             agent: Actor display name.
             token: Optional session token.
@@ -567,7 +569,9 @@ def create_taskboard_tools(
             name="taskboard_move",
             description=(
                 "Move a task through workflow. Inputs: task_id, status, reason, "
-                "agent, token, generation, force_code_review, force_security_audit."
+                "agent, token, generation, force_code_review, force_security_audit. "
+                "Status accepts legacy values plus SPEC v23 canonical states like "
+                "Code Review, Security Audit, QA, and Ready to Merge."
             ),
         ),
         StructuredTool.from_function(

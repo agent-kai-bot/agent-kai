@@ -31,6 +31,6 @@ Use branch `{branch_name_suggestion}` unless an existing branch for this task is
 Run focused tests for the changed behavior. If tests cannot run, explain the blocker and the remaining risk in the final summary.
 
 ## Submit
-Move the task to Review only after implementation and verification are complete. Write the final summary to `{output_target}` with the commit sha, tests run, and any known follow-up.
+Move the task to Code Review only after implementation and verification are complete. The taskboard `/move` API accepts SPEC v23 canonical statuses such as `Code Review`, `Security Audit`, `QA`, and `Ready to Merge`. Write the final summary to `{output_target}` with the commit sha, tests run, and any known follow-up.
 
 STOP: TASKBOARD_FIRE_PROMPT_END

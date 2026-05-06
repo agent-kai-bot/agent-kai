@@ -49,6 +49,8 @@ class PromptRendererTests(unittest.TestCase):
         self.assertIn("task-10153-kai-prompt-templates-for-taskboard-auto-fire", rendered)
         self.assertIn("developer/claude/artifacts/10153-final.txt", rendered)
         self.assertIn("Worktree path: ", rendered)
+        self.assertIn("Move the task to Code Review only after", rendered)
+        self.assertIn("/move` API accepts SPEC v23 canonical statuses", rendered)
         for placeholder in (
             "{title}",
             "{description}",
