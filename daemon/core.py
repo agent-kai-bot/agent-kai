@@ -21,6 +21,14 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from agent.auto_evaluator import (
+    AutoEvaluationInput,
+    AutoResponseEvaluator,
+    MIN_CONTINUE_CONFIDENCE,
+    ToolCallSummary,
+    render_auto_reply,
+    validate_auto_evaluation_decision,
+)
 from agent.auto_prompt import parse_auto_state
 from agent.core import AgentRunner
 from agent.signal_consumer import SignalConsumer
@@ -70,6 +78,33 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
         "+00:00", "Z"
     )
+
+
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, *, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
+def _env_positive_int(name: str, *, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return max(0, int(default))
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return max(0, int(default))
 
 
 def _normalize_session_name(name: str) -> str:
@@ -617,6 +652,15 @@ class Session:
         self.auto_iterations_total: int = 0
         self.auto_start_time: float = 0.0
         self.auto_max_duration: float = DEFAULT_AUTO_MAX_DURATION_SECONDS
+        self.auto_response_evaluator = AutoResponseEvaluator()
+        self.auto_evaluator_enabled: bool | None = None
+        self.auto_evaluator_shadow: bool | None = None
+        self.auto_evaluator_min_confidence: float = _env_float(
+            "KAI_AUTO_EVALUATOR_MIN_CONFIDENCE",
+            default=MIN_CONTINUE_CONFIDENCE,
+        )
+        self.auto_evaluator_continuations_used: int = 0
+        self.auto_evaluator_max_continuations: int = 0
 
         self.sub_agent_pool = SessionSubAgentPool(
             session_name=self.name,
@@ -803,6 +847,22 @@ class Session:
         self.auto_iterations_total = normalized_iterations
         self.auto_iterations_remaining = normalized_iterations
         self.auto_start_time = time.monotonic()
+        if self.auto_evaluator_enabled is None:
+            self.auto_evaluator_enabled = _env_flag(
+                "KAI_AUTO_EVALUATOR_ENABLED",
+                default=bool(self.taskboard_dispatcher),
+            )
+        if self.auto_evaluator_shadow is None:
+            self.auto_evaluator_shadow = _env_flag(
+                "KAI_AUTO_EVALUATOR_SHADOW",
+                default=True,
+            )
+        self.auto_evaluator_continuations_used = 0
+        default_evaluator_quota = 3 if self.taskboard_dispatcher else 1
+        self.auto_evaluator_max_continuations = _env_positive_int(
+            "KAI_AUTO_EVALUATOR_MAX_CONTINUATIONS",
+            default=default_evaluator_quota,
+        )
         if self.agent_runner is not None:
             self.agent_runner._auto_readonly = self.auto_readonly
             self.agent_runner.set_auto_mode(True, max_iterations=normalized_iterations)
@@ -830,6 +890,8 @@ class Session:
         self.auto_iterations_remaining = 0
         self.auto_iterations_total = 0
         self.auto_start_time = 0.0
+        self.auto_evaluator_continuations_used = 0
+        self.auto_evaluator_max_continuations = 0
         if self.agent_runner is not None:
             self.agent_runner._auto_readonly = False
             self.agent_runner.set_auto_mode(False)
@@ -1086,14 +1148,6 @@ class Session:
                             f"reason={auto_reason or '<none>'}",
                         ],
                     )
-                    if auto_state == "done":
-                        stopped = self.stop_auto_mode(auto_reason or "task complete")
-                        yield {"type": "auto_stopped", "data": stopped}
-                        break
-                    if auto_state == "pause":
-                        stopped = self.stop_auto_mode(auto_reason or "paused")
-                        yield {"type": "auto_stopped", "data": stopped}
-                        break
 
                     if self.auto_iterations_remaining <= 0:
                         stopped = self.stop_auto_mode("iteration budget exhausted")
@@ -1106,7 +1160,10 @@ class Session:
                         break
 
                     normalized_final = turn_final_text.strip()
-                    if normalized_final and normalized_final == last_final_text:
+                    repeated_final_detected = bool(
+                        normalized_final and normalized_final == last_final_text
+                    )
+                    if repeated_final_detected:
                         log_auto_event(
                             self,
                             "AUTO_LOOP_DETECTED",
@@ -1122,7 +1179,7 @@ class Session:
                         consecutive_no_tool_turns = 0
                     else:
                         consecutive_no_tool_turns += 1
-                        if consecutive_no_tool_turns >= 2:
+                        if consecutive_no_tool_turns >= 2 and auto_state != "done":
                             log_auto_event(
                                 self,
                                 "AUTO_LOOP_DETECTED",
@@ -1147,6 +1204,115 @@ class Session:
                             ["type=repeated_tool_call"],
                         )
                         stopped = self.stop_auto_mode("loop detected: repeated tool call")
+                        yield {"type": "auto_stopped", "data": stopped}
+                        break
+
+                    evaluator_decision = None
+                    if self.auto_evaluator_enabled:
+                        evaluator_decision = self.auto_response_evaluator.evaluate(
+                            AutoEvaluationInput(
+                                session_name=self.name,
+                                agent_name=str(self.agent_name or ""),
+                                auto_mode=bool(self.auto_mode),
+                                readonly=bool(self.auto_readonly),
+                                main_response=turn_final_text,
+                                parsed_auto_state=auto_state,  # type: ignore[arg-type]
+                                parsed_auto_reason=auto_reason,
+                                runtime_pause_reason=None,
+                                turn_tool_calls=[
+                                    ToolCallSummary(name=name, input_key=input_key)
+                                    for name, input_key in turn_tool_calls
+                                ],
+                                consecutive_no_tool_turns=consecutive_no_tool_turns,
+                                repeated_final_detected=repeated_final_detected,
+                                iterations_remaining=self.auto_iterations_remaining,
+                                elapsed_seconds=self.auto_elapsed_seconds(),
+                            )
+                        )
+                        evaluator_decision = validate_auto_evaluation_decision(
+                            evaluator_decision,
+                            readonly=self.auto_readonly,
+                            min_confidence=self.auto_evaluator_min_confidence,
+                        )
+                        evaluation_payload = evaluator_decision.to_event_payload()
+                        self.publish_event("auto.evaluation", evaluation_payload)
+                        yield {"type": "auto_evaluation", "data": evaluation_payload}
+                        log_auto_event(
+                            self,
+                            "AUTO_EVALUATION",
+                            [
+                                f"decision={evaluator_decision.decision}",
+                                f"pattern={evaluator_decision.pattern}",
+                                f"confidence={evaluator_decision.confidence:.2f}",
+                            ],
+                        )
+
+                    if (
+                        evaluator_decision is not None
+                        and not self.auto_evaluator_shadow
+                        and evaluator_decision.decision == "PAUSE"
+                    ):
+                        stopped = self.stop_auto_mode(evaluator_decision.reason or "paused")
+                        yield {"type": "auto_stopped", "data": stopped}
+                        break
+
+                    if (
+                        evaluator_decision is not None
+                        and not self.auto_evaluator_shadow
+                        and evaluator_decision.decision == "STOP"
+                    ):
+                        stopped = self.stop_auto_mode(
+                            evaluator_decision.reason or "auto evaluator stopped"
+                        )
+                        yield {"type": "auto_stopped", "data": stopped}
+                        break
+
+                    if (
+                        evaluator_decision is not None
+                        and not self.auto_evaluator_shadow
+                        and evaluator_decision.decision == "CONTINUE"
+                    ):
+                        if (
+                            self.auto_evaluator_continuations_used
+                            >= self.auto_evaluator_max_continuations
+                        ):
+                            stopped = self.stop_auto_mode(
+                                "auto evaluator continuation quota exhausted"
+                            )
+                            yield {"type": "auto_stopped", "data": stopped}
+                            break
+                        auto_reply = render_auto_reply(evaluator_decision.auto_reply_template)
+                        if not auto_reply:
+                            stopped = self.stop_auto_mode(
+                                "auto evaluator returned invalid reply template"
+                            )
+                            yield {"type": "auto_stopped", "data": stopped}
+                            break
+                        self.auto_evaluator_continuations_used += 1
+                        reply_payload = {
+                            "template": evaluator_decision.auto_reply_template,
+                            "reason": evaluator_decision.pattern,
+                        }
+                        self.publish_event("auto.reply", reply_payload)
+                        yield {"type": "auto_reply", "data": reply_payload}
+                        log_auto_event(
+                            self,
+                            "AUTO_REPLY",
+                            [
+                                f"template={evaluator_decision.auto_reply_template}",
+                                f"reason={evaluator_decision.pattern}",
+                            ],
+                        )
+                        current_input = auto_reply
+                        is_auto_continuation = True
+                        continue
+
+                    if auto_state == "done":
+                        stopped = self.stop_auto_mode(auto_reason or "task complete")
+                        yield {"type": "auto_stopped", "data": stopped}
+                        break
+                    if auto_state == "pause":
+                        stopped = self.stop_auto_mode(auto_reason or "paused")
                         yield {"type": "auto_stopped", "data": stopped}
                         break
 

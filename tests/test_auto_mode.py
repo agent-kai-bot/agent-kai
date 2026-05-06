@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import unittest
 from contextlib import contextmanager
+from unittest.mock import patch
 
 from langchain_core.messages import AIMessage, HumanMessage
 
+from agent.auto_evaluator import AutoEvaluationDecision
 from agent.core import AgentRunner
 from agent.tools import file_read, file_write, shell_exec
 from daemon.core import Session
@@ -22,6 +25,23 @@ class _DummyLogger:
 
     def error(self, *_args, **_kwargs):
         pass
+
+
+class _StaticEvaluator:
+    def __init__(self, decisions: list[AutoEvaluationDecision]) -> None:
+        self.decisions = list(decisions)
+        self.inputs = []
+
+    def evaluate(self, data):
+        self.inputs.append(data)
+        if self.decisions:
+            return self.decisions.pop(0)
+        return AutoEvaluationDecision(
+            "ACCEPT_MAIN_STATE",
+            1.0,
+            "main state accepted",
+            "unknown",
+        )
 
 
 class _FakeRunner:
@@ -127,6 +147,156 @@ class SessionAutoModeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(runner.inputs, ["Analyze"])
         self.assertEqual(events[-1]["data"]["reason"], "missing or malformed AUTO_STATE footer")
+
+    async def test_evaluator_continue_overrides_done_and_injects_template(self):
+        session, runner = self._make_session(
+            [
+                {"final": "Next I will update tests.\n[AUTO_STATE: done]"},
+                {"final": "Task complete.\n[AUTO_STATE: done]"},
+            ]
+        )
+        session.auto_evaluator_enabled = True
+        session.auto_evaluator_shadow = False
+        session.auto_response_evaluator = _StaticEvaluator(
+            [
+                AutoEvaluationDecision(
+                    "CONTINUE",
+                    0.95,
+                    "main stopped prematurely",
+                    "declared_next_step",
+                    "finish_requested_artifact",
+                ),
+                AutoEvaluationDecision(
+                    "ACCEPT_MAIN_STATE",
+                    1.0,
+                    "task complete",
+                    "main_done_accepted",
+                ),
+            ]
+        )
+        session.start_auto_mode(max_iterations=5)
+
+        events = await _collect_events(session, "Do the task")
+
+        self.assertEqual(
+            runner.inputs,
+            ["Do the task", "Finish the artifact or final answer requested by the task."],
+        )
+        self.assertEqual(runner.continuation_flags, [False, True])
+        self.assertIn("auto_evaluation", [event["type"] for event in events])
+        self.assertIn("auto_reply", [event["type"] for event in events])
+        self.assertEqual(events[-1]["data"]["reason"], "task complete")
+
+    async def test_evaluator_recovers_malformed_footer(self):
+        session, runner = self._make_session(
+            [
+                {"final": "I can run the existing tests next if you want."},
+                {"final": "Done.\n[AUTO_STATE: done]"},
+            ]
+        )
+        session.auto_evaluator_enabled = True
+        session.auto_evaluator_shadow = False
+        session.auto_response_evaluator = _StaticEvaluator(
+            [
+                AutoEvaluationDecision(
+                    "CONTINUE",
+                    0.91,
+                    "permission deflection",
+                    "permission_deflection",
+                    "proceed_readonly_analysis",
+                ),
+                AutoEvaluationDecision(
+                    "ACCEPT_MAIN_STATE",
+                    1.0,
+                    "task complete",
+                    "main_done_accepted",
+                ),
+            ]
+        )
+        session.start_auto_mode(max_iterations=5)
+
+        events = await _collect_events(session, "Analyze")
+
+        self.assertEqual(
+            runner.inputs,
+            ["Analyze", "Proceed with the read-only analysis you just described."],
+        )
+        self.assertEqual(events[-1]["data"]["reason"], "task complete")
+
+    async def test_evaluator_shadow_emits_event_without_altering_control_flow(self):
+        session, runner = self._make_session([{"final": "No footer here."}])
+        session.auto_evaluator_enabled = True
+        session.auto_evaluator_shadow = True
+        session.auto_response_evaluator = _StaticEvaluator(
+            [
+                AutoEvaluationDecision(
+                    "CONTINUE",
+                    0.95,
+                    "would continue if active",
+                    "permission_deflection",
+                    "continue_next_safe_step",
+                )
+            ]
+        )
+        session.start_auto_mode(max_iterations=5)
+
+        events = await _collect_events(session, "Analyze")
+
+        self.assertEqual(runner.inputs, ["Analyze"])
+        self.assertIn("auto_evaluation", [event["type"] for event in events])
+        self.assertNotIn("auto_reply", [event["type"] for event in events])
+        self.assertEqual(events[-1]["data"]["reason"], "missing or malformed AUTO_STATE footer")
+
+    async def test_evaluator_continuation_quota_exhausted_stops(self):
+        session, runner = self._make_session([{"final": "No footer here."}])
+        session.auto_evaluator_enabled = True
+        session.auto_evaluator_shadow = False
+        session.auto_response_evaluator = _StaticEvaluator(
+            [
+                AutoEvaluationDecision(
+                    "CONTINUE",
+                    0.95,
+                    "continue",
+                    "permission_deflection",
+                    "continue_next_safe_step",
+                )
+            ]
+        )
+        session.start_auto_mode(max_iterations=5)
+        session.auto_evaluator_max_continuations = 0
+
+        events = await _collect_events(session, "Analyze")
+
+        self.assertEqual(runner.inputs, ["Analyze"])
+        self.assertEqual(
+            events[-1]["data"]["reason"],
+            "auto evaluator continuation quota exhausted",
+        )
+
+    async def test_evaluator_low_confidence_stops_conservatively(self):
+        session, runner = self._make_session([{"final": "No footer here."}])
+        session.auto_evaluator_enabled = True
+        session.auto_evaluator_shadow = False
+        session.auto_response_evaluator = _StaticEvaluator(
+            [
+                AutoEvaluationDecision(
+                    "CONTINUE",
+                    0.1,
+                    "too low",
+                    "permission_deflection",
+                    "continue_next_safe_step",
+                )
+            ]
+        )
+        session.start_auto_mode(max_iterations=5)
+
+        events = await _collect_events(session, "Analyze")
+
+        self.assertEqual(runner.inputs, ["Analyze"])
+        self.assertEqual(
+            events[-1]["data"]["reason"],
+            "auto evaluator confidence below threshold",
+        )
 
     async def test_budget_exhaustion_stops_autonomous_loop(self):
         session, runner = self._make_session(
@@ -267,8 +437,9 @@ class ToolPolicyEnforcementTests(unittest.TestCase):
         runner = self._make_runner(readonly=False)
         wrapped = AgentRunner._wrap_tool(runner, shell_exec)
 
-        with self.assertRaisesRegex(RuntimeError, "requires approval for shell_exec"):
-            wrapped.invoke({"command": "echo hi"})
+        with patch.dict(os.environ, {"KAI_TRUSTED_AUTONOMOUS": "0"}):
+            with self.assertRaisesRegex(RuntimeError, "requires approval for shell_exec"):
+                wrapped.invoke({"command": "echo hi"})
 
     def test_auto_readonly_blocks_non_read_only_tools(self):
         runner = self._make_runner(readonly=True)
@@ -279,7 +450,7 @@ class ToolPolicyEnforcementTests(unittest.TestCase):
             wrapped_write.invoke({"path": "/tmp/blocked.txt", "content": "x"})
 
         result = wrapped_read.invoke({"path": __file__})
-        self.assertIn("ToolPolicyEnforcementTests", result)
+        self.assertIn("SessionAutoModeTests", result)
 
 
 if __name__ == "__main__":
