@@ -56,6 +56,31 @@ class HeartbeatServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HeartbeatConfigTests(unittest.TestCase):
+    def test_daemon_server_loads_agent_config_daemon_heartbeat(self):
+        config = {
+            "endpoint": None,
+            "fallback_endpoint": None,
+            "fallback_endpoints": [],
+            "daemon": {
+                "heartbeat": {
+                    "enabled": False,
+                    "interval_seconds": 9,
+                    "publish_session_events": False,
+                }
+            },
+        }
+
+        with mock.patch("daemon.server.get_agent_config", return_value=config):
+            server = DaemonServer(
+                agent_name="kai",
+                nats_url="nats://unit-test",
+                bus_factory=_FakeBus,
+            )
+
+        self.assertFalse(server.heartbeat_config.enabled)
+        self.assertEqual(server.heartbeat_config.interval_seconds, 9)
+        self.assertFalse(server.heartbeat_config.publish_session_events)
+
     def test_env_overrides_config(self):
         with mock.patch.dict(
             "os.environ",

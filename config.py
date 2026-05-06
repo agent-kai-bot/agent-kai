@@ -724,4 +724,9 @@ def get_agent_config(agent_name):
         "cooldown_seconds": health_cfg.cooldown_seconds,
         "default_executor": health_cfg.default_executor,
         "overflow_executor": health_cfg.overflow_executor,
+        # Preserve daemon-scoped settings from agent-config.json for runtime
+        # consumers that receive this normalized config dict.  In particular,
+        # DaemonServer loads its HeartbeatService settings from the documented
+        # top-level {"daemon": {"heartbeat": ...}} section.
+        "daemon": _config.get("daemon", {}),
     }
