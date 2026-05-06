@@ -7,7 +7,7 @@
 #        legacy IP-spawn race, since TASKBOARD_LEGACY_IP_SPAWN_ENABLED=0).
 #   AC2: Capacity gate from agent_runs ledger holds at max_concurrent_spawns
 #        (cache invalidation lets the count tick up after each spawn).
-#   AC3: IP→Review webhook fires three roles (CR + SA + QA) in parallel.
+#   AC3: IP→Review webhook fires a single Code Reviewer session.
 #   AC4: Sessions reach a terminal status_change in the agent_runs ledger
 #        and don't wedge at `spawning`.
 #
@@ -67,7 +67,7 @@ RESP=$($FIRE \
 echo "$RESP" | grep -q "HTTP=200" || fail "AC1 webhook rejected: $RESP"
 log "AC1: webhook accepted"
 
-# ---- AC3: IP → Review fans out to 3 review roles -----------------------
+# ---- AC3: IP → Review fires a single Code Reviewer session --------------
 log "AC3: firing IP→Review for synthetic task #$IP_REVIEW_TASK"
 RESP=$($FIRE \
   --task-id "$IP_REVIEW_TASK" \
@@ -146,6 +146,6 @@ fi
 echo
 echo "=== Phase 0 smoke PASSED ==="
 echo "  AC1 BL→IP single spawn:       $BL_IP_STATUS"
-echo "  AC3 IP→Review fan-out:        $IP_REVIEW_STATUS"
+echo "  AC3 IP→Review single reviewer: $IP_REVIEW_STATUS"
 echo "  AC4 sessions reachable:       yes"
 [[ "$CAPACITY" == "1" ]] && echo "  AC2 capacity gate ≤6:         active=$ACTIVE"
