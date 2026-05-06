@@ -103,7 +103,16 @@ class SessionTokenRoleCasingTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    async def test_review_fanout_mints_proper_case_for_each_reviewer(self) -> None:
+    async def test_legacy_review_status_mints_proper_case_for_code_reviewer(self) -> None:
+        """SPEC v23: legacy ``Review`` fires Code Reviewer alone (single mint).
+
+        Pre-#10261 this fired CR + SA + QA in parallel and raced the per-task
+        session_token generation (Router v2 #10276). With single-role fanout
+        only one mint happens per status transition, so the race is impossible.
+        The proper-case assertion still applies: mint must receive
+        ``"Code Reviewer"`` (not ``"code-reviewer"`` kebab-case).
+        """
+
         _seed_review_row(self.db, task_id=901, fire_generation=2)
         task = {"id": 901, "agent": "Developer", "fire_generation": 2}
         spawner = _CaptureSpawner()
@@ -131,16 +140,13 @@ class SessionTokenRoleCasingTests(unittest.IsolatedAsyncioTestCase):
         ):
             await dispatcher.run_once()
 
-        # Three reviewer mints, one per role, all PROPER-CASE not kebab.
-        self.assertEqual(len(mint_calls), 3)
-        roles_passed = {role for _, role in mint_calls}
+        self.assertEqual(len(mint_calls), 1)
         self.assertEqual(
-            roles_passed,
-            {"Code Reviewer", "Security Auditor", "QA Agent"},
-            "Mint must receive proper-case role names that match "
-            "taskboard's REVIEWER_AGENT_TO_TYPE keys, NOT kebab-case",
+            mint_calls[0],
+            (901, "Code Reviewer"),
+            "Mint must receive proper-case ``Code Reviewer`` matching the "
+            "taskboard's REVIEWER_AGENT_TO_TYPE key, NOT kebab-case",
         )
-        # Sanity: never see kebab-case in the mint call list.
         for _, role in mint_calls:
             self.assertNotIn("-", role, f"kebab-case leaked into mint: {role}")
 
