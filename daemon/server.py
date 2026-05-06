@@ -23,7 +23,12 @@ from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_logger import get_logger, log_slash_command
-from agent.taskboard_dispatcher import DaemonTaskboardSpawner, TaskboardDispatcher
+from agent.agent_runs_client import AgentRunsClient
+from agent.taskboard_dispatcher import (
+    DaemonTaskboardSpawner,
+    TaskboardDispatcher,
+    reap_orphan_ledger_rows,
+)
 from agent.signal_consumer import Signal, SignalConsumer
 from agent.strategy_agent_tools import (
     InProcessStrategyRuntime,
@@ -634,6 +639,9 @@ class DaemonServer:
                 await asyncio.to_thread(apply_migrations, self.db_path)
             except Exception as exc:  # noqa: BLE001
                 self.log.warning("taskboard dispatcher migrations failed: %s", exc)
+
+        await self._sweep_orphan_ledger_rows()
+
         self.taskboard_dispatcher = TaskboardDispatcher(
             db_path=self.db_path,
             task_client=self.taskboard_client,
@@ -642,6 +650,40 @@ class DaemonServer:
         )
         self.taskboard_dispatcher_task = asyncio.create_task(
             self.taskboard_dispatcher.run()
+        )
+
+    async def _sweep_orphan_ledger_rows(self) -> None:
+        """Finalize agent_runs zombies before the dispatcher loop reads capacity.
+
+        Router v2 #10275: every daemon restart drops finalize callbacks for
+        in-flight sessions, so the ledger accumulates rows stuck in
+        ``queued``/``dispatching``/``spawning``/``running``. The capacity gate
+        counts them and at active>=cap the dispatcher refuses every new spawn
+        until an operator manually PATCHes them.
+        """
+
+        try:
+            agent_runs_client = AgentRunsClient.from_env()
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("agent_runs_client.from_env failed: %s", exc)
+            return
+        if not getattr(agent_runs_client, "enabled", False):
+            return
+        try:
+            counts = await asyncio.to_thread(
+                reap_orphan_ledger_rows,
+                agent_runs_client,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("taskboard_orphan_sweep failed: %s", exc)
+            return
+        self.log.info(
+            "taskboard_orphan_sweep cancelled=%s stuck_aborted=%s "
+            "skipped_live=%s errors=%s",
+            counts["cancelled"],
+            counts["stuck_aborted"],
+            counts["skipped_live"],
+            counts["errors"],
         )
 
     async def _stop_taskboard_dispatcher(self) -> None:

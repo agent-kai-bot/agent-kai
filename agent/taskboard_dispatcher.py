@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any, Protocol
 
 from agent.prompt_renderer import render_taskboard_fire_prompt
@@ -2310,3 +2311,126 @@ def _consume_task_exception(task: asyncio.Task[Any]) -> None:
         return
     if exc is not None:
         LOGGER.exception("taskboard spawned session task failed", exc_info=exc)
+
+
+# ---------------------------------------------------------------------------
+# Router v2 #10275: daemon-startup orphan-row sweep
+# ---------------------------------------------------------------------------
+
+_REAP_LEDGER_STATUSES: tuple[str, ...] = ("queued", "dispatching", "spawning", "running")
+
+
+def reap_orphan_ledger_rows(
+    agent_runs_client: Any,
+    *,
+    live_session_ids: Iterable[str] | None = None,
+    failure_detail: str = "daemon_restart_casualty",
+) -> dict[str, int]:
+    """Finalize ``agent_runs`` ledger rows orphaned by a daemon restart.
+
+    Every ``asyncio`` loop death drops the finalize callbacks for sessions
+    that were ``queued``/``dispatching``/``spawning``/``running``. The
+    ledger then accumulates zombie rows whose status never advances to
+    terminal, the capacity gate counts them, and at active>=cap the
+    dispatcher refuses every new spawn until an operator manually PATCHes
+    them. Observed 3+ times during the 2026-05-02 Phase 0 cutover.
+
+    This sweep walks the ledger active-statuses, skips any row whose
+    ``session_id`` is in ``live_session_ids`` (the freshly started daemon's
+    in-process sessions), and PATCHes the rest to a terminal status:
+
+        ``queued`` / ``dispatching``  -> ``cancelled``
+        ``spawning`` / ``running``    -> ``stuck_aborted``
+                                          (failure_class=session_stuck_no_progress)
+
+    Args:
+        agent_runs_client: An :class:`AgentRunsClient` (or duck-compatible
+            object exposing ``enabled``, ``list_by_status``, ``patch``).
+            Disabled clients short-circuit to a zero-count return.
+        live_session_ids: Session ids the freshly-started daemon already
+            owns. At normal startup this is empty (no sessions yet); kept
+            as a parameter so future multi-daemon deployments can pass the
+            set of live ids and avoid reaping a peer daemon's rows.
+        failure_detail: Detail string written to ``stuck_aborted`` rows. The
+            default is the canonical daemon-restart marker used by ledger
+            audits.
+
+    Returns:
+        Mapping with keys ``cancelled``, ``stuck_aborted``, ``skipped_live``,
+        ``errors`` for caller logging / metrics.
+    """
+
+    counts = {"cancelled": 0, "stuck_aborted": 0, "skipped_live": 0, "errors": 0}
+    if not getattr(agent_runs_client, "enabled", False):
+        return counts
+
+    live_set: set[str] = {sid for sid in (live_session_ids or ()) if sid}
+    seen_ids: set[int] = set()
+
+    for status in _REAP_LEDGER_STATUSES:
+        try:
+            rows = agent_runs_client.list_by_status(status, limit=500)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "reap_orphan_ledger_rows.list_by_status status=%s error=%s",
+                status,
+                exc,
+            )
+            counts["errors"] += 1
+            continue
+        if rows is None:
+            counts["errors"] += 1
+            continue
+
+        for row in rows:
+            row_id = row.get("id")
+            if not isinstance(row_id, int) or row_id in seen_ids:
+                continue
+            seen_ids.add(row_id)
+            row_status = row.get("status")
+            session_id = row.get("session_id") or ""
+            if session_id and session_id in live_set:
+                counts["skipped_live"] += 1
+                continue
+
+            if row_status in ("queued", "dispatching"):
+                terminal_status = "cancelled"
+                body: dict[str, Any] = {"status": terminal_status}
+            elif row_status in ("spawning", "running"):
+                terminal_status = "stuck_aborted"
+                body = {
+                    "status": terminal_status,
+                    "failure_class": "session_stuck_no_progress",
+                    "failure_detail": failure_detail,
+                }
+            else:
+                continue
+
+            try:
+                result = agent_runs_client.patch(row_id, body)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning(
+                    "reap_orphan_ledger_rows.patch run_id=%s error=%s",
+                    row_id,
+                    exc,
+                )
+                counts["errors"] += 1
+                continue
+            if result is None:
+                counts["errors"] += 1
+                continue
+
+            if terminal_status == "cancelled":
+                counts["cancelled"] += 1
+            else:
+                counts["stuck_aborted"] += 1
+
+    LOGGER.info(
+        "reap_orphan_ledger_rows complete cancelled=%s stuck_aborted=%s "
+        "skipped_live=%s errors=%s",
+        counts["cancelled"],
+        counts["stuck_aborted"],
+        counts["skipped_live"],
+        counts["errors"],
+    )
+    return counts
