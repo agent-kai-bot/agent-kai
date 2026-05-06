@@ -92,25 +92,46 @@ class TaskboardToolsTests(unittest.TestCase):
 
     @mock.patch("agent.taskboard_tools.requests.request")
     def test_move_shapes_force_review_params(self, request_mock) -> None:
-        """Move tool sends review trigger flags expected by taskboard."""
+        """Move tool sends canonical SPEC v23 statuses and review flags unchanged."""
 
         request_mock.return_value = _FakeResponse(payload={"status": "moved"})
 
         result = self.client.move(
             123,
-            "Review",
+            "Code Review",
             reason="ready",
             force_code_review=True,
             force_security_audit=False,
         )
 
         _, kwargs = request_mock.call_args
-        self.assertEqual(kwargs["params"]["status"], "Review")
+        self.assertEqual(kwargs["params"]["status"], "Code Review")
         self.assertEqual(kwargs["params"]["reason"], "ready")
         self.assertEqual(kwargs["params"]["agent"], "Developer")
         self.assertEqual(kwargs["params"]["force_code_review"], "true")
         self.assertEqual(kwargs["params"]["force_security_audit"], "false")
         self.assertTrue(json.loads(result)["ok"])
+
+    @mock.patch("agent.taskboard_tools.requests.request")
+    def test_move_accepts_all_spec_v23_canonical_statuses(self, request_mock) -> None:
+        """Move tool forwards canonical staged-review statuses without remapping."""
+
+        request_mock.return_value = _FakeResponse(payload={"status": "moved"})
+
+        for status_name in (
+            "Backlog",
+            "In Progress",
+            "Code Review",
+            "Security Audit",
+            "QA",
+            "Ready to Merge",
+            "Fixing",
+            "Done",
+        ):
+            with self.subTest(status=status_name):
+                self.client.move(123, status_name)
+                _, kwargs = request_mock.call_args
+                self.assertEqual(kwargs["params"]["status"], status_name)
 
     @mock.patch("agent.taskboard_tools.requests.request")
     def test_request_exception_is_returned_as_redacted_json(self, request_mock) -> None:
