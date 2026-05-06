@@ -6,7 +6,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agent.taskboard_dispatcher import RepoTarget, _cleanup_dispatcher_worktree, _resolve_repo_target
+from agent.taskboard_dispatcher import (
+    RepoRoutingError,
+    RepoTarget,
+    _cleanup_dispatcher_worktree,
+    _resolve_repo_target,
+)
 from agent.worktree_manager import WorktreeManager
 
 
@@ -21,6 +26,7 @@ class RepoWorkspaceRoutingTests(unittest.TestCase):
                 }
             },
             fallback_repo_root=Path("/srv/local/kai"),
+            role="Developer",
         )
         self.assertEqual(
             target,
@@ -35,7 +41,7 @@ class RepoWorkspaceRoutingTests(unittest.TestCase):
         )
 
     def test_resolve_repo_target_falls_back_to_local_repo(self) -> None:
-        target = _resolve_repo_target({}, fallback_repo_root=Path("/srv/local/kai"))
+        target = _resolve_repo_target({}, fallback_repo_root=Path("/srv/local/kai"), role="Architect")
         self.assertEqual(target.routing_mode, "fallback_local")
         self.assertEqual(target.repo_url, "/srv/local/kai")
         self.assertEqual(target.default_branch, "main")
@@ -65,6 +71,26 @@ class RepoWorkspaceRoutingTests(unittest.TestCase):
         self.assertEqual(payload["repo"]["repo_url"], "https://forgejo.example/openclawdev/taskboard.git")
         self.assertEqual(payload["paths"]["primary_repo_path"], str(primary))
         self.assertEqual(payload["paths"]["worktree_path"], str(worktree))
+
+    def test_resolve_repo_target_rejects_missing_repo_for_developer(self) -> None:
+        with self.assertRaises(RepoRoutingError):
+            _resolve_repo_target({}, fallback_repo_root=Path("/srv/local/kai"), role="Developer")
+
+    def test_resolve_repo_target_rejects_malformed_repo_for_developer(self) -> None:
+        with self.assertRaises(RepoRoutingError):
+            _resolve_repo_target(
+                {"project": {"repoUrl": "not a repo url"}},
+                fallback_repo_root=Path("/srv/local/kai"),
+                role="Developer",
+            )
+
+    def test_resolve_repo_target_falls_back_for_malformed_repo_for_architect(self) -> None:
+        target = _resolve_repo_target(
+            {"project": {"repoUrl": "not a repo url"}},
+            fallback_repo_root=Path("/srv/local/kai"),
+            role="Architect",
+        )
+        self.assertEqual(target.routing_mode, "fallback_local")
 
     def test_cleanup_uses_session_repo_root_when_available(self) -> None:
         daemon_server = mock.Mock()

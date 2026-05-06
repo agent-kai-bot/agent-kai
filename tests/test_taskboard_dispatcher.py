@@ -14,6 +14,7 @@ from agent.taskboard_dispatcher import (
     BACKPRESSURE_SUBJECT,
     DISPATCHER_SOURCE,
     SPAWN_FAILED_SUBJECT,
+    RepoRoutingError,
     TaskboardDispatcher,
     resolve_taskboard_role,
 )
@@ -218,6 +219,42 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["error_class"], "RuntimeError")
         self.assertEqual(payload["error_message"], "executor unavailable")
         self.assertEqual(payload["ts"], "2026-04-28T12:00:00Z")
+
+    async def test_repo_routing_error_marks_spawn_failed_without_spawn(self) -> None:
+        """Repo routing failures fail closed for implementation roles."""
+
+        row_id = self._insert_pending(10156, 6, "Developer")
+        task = {"id": 10156, "agent": "Developer", "fire_generation": 6}
+        task_client = _FakeTaskClient({10156: task})
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        session_manager.spawn_error = RepoRoutingError(
+            "missing repo routing metadata for role=Developer"
+        )
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="rendered prompt",
+        ):
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawn_failed": 1})
+        self.assertEqual(session_manager.spawn_calls, [])
+        self.assertEqual(self._pending_row(row_id)["dispatch_status"], "spawn_failed")
+        self.assertEqual(
+            task_client.comments,
+            [
+                (
+                    10156,
+                    "[System] spawn failed for #10156: missing repo routing metadata for role=Developer; "
+                    "retry with agent-ops fire 10156",
+                )
+            ],
+        )
 
     async def test_dedup_marks_second_row_duplicate(self) -> None:
         """Two rows with the same task/fire/agent key spawn only once."""

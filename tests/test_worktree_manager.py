@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 import subprocess
 import tempfile
 import unittest
@@ -127,3 +129,48 @@ class WorktreeManagerTests(unittest.TestCase):
 
         with mock.patch("agent.worktree_manager.subprocess.run", side_effect=fake_run):
             self.manager.cleanup("sess-4")
+
+    def test_ensure_repo_clone_serializes_bootstrap_per_repo(self) -> None:
+        repo_url = "https://forgejo.example/openclawdev/taskboard.git"
+        active = 0
+        max_active = 0
+        calls: list[list[str]] = []
+        active_lock = threading.Lock()
+
+        def fake_run(cmd, check, capture_output, text):
+            nonlocal active, max_active
+            calls.append(cmd)
+            if cmd[:2] == ["git", "clone"]:
+                repo_path = Path(cmd[-1])
+                with active_lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.1)
+                (repo_path / ".git").mkdir(parents=True, exist_ok=True)
+                with active_lock:
+                    active -= 1
+            return mock.Mock(stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch("agent.worktree_manager.REPO_CACHE_ROOT", Path(temp_dir) / "repos"), \
+             mock.patch("agent.worktree_manager.REPO_CACHE_LOCK_ROOT", Path(temp_dir) / "repos" / ".locks"), \
+             mock.patch("agent.worktree_manager.subprocess.run", side_effect=fake_run):
+            results: list[Path] = []
+            errors: list[Exception] = []
+
+            def worker():
+                try:
+                    results.append(WorktreeManager.ensure_repo_clone(repo_url, default_branch="main"))
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(max_active, 1)
+        self.assertEqual(sum(1 for cmd in calls if cmd[:2] == ["git", "clone"]), 1)
+        self.assertEqual(len(results), 2)

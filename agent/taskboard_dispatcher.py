@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections.abc import Iterable
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from agent.prompt_renderer import render_taskboard_fire_prompt
 from agent.taskboard_status_router import route_event
@@ -429,6 +430,10 @@ class RepoTarget:
     display_name: str
 
 
+class RepoRoutingError(ValueError):
+    """Raised when task repo metadata is invalid for the requesting role."""
+
+
 class DaemonTaskboardSpawner:
     """Session spawn adapter backed by :class:`daemon.server.DaemonServer`.
 
@@ -468,7 +473,11 @@ class DaemonTaskboardSpawner:
             task_id = kwargs.get("task_id") or task_payload.get("id") or "unknown"
             fire_generation = kwargs.get("fire_generation")
             branch_name = f"task-{task_id}-{agent_id}-{fire_generation}"
-            repo_target = _resolve_repo_target(task_payload, fallback_repo_root=self.repo_root)
+            repo_target = _resolve_repo_target(
+                task_payload,
+                fallback_repo_root=self.repo_root,
+                role=str(kwargs.get("role") or agent_id),
+            )
             repo_root = self.repo_root
             if repo_target.routing_mode == "explicit":
                 repo_root = WorktreeManager.ensure_repo_clone(
@@ -2183,6 +2192,7 @@ def _resolve_repo_target(
     task: Mapping[str, Any],
     *,
     fallback_repo_root: Path,
+    role: str | None = None,
 ) -> RepoTarget:
     """Resolve the dispatcher repo routing target from structured task metadata."""
 
@@ -2206,21 +2216,35 @@ def _resolve_repo_target(
         or _field_value(project, "default_branch", "defaultBranch")
         or "main"
     )
-    if repo_url:
-        repo_url_str = str(repo_url).strip()
-        source = "task.repo_url"
-        if _field_value(project, "repo_url", "repoUrl", "repository_url", "repositoryUrl") == repo_url:
-            source = "task.project.repoUrl"
-        return RepoTarget(
-            repo_key=WorktreeManager.repo_key_for_url(repo_url_str),
-            repo_url=repo_url_str,
-            default_branch=default_branch,
-            source=source,
-            routing_mode="explicit",
-            display_name=str(
-                _field_value(project, "slug", "name")
-                or WorktreeManager.repo_key_for_url(repo_url_str)
-            ),
+    normalized_role = _normalize_role(role or "")
+    fail_closed_roles = {"developer"}
+    raw_repo_value = "" if repo_url is None else str(repo_url).strip()
+
+    if raw_repo_value:
+        if not _is_valid_repo_target(raw_repo_value):
+            if normalized_role in fail_closed_roles:
+                raise RepoRoutingError(
+                    f"invalid repo routing metadata for role={role or 'unknown'}: {raw_repo_value!r}"
+                )
+        else:
+            source = "task.repo_url"
+            if _field_value(project, "repo_url", "repoUrl", "repository_url", "repositoryUrl") == repo_url:
+                source = "task.project.repoUrl"
+            return RepoTarget(
+                repo_key=WorktreeManager.repo_key_for_url(raw_repo_value),
+                repo_url=raw_repo_value,
+                default_branch=default_branch,
+                source=source,
+                routing_mode="explicit",
+                display_name=str(
+                    _field_value(project, "slug", "name")
+                    or WorktreeManager.repo_key_for_url(raw_repo_value)
+                ),
+            )
+
+    if normalized_role in fail_closed_roles and not raw_repo_value:
+        raise RepoRoutingError(
+            f"missing repo routing metadata for role={role or 'unknown'}"
         )
 
     return RepoTarget(
@@ -2231,6 +2255,23 @@ def _resolve_repo_target(
         routing_mode="fallback_local",
         display_name=fallback_repo_root.name,
     )
+
+
+def _is_valid_repo_target(value: str) -> bool:
+    """Return True when ``value`` looks like a usable repo target."""
+
+    repo_value = (value or "").strip()
+    if not repo_value:
+        return False
+    if repo_value.startswith(("/", "./", "../")):
+        return True
+    if ":" in repo_value and "://" not in repo_value and "@" in repo_value:
+        host, _, tail = repo_value.partition(":")
+        return bool(host.strip() and tail.strip())
+    split = urlsplit(repo_value)
+    if split.scheme in {"http", "https", "ssh", "git", "file"}:
+        return bool((split.netloc or split.scheme == "file") and split.path.strip("/"))
+    return False
 
 
 def _extract_task_id(payload: dict[str, Any], task: dict[str, Any]) -> int:
