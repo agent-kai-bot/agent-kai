@@ -11,6 +11,7 @@ from unittest import mock
 
 from fastapi.testclient import TestClient
 
+import config as app_config
 from daemon.heartbeat import HeartbeatConfig, HeartbeatService, load_heartbeat_config
 from daemon.scheduler import Scheduler
 from daemon.server import DaemonServer, create_app
@@ -56,21 +57,37 @@ class HeartbeatServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HeartbeatConfigTests(unittest.TestCase):
-    def test_daemon_server_loads_agent_config_daemon_heartbeat(self):
-        config = {
-            "endpoint": None,
-            "fallback_endpoint": None,
-            "fallback_endpoints": [],
-            "daemon": {
-                "heartbeat": {
-                    "enabled": False,
-                    "interval_seconds": 9,
-                    "publish_session_events": False,
-                }
-            },
+    def test_get_agent_config_preserves_top_level_daemon_heartbeat(self):
+        daemon_config = {
+            "heartbeat": {
+                "enabled": False,
+                "interval_seconds": 9,
+                "publish_session_events": False,
+            }
         }
 
-        with mock.patch("daemon.server.get_agent_config", return_value=config):
+        with mock.patch.object(app_config, "_config", {"daemon": daemon_config}):
+            resolved = app_config.get_agent_config("kai")
+
+        self.assertEqual(resolved["daemon"], daemon_config)
+        heartbeat = load_heartbeat_config(resolved)
+        self.assertFalse(heartbeat.enabled)
+        self.assertEqual(heartbeat.interval_seconds, 9)
+        self.assertFalse(heartbeat.publish_session_events)
+
+    def test_daemon_server_loads_real_agent_config_daemon_heartbeat(self):
+        daemon_config = {
+            "heartbeat": {
+                "enabled": False,
+                "interval_seconds": 9,
+                "publish_session_events": False,
+            }
+        }
+
+        with mock.patch.object(app_config, "_config", {"daemon": daemon_config}), mock.patch(
+            "daemon.server.get_agent_config",
+            side_effect=app_config.get_agent_config,
+        ):
             server = DaemonServer(
                 agent_name="kai",
                 nats_url="nats://unit-test",
