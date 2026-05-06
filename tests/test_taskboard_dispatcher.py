@@ -557,8 +557,10 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         # session_generation kwargs (empty in tests when the mint endpoint
         # is unreachable, which is the case here since there's no real
         # taskboard).
+        # Router v2 #10258: Backlog -> In Progress now routes by task.agent,
+        # so a QA Agent task fires QA Agent (not Developer).
         renderer.assert_called_once_with(
-            "Developer",
+            "QA Agent",
             task,
             session_token="",
             session_generation=None,
