@@ -49,7 +49,7 @@
     "codex-cli": {
       "provider": "codex-cli",
       "base_url": "https://chatgpt.com/backend-api/codex",
-      "default_model": "gpt-5.4",
+      "default_model": "gpt-5.5",
       "models": {
         "gpt-5.5": {
           "context_window": 200000,
@@ -81,7 +81,7 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "api_key_env": "OPENAI_API_KEY",
-      "default_model": "gpt-5.4",
+      "default_model": "gpt-5.5",
       "models": {
         "gpt-5.5": {
           "context_window": 200000,
@@ -261,7 +261,7 @@
       "fallback_endpoints": [
         {
           "endpoint": "codex-cli",
-          "model": "gpt-5.4"
+          "model": "gpt-5.5"
         },
         {
           "endpoint": "kai-local",

@@ -4,7 +4,9 @@ executors:
   codex:
     provider: codex-cli
     endpoint: codex-cli
-    model: gpt-5.4
+    # Default codex model — Dan's hard rule: gpt-5.5 is the floor, do NOT
+    # downgrade to 5.4 (see memory: 2026-05-06_dan_default_codex_model_is_5_5).
+    model: gpt-5.5
     health_probe:
       command: "echo healthy"
       interval_seconds: 60
