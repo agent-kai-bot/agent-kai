@@ -97,6 +97,12 @@ from daemon.core import (
     remove_indexed_session,
     serialize_messages,
 )
+from daemon.heartbeat import (
+    HeartbeatConfig,
+    HeartbeatService,
+    HeartbeatTick,
+    load_heartbeat_config,
+)
 from daemon.scheduler import DaemonEventBus, Scheduler
 from daemon.protocol import (
     AttachEnvelope,
@@ -531,6 +537,7 @@ class DaemonServer:
         forgejo_webhook_secret_provider: WebhookSecretProvider | None = None,
         taskboard_client: Any | None = None,
         taskboard_dispatcher_enabled: bool | None = None,
+        heartbeat_config: HeartbeatConfig | None = None,
     ) -> None:
         self.agent_name = agent_name
         self.nats_url = nats_url
@@ -554,6 +561,10 @@ class DaemonServer:
         self.event_bus = DaemonEventBus()
         self.signal_consumer = SignalConsumer()
         self.scheduler: Scheduler | None = None
+        self.heartbeat_config = heartbeat_config or load_heartbeat_config(
+            get_agent_config(agent_name)
+        )
+        self.heartbeat_service: HeartbeatService | None = None
         self.daemon_token = ""
         self.started_at_monotonic: float | None = None
         self.log = get_logger("daemon.server")
@@ -612,11 +623,21 @@ class DaemonServer:
             event_callback=self._handle_scheduler_event,
         )
         await self.scheduler.start()
+        self.heartbeat_service = HeartbeatService(
+            interval_seconds=self.heartbeat_config.interval_seconds,
+            tick_callback=self._handle_heartbeat_tick,
+            enabled=self.heartbeat_config.enabled,
+        )
+        await self.heartbeat_service.start()
         await self._start_taskboard_dispatcher()
 
     async def shutdown(self) -> None:
         """Stop all managed runtime resources."""
         await self._stop_taskboard_dispatcher()
+        if self.heartbeat_service is not None:
+            with suppress(Exception):
+                await self.heartbeat_service.shutdown()
+            self.heartbeat_service = None
         for managed in self.sessions.values():
             with suppress(Exception):
                 await managed.session.sub_agent_registry.stop_all()
@@ -630,6 +651,21 @@ class DaemonServer:
             with suppress(Exception):
                 await self.bus.disconnect()
             self.bus = None
+
+    async def _handle_heartbeat_tick(self, tick: HeartbeatTick) -> None:
+        """Fan out one daemon-owned heartbeat tick without waking the agent."""
+
+        payload = tick.to_event_payload()
+        await self.event_bus.publish("heartbeat", payload)
+        if not self.heartbeat_config.publish_session_events:
+            return
+        session_payload = {
+            **payload,
+            "pending": False,
+            "agent_wakeup_enabled": False,
+        }
+        for managed in list(self.sessions.values()):
+            managed.session.publish_event("heartbeat.tick", session_payload)
 
     async def _start_taskboard_dispatcher(self) -> None:
         if not self.taskboard_dispatcher_enabled:
@@ -721,10 +757,37 @@ class DaemonServer:
         else:
             scheduler_jobs = []
         scheduler_status_counts = Counter(job.status for job in scheduler_jobs)
+        heartbeat_last_tick = None
+        if (
+            self.heartbeat_service is not None
+            and self.heartbeat_service.last_tick is not None
+        ):
+            heartbeat_last_tick = self.heartbeat_service.last_tick.to_event_payload()
         return {
             "agent_name": self.agent_name,
             "uptime_seconds": round(self.uptime_seconds(), 3),
             "bus_connected": self.bus is not None,
+            "heartbeat": {
+                "enabled": self.heartbeat_config.enabled,
+                "running": (
+                    self.heartbeat_service.running
+                    if self.heartbeat_service is not None
+                    else False
+                ),
+                "interval_seconds": self.heartbeat_config.interval_seconds,
+                "publish_session_events": self.heartbeat_config.publish_session_events,
+                "tick_count": (
+                    self.heartbeat_service.tick_count
+                    if self.heartbeat_service is not None
+                    else 0
+                ),
+                "failure_count": (
+                    self.heartbeat_service.failure_count
+                    if self.heartbeat_service is not None
+                    else 0
+                ),
+                "last_tick": heartbeat_last_tick,
+            },
             "process": {
                 "pid": os.getpid(),
                 "memory_rss_bytes": _process_memory_bytes(),
@@ -759,6 +822,7 @@ class DaemonServer:
             "memory_rss_bytes": metrics["process"]["memory_rss_bytes"],
             "agent_queue_depth": metrics["sessions"]["queue_depth"]["total"],
             "scheduler_job_count": metrics["scheduler"]["job_count"],
+            "heartbeat": metrics["heartbeat"],
         }
 
     def _is_authorized(self, *, token: str | None, client_host: str | None) -> bool:
@@ -2312,6 +2376,7 @@ def create_app(
     forgejo_webhook_secret_provider: WebhookSecretProvider | None = None,
     taskboard_client: Any | None = None,
     taskboard_dispatcher_enabled: bool | None = None,
+    heartbeat_config: HeartbeatConfig | None = None,
 ) -> FastAPI:
     """Build the FastAPI app that exposes the daemon WebSocket server.
 
@@ -2335,6 +2400,7 @@ def create_app(
             or Vault-backed provider during startup.
         taskboard_client: Optional taskboard fetch client for dispatcher tests.
         taskboard_dispatcher_enabled: Optional dispatcher lifecycle override.
+        heartbeat_config: Optional heartbeat override for tests.
 
     Returns:
         Configured FastAPI application.
@@ -2351,6 +2417,7 @@ def create_app(
         forgejo_webhook_secret_provider=forgejo_webhook_secret_provider,
         taskboard_client=taskboard_client,
         taskboard_dispatcher_enabled=taskboard_dispatcher_enabled,
+        heartbeat_config=heartbeat_config,
     )
 
     @asynccontextmanager
