@@ -2378,7 +2378,7 @@ def reap_orphan_ledger_rows(
 
     for status in _REAP_LEDGER_STATUSES:
         try:
-            rows = agent_runs_client.list_by_status(status, limit=500)
+            rows = agent_runs_client.list_by_status(status, limit=200)
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning(
                 "reap_orphan_ledger_rows.list_by_status status=%s error=%s",
