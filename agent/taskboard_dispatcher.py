@@ -2340,8 +2340,17 @@ def reap_orphan_ledger_rows(
     in-process sessions), and PATCHes the rest to a terminal status:
 
         ``queued`` / ``dispatching``  -> ``cancelled``
-        ``spawning`` / ``running``    -> ``stuck_aborted``
-                                          (failure_class=session_stuck_no_progress)
+        ``spawning`` / ``running``    -> ``failed``
+                                          (failure_class=session_stuck_no_progress
+                                           failure_detail=daemon_restart_casualty)
+
+    Note on terminal status: the taskboard's ``agent_runs`` state machine
+    rejects ``spawning -> stuck_aborted`` (allowed next from ``spawning`` is
+    ``endpoint_failed | failed | running | spawning`` only). The reaper uses
+    ``failed`` to satisfy that table while keeping the canonical
+    ``session_stuck_no_progress`` ``failure_class`` so audit queries find
+    daemon-restart casualties via that label even though the row's terminal
+    status reads ``failed`` instead of ``stuck_aborted``.
 
     Args:
         agent_runs_client: An :class:`AgentRunsClient` (or duck-compatible
@@ -2351,16 +2360,16 @@ def reap_orphan_ledger_rows(
             owns. At normal startup this is empty (no sessions yet); kept
             as a parameter so future multi-daemon deployments can pass the
             set of live ids and avoid reaping a peer daemon's rows.
-        failure_detail: Detail string written to ``stuck_aborted`` rows. The
+        failure_detail: Detail string written to reaped failure rows. The
             default is the canonical daemon-restart marker used by ledger
             audits.
 
     Returns:
-        Mapping with keys ``cancelled``, ``stuck_aborted``, ``skipped_live``,
+        Mapping with keys ``cancelled``, ``failed``, ``skipped_live``,
         ``errors`` for caller logging / metrics.
     """
 
-    counts = {"cancelled": 0, "stuck_aborted": 0, "skipped_live": 0, "errors": 0}
+    counts = {"cancelled": 0, "failed": 0, "skipped_live": 0, "errors": 0}
     if not getattr(agent_runs_client, "enabled", False):
         return counts
 
@@ -2397,7 +2406,7 @@ def reap_orphan_ledger_rows(
                 terminal_status = "cancelled"
                 body: dict[str, Any] = {"status": terminal_status}
             elif row_status in ("spawning", "running"):
-                terminal_status = "stuck_aborted"
+                terminal_status = "failed"
                 body = {
                     "status": terminal_status,
                     "failure_class": "session_stuck_no_progress",
@@ -2423,13 +2432,13 @@ def reap_orphan_ledger_rows(
             if terminal_status == "cancelled":
                 counts["cancelled"] += 1
             else:
-                counts["stuck_aborted"] += 1
+                counts["failed"] += 1
 
     LOGGER.info(
-        "reap_orphan_ledger_rows complete cancelled=%s stuck_aborted=%s "
+        "reap_orphan_ledger_rows complete cancelled=%s failed=%s "
         "skipped_live=%s errors=%s",
         counts["cancelled"],
-        counts["stuck_aborted"],
+        counts["failed"],
         counts["skipped_live"],
         counts["errors"],
     )

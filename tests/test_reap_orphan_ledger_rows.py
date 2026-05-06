@@ -49,7 +49,7 @@ def test_returns_zero_counts_for_disabled_client() -> None:
     counts = reap_orphan_ledger_rows(client)
     assert counts == {
         "cancelled": 0,
-        "stuck_aborted": 0,
+        "failed": 0,
         "skipped_live": 0,
         "errors": 0,
     }
@@ -66,7 +66,7 @@ def test_queued_and_dispatching_rows_marked_cancelled() -> None:
     )
     counts = reap_orphan_ledger_rows(client)
     assert counts["cancelled"] == 2
-    assert counts["stuck_aborted"] == 0
+    assert counts["failed"] == 0
     assert counts["errors"] == 0
     assert sorted(call[0] for call in client.patch_calls) == [11, 12]
     for _, body in client.patch_calls:
@@ -74,7 +74,7 @@ def test_queued_and_dispatching_rows_marked_cancelled() -> None:
         assert "failure_class" not in body  # cancelled is not a failure status
 
 
-def test_spawning_and_running_rows_marked_stuck_aborted_with_failure_class() -> None:
+def test_spawning_and_running_rows_marked_failed_with_failure_class() -> None:
     client = _FakeAgentRunsClient(
         rows_by_status={
             "spawning": [{"id": 21, "status": "spawning", "session_id": "s-21"}],
@@ -82,11 +82,11 @@ def test_spawning_and_running_rows_marked_stuck_aborted_with_failure_class() -> 
         }
     )
     counts = reap_orphan_ledger_rows(client)
-    assert counts["stuck_aborted"] == 2
+    assert counts["failed"] == 2
     assert counts["cancelled"] == 0
     assert counts["errors"] == 0
     for _, body in client.patch_calls:
-        assert body["status"] == "stuck_aborted"
+        assert body["status"] == "failed"
         assert body["failure_class"] == "session_stuck_no_progress"
         assert body["failure_detail"] == "daemon_restart_casualty"
 
@@ -102,13 +102,13 @@ def test_live_session_ids_are_skipped() -> None:
     )
     counts = reap_orphan_ledger_rows(client, live_session_ids={"live-session-A"})
     assert counts["skipped_live"] == 1
-    assert counts["stuck_aborted"] == 1
+    assert counts["failed"] == 1
     assert counts["errors"] == 0
     assert client.patch_calls == [
         (
             32,
             {
-                "status": "stuck_aborted",
+                "status": "failed",
                 "failure_class": "session_stuck_no_progress",
                 "failure_detail": "daemon_restart_casualty",
             },
@@ -125,12 +125,12 @@ def test_list_failure_increments_errors_and_continues_other_statuses() -> None:
     )
     counts = reap_orphan_ledger_rows(client)
     assert counts["errors"] == 1
-    assert counts["stuck_aborted"] == 1
+    assert counts["failed"] == 1
     assert client.patch_calls == [
         (
             41,
             {
-                "status": "stuck_aborted",
+                "status": "failed",
                 "failure_class": "session_stuck_no_progress",
                 "failure_detail": "daemon_restart_casualty",
             },
@@ -150,7 +150,7 @@ def test_patch_failure_increments_errors_and_continues() -> None:
     )
     counts = reap_orphan_ledger_rows(client)
     assert counts["errors"] == 1
-    assert counts["stuck_aborted"] == 1
+    assert counts["failed"] == 1
     assert sorted(c[0] for c in client.patch_calls) == [51, 52]
 
 
@@ -178,7 +178,7 @@ def test_dedupes_rows_appearing_in_multiple_statuses() -> None:
     )
     counts = reap_orphan_ledger_rows(client)
     assert len(client.patch_calls) == 1
-    assert counts["stuck_aborted"] == 1
+    assert counts["failed"] == 1
 
 
 def test_unknown_row_status_is_ignored() -> None:
@@ -193,12 +193,12 @@ def test_unknown_row_status_is_ignored() -> None:
         }
     )
     counts = reap_orphan_ledger_rows(client)
-    assert counts["stuck_aborted"] == 1
+    assert counts["failed"] == 1
     assert client.patch_calls == [
         (
             82,
             {
-                "status": "stuck_aborted",
+                "status": "failed",
                 "failure_class": "session_stuck_no_progress",
                 "failure_detail": "daemon_restart_casualty",
             },

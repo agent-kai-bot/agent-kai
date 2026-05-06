@@ -678,10 +678,10 @@ class DaemonServer:
             self.log.warning("taskboard_orphan_sweep failed: %s", exc)
             return
         self.log.info(
-            "taskboard_orphan_sweep cancelled=%s stuck_aborted=%s "
+            "taskboard_orphan_sweep cancelled=%s failed=%s "
             "skipped_live=%s errors=%s",
             counts["cancelled"],
-            counts["stuck_aborted"],
+            counts["failed"],
             counts["skipped_live"],
             counts["errors"],
         )
