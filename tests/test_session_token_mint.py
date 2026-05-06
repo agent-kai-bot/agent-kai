@@ -61,6 +61,9 @@ class PromptRendererSessionTokenTests(unittest.TestCase):
         self.assertIn("tok-abc-123", rendered)
         self.assertIn("Session generation: 7", rendered)
         self.assertIn("Worktree path: /tmp/kai/sessions/taskboard-999-7-developer", rendered)
+        self.assertIn("Target repo URL:", rendered)
+        self.assertIn("Primary repo path:", rendered)
+        self.assertIn("Workspace manifest path:", rendered)
 
     def test_missing_session_kwargs_render_empty(self) -> None:
         rendered = render_taskboard_fire_prompt(

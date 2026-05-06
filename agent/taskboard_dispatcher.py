@@ -11,6 +11,7 @@ import re
 import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from collections.abc import Mapping
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -416,6 +417,18 @@ class DefaultTaskboardTaskClient:
         return envelope
 
 
+@dataclass(frozen=True)
+class RepoTarget:
+    """Resolved repository routing target for one taskboard task."""
+
+    repo_key: str
+    repo_url: str
+    default_branch: str
+    source: str
+    routing_mode: str
+    display_name: str
+
+
 class DaemonTaskboardSpawner:
     """Session spawn adapter backed by :class:`daemon.server.DaemonServer`.
 
@@ -431,6 +444,7 @@ class DaemonTaskboardSpawner:
         self.daemon_server = daemon_server
         self.repo_root = Path(repo_root or Path(__file__).resolve().parents[1])
         self.worktree_manager = WorktreeManager(self.repo_root)
+        self._session_repo_roots: dict[str, Path] = {}
 
     async def spawn(self, **kwargs: Any) -> str:
         """Create a live daemon session and submit the rendered prompt.
@@ -447,22 +461,67 @@ class DaemonTaskboardSpawner:
         prompt = str(kwargs["prompt"])
         task_payload = kwargs.get("task") if isinstance(kwargs.get("task"), dict) else {}
         worktree_path = ""
+        primary_repo_path = ""
+        workspace_manifest_path = ""
+        repo_routing_mode = str(task_payload.get("repo_routing_mode") or "")
         if _worktree_isolation_enabled():
             task_id = kwargs.get("task_id") or task_payload.get("id") or "unknown"
             fire_generation = kwargs.get("fire_generation")
             branch_name = f"task-{task_id}-{agent_id}-{fire_generation}"
-            worktree = self.worktree_manager.create(
+            repo_target = _resolve_repo_target(task_payload, fallback_repo_root=self.repo_root)
+            repo_root = self.repo_root
+            if repo_target.routing_mode == "explicit":
+                repo_root = WorktreeManager.ensure_repo_clone(
+                    repo_target.repo_url,
+                    repo_key=repo_target.repo_key,
+                    default_branch=repo_target.default_branch,
+                )
+            manager = WorktreeManager(repo_root)
+            worktree = manager.create(
                 session_id=session_id,
                 branch_name=branch_name,
-                base_branch=str(task_payload.get("default_branch") or "main"),
+                base_branch=repo_target.default_branch,
             )
+            self._session_repo_roots[session_id] = repo_root
             worktree_path = str(worktree)
+            primary_repo_path = str(repo_root)
+            repo_routing_mode = repo_target.routing_mode
+            task_payload = dict(task_payload)
+            task_payload.update(
+                {
+                    "repo_url": repo_target.repo_url,
+                    "default_branch": repo_target.default_branch,
+                    "repo_routing_mode": repo_target.routing_mode,
+                    "primary_repo_path": primary_repo_path,
+                    "worktree_path": worktree_path,
+                }
+            )
+            workspace_manifest_path = str(
+                WorktreeManager.write_workspace_manifest(
+                    worktree,
+                    task_id=task_id,
+                    session_id=session_id,
+                    fire_generation=_coerce_positive_int(fire_generation),
+                    agent_id=agent_id,
+                    role=str(kwargs.get("role") or agent_id),
+                    primary_repo_path=repo_root,
+                    repo_url=repo_target.repo_url,
+                    default_branch=repo_target.default_branch,
+                    repo_routing_mode=repo_target.routing_mode,
+                    source=repo_target.source,
+                    repo_key=repo_target.repo_key,
+                )
+            )
+            task_payload["workspace_manifest_path"] = workspace_manifest_path
             prompt = render_taskboard_fire_prompt(
                 str(kwargs.get("role") or agent_id),
                 task_payload,
                 session_token=str(kwargs.get("session_token") or ""),
                 session_generation=kwargs.get("session_generation"),
                 worktree_path=worktree_path,
+                primary_repo_path=primary_repo_path,
+                workspace_manifest_path=workspace_manifest_path,
+                repo_routing_mode=repo_routing_mode,
             )
         managed = await self.daemon_server.get_or_create_session(
             session_id,
@@ -481,6 +540,9 @@ class DaemonTaskboardSpawner:
             "task_id": kwargs.get("task_id"),
             "fire_generation": kwargs.get("fire_generation"),
             "worktree_path": worktree_path,
+            "primary_repo_path": primary_repo_path,
+            "workspace_manifest_path": workspace_manifest_path,
+            "repo_routing_mode": repo_routing_mode,
         }
         managed.session.taskboard_context = SimpleNamespace(
             base_url=str(kwargs.get("taskboard_base_url") or os.getenv("TASKBOARD_URL", "http://localhost:8080")),
@@ -2102,6 +2164,75 @@ def _extract_task(payload: Any) -> dict[str, Any]:
     raise ValueError("task payload does not contain a task id")
 
 
+def _mapping_value(mapping: Mapping[str, Any], *names: str) -> Mapping[str, Any]:
+    for name in names:
+        value = mapping.get(name)
+        if isinstance(value, Mapping):
+            return value
+    return {}
+
+
+def _field_value(mapping: Mapping[str, Any], *names: str) -> Any:
+    for name in names:
+        if name in mapping and mapping.get(name) not in (None, ""):
+            return mapping.get(name)
+    return None
+
+
+def _resolve_repo_target(
+    task: Mapping[str, Any],
+    *,
+    fallback_repo_root: Path,
+) -> RepoTarget:
+    """Resolve the dispatcher repo routing target from structured task metadata."""
+
+    task_mapping: Mapping[str, Any] = task if isinstance(task, Mapping) else {}
+    project = _mapping_value(task_mapping, "project")
+    repo_url = _field_value(
+        task_mapping,
+        "repo_url",
+        "repoUrl",
+        "repository_url",
+        "repositoryUrl",
+    ) or _field_value(
+        project,
+        "repo_url",
+        "repoUrl",
+        "repository_url",
+        "repositoryUrl",
+    )
+    default_branch = str(
+        _field_value(task_mapping, "default_branch", "defaultBranch")
+        or _field_value(project, "default_branch", "defaultBranch")
+        or "main"
+    )
+    if repo_url:
+        repo_url_str = str(repo_url).strip()
+        source = "task.repo_url"
+        if _field_value(project, "repo_url", "repoUrl", "repository_url", "repositoryUrl") == repo_url:
+            source = "task.project.repoUrl"
+        return RepoTarget(
+            repo_key=WorktreeManager.repo_key_for_url(repo_url_str),
+            repo_url=repo_url_str,
+            default_branch=default_branch,
+            source=source,
+            routing_mode="explicit",
+            display_name=str(
+                _field_value(project, "slug", "name")
+                or WorktreeManager.repo_key_for_url(repo_url_str)
+            ),
+        )
+
+    return RepoTarget(
+        repo_key=WorktreeManager.repo_key_for_url(str(fallback_repo_root), fallback="local-repo"),
+        repo_url=str(fallback_repo_root),
+        default_branch=default_branch,
+        source="fallback_local",
+        routing_mode="fallback_local",
+        display_name=fallback_repo_root.name,
+    )
+
+
 def _extract_task_id(payload: dict[str, Any], task: dict[str, Any]) -> int:
     value = payload.get("task_id", task.get("id"))
     if value is None:
@@ -2141,11 +2272,15 @@ def _normalize_spawn_session_id(result: Any, *, default: str) -> str:
 
 def _cleanup_dispatcher_worktree(daemon_server: Any, session_id: str) -> None:
     """Best-effort session worktree cleanup after terminal ledger updates."""
-    del daemon_server
     if not _worktree_isolation_enabled():
         return
     try:
-        manager = WorktreeManager(Path(__file__).resolve().parents[1])
+        repo_root = Path(__file__).resolve().parents[1]
+        dispatcher = getattr(daemon_server, "taskboard_dispatcher", None)
+        repo_roots = getattr(dispatcher, "_session_repo_roots", None) if dispatcher else None
+        if isinstance(repo_roots, dict):
+            repo_root = Path(repo_roots.pop(session_id, repo_root))
+        manager = WorktreeManager(repo_root)
         manager.cleanup(session_id)
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("worktree cleanup failed session_id=%s error=%s", session_id, exc)

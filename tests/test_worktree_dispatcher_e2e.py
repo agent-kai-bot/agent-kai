@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,39 +60,57 @@ class WorktreeDispatcherE2ETests(unittest.IsolatedAsyncioTestCase):
         cleanup_calls: list[str] = []
 
         async def run_case():
-            with mock.patch("agent.taskboard_dispatcher._worktree_isolation_enabled", return_value=True), \
-                 mock.patch.object(spawner.worktree_manager, "create", return_value=Path("/tmp/kai/sessions/sess-e2e")), \
-                 mock.patch("agent.taskboard_dispatcher.render_taskboard_fire_prompt", return_value="prompt"), \
-                 mock.patch("agent.taskboard_dispatcher.WorktreeManager.cleanup", side_effect=lambda self, sid: cleanup_calls.append(sid)), \
-                 mock.patch("agent.taskboard_dispatcher._resolve_max_iterations_for_role", return_value=5), \
-                 mock.patch("agent.agent_runs_client.AgentRunsClient.from_env") as from_env:
-                client = mock.Mock(enabled=True)
-                client.list_for_task.return_value = [{"id": 7, "session_id": "sess-e2e", "status": "spawning"}]
-                client.patch.return_value = None
-                from_env.return_value = client
-                session_id = await spawner.spawn(
-                    session_id="sess-e2e",
-                    task_id=10255,
-                    fire_generation=1,
-                    role="Developer",
-                    agent_id="developer",
-                    model="codex",
-                    profile="xhigh",
-                    prompt="orig prompt",
-                    task={"id": 10255, "default_branch": "main"},
-                    session_token="",
-                    session_generation=None,
-                )
-                self.assertEqual(session_id, "sess-e2e")
-                self.assertEqual(
-                    daemon.managed.session.taskboard_dispatcher["worktree_path"],
-                    "/tmp/kai/sessions/sess-e2e",
-                )
-                self.assertEqual(daemon.managed.session.taskboard_context.agent_name, "developer")
-                with mock.patch("agent.taskboard_dispatcher._cleanup_dispatcher_worktree", side_effect=lambda daemon_server, session_id: cleanup_calls.append(session_id)):
-                    task = asyncio.get_running_loop().create_task(asyncio.sleep(0))
-                    await task
-                    _finalize_dispatcher_inprocess_run(task, daemon, "sess-e2e", 10255, "developer")
+            with tempfile.TemporaryDirectory() as temp_dir:
+                manifest_path = Path(temp_dir) / "workspace-manifest.json"
+
+                def write_manifest(*args, **kwargs):
+                    manifest_path.write_text('{"repo":{"routing_mode":"fallback_local"}}')
+                    return manifest_path
+
+                with mock.patch("agent.taskboard_dispatcher._worktree_isolation_enabled", return_value=True), \
+                    mock.patch("agent.taskboard_dispatcher.WorktreeManager.create", return_value=Path("/tmp/kai/sessions/sess-e2e")), \
+                    mock.patch("agent.taskboard_dispatcher.WorktreeManager.write_workspace_manifest", side_effect=write_manifest), \
+                    mock.patch("agent.taskboard_dispatcher.render_taskboard_fire_prompt", return_value="prompt"), \
+                    mock.patch("agent.taskboard_dispatcher.WorktreeManager.cleanup", side_effect=lambda self, sid: cleanup_calls.append(sid)), \
+                    mock.patch("agent.taskboard_dispatcher._resolve_max_iterations_for_role", return_value=5), \
+                    mock.patch("agent.agent_runs_client.AgentRunsClient.from_env") as from_env:
+                    client = mock.Mock(enabled=True)
+                    client.list_for_task.return_value = [{"id": 7, "session_id": "sess-e2e", "status": "spawning"}]
+                    client.patch.return_value = None
+                    from_env.return_value = client
+                    session_id = await spawner.spawn(
+                        session_id="sess-e2e",
+                        task_id=10255,
+                        fire_generation=1,
+                        role="Developer",
+                        agent_id="developer",
+                        model="codex",
+                        profile="xhigh",
+                        prompt="orig prompt",
+                        task={"id": 10255, "default_branch": "main"},
+                        session_token="",
+                        session_generation=None,
+                    )
+                    self.assertEqual(session_id, "sess-e2e")
+                    self.assertEqual(
+                        daemon.managed.session.taskboard_dispatcher["worktree_path"],
+                        "/tmp/kai/sessions/sess-e2e",
+                    )
+                    self.assertEqual(
+                        daemon.managed.session.taskboard_dispatcher["primary_repo_path"],
+                        str(Path.cwd()),
+                    )
+                    self.assertEqual(
+                        daemon.managed.session.taskboard_dispatcher["workspace_manifest_path"],
+                        str(manifest_path),
+                    )
+                    manifest = json.loads(manifest_path.read_text())
+                    self.assertEqual(manifest["repo"]["routing_mode"], "fallback_local")
+                    self.assertEqual(daemon.managed.session.taskboard_context.agent_name, "developer")
+                    with mock.patch("agent.taskboard_dispatcher._cleanup_dispatcher_worktree", side_effect=lambda daemon_server, session_id: cleanup_calls.append(session_id)):
+                        task = asyncio.get_running_loop().create_task(asyncio.sleep(0))
+                        await task
+                        _finalize_dispatcher_inprocess_run(task, daemon, "sess-e2e", 10255, "developer")
 
         await run_case()
         self.assertIn("sess-e2e", cleanup_calls)

@@ -50,6 +50,9 @@ def render_taskboard_fire_prompt(
     session_token: str = "",
     session_generation: int | None = None,
     worktree_path: str = "",
+    primary_repo_path: str = "",
+    workspace_manifest_path: str = "",
+    repo_routing_mode: str = "",
 ) -> str:
     """Render a role-specific taskboard auto-fire prompt.
 
@@ -89,6 +92,12 @@ def render_taskboard_fire_prompt(
         substitutions["session_generation"] = str(session_generation)
     if worktree_path:
         substitutions["worktree_path"] = worktree_path
+    if primary_repo_path:
+        substitutions["primary_repo_path"] = primary_repo_path
+    if workspace_manifest_path:
+        substitutions["workspace_manifest_path"] = workspace_manifest_path
+    if repo_routing_mode:
+        substitutions["repo_routing_mode"] = repo_routing_mode
     return _render_prompt(
         TASKBOARD_PROMPT_ROOT,
         role,
@@ -282,6 +291,15 @@ def _extract_taskboard_substitutions(
         ),
         "worktree_path": _stringify(
             _field(task_mapping, "worktree_path", "worktreePath")
+        ),
+        "primary_repo_path": _stringify(
+            _field(task_mapping, "primary_repo_path", "primaryRepoPath")
+        ),
+        "workspace_manifest_path": _stringify(
+            _field(task_mapping, "workspace_manifest_path", "workspaceManifestPath")
+        ),
+        "repo_routing_mode": _stringify(
+            _field(task_mapping, "repo_routing_mode", "repoRoutingMode")
         ),
         "output_target": output_target,
         "comments_context": _stringify(
