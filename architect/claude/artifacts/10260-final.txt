@@ -1,0 +1,74 @@
+Task #10260 — Final Architecture Artifact
+
+Branch: feat/spec-10258
+Spec: docs/architecture/10260-explicit-dispatch-event.md
+
+Summary
+- Produced an architecture spec for explicit dispatch events to support same-status handoffs, changes-requested loops, and operator re-fire flows.
+- Recommendation: introduce a new webhook event type `task.dispatch_requested` and a new API endpoint `POST /api/tasks/{id}/dispatch`.
+- Recommendation: redefine `fire_generation` as a monotonic per-task spawn-generation counter that increments on every spawn-eligible event, including explicit dispatch requests.
+
+Chosen Design
+1. Event shape
+   - New event type: `task.dispatch_requested`
+   - Keep `task.status_changed` focused on workflow state only.
+
+2. Trigger surface
+   - New endpoint: `POST /api/tasks/{id}/dispatch`
+   - `/move` and generic PATCH remain status/field mutation surfaces.
+
+3. fire_generation semantics
+   - Increment per spawn-eligible event, including same-status explicit dispatch.
+
+4. Idempotency / dedup
+   - API dedup key: unique `(task_id, idempotency_key)`
+   - Webhook event identity: unique `event_id`
+   - Dispatcher dedup: existing `(task_id, fire_generation, agent_id)` reservation key remains valid.
+
+5. Audit trail
+   - Add durable dispatch ledger rows with target agent, reason, actor, idempotency key, comment, correlation key, and task snapshot.
+   - Dispatcher log reason format: `explicit_dispatch:<dispatch.reason>`.
+
+6. Backward compatibility
+   - Existing `task.status_changed` subscribers continue unchanged.
+   - `task.dispatch_requested` is additive and opt-in.
+
+Alternatives Rejected
+- Overloading `task.status_changed` with dispatch fields.
+- Synthetic status toggles to force re-fire.
+- Implicit spawn-on-agent-change.
+- Adding a dispatch/re-fire switch to `/move` or generic PATCH.
+
+Recommended Implementation Sequence
+1. Taskboard API
+   - Add `POST /api/tasks/{id}/dispatch`
+   - Add dispatch ledger table and idempotency constraint
+   - Add transaction helper that bumps `fire_generation`, records dispatch, and enqueues webhook outbox event atomically
+
+2. Dispatcher/router
+   - Extend router boundary to handle `task.dispatch_requested`
+   - Route directly from `dispatch.target_agent`
+   - Preserve current `task.status_changed` behavior unchanged
+
+3. Integration
+   - Update orchestrator/operator flows to call `/dispatch` for same-status handoffs, changes-requested loops, and replay actions
+
+4. Rollout
+   - Add metrics/logging and optional feature flag
+   - Validate in staging against existing webhook subscribers
+
+Key Risks
+- Confusion if callers use both status changes and explicit dispatch without clear ownership rules
+- Duplicate dispatch attempts if idempotency keys are omitted or inconsistently generated
+- Subscriber fragility if unknown event types are treated as fatal instead of ignored
+
+Guardrails
+- Require idempotency key at API boundary
+- Validate canonical target agent names before enqueue
+- Keep `task.status_changed` payload contract stable
+- Roll back the whole transaction if outbox enqueue fails
+
+Acceptance Criteria Coverage
+- All 6 requested design questions are answered concretely in the spec.
+- Spec includes data contract, rejected alternatives, failure modes, testing, implementation phases, and rollout guardrails.
+- Follow-up implementation ticket to be filed referencing this spec.
