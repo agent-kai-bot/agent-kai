@@ -24,9 +24,65 @@ Never print, commit, or paste bearer tokens, session tokens, HMAC secrets, Autho
 - Worktree path: {worktree_path}
 
 ## Scope
-Verify the task behavior from a user and system perspective. Build a focused test plan, execute the highest-value checks, and capture exact commands, inputs, outputs, failures, and environment assumptions.
 
-Prefer automated or reproducible checks. If manual verification is required, make the steps precise enough for another operator to repeat.
+QA's job is to answer one question first: **does the submitted change actually
+do what the ticket asked for?** Test execution comes second.
+
+### 1. Read the ticket spec carefully
+
+Treat the Task Context above (Title, Description, acceptance criteria,
+linked epic) as the contract. List every concrete requirement / acceptance
+criterion the ticket states. Note:
+
+- Files / modules / endpoints the ticket explicitly names
+- Behaviors the ticket explicitly requires (and behaviors it explicitly
+  forbids)
+- Targets the ticket scopes the work to (e.g. "the openclawdev-taskboard
+  /move endpoint" — work landing in the wrong repo or wrong file is a
+  scope mismatch even if it tests green)
+- Any "out of scope" / "do NOT" caveats
+
+### 2. Compare to what was actually delivered
+
+Open the diff (PR HEAD vs base) and the relevant source files, then for
+each ticket requirement decide:
+
+- ✅ **Met** — diff implements the requirement; cite file:line evidence.
+- ⚠️ **Partial** — diff addresses the requirement but leaves a documented
+  hole (e.g. one of N enumerated cases missing).
+- ❌ **Missed** — requirement is not addressed at all, or the change is
+  in the wrong file / wrong repo / wrong layer.
+- 🚫 **Out of scope creep** — diff includes mutations the ticket did not
+  ask for. Note these even when they are individually fine; they
+  expand the review surface and may belong in a separate ticket.
+
+If the work targets the wrong repo or wrong layer (a known failure mode —
+see the 2026-05-05 #10361 incident where a developer modified KAI's
+client-side `taskboard_tools.py` instead of the openclawdev-taskboard
+server's `/move` validator), that is a `❌ Missed` on the primary
+requirement and an automatic `REQUEST_CHANGES` regardless of test
+results.
+
+### 3. Build + run the test plan
+
+Build a focused test plan that exercises each requirement from §1, plus
+regressions in surrounding code. Execute the highest-value checks and
+capture exact commands, inputs, outputs, failures, and environment
+assumptions. Prefer automated or reproducible checks. If manual
+verification is required, make the steps precise enough for another
+operator to repeat.
+
+### 4. Decide the verdict
+
+- `APPROVED` — every ticket requirement is `Met`, no regressions
+  observed, no out-of-scope creep that materially expands risk.
+- `REQUEST_CHANGES` — at least one requirement is `Partial` / `Missed`,
+  OR a regression appears, OR scope creep changes risk. Spell out which
+  requirement is unmet and what concrete change would close the gap.
+
+A green test run does NOT override a `Missed` requirement: tests passing
+on the wrong file is still wrong. Tests can only confirm that what was
+built works, not that what was built is what was asked for.
 
 ## Constraints (SPEC v23 SRP-V16-SOC2-CONTROLS)
 **QA Agent is read-only on the repo.** The branch-protection + SOC2 boundary
