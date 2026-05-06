@@ -7,13 +7,17 @@ import logging
 import re
 import shutil
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+import fcntl
+
 LOGGER = logging.getLogger(__name__)
 SESSIONS_ROOT = Path("/tmp/kai/sessions")
 REPO_CACHE_ROOT = Path("/tmp/kai/taskboard-repos")
+REPO_CACHE_LOCK_ROOT = REPO_CACHE_ROOT / ".locks"
 
 
 class WorktreeManager:
@@ -87,22 +91,23 @@ class WorktreeManager:
         sanitized_key = cls.repo_key_for_url(repo_url, fallback=repo_key or "repo")
         repo_path = REPO_CACHE_ROOT / sanitized_key
         repo_path.parent.mkdir(parents=True, exist_ok=True)
-        if not (repo_path / ".git").exists():
-            if repo_path.exists():
-                shutil.rmtree(repo_path, ignore_errors=True)
-            cls._run_static(["git", "clone", repo_url, str(repo_path)])
-        else:
-            cls._run_static(["git", "-C", str(repo_path), "fetch", "--prune", "origin"])
+        with cls._repo_lock(sanitized_key):
+            if not (repo_path / ".git").exists():
+                if repo_path.exists():
+                    shutil.rmtree(repo_path, ignore_errors=True)
+                cls._run_static(["git", "clone", repo_url, str(repo_path)])
+            else:
+                cls._run_static(["git", "-C", str(repo_path), "fetch", "--prune", "origin"])
 
-        base_branch = (default_branch or "main").strip() or "main"
-        cls._run_static([
-            "git",
-            "-C",
-            str(repo_path),
-            "fetch",
-            "origin",
-            base_branch,
-        ])
+            base_branch = (default_branch or "main").strip() or "main"
+            cls._run_static([
+                "git",
+                "-C",
+                str(repo_path),
+                "fetch",
+                "origin",
+                base_branch,
+            ])
         return repo_path
 
     @classmethod
@@ -166,6 +171,21 @@ class WorktreeManager:
             normalized = normalized[:-4]
         key = re.sub(r"[^A-Za-z0-9._-]+", "-", normalized).strip("-._").lower()
         return key or fallback
+
+    @classmethod
+    @contextmanager
+    def _repo_lock(cls, repo_key: str):
+        """Serialize clone-cache bootstrap/fetch work per repo key."""
+
+        lock_root = REPO_CACHE_LOCK_ROOT
+        lock_root.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_root / f"{repo_key}.lock"
+        with lock_path.open("w") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _run(self, cmd: list[str]) -> None:
         self._run_static(cmd)

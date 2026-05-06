@@ -64,10 +64,11 @@ class WorktreeDispatcherE2ETests(unittest.IsolatedAsyncioTestCase):
                 manifest_path = Path(temp_dir) / "workspace-manifest.json"
 
                 def write_manifest(*args, **kwargs):
-                    manifest_path.write_text('{"repo":{"routing_mode":"fallback_local"}}')
+                    manifest_path.write_text('{"repo":{"routing_mode":"explicit"}}')
                     return manifest_path
 
                 with mock.patch("agent.taskboard_dispatcher._worktree_isolation_enabled", return_value=True), \
+                    mock.patch("agent.taskboard_dispatcher.WorktreeManager.ensure_repo_clone", return_value=Path("/tmp/kai/taskboard-repos/taskboard")), \
                     mock.patch("agent.taskboard_dispatcher.WorktreeManager.create", return_value=Path("/tmp/kai/sessions/sess-e2e")), \
                     mock.patch("agent.taskboard_dispatcher.WorktreeManager.write_workspace_manifest", side_effect=write_manifest), \
                     mock.patch("agent.taskboard_dispatcher.render_taskboard_fire_prompt", return_value="prompt"), \
@@ -87,7 +88,11 @@ class WorktreeDispatcherE2ETests(unittest.IsolatedAsyncioTestCase):
                         model="codex",
                         profile="xhigh",
                         prompt="orig prompt",
-                        task={"id": 10255, "default_branch": "main"},
+                        task={
+                            "id": 10255,
+                            "default_branch": "main",
+                            "project": {"repoUrl": "https://forgejo.example/openclawdev/taskboard.git"},
+                        },
                         session_token="",
                         session_generation=None,
                     )
@@ -98,14 +103,14 @@ class WorktreeDispatcherE2ETests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(
                         daemon.managed.session.taskboard_dispatcher["primary_repo_path"],
-                        str(Path.cwd()),
+                        "/tmp/kai/taskboard-repos/taskboard",
                     )
                     self.assertEqual(
                         daemon.managed.session.taskboard_dispatcher["workspace_manifest_path"],
                         str(manifest_path),
                     )
                     manifest = json.loads(manifest_path.read_text())
-                    self.assertEqual(manifest["repo"]["routing_mode"], "fallback_local")
+                    self.assertEqual(manifest["repo"]["routing_mode"], "explicit")
                     self.assertEqual(daemon.managed.session.taskboard_context.agent_name, "developer")
                     with mock.patch("agent.taskboard_dispatcher._cleanup_dispatcher_worktree", side_effect=lambda daemon_server, session_id: cleanup_calls.append(session_id)):
                         task = asyncio.get_running_loop().create_task(asyncio.sleep(0))
