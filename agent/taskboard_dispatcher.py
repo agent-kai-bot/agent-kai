@@ -806,9 +806,15 @@ class TaskboardDispatcher:
                 # leave the token blank and the prompt template renders
                 # the placeholder empty — the agent then 409s on writes
                 # but the spawn itself still happens.
+                # Phase 0 follow-up (#10271): pass `route.role` (proper-case
+                # "Code Reviewer" / "Security Auditor" / "QA Agent" / "Developer")
+                # not `route.agent_id` (kebab-case "code-reviewer" / etc).
+                # The taskboard's validate_task_status checks the session row's
+                # `agent` column against REVIEWER_AGENT_TO_TYPE keys, which use
+                # proper-case names. Kebab-case mismatches → 409.
                 session_token, session_generation_value = self._mint_taskboard_session_token(
                     task_id=task_id,
-                    role=route.agent_id,
+                    role=route.role,
                 )
 
                 prompt = render_taskboard_fire_prompt(
