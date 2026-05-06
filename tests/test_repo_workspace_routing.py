@@ -10,6 +10,7 @@ from agent.taskboard_dispatcher import (
     RepoRoutingError,
     RepoTarget,
     _cleanup_dispatcher_worktree,
+    _multi_repo_routing_enabled,
     _resolve_repo_target,
 )
 from agent.worktree_manager import WorktreeManager
@@ -91,6 +92,14 @@ class RepoWorkspaceRoutingTests(unittest.TestCase):
             role="Architect",
         )
         self.assertEqual(target.routing_mode, "fallback_local")
+
+    def test_multi_repo_routing_flag_defaults_off(self) -> None:
+        with mock.patch.dict("os.environ", {}, clear=False):
+            self.assertFalse(_multi_repo_routing_enabled())
+
+    def test_multi_repo_routing_flag_accepts_enabled_values(self) -> None:
+        with mock.patch.dict("os.environ", {"TASKBOARD_MULTI_REPO_ROUTING": "1"}, clear=False):
+            self.assertTrue(_multi_repo_routing_enabled())
 
     def test_cleanup_uses_session_repo_root_when_available(self) -> None:
         daemon_server = mock.Mock()

@@ -39,7 +39,14 @@ class PromptRendererTests(unittest.TestCase):
     def test_render_developer_template_substitutes_task_fields(self) -> None:
         """Developer template renders expected task substitutions."""
 
-        rendered = render_taskboard_fire_prompt("developer", self._sample_task())
+        rendered = render_taskboard_fire_prompt(
+            "developer",
+            self._sample_task(),
+            worktree_path="/tmp/kai/sessions/taskboard-10153-3-developer",
+            primary_repo_path="/tmp/kai/taskboard-repos/agent-kai",
+            workspace_manifest_path="/tmp/kai/sessions/taskboard-10153-3-developer/.kai/workspace-manifest.json",
+            repo_routing_mode="explicit",
+        )
 
         self.assertIn("# Developer Taskboard Auto-Fire Prompt", rendered)
         self.assertIn("KAI prompt templates for taskboard auto-fire", rendered)
@@ -48,7 +55,14 @@ class PromptRendererTests(unittest.TestCase):
         self.assertIn("agent-kai Agent KAI", rendered)
         self.assertIn("task-10153-kai-prompt-templates-for-taskboard-auto-fire", rendered)
         self.assertIn("developer/claude/artifacts/10153-final.txt", rendered)
-        self.assertIn("Worktree path: ", rendered)
+        self.assertIn("Target repo URL: https://github.com/agent-kai-bot/agent-kai", rendered)
+        self.assertIn("Repo routing mode: explicit", rendered)
+        self.assertIn("Primary repo path: /tmp/kai/taskboard-repos/agent-kai", rendered)
+        self.assertIn("Worktree path: /tmp/kai/sessions/taskboard-10153-3-developer", rendered)
+        self.assertIn(
+            "Workspace manifest path: /tmp/kai/sessions/taskboard-10153-3-developer/.kai/workspace-manifest.json",
+            rendered,
+        )
         self.assertIn("Move the task to Code Review only after", rendered)
         self.assertIn("/move` API accepts SPEC v23 canonical statuses", rendered)
         for placeholder in (
@@ -84,6 +98,10 @@ class PromptRendererTests(unittest.TestCase):
 
         self.assertIn("Sparse task", rendered)
         self.assertIn("- Epic: ", rendered)
+        self.assertIn("- Target repo URL: ", rendered)
+        self.assertIn("- Primary repo path: ", rendered)
+        self.assertIn("- Worktree path: ", rendered)
+        self.assertIn("- Workspace manifest path: ", rendered)
         self.assertNotIn("{epic_title}", rendered)
 
     def test_all_role_templates_are_loadable(self) -> None:

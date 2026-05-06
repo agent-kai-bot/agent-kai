@@ -35,6 +35,7 @@ DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_SWEEP_INTERVAL_SECONDS = 60.0
 DEFAULT_STUCK_AFTER_SECONDS = 60 * 60
 WORKTREE_ISOLATION_ENV = "KAI_WORKTREE_ISOLATION_ENABLED"
+MULTI_REPO_ROUTING_ENV = "TASKBOARD_MULTI_REPO_ROUTING"
 
 # Phase 0 (#10247) — fleet hardening. Per-role max_iterations cascade:
 #   1. env  KAI_MAX_ITERATIONS_<ROLE_UPPER>   (escape hatch per role)
@@ -48,6 +49,11 @@ _MAX_ITERATIONS_PER_ROLE_PREFIX = "KAI_MAX_ITERATIONS_"
 
 def _worktree_isolation_enabled() -> bool:
     raw = os.getenv(WORKTREE_ISOLATION_ENV, "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _multi_repo_routing_enabled() -> bool:
+    raw = os.getenv(MULTI_REPO_ROUTING_ENV, "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
@@ -479,11 +485,24 @@ class DaemonTaskboardSpawner:
                 role=str(kwargs.get("role") or agent_id),
             )
             repo_root = self.repo_root
-            if repo_target.routing_mode == "explicit":
+            multi_repo_enabled = _multi_repo_routing_enabled()
+            if repo_target.routing_mode == "explicit" and multi_repo_enabled:
                 repo_root = WorktreeManager.ensure_repo_clone(
                     repo_target.repo_url,
                     repo_key=repo_target.repo_key,
                     default_branch=repo_target.default_branch,
+                )
+            elif repo_target.routing_mode == "explicit" and not multi_repo_enabled:
+                repo_target = RepoTarget(
+                    repo_key=WorktreeManager.repo_key_for_url(
+                        str(self.repo_root),
+                        fallback="local-repo",
+                    ),
+                    repo_url=str(self.repo_root),
+                    default_branch=repo_target.default_branch,
+                    source=f"{repo_target.source}:multi_repo_flag_disabled",
+                    routing_mode="fallback_local_flag_disabled",
+                    display_name=self.repo_root.name,
                 )
             manager = WorktreeManager(repo_root)
             worktree = manager.create(
