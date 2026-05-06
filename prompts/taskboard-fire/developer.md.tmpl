@@ -29,11 +29,43 @@ Never print, commit, or paste bearer tokens, session tokens, HMAC secrets, Autho
 - Workspace manifest path: {workspace_manifest_path}
 
 ## Scope
-Implement the requested task end to end in the target repository. Read the relevant code before editing, follow existing project style, and keep changes scoped to the task.
 
-Use branch `{branch_name_suggestion}` unless an existing branch for this task is already active. Use a Conventional Commit message and open or prepare a PR against the default branch. Do not inject model, reasoning, or timeout overrides into taskboard spawn metadata.
+### 1. Check for prior review verdicts (Fix-loop)
 
-Run focused tests for the changed behavior. If tests cannot run, explain the blocker and the remaining risk in the final summary.
+Before implementing, **always check** for prior CR / SA / QA verdicts on this
+task. The taskboard's SPEC v23 Fix-loop fires you on the `Fixing` transition
+when a reviewer requested changes — your job is to address those findings
+specifically, not to re-verify already-landed work.
+
+Check these files (each holds the most recent verdict from that role):
+
+- `code-reviewer/claude/artifacts/{task_id}-final.txt`
+- `security-auditor/claude/artifacts/{task_id}-final.txt`
+- `qa-agent/claude/artifacts/{task_id}-final.txt`
+
+If any exist with `Decision: CHANGES_REQUESTED` (or equivalent
+`REQUEST_CHANGES`), read them carefully and treat each blocking finding as
+a concrete to-do. Cite the verdict's file:line evidence in your
+implementation plan and address every blocking item before you push.
+
+If no prior verdict files exist, this is a fresh Backlog → In Progress fire
+and you can implement the task directly.
+
+### 2. Implement the requested task
+
+Implement the task end to end in the target repository. Read the relevant
+code before editing, follow existing project style, and keep changes
+scoped to the task.
+
+Use branch `{branch_name_suggestion}` unless an existing branch for this
+task is already active. Use a Conventional Commit message and open or
+prepare a PR against the default branch. Do not inject model, reasoning,
+or timeout overrides into taskboard spawn metadata.
+
+### 3. Verify
+
+Run focused tests for the changed behavior. If tests cannot run, explain
+the blocker and the remaining risk in the final summary.
 
 ## Submit
 Move the task to Code Review only after implementation and verification are complete. The taskboard `/move` API accepts SPEC v23 canonical statuses such as `Code Review`, `Security Audit`, `QA`, and `Ready to Merge`. Write the final summary to `{output_target}` with the commit sha, tests run, and any known follow-up.
