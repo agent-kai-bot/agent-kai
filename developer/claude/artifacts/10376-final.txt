@@ -1,0 +1,19 @@
+Task 10376 implementation complete.
+
+Commit: 3c8476974c2d4355ed2954d3e321d534cfe8a0b8
+Branch: task-10376-feat-implement-heartbeat-phase-2-per-10374-spec
+
+Summary:
+- Extended heartbeat config with 1800s cadence, template path, passive cutover injection cap default 0, env overrides, clamps, and kill switch.
+- Added git-tracked heartbeat prompt template loading/rendering with safe formatting.
+- Added per-session heartbeat subscription state, persistence, taskboard opt-out, and single-auto-iteration/pre-injected-input plumbing to prevent duplicate HumanMessage entries.
+- Integrated heartbeat tick injection with suppression, sliding-window rate limit, telemetry, passive fanout preservation, and health/metrics subscriber count.
+- Added regression/unit/integration tests for config, template rendering, single iteration, duplicate prevention, rate limiting, and health metrics.
+
+Verification:
+- python3 -m py_compile daemon/heartbeat.py daemon/core.py daemon/server.py agent/core.py agent/taskboard_dispatcher.py
+- .venv/bin/python -m pytest -q tests/test_heartbeat.py tests/test_auto_mode.py -q
+  Result: 32 passed; existing PytestConfigWarning for unknown asyncio_mode.
+
+Known follow-up:
+- None.
