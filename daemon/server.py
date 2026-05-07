@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agent_logger import get_logger, log_slash_command
 from agent.agent_runs_client import AgentRunsClient
+from agent.auto_loop_brain import AutoLoopBrainConfig, build_toolless_llm_client
 from agent.taskboard_dispatcher import (
     DaemonTaskboardSpawner,
     TaskboardDispatcher,
@@ -578,10 +579,35 @@ class DaemonServer:
     def _default_bus_factory(url: str, agent_name: str) -> NatsBus:
         return NatsBus(url=url, agent_name=agent_name)
 
+    def _validate_auto_loop_brain_startup(self) -> None:
+        """Fail fast when enabled auto-loop-brain client routing is unusable."""
+
+        config = AutoLoopBrainConfig.from_sources()
+        if not config.enabled:
+            return
+        try:
+            client = build_toolless_llm_client(config)
+            client.complete_json(
+                model=config.model_id,
+                system="ping",
+                user="reply with the literal string 'pong'",
+                timeout=config.timeout_seconds,
+                temperature=0.0,
+                max_output_tokens=4,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning(
+                "auto-loop-brain startup validation failed: %s: %s",
+                exc.__class__.__name__,
+                exc,
+            )
+            raise
+
     async def startup(self) -> None:
         """Connect shared resources used by daemon-backed sessions."""
         self.daemon_token = ensure_daemon_token(self.token_path)
         self.started_at_monotonic = time.monotonic()
+        self._validate_auto_loop_brain_startup()
         try:
             apply_migrations(self.db_path)
         except Exception as exc:  # noqa: BLE001

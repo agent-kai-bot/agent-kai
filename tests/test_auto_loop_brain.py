@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 import unittest
 from dataclasses import dataclass
 from typing import Any
+from unittest.mock import patch
 
 from agent.auto_evaluator import AutoEvaluationDecision, AutoEvaluationInput, AutoResponseEvaluator, ToolCallSummary, render_auto_reply
-from agent.auto_loop_brain import AutoLoopBrainConfig, LLMCriticEvaluator, LLMResult, TokenUsage, build_auto_response_evaluator, _build_critic_prompt, redact_prompt_secrets
+from agent.auto_loop_brain import (
+    AnthropicToollessLLMClient, AutoLoopBrainConfig, ClaudeCLIToollessLLMClient,
+    LLMCriticEvaluator, LLMResult, OpenAICompatToollessLLMClient, TokenUsage,
+    build_auto_response_evaluator, build_toolless_llm_client, _build_critic_prompt, redact_prompt_secrets,
+)
 
 
 @dataclass
@@ -50,6 +56,95 @@ class AlwaysStopEvaluator(AutoResponseEvaluator):
 class ContinueEvaluator(AutoResponseEvaluator):
     def evaluate(self, data: AutoEvaluationInput) -> AutoEvaluationDecision:
         return AutoEvaluationDecision("CONTINUE", 0.91, "regex continue", "permission_deflection", "continue_next_safe_step")
+
+
+def _assert_no_tool_keys(testcase: unittest.TestCase, value: Any) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            testcase.assertNotIn(str(key), {"tools", "tool_choice", "tool_config", "tool_calls", "function_call", "functions"})
+            _assert_no_tool_keys(testcase, child)
+    elif isinstance(value, list):
+        for child in value:
+            _assert_no_tool_keys(testcase, child)
+
+
+class FakeHTTPResponse:
+    def __init__(self, body: dict[str, Any]) -> None:
+        self.body = body
+    def raise_for_status(self) -> None:
+        return None
+    def json(self) -> dict[str, Any]:
+        return self.body
+
+
+class AutoLoopBrainClientTests(unittest.TestCase):
+    def _decision_for_result(self, result: LLMResult) -> str:
+        evaluator = LLMCriticEvaluator(
+            chat_history_provider=tuple,
+            llm_client=FakeLLMClient(result),
+            config=AutoLoopBrainConfig(enabled=True),
+            regex_evaluator=AlwaysStopEvaluator(),
+        )
+        data = AutoEvaluationInput(
+            session_name="alpha", agent_name="developer", auto_mode=True, readonly=False,
+            main_response="continue?", parsed_auto_state="unknown", parsed_auto_reason=None,
+            runtime_pause_reason=None, turn_tool_calls=[], consecutive_no_tool_turns=1,
+            repeated_final_detected=False, iterations_remaining=3, elapsed_seconds=1.0,
+        )
+        return evaluator.evaluate(data).decision
+
+    def test_claude_cli_success_timeout_transport_and_toolless_command(self):
+        client = ClaudeCLIToollessLLMClient()
+        command = client.build_command(model="sonnet", system="sys", user="user")
+        self.assertEqual(command, ["claude", "-p", "--append-system-prompt", "sys", "--model", "sonnet", "user"])
+        self.assertFalse(any("tool" in part.lower() for part in command))
+        with patch("agent.auto_loop_brain.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(command, 0, stdout='{"decision":"STOP"}\n', stderr="")
+            result = client.complete_json(model="sonnet", system="sys", user="user", timeout=1)
+        self.assertEqual(result.text, '{"decision":"STOP"}')
+        self.assertIsNone(result.usage.input_tokens if result.usage else None)
+        with patch("agent.auto_loop_brain.subprocess.run", side_effect=subprocess.TimeoutExpired(command, 1)):
+            with self.assertRaises(TimeoutError):
+                client.complete_json(model="sonnet", system="sys", user="user", timeout=1)
+        with patch("agent.auto_loop_brain.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(command, 1, stdout="", stderr="boom")
+            with self.assertRaises(RuntimeError):
+                client.complete_json(model="sonnet", system="sys", user="user", timeout=1)
+
+    def test_openai_success_transport_tool_attempt_and_toolless_payload(self):
+        client = OpenAICompatToollessLLMClient(endpoint_name="kai-local", endpoint_config={"base_url": "http://llm", "api_key": "not-secret"})
+        payload = client.build_payload(model="model-a", system="sys", user="user")
+        _assert_no_tool_keys(self, payload)
+        body = {"model": "model-a", "choices": [{"message": {"content": '{"decision":"STOP"}'}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 11, "completion_tokens": 7}}
+        with patch("agent.auto_loop_brain.requests.post", return_value=FakeHTTPResponse(body)) as post:
+            result = client.complete_json(model="model-a", system="sys", user="user", timeout=2, max_output_tokens=9)
+        self.assertEqual(post.call_args.args[0], "http://llm/v1/chat/completions")
+        _assert_no_tool_keys(self, post.call_args.kwargs["json"])
+        self.assertEqual(result.text, '{"decision":"STOP"}')
+        self.assertEqual(result.usage.input_tokens if result.usage else None, 11)
+        with patch("agent.auto_loop_brain.requests.post", return_value=FakeHTTPResponse({"choices": [{"message": {"content": "{}", "tool_calls": []}}]})):
+            self.assertTrue(client.complete_json(model="m", system="s", user="u", timeout=1).tool_call_attempted)
+        with patch("agent.auto_loop_brain.requests.post", side_effect=TimeoutError("slow")):
+            with self.assertRaises(TimeoutError):
+                client.complete_json(model="m", system="s", user="u", timeout=1)
+
+    def test_anthropic_success_transport_tool_attempt_and_toolless_payload(self):
+        client = AnthropicToollessLLMClient(api_key="not-secret", base_url="http://anthropic")
+        body = {"model": "claude", "content": [{"type": "text", "text": '{"decision":"STOP"}'}], "usage": {"input_tokens": 3, "output_tokens": 4}}
+        with patch("agent.auto_loop_brain.requests.post", return_value=FakeHTTPResponse(body)) as post:
+            result = client.complete_json(model="claude", system="sys", user="user", timeout=1)
+        _assert_no_tool_keys(self, post.call_args.kwargs["json"])
+        self.assertEqual(result.text, '{"decision":"STOP"}')
+        self.assertEqual(result.usage.input_tokens if result.usage else None, 3)
+        malformed = LLMResult("not json", "claude")
+        self.assertEqual(self._decision_for_result(malformed), "STOP")
+        with patch("agent.auto_loop_brain.requests.post", return_value=FakeHTTPResponse({"content": [{"type": "tool_use", "name": "x"}]})):
+            tool_result = client.complete_json(model="claude", system="s", user="u", timeout=1)
+        self.assertTrue(tool_result.tool_call_attempted)
+        self.assertEqual(self._decision_for_result(tool_result), "STOP")
+        with patch("agent.auto_loop_brain.requests.post", side_effect=RuntimeError("net")):
+            with self.assertRaises(RuntimeError):
+                client.complete_json(model="claude", system="s", user="u", timeout=1)
 
 
 class AutoLoopBrainTests(unittest.TestCase):
@@ -281,6 +376,25 @@ class AutoLoopBrainTests(unittest.TestCase):
         self.assertEqual(client.calls, [])
         cfg = AutoLoopBrainConfig.from_sources({"daemon": {"auto_loop_brain": {"enabled": True, "model_id": "claude-haiku-3"}}})
         self.assertFalse(cfg.enabled)
+
+    def test_factory_routes_configured_clients_and_rejects_bad_openai_config(self):
+        raw_config = {"endpoints": {"local": {"base_url": "http://llm", "api_key": "not-secret"}}}
+        self.assertIsInstance(build_toolless_llm_client(AutoLoopBrainConfig(client="claude-cli"), raw_config=raw_config), ClaudeCLIToollessLLMClient)
+        self.assertIsInstance(build_toolless_llm_client(AutoLoopBrainConfig(client="anthropic"), raw_config=raw_config), AnthropicToollessLLMClient)
+        self.assertIsInstance(build_toolless_llm_client(AutoLoopBrainConfig(client="openai", endpoint="local"), raw_config=raw_config), OpenAICompatToollessLLMClient)
+        with self.assertRaisesRegex(ValueError, "valid choices"):
+            build_toolless_llm_client(AutoLoopBrainConfig(client="bogus"), raw_config=raw_config)
+        with self.assertRaisesRegex(ValueError, "requires"):
+            build_toolless_llm_client(AutoLoopBrainConfig(client="openai"), raw_config=raw_config)
+        with self.assertRaisesRegex(ValueError, "not found"):
+            build_toolless_llm_client(AutoLoopBrainConfig(client="openai", endpoint="missing"), raw_config=raw_config)
+
+    def test_config_client_endpoint_env_overrides(self):
+        raw = {"daemon": {"auto_loop_brain": {"client": "anthropic", "endpoint": "old"}}}
+        with patch.dict("os.environ", {"KAI_AUTO_LOOP_BRAIN_CLIENT": "openai", "KAI_AUTO_LOOP_BRAIN_ENDPOINT": "new"}, clear=False):
+            cfg = AutoLoopBrainConfig.from_sources(raw)
+        self.assertEqual(cfg.client, "openai")
+        self.assertEqual(cfg.endpoint, "new")
 
     def test_cost_caps_force_stop(self):
         evaluator, client, _, _ = self._evaluator()

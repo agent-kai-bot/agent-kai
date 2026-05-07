@@ -368,7 +368,9 @@
   "daemon": {
     "auto_loop_brain": {
       "enabled": false,
-      "model_id": "claude-sonnet-4-6",
+      "client": "claude-cli",
+      "endpoint": null,
+      "model_id": "sonnet",
       "max_history_tokens": 16000,
       "temperature": 0.0,
       "min_continue_confidence": 0.85,
