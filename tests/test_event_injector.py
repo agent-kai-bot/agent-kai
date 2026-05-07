@@ -112,6 +112,31 @@ class EventInjectorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(session.events[-1], ("auto.unit_dropped", {"seq": 7, "reason": "template_render_failed"}))
         self.assertEqual(session.chat_history, [])
+        self.assertFalse(session._event_turn_active)
+
+    async def test_handle_template_render_failure_clears_active_flag(self):
+        async def run_input(*_args, **_kwargs):
+            raise AssertionError("should not run")
+
+        class _BadTemplate(EventInjectionTemplate):
+            def render_map(self, _values):
+                raise RuntimeError("boom")
+
+        session = _Session()
+        managed = _Managed(session)
+        injector = EventInjector(run_input=run_input)
+        request = self._request(_BadTemplate("bad", __file__, ""))
+
+        decision = await injector.handle(managed, request)
+        self.assertTrue(decision.ok)
+        for _ in range(20):
+            if not session._event_turn_active:
+                break
+            await asyncio.sleep(0.01)
+
+        self.assertFalse(session._event_turn_active)
+        self.assertEqual(session.events[-1], ("auto.unit_dropped", {"seq": 7, "reason": "template_render_failed"}))
+        self.assertEqual(session.chat_history, [])
 
 
 if __name__ == "__main__":
