@@ -171,9 +171,21 @@ class OpenAICompatToollessLLMClient:
             if isinstance(models, dict) and models:
                 self.default_model = str(next(iter(models)))
 
+    def resolve_model(self, model: str) -> str:
+        """Resolve the chat model for this endpoint.
+
+        The auto-loop-brain default model (``sonnet``) is Claude-CLI oriented.
+        For OpenAI-compatible endpoints, prefer the endpoint's configured model
+        unless the operator explicitly supplied a different model_id override.
+        """
+        requested_model = str(model or "").strip()
+        if requested_model and requested_model != DEFAULT_CRITIC_MODEL:
+            return requested_model
+        return self.default_model or requested_model
+
     def build_payload(self, *, model: str, system: str, user: str, temperature: float = 0.0, max_output_tokens: int = 512) -> dict[str, Any]:
         return {
-            "model": model or self.default_model,
+            "model": self.resolve_model(model),
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "temperature": float(temperature),
             "max_tokens": int(max_output_tokens),

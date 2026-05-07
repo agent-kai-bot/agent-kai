@@ -114,6 +114,7 @@ class AutoLoopBrainClientTests(unittest.TestCase):
     def test_openai_success_transport_tool_attempt_and_toolless_payload(self):
         client = OpenAICompatToollessLLMClient(endpoint_name="kai-local", endpoint_config={"base_url": "http://llm", "api_key": "not-secret"})
         payload = client.build_payload(model="model-a", system="sys", user="user")
+        self.assertEqual(payload["model"], "model-a")
         _assert_no_tool_keys(self, payload)
         body = {"model": "model-a", "choices": [{"message": {"content": '{"decision":"STOP"}'}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 11, "completion_tokens": 7}}
         with patch("agent.auto_loop_brain.requests.post", return_value=FakeHTTPResponse(body)) as post:
@@ -127,6 +128,20 @@ class AutoLoopBrainClientTests(unittest.TestCase):
         with patch("agent.auto_loop_brain.requests.post", side_effect=TimeoutError("slow")):
             with self.assertRaises(TimeoutError):
                 client.complete_json(model="m", system="s", user="u", timeout=1)
+
+    def test_openai_uses_endpoint_model_for_default_critic_model(self):
+        client = OpenAICompatToollessLLMClient(
+            endpoint_name="kai-local",
+            endpoint_config={"base_url": "http://llm/v1", "api_key": "not-secret", "models": {"qwen35-gptq": {}}},
+        )
+        payload = client.build_payload(model="sonnet", system="sys", user="user")
+        self.assertEqual(payload["model"], "qwen35-gptq")
+        body = {"choices": [{"message": {"content": '{}'}, "finish_reason": "stop"}]}
+        with patch("agent.auto_loop_brain.requests.post", return_value=FakeHTTPResponse(body)) as post:
+            result = client.complete_json(model="sonnet", system="sys", user="user", timeout=2)
+        self.assertEqual(post.call_args.kwargs["json"]["model"], "qwen35-gptq")
+        self.assertEqual(result.model_id, "qwen35-gptq")
+        _assert_no_tool_keys(self, post.call_args.kwargs["json"])
 
     def test_openai_requires_configured_env_key_when_api_key_env_is_declared(self):
         endpoint_config = {"base_url": "http://llm", "api_key_env": "AUTO_LOOP_BRAIN_TEST_KEY", "api_key": "missing-kai-api-key"}
@@ -389,10 +404,12 @@ class AutoLoopBrainTests(unittest.TestCase):
         self.assertFalse(cfg.enabled)
 
     def test_factory_routes_configured_clients_and_rejects_bad_openai_config(self):
-        raw_config = {"endpoints": {"local": {"base_url": "http://llm", "api_key": "not-secret"}}}
+        raw_config = {"endpoints": {"local": {"base_url": "http://llm", "api_key": "not-secret", "models": {"endpoint-model": {}}}}}
         self.assertIsInstance(build_toolless_llm_client(AutoLoopBrainConfig(client="claude-cli"), raw_config=raw_config), ClaudeCLIToollessLLMClient)
         self.assertIsInstance(build_toolless_llm_client(AutoLoopBrainConfig(client="anthropic"), raw_config=raw_config), AnthropicToollessLLMClient)
-        self.assertIsInstance(build_toolless_llm_client(AutoLoopBrainConfig(client="openai", endpoint="local"), raw_config=raw_config), OpenAICompatToollessLLMClient)
+        openai_client = build_toolless_llm_client(AutoLoopBrainConfig(client="openai", endpoint="local"), raw_config=raw_config)
+        self.assertIsInstance(openai_client, OpenAICompatToollessLLMClient)
+        self.assertEqual(openai_client.build_payload(model="sonnet", system="s", user="u")["model"], "endpoint-model")
         with self.assertRaisesRegex(ValueError, "valid choices"):
             build_toolless_llm_client(AutoLoopBrainConfig(client="bogus"), raw_config=raw_config)
         with self.assertRaisesRegex(ValueError, "requires"):
