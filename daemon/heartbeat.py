@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from daemon.event_injector import EventInjectionTemplate, SafeFormatDict
+
 
 def utc_now() -> datetime:
     """Return the current UTC time as a timezone-aware datetime."""
@@ -63,33 +65,14 @@ class HeartbeatConfig:
     max_injected_turns_per_hour: int = 0
 
 
-class SafeFormatDict(dict):
-    """Format mapping that keeps unknown placeholders visible."""
-
-    def __missing__(self, key: str) -> str:
-        return "{" + key + "}"
-
-
 @dataclass(frozen=True)
-class HeartbeatPromptTemplate:
-    """Git-tracked prompt template rendered for heartbeat turns."""
-
-    name: str
-    path: Path
-    content: str
+class HeartbeatPromptTemplate(EventInjectionTemplate):
+    """Heartbeat compatibility wrapper around EventInjectionTemplate."""
 
     @classmethod
     def load(cls, template_path: str | Path) -> "HeartbeatPromptTemplate":
-        path = Path(template_path)
-        if not path.is_absolute():
-            path = Path(__file__).resolve().parent.parent / path
-        try:
-            content = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise FileNotFoundError(
-                f"heartbeat prompt template is not readable: {path}"
-            ) from exc
-        return cls(name=path.name, path=path, content=content)
+        template = EventInjectionTemplate.load(template_path)
+        return cls(name=template.name, path=template.path, content=template.content)
 
     def render(
         self,
