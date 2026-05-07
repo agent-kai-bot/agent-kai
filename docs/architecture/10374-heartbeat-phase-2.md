@@ -1,126 +1,688 @@
-Task 10374 — ARCH: heartbeat phase 2 — main-agent subscribes + injects prompt on tick
+# Architecture Artifact: Task 10374 — Heartbeat Phase 2: Main-Agent Tick Subscription + Prompt Injection
 
-Status: architecture complete
-Author: Architect (orchestrator-written; original architect spawn lost its session worktree before committing — see `Process notes` below)
-Date: 2026-05-06
+## Context
 
-Context
-- Phase 1 (#10370, merged) added a daemon-owned `HeartbeatService` that emits monotonic UTC ticks at a configurable interval and publishes them to (a) the `DaemonEventBus` `heartbeat` channel and (b) every live session's event stream as `heartbeat.tick`. Phase 1 is intentionally tick-only: `_handle_heartbeat_tick` in `daemon/server.py:655` carries the comment "Fan out one daemon-owned heartbeat tick without waking the agent." Nothing today consumes those ticks to drive agent behavior.
-- Phase 1 also defined `SessionHeartbeatState` per `10368-heartbeat-tick.md` — the per-session tick mailbox the main loop is supposed to consume. That mailbox exists but no consumer is wired.
-- Dan's stated goal (2026-05-06 conversation): "ability to inject messages into the main agent kai loop from a heartbeat ... runs every 30mins and is configurable." Today's default is 60 s with no injection at all.
+Phase 1 introduced a daemon-owned heartbeat service (`daemon/heartbeat.py`) that emits periodic `HeartbeatTick` objects and fans them out through `DaemonServer._handle_heartbeat_tick()`. Today the tick is intentionally passive: it publishes daemon/session events only and never wakes an agent.
 
-Problem statement
-Phase 1 ships a clock that nobody reads. Phase 2 must wire the main-agent loop to that clock so the agent self-prompts on cadence — without racing user/scheduler/taskboard runs, without burning LLM/tool budget on every tick, and without leaking heartbeat ticks into spawn sessions (taskboard-fire CR/SA/QA/dev) that should not be self-prompting.
+Task 10374 wires this tick stream into the main KAI agent loop so auto-mode sessions can receive a fresh self-prompt on cadence. The design must preserve Phase 1 behavior for non-subscribed sessions, avoid queued heartbeat backlogs, protect token spend, and keep the injected prompt git-tracked.
 
-Recommendation summary
-Add a per-session `HeartbeatSubscriber` that drains the existing `SessionHeartbeatState` mailbox and, when policy allows, calls `Session.run_input(prompt, source="heartbeat")` with a rendered prompt template. Default the daemon cadence to 30 min. Default subscription on for the kai main agent and off for taskboard-fire spawn sessions. Cap injected runs per hour to bound cost. Make the prompt template git-tracked at `prompts/heartbeat/main.md.tmpl`.
+Relevant existing code inspected:
 
-Chosen design
+- `daemon/heartbeat.py`
+  - `HeartbeatConfig(enabled=True, interval_seconds=60.0, publish_session_events=True)`
+  - `load_heartbeat_config()` reads `daemon.heartbeat.*` from `agent-config.json` and env overrides including `KAI_HEARTBEAT_INTERVAL_SECONDS`.
+  - `HeartbeatService.emit_once()` builds `HeartbeatTick` and invokes the callback.
+- `daemon/server.py`
+  - `DaemonServer.startup()` creates `HeartbeatService`.
+  - `_handle_heartbeat_tick()` publishes `heartbeat` on `DaemonEventBus` and `heartbeat.tick` session events.
+  - `run_input()` serializes turns with `ManagedSession.input_lock` and sets `current_input_task` / activity status.
+  - `/api/metrics` and `/api/health` already include heartbeat status.
+- `daemon/core.py`
+  - `Session.start_auto_mode()` enables autonomous mode.
+  - `Session.stream_agent_events()` runs one input and, when `auto_mode` is enabled, may continue internally while `AUTO_STATE: continue` is emitted.
+  - `chat_history` is shared with `AgentRunner.chat_history`; injected prompts must be added as `HumanMessage` entries.
+- `agent/taskboard_dispatcher.py`
+  - Taskboard-fire sessions call `managed.session.start_auto_mode()` before their run; these spawn sessions must default heartbeat subscription off.
+- `tests/test_heartbeat.py`
+  - Existing tests assert Phase 1 ticks fan out without agent wakeup. These should be updated only where a subscribed main-agent session is intentionally enabled; non-subscribed behavior remains covered.
 
-1. Configuration
-   - Extend `HeartbeatConfig` in `daemon/heartbeat.py`:
-     - `interval_seconds: float = 1800.0` (was 60.0). Existing env override `KAI_HEARTBEAT_INTERVAL_SECONDS` stays.
-     - `prompt_template_path: str = "prompts/heartbeat/main.md.tmpl"` (relative to repo root). Env override: `KAI_HEARTBEAT_PROMPT_TEMPLATE_PATH`.
-     - `max_injected_turns_per_hour: int = 4` (matches 30 min cadence with one safety skip headroom). Env: `KAI_HEARTBEAT_MAX_INJECTED_TURNS_PER_HOUR`.
-   - All values clamped at config-load time. Floor on `interval_seconds` stays 0.1 s; floor on `max_injected_turns_per_hour` is 0 (0 ⇒ ticks fan out but injection is disabled, equivalent to phase 1 today).
-   - Top-level config layout in `agent-config.json`:
-     ```json
-     {
-       "daemon": {
-         "heartbeat": {
-           "enabled": true,
-           "interval_seconds": 1800,
-           "publish_session_events": true,
-           "prompt_template_path": "prompts/heartbeat/main.md.tmpl",
-           "max_injected_turns_per_hour": 4
-         }
-       }
-     }
-     ```
+## Goals / Acceptance Mapping
 
-2. Prompt template
-   - New file `prompts/heartbeat/main.md.tmpl` (git-tracked, NOT in Vault — there are no secrets in this prompt).
-   - Variables passed to the renderer: `tick_seq`, `tick_emitted_at`, `session_name`, `agent_name`, `last_active_at`, `idle_seconds`.
-   - Default body should give the agent enough orientation to self-route ("you are Kai; the daemon just fired a 30 min heartbeat at $tick_emitted_at; you've been idle $idle_seconds seconds; resume the highest-priority work in flight or, if there is none, run a system health check"). The literal default text is part of the impl ticket, not this spec.
+1. Change default heartbeat cadence from 60 seconds to 30 minutes (`1800` seconds) while preserving `KAI_HEARTBEAT_INTERVAL_SECONDS` override.
+2. Load a daemon-start heartbeat prompt template from a git-tracked file. Default: `prompts/heartbeat/main.md.tmpl`; config-overridable path.
+3. Subscribe eligible main-agent sessions on `start_auto_mode`; on each tick append rendered template as `HumanMessage` and trigger exactly one agent turn.
+4. Drop ticks when the session is busy, mid-tool-call, or already auto-continuing. Do not queue missed ticks.
+5. Add per-session opt-out: `heartbeat_subscribed: false`; default true for KAI main agent; default false for taskboard-fire sessions.
+6. Emit telemetry event `auto.heartbeat_injected` with `seq`, `template_name`, `chars_injected`; expose `heartbeat.subscribers_count` in health/metrics.
+7. Add unit, integration, and e2e coverage.
+8. Add configurable cap: default max 4 heartbeat-injected turns/hour.
 
-3. Subscription model
-   - New per-session field `heartbeat_subscribed: bool` on `Session`. Default value comes from session source:
-     - `source == "kai-main"` (the always-on top-level Kai session): `true`.
-     - `source.startswith("taskboard-")` (spawn sessions for CR/SA/QA/dev): `false`.
-     - Other / future sources: `false` until explicitly opted in.
-   - `Session` exposes `set_heartbeat_subscribed(bool, reason: str)` for runtime overrides; that call publishes a `session.heartbeat_subscription_changed` event so the UI/health endpoint can reflect it.
-   - Subscription is cheap; it adds the session to `HeartbeatService._subscribers` so phase-1 fanout is the same loop that delivers to the mailbox.
+## Recommended Design
 
-4. The injection step
-   - Each subscribed session gets a `HeartbeatSubscriber` task that awaits new ticks from its `SessionHeartbeatState` mailbox.
-   - On tick:
-     1. Acquire `Session.input_lock` non-blocking. If already held (user/scheduler/taskboard run in flight, or another auto-mode iteration): drop the tick. Heartbeat is a fresh signal, never queued.
-     2. Check rate limit: if injections in the last 3600 s ≥ `max_injected_turns_per_hour`: drop and emit `auto.heartbeat_rate_limited`.
-     3. Check auto-mode state: if `Session.auto_mode` is on AND `auto_iterations_remaining > 0`: drop (the agent is already self-driving).
-     4. Render `prompt_template_path` with the tick variables. Get back a single string.
-     5. Append a `HumanMessage` with that string to `Session.chat_history`.
-     6. Call `Session.run_input(rendered_prompt, source="heartbeat", auto_iterations=1)` — exactly **one** auto iteration. Heartbeats wake the agent; they don't start a long auto-mode session. If the agent's response sets `AUTO_STATE: continue`, the existing auto-evaluator path handles the rest within its own quota; phase 2 doesn't extend that quota.
-     7. Release `input_lock` after the iteration completes. Increment a per-session injection counter with rolling 1-hour window.
-   - All steps inside a `try/except` that increments `Session.heartbeat_failure_count` and emits `auto.heartbeat_error` with the exception class name — never the message (sensitive content protection).
+### High-Level Flow
 
-5. Telemetry & observability
-   - Per-tick events:
-     - `auto.heartbeat_tick_received` (subscriber-side, before policy checks): `{session_name, tick_seq, idle_seconds}`.
-     - `auto.heartbeat_dropped`: `{session_name, tick_seq, reason: "input_locked"|"rate_limited"|"auto_mode_active"|"render_failed"}`.
-     - `auto.heartbeat_injected`: `{session_name, tick_seq, template_name, chars_injected, prompt_id}`.
-     - `auto.heartbeat_error`: `{session_name, tick_seq, exception_kind}`.
-   - `/api/health` heartbeat block (already exists in `daemon/server.py:770`) gets two new fields:
-     - `subscribers_count: int` — current subscribed sessions.
-     - `injections_last_hour_total: int` — sum across sessions.
+```mermaid
+sequenceDiagram
+    participant HB as HeartbeatService
+    participant DS as DaemonServer
+    participant S as Session(main)
+    participant AR as AgentRunner
+    participant UI as Session Event Bus
 
-6. Backward compatibility
-   - Phase 1 ticks-only behavior is preserved for non-subscribed sessions. They still receive `heartbeat.tick` events on their event bus; nothing else changes.
-   - Default for `prompts/heartbeat/main.md.tmpl` ships with the impl PR. Operators can override path/contents per env or config.
-   - If `prompts/heartbeat/main.md.tmpl` is missing at startup, the service logs an error, sets `subscribers_count = 0`, and falls back to phase-1 ticks-only behavior. **No silent partial-functionality.**
+    HB->>DS: HeartbeatTick(seq, emitted_at, interval)
+    DS->>DS: publish daemon event: heartbeat
+    DS->>UI: publish heartbeat.tick (phase-1 compatibility)
+    DS->>DS: find subscribed sessions
+    alt session busy / auto-continuing / rate-limited / opted-out
+        DS->>UI: optional heartbeat.dropped diagnostic
+    else eligible
+        DS->>S: append HumanMessage(rendered_template)
+        DS->>UI: auto.heartbeat_injected(seq, template_name, chars_injected)
+        DS->>AR: run exactly one heartbeat turn
+        AR-->>UI: normal agent.* events
+    end
+```
 
-Test plan
-- Unit (`tests/test_heartbeat_subscriber.py`):
-  - Template loader handles missing file, malformed Jinja, valid render.
-  - Suppression rules: input_lock held → drop; auto_mode + iterations remaining → drop; rate limit hit → drop.
-  - Counter rolling-window correctness across mocked clocks.
-- Integration (`tests/test_heartbeat_phase2_integration.py`):
-  - Start daemon with `interval_seconds=0.5`, `max_injected_turns_per_hour=10`, subscribe a fake `Session` whose `run_input` records calls.
-  - Wait for two ticks; assert `run_input` called exactly twice with `source="heartbeat"`.
-  - Confirm `chat_history` got the rendered prompt as a `HumanMessage`.
-- E2E (`tests/test_heartbeat_phase2_e2e.py`):
-  - Real daemon, real Kai session, `interval_seconds=2.0`, prompt template that asks the agent to emit a single sentinel string. Assert sentinel appears in agent response within one tick boundary.
+### Component Additions
 
-Failure modes & rejected alternatives
-- **Queue ticks instead of dropping**: rejected. Heartbeat is a freshness signal, not a backlog; a 4-hour-old tick is meaningless.
-- **Inject directly without going through `run_input`**: rejected. Bypasses auto-evaluator, tool gates, and event publication; produces a divergent execution path.
-- **Use a separate "heartbeat agent" with its own LLM call**: rejected for phase 2. The injection target IS the main agent. A separate critic agent is what `#10375 auto-loop-brain` is for.
-- **Couple cadence to user activity** (e.g. fire after N minutes of UI silence): rejected for phase 2 — cadence is daemon-owned and global. Per-session adaptive cadence is a future ticket if needed.
+#### 1. Extend `HeartbeatConfig`
 
-Rollout guardrails
-- Ship with `max_injected_turns_per_hour: 0` as the default for the FIRST production cutover. Operator flips it to 4 once telemetry confirms the injection path is healthy.
-- Add a `KAI_HEARTBEAT_INJECTION_KILL_SWITCH=1` env var that forces `max_injected_turns_per_hour=0` regardless of config. Quick break-glass.
+Update `daemon/heartbeat.py`:
 
-Implementation sequence
-1. Land config schema + 30 min default + tests for `load_heartbeat_config` (small, low-risk).
-2. Add `prompts/heartbeat/main.md.tmpl` + Jinja renderer integration + unit tests.
-3. Add `Session.heartbeat_subscribed` + `set_heartbeat_subscribed` + integration tests.
-4. Add `HeartbeatSubscriber` worker + the suppression/rate-limit logic + `auto.heartbeat_*` events.
-5. Wire subscriber into `HeartbeatService` startup. E2E test.
-6. Ship with kill-switch on, flip kill-switch off after one hour of green telemetry.
+```python
+@dataclass(frozen=True)
+class HeartbeatConfig:
+    enabled: bool = True
+    interval_seconds: float = 1800.0
+    publish_session_events: bool = True
+    prompt_template_path: str = "prompts/heartbeat/main.md.tmpl"
+    max_injected_turns_per_hour: int = 4
+```
 
-Acceptance criteria mapping (against the parent ticket #10374)
-- AC1 (default cadence 30 min): step 1.
-- AC2 (configurable prompt template): step 2.
-- AC3 (main agent subscribes; tick injects HumanMessage; single auto iteration): steps 3 + 4.
-- AC4 (suppression rules — drop never queue): step 4.
-- AC5 (per-session opt-out; default true for kai-main, false for spawn): step 3.
-- AC6 (telemetry events + `/api/health` subscribers_count): step 4 + 5.
-- AC7 (unit / integration / e2e tests): all steps.
+Config keys under `daemon.heartbeat`:
 
-Risks
-- Token cost on Kai-main if the prompt template is verbose. Mitigation: keep the default tight; rate-limit cap is the safety net.
-- Re-entrancy from a heartbeat-injected turn invoking auto-mode that runs longer than 30 min and gets clipped by the next tick. Mitigation: the rate limit + the `auto_mode_active` drop rule together prevent this.
-- Worktree-cleanup pattern (the bug that lost the original architect spawn's artifact) is not in this spec's scope but should not be allowed to lose dev/CR/SA/QA artifacts in the impl phase. File a separate ticket if the impl dev sees the same loss.
+```json
+{
+  "daemon": {
+    "heartbeat": {
+      "enabled": true,
+      "interval_seconds": 1800,
+      "publish_session_events": true,
+      "prompt_template_path": "prompts/heartbeat/main.md.tmpl",
+      "max_injected_turns_per_hour": 4
+    }
+  }
+}
+```
 
-Process notes
-- The original architect spawn for #10374 ran but its session worktree was reaped before any commit landed in the consolidated branch. Only a taskboard summary comment was preserved. This spec was written by the orchestrator from the in-conversation design with Dan plus the architect's summary, so it could be re-used for impl. The artifact-loss issue is a separate process bug worth filing if it recurs.
+Env overrides:
+
+- Existing: `KAI_HEARTBEAT_ENABLED`
+- Existing: `KAI_HEARTBEAT_INTERVAL_SECONDS`
+- Existing: `KAI_HEARTBEAT_PUBLISH_SESSION_EVENTS`
+- New recommended: `KAI_HEARTBEAT_PROMPT_TEMPLATE_PATH`
+- New recommended: `KAI_HEARTBEAT_MAX_INJECTED_TURNS_PER_HOUR`
+
+Validation:
+
+- Clamp `interval_seconds` to `>= 0.1` as current code does.
+- Clamp `max_injected_turns_per_hour` to `>= 0`; `0` means disable prompt injection while leaving passive heartbeat ticks active.
+- Resolve relative `prompt_template_path` against repo root / current process CWD consistently. Prefer a helper anchored at `Path(__file__).resolve().parent.parent` so tests and daemon launches are stable.
+
+#### 2. Add Template Loader
+
+Create a small, testable helper, preferably in `daemon/heartbeat.py` or a new `daemon/heartbeat_prompt.py`.
+
+Recommended contract:
+
+```python
+@dataclass(frozen=True)
+class HeartbeatPromptTemplate:
+    name: str              # basename or config logical name, e.g. main.md.tmpl
+    path: Path
+    content: str
+
+    def render(self, tick: HeartbeatTick, *, session_name: str, agent_name: str | None) -> str:
+        ...
+```
+
+Template rendering should be intentionally simple: Python `str.format_map()` with a safe dict is enough. Do not introduce Jinja unless the project already depends on it.
+
+Supported variables:
+
+- `{seq}`
+- `{emitted_at}`
+- `{interval_seconds}`
+- `{session_name}`
+- `{agent_name}`
+- `{source}`
+- `{reason}`
+
+Failure policy:
+
+- Daemon startup should fail fast if the configured template file is missing or unreadable. This prevents silent prompt drift and misconfiguration.
+- Rendering failures on a tick should not crash the heartbeat loop; increment heartbeat failure/diagnostic counters and publish/drop the tick without agent wakeup.
+- Unknown template variables should render as empty or be left literal; choose one behavior and cover it with a unit test. Recommendation: use a `SafeFormatDict` that leaves unknown placeholders literal, making template mistakes visible in chat history.
+
+Default template file to add:
+
+`prompts/heartbeat/main.md.tmpl`
+
+Suggested content:
+
+```markdown
+Heartbeat tick {seq} at {emitted_at} UTC.
+
+You are in autonomous mode. Briefly inspect current state, continue any useful pending work, and stop if there is nothing actionable.
+
+End with the required AUTO_STATE footer.
+```
+
+This is intentionally compact to reduce recurring token spend.
+
+#### 3. Session-Level Subscription State
+
+Add to `daemon/core.py::Session`:
+
+```python
+self.heartbeat_subscribed: bool = False
+self.heartbeat_injection_timestamps: deque[float] = deque()
+self._heartbeat_turn_active: bool = False
+```
+
+Also persist/load `heartbeat_subscribed` if session config/state persistence is desired. The acceptance says “session config flag”; the cleanest minimal implementation is:
+
+- Include `heartbeat_subscribed` in `Session.save()` state.
+- Load it in `Session.load()` if present.
+- Add a setter method:
+
+```python
+def set_heartbeat_subscribed(self, enabled: bool) -> None:
+    self.heartbeat_subscribed = bool(enabled)
+    self.publish_event("heartbeat.subscription", {"subscribed": self.heartbeat_subscribed})
+```
+
+Defaulting rules:
+
+- KAI main agent session: default true when `start_auto_mode()` is called, unless state/config explicitly set `heartbeat_subscribed` false.
+- Taskboard-fire spawn sessions: default false before calling `start_auto_mode()`.
+
+To make invalid states less likely, avoid inferring from names in many places. Add a boolean parameter to `Session.start_auto_mode()`:
+
+```python
+def start_auto_mode(..., heartbeat_subscribed: bool | None = None):
+    if heartbeat_subscribed is not None:
+        self.set_heartbeat_subscribed(heartbeat_subscribed)
+    elif not self.taskboard_dispatcher and self.agent_name == "kai":
+        # default true for main KAI only if not explicitly disabled
+        self.heartbeat_subscribed = True
+```
+
+However, beware persisted explicit `false`. Recommended stronger model:
+
+- Track `self.heartbeat_subscription_configured: bool = False`.
+- `set_heartbeat_subscribed()` sets configured true.
+- `start_auto_mode(heartbeat_subscribed=None)` applies default only when not configured.
+
+Minimal acceptable alternative:
+
+- `start_auto_mode(..., heartbeat_subscribed=True)` default, and taskboard dispatcher passes `False`.
+- This is simpler but can overwrite a persisted/user opt-out if `/auto` is used. If implemented, add a follow-up action item for durable explicit opt-out handling.
+
+#### 4. Suppression Rules
+
+Implement eligibility centrally to make unit testing easy.
+
+Recommended new method on `DaemonServer` or a helper:
+
+```python
+def heartbeat_injection_decision(self, managed: ManagedSession, tick: HeartbeatTick) -> tuple[bool, str]:
+    session = managed.session
+    if not session.heartbeat_subscribed:
+        return False, "not_subscribed"
+    if not session.auto_mode:
+        return False, "auto_mode_off"
+    if managed.input_lock.locked():
+        return False, "busy"
+    if managed.current_input_task is not None and not managed.current_input_task.done():
+        return False, "mid_turn"
+    runner = session.agent_runner
+    if runner is not None and getattr(runner, "_active_recorder", None) is not None:
+        return False, "mid_tool_call"
+    if runner is not None and getattr(runner, "_is_auto_continuation", False):
+        return False, "auto_continuing"
+    if session._heartbeat_turn_active:
+        return False, "heartbeat_turn_active"
+    if rate_limit_exceeded(session, now=time.monotonic()):
+        return False, "rate_limited"
+    return True, "ok"
+```
+
+Notes:
+
+- `managed.input_lock.locked()` is the most reliable existing guard for “mid-turn” because `run_input()` holds it across the entire streamed turn and any internal auto-continuations.
+- `_is_auto_continuation` is reset in `Session.stream_agent_events()` finally blocks; use it as an additional guard, not the only guard.
+- “mid-tool-call” is likely already covered by `input_lock`, but check `AgentRunner` internals for any active recorder/tool state. If no precise flag exists, add one near tool execution in `agent/core.py` (e.g. `_tool_call_depth` increment/decrement) and expose `is_tool_call_active` property. Do not rely only on activity label text.
+- Dropped ticks are not queued. Do not append to `input_queue`.
+
+#### 5. Trigger Exactly One Auto-Mode Iteration
+
+Current `Session.stream_agent_events()` can perform multiple turns in a single `run_input()` call when `auto_mode` is true and the model returns `AUTO_STATE: continue`. Heartbeat acceptance requires a single auto-mode iteration, not a full re-run.
+
+Recommended implementation: add a `single_auto_iteration` parameter to `Session.stream_agent_events()` and `DaemonServer.run_input()`.
+
+```python
+async def run_input(..., single_auto_iteration: bool = False):
+    async for event in managed.session.stream_agent_events(..., single_auto_iteration=single_auto_iteration):
+        ...
+```
+
+In `stream_agent_events()`, after one agent turn and after publishing `auto.progress`, if `single_auto_iteration` is true:
+
+- Do not parse/enforce hidden `AUTO_CONTINUE` loop beyond this turn.
+- Do not call `stop_auto_mode()` just because the heartbeat turn ended.
+- Leave `session.auto_mode` enabled for future heartbeat/user turns.
+- Decrement `auto_iterations_remaining` by one as normal.
+- If iteration budget reaches 0, stop auto mode with existing “iteration budget exhausted”.
+- If the model explicitly returns `AUTO_STATE: done` or `pause`, it is acceptable to stop auto mode using existing semantics; the key is to avoid hidden self-continuation loops triggered by one heartbeat.
+
+Pseudo-control-flow insertion:
+
+```python
+# after one agent_runner.run() turn
+if self.auto_mode:
+    self.auto_iterations_remaining = max(0, self.auto_iterations_remaining - 1)
+    yield auto_progress
+
+    if single_auto_iteration:
+        if self.auto_iterations_remaining <= 0:
+            yield auto_stopped("iteration budget exhausted")
+        elif auto_state in {"done", "pause"}:
+            yield auto_stopped(auto_reason or ...)
+        # For continue/malformed, do not inject hidden turn; just return.
+        break
+```
+
+This isolates heartbeat behavior without changing ordinary `/auto` or taskboard-fire runs.
+
+#### 6. Heartbeat Injection Handler
+
+Modify `DaemonServer._handle_heartbeat_tick()`:
+
+1. Preserve existing Phase 1 fanout first:
+   - Publish daemon event `heartbeat`.
+   - Publish session event `heartbeat.tick` if enabled.
+2. Then iterate sessions and inject only where eligible.
+3. Start the one-turn run in a background task so the heartbeat service callback is not blocked by LLM execution.
+
+Recommended helper methods:
+
+```python
+async def _handle_heartbeat_tick(self, tick: HeartbeatTick) -> None:
+    await self._publish_heartbeat_tick_events(tick)
+    self._trigger_heartbeat_subscribers(tick)
+
+
+def _trigger_heartbeat_subscribers(self, tick: HeartbeatTick) -> None:
+    for managed in list(self.sessions.values()):
+        ok, reason = self._heartbeat_injection_decision(managed, tick)
+        if not ok:
+            self._publish_heartbeat_drop(managed, tick, reason)  # optional diagnostic
+            continue
+        task = asyncio.create_task(self._run_heartbeat_turn(managed, tick), name=f"heartbeat-{managed.session.name}-{tick.seq}")
+        task.add_done_callback(_consume_task_exception)
+```
+
+In `_run_heartbeat_turn()`:
+
+```python
+prompt = self.heartbeat_prompt_template.render(...)
+managed.session.chat_history.append(HumanMessage(content=prompt))
+managed.session.agent_runner.chat_history = managed.session.chat_history
+managed.session.record_heartbeat_injection(now)
+managed.session.publish_event("auto.heartbeat_injected", {
+    "seq": tick.seq,
+    "template_name": self.heartbeat_prompt_template.name,
+    "chars_injected": len(prompt),
+})
+managed.session._heartbeat_turn_active = True
+try:
+    await self.run_input(
+        managed,
+        prompt,
+        source="heartbeat",
+        job_id=f"heartbeat:{tick.seq}",
+        single_auto_iteration=True,
+    )
+finally:
+    managed.session._heartbeat_turn_active = False
+```
+
+Important chat-history detail:
+
+- `AgentRunner.run(user_input)` appends `HumanMessage(content=user_input)` internally in `agent/core.py` around line 799. If `_run_heartbeat_turn()` also appends before calling `run_input(prompt)`, the prompt may be duplicated.
+- Acceptance explicitly says the tick injects the rendered prompt into `chat_history` as a `HumanMessage` and triggers the iteration. There are two safe implementation options:
+
+Option A (recommended): add `pre_injected_input: bool = False` to `run_input()` / `stream_agent_events()` / `AgentRunner.run()` so heartbeat can append once and tell the runner not to append the same user input again. This is precise but touches more call sites.
+
+Option B: let `AgentRunner.run(prompt)` append the `HumanMessage` and treat that as the injection; emit telemetry immediately before running. This is minimal but less explicit and makes the integration assertion rely on normal run behavior rather than a dedicated injection path.
+
+Recommended for acceptance clarity: Option A. Add tests that count only one heartbeat prompt in `chat_history`.
+
+#### 7. Subscriber Count
+
+Expose `heartbeat.subscribers_count` in `metrics_snapshot()` and therefore `/api/health`.
+
+Definition:
+
+```python
+def heartbeat_subscribers_count(self) -> int:
+    return sum(
+        1 for managed in self.sessions.values()
+        if managed.session.heartbeat_subscribed and managed.session.auto_mode
+    )
+```
+
+Include in heartbeat metrics:
+
+```python
+"subscribers_count": self.heartbeat_subscribers_count(),
+"max_injected_turns_per_hour": self.heartbeat_config.max_injected_turns_per_hour,
+"prompt_template_name": self.heartbeat_prompt_template.name,
+```
+
+Acceptance only requires `subscribers_count`, but the additional fields help operations verify config.
+
+#### 8. Rate Limit / Token Cost Protection
+
+Add per-session sliding-window rate limiting.
+
+- Store monotonic timestamps of successful heartbeat injections in a `deque` on `Session`.
+- Before injection, drop timestamps older than 3600 seconds.
+- If count >= `max_injected_turns_per_hour`, drop tick with reason `rate_limited`.
+- Default 4. With 30-minute cadence this allows two expected ticks and two catch-up/safety ticks per hour if cadence is temporarily shorter in tests/dev.
+
+This limiter applies to successful injections only, not passive `heartbeat.tick` events.
+
+#### 9. Session Opt-Out Defaults
+
+Main KAI session:
+
+- On `/auto` command, call `session.start_auto_mode(..., heartbeat_subscribed=True)` unless the session has explicit opt-out.
+- If a direct API path starts auto mode, use the same default.
+
+Taskboard-fire sessions:
+
+- In `agent/taskboard_dispatcher.py`, change current call:
+
+```python
+managed.session.start_auto_mode(max_iterations=max_iters, readonly=False)
+```
+
+to:
+
+```python
+managed.session.start_auto_mode(
+    max_iterations=max_iters,
+    readonly=False,
+    heartbeat_subscribed=False,
+)
+```
+
+This prevents background heartbeat prompts from perturbing architecture/developer/QA taskboard sessions.
+
+Config flag:
+
+- Accept persisted session state `heartbeat_subscribed: false`.
+- If there is already a session config system outside inspected files, use the same field name there. Otherwise state persistence is sufficient for this task.
+
+## Rejected Alternatives
+
+### Alternative A: Use Scheduler Jobs for Heartbeat Wakeups
+
+Rejected because the task explicitly says scheduled-job-style “every X minutes” jobs are out of scope and already handled by the BIO scheduler. Heartbeat should remain a daemon-level fresh signal, not a durable job backlog.
+
+### Alternative B: Enqueue Heartbeat Prompts in `input_queue`
+
+Rejected because acceptance requires dropped ticks when busy and no backlog. `input_queue` would create stale work and surprise token spend after a long busy period.
+
+### Alternative C: Let Every Session Subscribe by Default
+
+Rejected because taskboard-fire sessions run long autonomous implementation jobs. Injecting heartbeat prompts into those sessions could corrupt task-specific prompts, break completion semantics, and inflate token cost. Defaults must be role/session aware.
+
+### Alternative D: Invoke Full Auto-Mode Loop on Tick
+
+Rejected because a heartbeat should trigger a single cadence check, not consume the entire remaining auto budget or enter hidden `AUTO_CONTINUE` loops. A `single_auto_iteration` mode is needed.
+
+### Alternative E: Store Template in Vault
+
+Rejected by constraint: “No prompt drift: the template is git-tracked, not Vault.”
+
+## Data Contracts
+
+### Heartbeat Tick Payload (Existing)
+
+Published on daemon channel `heartbeat` and session topic `heartbeat.tick`:
+
+```json
+{
+  "seq": 12,
+  "emitted_at": "2026-05-06T16:30:00Z",
+  "monotonic_seconds": 123456.78,
+  "interval_seconds": 1800.0,
+  "source": "daemon",
+  "reason": "periodic",
+  "type": "heartbeat.tick",
+  "pending": false,
+  "agent_wakeup_enabled": true
+}
+```
+
+For non-subscribed sessions, keep `agent_wakeup_enabled: false` or omit new meaning. For subscribed sessions, it is acceptable to set true in session event payload, but do not change the daemon event contract.
+
+### Injected Telemetry Event
+
+Session event topic: `auto.heartbeat_injected`
+
+Payload:
+
+```json
+{
+  "seq": 12,
+  "template_name": "main.md.tmpl",
+  "chars_injected": 231
+}
+```
+
+Optional useful additions that do not violate acceptance:
+
+```json
+{
+  "session": "terminal",
+  "source": "heartbeat",
+  "emitted_at": "2026-05-06T16:30:00Z"
+}
+```
+
+### Optional Drop Diagnostic
+
+Not required, but recommended for debugging:
+
+Topic: `auto.heartbeat_dropped`
+
+```json
+{
+  "seq": 12,
+  "reason": "busy|mid_turn|mid_tool_call|auto_continuing|rate_limited|not_subscribed|auto_mode_off",
+  "subscribed": true
+}
+```
+
+Do not expose this as an error.
+
+### Health / Metrics
+
+`GET /api/health` heartbeat object should include:
+
+```json
+{
+  "enabled": true,
+  "running": true,
+  "interval_seconds": 1800.0,
+  "publish_session_events": true,
+  "tick_count": 10,
+  "failure_count": 0,
+  "last_tick": {...},
+  "subscribers_count": 1
+}
+```
+
+## Failure Modes and Handling
+
+1. **Template missing at daemon start**
+   - Fail startup with a clear error naming only the path, no secrets.
+   - Rationale: prompt drift/misconfiguration should be obvious.
+
+2. **Template render exception at tick time**
+   - Drop injection for that tick.
+   - Preserve passive tick publication.
+   - Log warning and optionally increment a render/drop counter.
+
+3. **Session busy / tool active / auto-continuing**
+   - Drop tick, no queue.
+   - Optional `auto.heartbeat_dropped` event.
+
+4. **Rate limit exceeded**
+   - Drop tick, no queue.
+   - Passive Phase 1 heartbeat still emitted.
+
+5. **Heartbeat-triggered run crashes**
+   - `run_input()` already captures errors into `InputRunResult` and publishes `agent.error`.
+   - Ensure background task exceptions are consumed via existing `_consume_task_exception` pattern.
+   - Reset `_heartbeat_turn_active` in `finally`.
+
+6. **Agent returns `AUTO_STATE: continue`**
+   - In heartbeat single-iteration mode, do not inject hidden “Continue with the next step.”
+   - Leave auto mode enabled unless budget exhausted.
+
+7. **Agent returns `AUTO_STATE: done/pause`**
+   - Existing stop semantics may apply. This is acceptable; the heartbeat prompt asks the agent to stop if nothing actionable.
+
+8. **Non-subscribed sessions**
+   - Must continue receiving only passive `heartbeat.tick` events if `publish_session_events` is true.
+   - No prompt injection, no input queue changes, no `current_input_task` created.
+
+## Implementation Sequence
+
+1. **Config and Template Loader**
+   - Change default interval to `1800.0` in `HeartbeatConfig` and `load_heartbeat_config()` fallback.
+   - Add `prompt_template_path` and `max_injected_turns_per_hour` fields + env overrides.
+   - Add `HeartbeatPromptTemplate` loader/renderer.
+   - Add `prompts/heartbeat/main.md.tmpl`.
+   - Unit tests for defaults, env overrides, path load, render variables, missing file failure.
+
+2. **Session Subscription State**
+   - Add `heartbeat_subscribed` state and setter to `Session`.
+   - Persist/load the flag.
+   - Extend `start_auto_mode()` with subscription parameter/default behavior.
+   - Update taskboard dispatcher to pass `heartbeat_subscribed=False`.
+
+3. **Single-Iteration Run Support**
+   - Add `single_auto_iteration` plumbing through `DaemonServer.run_input()` and `Session.stream_agent_events()`.
+   - Ensure ordinary auto mode remains unchanged.
+   - Test that `AUTO_STATE: continue` does not cause a second hidden turn when `single_auto_iteration=True`.
+
+4. **Injection Handler**
+   - Load template once in `DaemonServer.__init__` or `startup()`.
+   - Add `_heartbeat_injection_decision()` and `_run_heartbeat_turn()`.
+   - In `_handle_heartbeat_tick()`, preserve Phase 1 publish behavior then trigger eligible subscribers.
+   - Add rate limiter.
+   - Emit `auto.heartbeat_injected` telemetry.
+
+5. **Health/Metrics**
+   - Add `subscribers_count` under heartbeat in `metrics_snapshot()`.
+   - Ensure `/api/health` inherits it.
+
+6. **Tests**
+   - Update existing config tests to expect 1800 default where no override is provided.
+   - Add suppression-rule unit tests.
+   - Add integration test: start auto mode on a main session, emit tick, assert one `HumanMessage` with rendered template appears in `chat_history` and `auto.heartbeat_injected` event is published.
+   - Add non-subscribed/taskboard test: tick does not mutate `chat_history` or queue.
+   - Add e2e/smoke test with a short overridden interval (e.g. 0.2s) to avoid waiting 30 minutes, plus one test that asserts default interval value is 1800. For true “30 min boundary” validation, use fake clock/controlled `emit_once()` rather than sleeping.
+
+7. **Docs / Operational Notes**
+   - Add a short section in local docs referencing the external target `docs.openclaw.ai/gateway/heartbeat`.
+   - Document config keys and env overrides.
+
+## Test Plan Detail
+
+### Unit Tests
+
+- `load_heartbeat_config({})` returns `interval_seconds == 1800.0`.
+- `KAI_HEARTBEAT_INTERVAL_SECONDS` still overrides to custom value.
+- Template loader reads `prompts/heartbeat/main.md.tmpl`; returned `name == "main.md.tmpl"`.
+- Template render substitutes `seq`, `emitted_at`, `session_name`, `agent_name`.
+- Missing template path raises a clear exception at startup/load.
+- Rate limiter allows first N injections in a rolling hour and rejects N+1.
+- Suppression decisions return false for:
+  - not subscribed
+  - auto mode off
+  - `input_lock.locked()`
+  - current input task active
+  - runner tool-call active flag
+  - `_is_auto_continuation` true
+  - rate limited
+
+### Integration Tests
+
+- Create `DaemonServer` with disabled background heartbeat but call `emit_once()` manually.
+- Create session `terminal`, attach fake runtime, start auto mode with heartbeat subscribed.
+- Emit tick.
+- Await `auto.heartbeat_injected` event.
+- Assert:
+  - one rendered heartbeat `HumanMessage` in `session.chat_history`
+  - `chars_injected` equals rendered prompt length
+  - `template_name` matches default template
+  - `managed.session.input_queue == []`
+  - `auto_mode` remains enabled unless fake agent returns done/pause
+
+### Non-Regression Tests
+
+- Existing Phase 1 test: with no subscription, `heartbeat.tick` still publishes and does not wake agent.
+- Taskboard-fire session: after dispatcher starts auto mode, `heartbeat_subscribed` is false and tick does not inject.
+
+### E2E / Smoke
+
+- Start daemon with `KAI_HEARTBEAT_INTERVAL_SECONDS=0.2` and `KAI_HEARTBEAT_MAX_INJECTED_TURNS_PER_HOUR=1` in a controlled test environment.
+- Attach/start main auto-mode session.
+- Wait for tick and observe `auto.heartbeat_injected` via WebSocket/session event.
+- Assert health reports `subscribers_count == 1` while subscribed.
+- Separately assert production default config is 1800 seconds; do not make CI sleep 30 minutes.
+
+## Rollout Guardrails
+
+- Default `max_injected_turns_per_hour=4` to cap recurring spend.
+- Taskboard-fire sessions default opt-out to avoid interfering with implementation agents.
+- Passive ticks remain active even when injection fails/suppresses.
+- Daemon startup fails fast on missing template so operators catch bad deploys immediately.
+- Emit clear telemetry for every successful injection.
+- Prefer optional drop telemetry for diagnosing why a subscribed session did not wake.
+- Keep template compact and git-reviewed.
+
+## Risks
+
+1. **Duplicate HumanMessage injection**
+   - Existing `AgentRunner.run()` appends user input. If heartbeat code also appends, chat history can contain duplicates. Mitigate with a `pre_injected_input` flag or by centralizing the append in one place and testing exact count.
+
+2. **Changing auto-loop semantics globally**
+   - Adding `single_auto_iteration` must be opt-in for heartbeat only. Ordinary `/auto` and taskboard dispatcher runs should continue current behavior.
+
+3. **Busy-state race**
+   - A session can become busy between eligibility check and background task start. Mitigate by rechecking under `managed.input_lock` or relying on `run_input()` lock plus `_heartbeat_turn_active`; if lock is acquired later, still no queue is formed, but the task may wait. Prefer a non-blocking guard: recheck at `_run_heartbeat_turn()` start and drop if locked.
+
+4. **Long heartbeat run overlaps next tick**
+   - Suppression via `input_lock` and `_heartbeat_turn_active` drops the next tick.
+
+5. **Persisted opt-out ambiguity**
+   - If `start_auto_mode()` blindly defaults true, it can override a saved false. Track explicit configuration or have caller pass default only when no saved value exists.
+
+6. **Test fragility around real LLMs**
+   - Integration tests should use fake runtimes/runners; e2e smoke can use short interval and controlled fake model where available.
+
+## Acceptance Criteria Checklist
+
+- [ ] Default cadence changed to 30 minutes (`daemon.heartbeat.interval_seconds = 1800`) with `KAI_HEARTBEAT_INTERVAL_SECONDS` override preserved.
+- [ ] Configurable git-tracked heartbeat template loaded at daemon start; default path `prompts/heartbeat/main.md.tmpl`.
+- [ ] Main KAI auto-mode session subscribes on `start_auto_mode` and tick injects rendered prompt as exactly one `HumanMessage`.
+- [ ] Tick triggers exactly one auto-mode iteration, not a hidden full auto continuation loop.
+- [ ] Suppression drops ticks when busy, mid-turn, mid-tool-call, auto-continuing, or rate-limited; no queue/backlog.
+- [ ] Session opt-out flag `heartbeat_subscribed: false`; main KAI default true; taskboard-fire default false.
+- [ ] Telemetry event `auto.heartbeat_injected` includes `seq`, `template_name`, `chars_injected`.
+- [ ] `/api/health` exposes `heartbeat.subscribers_count`.
+- [ ] Unit, integration, e2e/smoke tests added as described.
+- [ ] Phase 1 passive tick behavior preserved for non-subscribed sessions.
+- [ ] Injection cap configurable, default 4 per hour.
+
+## Recommended Owner Handoff
+
+Implementation should be assigned to a developer familiar with `daemon/server.py` and `daemon/core.py`. The highest-risk code path is the single-iteration heartbeat run because it touches auto-mode continuation semantics. Code review should focus on ensuring heartbeat-specific behavior is opt-in and that taskboard-fire sessions cannot receive heartbeat prompt injections by default.
