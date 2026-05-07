@@ -230,11 +230,24 @@ class AgentRunsClient:
             LOGGER.warning("agent_runs_client.list_for_task network error: %s", exc)
             return None
         if response.status_code != 200:
-            LOGGER.warning(
-                "agent_runs_client.list_for_task task_id=%s status=%s",
-                task_id,
-                response.status_code,
-            )
+            # Auth (401/403) and not-found (404) won't recover within this
+            # process — the reaper retries the same artifact every poll
+            # cycle (~1s), so WARNING here floods the daemon log. Demote
+            # to DEBUG; the caller still gets None and decides what to do.
+            # See follow-up: reaper should give up after N consecutive
+            # non-200s on the same artifact (#TODO file).
+            if response.status_code in (401, 403, 404):
+                LOGGER.debug(
+                    "agent_runs_client.list_for_task task_id=%s status=%s",
+                    task_id,
+                    response.status_code,
+                )
+            else:
+                LOGGER.warning(
+                    "agent_runs_client.list_for_task task_id=%s status=%s",
+                    task_id,
+                    response.status_code,
+                )
             return None
         try:
             return response.json()
