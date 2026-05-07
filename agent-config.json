@@ -383,6 +383,21 @@
       "publish_session_events": true,
       "prompt_template_path": "prompts/heartbeat/main.md.tmpl",
       "max_injected_turns_per_hour": 0
+    },
+    "alert_subscriber": {
+      "enabled": true,
+      "kill_switch": false,
+      "alerts_yaml_path": "alerts.yaml",
+      "subscriptions": [
+        {
+          "name": "polymarket-default",
+          "subject_pattern": "polymarket.alpha.alarm.>",
+          "prompt_template_path": "prompts/alerts/polymarket.md.tmpl",
+          "target_session": "kai",
+          "max_injected_turns_per_hour": 10,
+          "enabled": false
+        }
+      ]
     }
   }
 }

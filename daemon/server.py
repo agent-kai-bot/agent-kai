@@ -19,7 +19,6 @@ from typing import Any
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
-from langchain_core.messages import HumanMessage
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -97,6 +96,11 @@ from daemon.core import (
     list_indexed_sessions,
     remove_indexed_session,
     serialize_messages,
+)
+from daemon.event_injector import (
+    EventInjectionPolicy,
+    EventInjectionRequest,
+    EventInjector,
 )
 from daemon.heartbeat import (
     HeartbeatConfig,
@@ -569,6 +573,11 @@ class DaemonServer:
         self.heartbeat_prompt_template = HeartbeatPromptTemplate.load(
             self.heartbeat_config.prompt_template_path
         )
+        self.event_injector = EventInjector(
+            run_input=self.run_input,
+            background_exception_handler=self._consume_background_task_exception,
+            log=get_logger("daemon.event_injector"),
+        )
         self.heartbeat_service: HeartbeatService | None = None
         self.daemon_token = ""
         self.started_at_monotonic: float | None = None
@@ -672,16 +681,10 @@ class DaemonServer:
                 managed.session.publish_event("heartbeat.tick", session_payload)
 
         for managed in list(self.sessions.values()):
-            ok, reason = self._heartbeat_injection_decision(managed, tick)
-            if not ok:
-                self._publish_heartbeat_drop(managed, tick, reason)
-                continue
-            managed.session._heartbeat_turn_active = True
-            task = asyncio.create_task(
-                self._run_heartbeat_turn(managed, tick),
-                name=f"heartbeat-{managed.session.name}-{tick.seq}",
+            await self.event_injector.handle(
+                managed,
+                self._heartbeat_injection_request(managed, tick),
             )
-            task.add_done_callback(self._consume_background_task_exception)
 
     @staticmethod
     def _consume_background_task_exception(task: asyncio.Task[Any]) -> None:
@@ -697,41 +700,55 @@ class DaemonServer:
             if managed.session.heartbeat_subscribed and managed.session.auto_mode
         )
 
+    def _heartbeat_injection_request(
+        self,
+        managed: ManagedSession,
+        tick: HeartbeatTick,
+    ) -> EventInjectionRequest:
+        return EventInjectionRequest(
+            event=tick,
+            template=self.heartbeat_prompt_template,
+            policy=EventInjectionPolicy(
+                source="heartbeat",
+                drop_topic="auto.heartbeat_dropped",
+                injected_topic="auto.heartbeat_injected",
+                active_attr="_heartbeat_turn_active",
+                timestamp_attr="heartbeat_injection_timestamps",
+                max_injected_turns_per_hour=(
+                    self.heartbeat_config.max_injected_turns_per_hour
+                ),
+                require_subscription_attr="heartbeat_subscribed",
+                require_auto_mode=True,
+                suppress_drop_reasons=frozenset(
+                    {"not_subscribed", "auto_mode_disabled"}
+                ),
+                active_reason="heartbeat_turn_active",
+            ),
+            render_values={
+                "seq": tick.seq,
+                "emitted_at": tick.emitted_at,
+                "interval_seconds": tick.interval_seconds,
+                "session_name": managed.session.name,
+                "agent_name": managed.session.agent_name or self.agent_name,
+                "source": tick.source,
+                "reason": tick.reason,
+            },
+            seq=tick.seq,
+            monotonic_seconds=tick.monotonic_seconds,
+            job_id=f"heartbeat:{tick.seq}",
+            task_name=f"heartbeat-{managed.session.name}-{tick.seq}",
+        )
+
     def _heartbeat_injection_decision(
         self,
         managed: ManagedSession,
         tick: HeartbeatTick,
     ) -> tuple[bool, str]:
-        session = managed.session
-        if not session.heartbeat_subscribed:
-            return False, "not_subscribed"
-        if not session.auto_mode:
-            return False, "auto_mode_disabled"
-        if self.heartbeat_config.max_injected_turns_per_hour <= 0:
-            return False, "rate_limit_disabled"
-        if managed.input_lock.locked() or (
-            managed.current_input_task is not None and not managed.current_input_task.done()
-        ):
-            return False, "busy"
-        runner = session.agent_runner
-        if runner is None:
-            return False, "runtime_not_attached"
-        if bool(getattr(runner, "_is_auto_continuation", False)):
-            return False, "auto_continuing"
-        if (
-            bool(getattr(runner, "tool_call_active", False))
-            or getattr(runner, "_active_recorder", None) is not None
-        ):
-            return False, "mid_tool_call"
-        if session._heartbeat_turn_active:
-            return False, "heartbeat_turn_active"
-        session.prune_heartbeat_injections(tick.monotonic_seconds)
-        if (
-            len(session.heartbeat_injection_timestamps)
-            >= self.heartbeat_config.max_injected_turns_per_hour
-        ):
-            return False, "rate_limited"
-        return True, "ok"
+        decision = self.event_injector.injection_decision(
+            managed,
+            self._heartbeat_injection_request(managed, tick),
+        )
+        return decision.ok, decision.reason
 
     def _publish_heartbeat_drop(
         self,
@@ -739,11 +756,10 @@ class DaemonServer:
         tick: HeartbeatTick,
         reason: str,
     ) -> None:
-        if reason in {"not_subscribed", "auto_mode_disabled"}:
-            return
-        managed.session.publish_event(
-            "auto.heartbeat_dropped",
-            {"seq": tick.seq, "reason": reason},
+        self.event_injector.publish_drop(
+            managed,
+            self._heartbeat_injection_request(managed, tick),
+            reason,
         )
 
     async def _run_heartbeat_turn(
@@ -751,46 +767,10 @@ class DaemonServer:
         managed: ManagedSession,
         tick: HeartbeatTick,
     ) -> None:
-        session = managed.session
-        if managed.input_lock.locked() or (
-            managed.current_input_task is not None and not managed.current_input_task.done()
-        ):
-            self._publish_heartbeat_drop(managed, tick, "busy")
-            session._heartbeat_turn_active = False
-            return
-        try:
-            prompt = self.heartbeat_prompt_template.render(
-                tick,
-                session_name=session.name,
-                agent_name=session.agent_name or self.agent_name,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.log.warning("heartbeat prompt render failed for %s: %s", session.name, exc)
-            self._publish_heartbeat_drop(managed, tick, "template_render_failed")
-            return
-
-        session.chat_history.append(HumanMessage(content=prompt))
-        session.agent_runner.chat_history = session.chat_history
-        session.record_heartbeat_injection(tick.monotonic_seconds)
-        session.publish_event(
-            "auto.heartbeat_injected",
-            {
-                "seq": tick.seq,
-                "template_name": self.heartbeat_prompt_template.name,
-                "chars_injected": len(prompt),
-            },
+        await self.event_injector.run_turn(
+            managed,
+            self._heartbeat_injection_request(managed, tick),
         )
-        try:
-            await self.run_input(
-                managed,
-                prompt,
-                source="heartbeat",
-                job_id=f"heartbeat:{tick.seq}",
-                single_auto_iteration=True,
-                pre_injected_input=True,
-            )
-        finally:
-            session._heartbeat_turn_active = False
 
     async def _start_taskboard_dispatcher(self) -> None:
         if not self.taskboard_dispatcher_enabled:
