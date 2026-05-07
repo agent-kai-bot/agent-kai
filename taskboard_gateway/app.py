@@ -184,7 +184,11 @@ async def execute_run_with_local_session(run: TaskboardRun, store: RunStore) -> 
         agent_name=run.requested_agent_id,
     )
     session.attach_runtime(agent_name=run.local_agent_name)
-    session.start_auto_mode(max_iterations=20, readonly=False)
+    session.start_auto_mode(
+        max_iterations=20,
+        readonly=False,
+        heartbeat_subscribed=False,
+    )
     await asyncio.to_thread(store.update_status, run, "running")
 
     final_text = ""

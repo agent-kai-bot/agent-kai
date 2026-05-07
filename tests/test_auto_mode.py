@@ -587,6 +587,7 @@ class ToolPolicyEnforcementTests(unittest.TestCase):
         runner = AgentRunner.__new__(AgentRunner)
         runner._auto_mode = True
         runner._auto_readonly = readonly
+        runner._active_tool_call_count = 0
         runner.agent_name = "nano"
         return runner
 
@@ -608,6 +609,27 @@ class ToolPolicyEnforcementTests(unittest.TestCase):
 
         result = wrapped_read.invoke({"path": __file__})
         self.assertIn("SessionAutoModeTests", result)
+        self.assertFalse(runner.tool_call_active)
+
+    def test_tool_call_active_flag_is_set_during_sync_tool_execution(self):
+        runner = self._make_runner(readonly=False)
+        observed = []
+
+        def probe() -> str:
+            observed.append(runner.tool_call_active)
+            return "ok"
+
+        from langchain_core.tools import StructuredTool
+
+        wrapped = AgentRunner._wrap_tool(
+            runner,
+            StructuredTool.from_function(func=probe, name="probe", description="probe"),
+        )
+
+        self.assertFalse(runner.tool_call_active)
+        self.assertEqual(wrapped.invoke({}), "ok")
+        self.assertEqual(observed, [True])
+        self.assertFalse(runner.tool_call_active)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ class _FakeSession:
         self.saved = False
         self.agent_name = None
         self.auto_started = False
+        self.heartbeat_subscribed = None
 
     instances: list["_FakeSession"] = []
 
@@ -50,19 +51,31 @@ class _FakeSession:
         self.agent_name = agent_name
         return object()
 
-    def start_auto_mode(self, *, max_iterations: int, readonly: bool) -> dict:
+    def start_auto_mode(
+        self,
+        *,
+        max_iterations: int,
+        readonly: bool,
+        heartbeat_subscribed: bool | None = None,
+    ) -> dict:
         """Record auto-mode startup.
 
         Args:
             max_iterations: Auto-mode iteration budget.
             readonly: Whether auto mode is read-only.
+            heartbeat_subscribed: Whether daemon heartbeat injections are enabled.
 
         Returns:
             Minimal auto-mode payload.
         """
 
         self.auto_started = True
-        return {"iterations_total": max_iterations, "readonly": readonly}
+        self.heartbeat_subscribed = heartbeat_subscribed
+        return {
+            "iterations_total": max_iterations,
+            "readonly": readonly,
+            "heartbeat_subscribed": heartbeat_subscribed,
+        }
 
     async def stream_agent_events(self, user_input: str, *, source: str, job_id: str):
         """Yield a deterministic fake agent event stream.
@@ -509,6 +522,7 @@ class TaskboardGatewayTests(unittest.TestCase):
         context = _FakeSession.instances[0].taskboard_context
         self.assertEqual(context.session_token, "tok-123")
         self.assertEqual(context.session_generation, 3)
+        self.assertFalse(_FakeSession.instances[0].heartbeat_subscribed)
 
 
 if __name__ == "__main__":

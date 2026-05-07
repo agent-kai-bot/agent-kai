@@ -376,6 +376,13 @@
       "max_output_tokens": 512,
       "max_llm_critic_calls_per_session": 20,
       "max_consecutive_llm_critic_calls": 5
+    },
+    "heartbeat": {
+      "enabled": true,
+      "interval_seconds": 1800,
+      "publish_session_events": true,
+      "prompt_template_path": "prompts/heartbeat/main.md.tmpl",
+      "max_injected_turns_per_hour": 0
     }
   }
 }

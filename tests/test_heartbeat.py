@@ -34,6 +34,7 @@ class _HeartbeatFakeRunner:
         self._is_auto_continuation = False
         self._auto_readonly = False
         self._pause_reason: str | None = None
+        self.tool_call_active = False
 
     def set_auto_mode(self, _enabled: bool, max_iterations: int = 40):
         return None
@@ -246,6 +247,34 @@ class DaemonHeartbeatTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(tick.seq, 1)
                 finally:
                     await server.shutdown()
+
+    async def test_heartbeat_decision_drops_while_tool_call_active(self):
+        server = DaemonServer(
+            agent_name="kai",
+            nats_url="nats://unit-test",
+            bus_factory=_FakeBus,
+            heartbeat_config=HeartbeatConfig(
+                enabled=False,
+                interval_seconds=60,
+                max_injected_turns_per_hour=4,
+            ),
+        )
+        managed = await server.get_or_create_session("terminal", create_if_missing=True)
+        runner = _HeartbeatFakeRunner()
+        runner.tool_call_active = True
+        managed.session.agent_runner = runner
+        managed.session.start_auto_mode(max_iterations=5)
+        tick = HeartbeatTick(
+            seq=1,
+            emitted_at="2026-05-06T16:30:00Z",
+            monotonic_seconds=1.0,
+            interval_seconds=60,
+        )
+
+        ok, reason = server._heartbeat_injection_decision(managed, tick)
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "tool_call_active")
 
     async def test_heartbeat_rate_limit_drops_without_queueing(self):
         with tempfile.TemporaryDirectory() as tmpdir:

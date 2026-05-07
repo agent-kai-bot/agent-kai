@@ -424,6 +424,7 @@ class AgentRunner:
         self._last_auto_pause_reason: str | None = None
         self._last_auto_state: tuple[str, str | None] = ("unknown", None)
         self._active_llm_chat_history: list[Any] | None = None
+        self._active_tool_call_count = 0
 
         cfg = get_agent_config(agent_name) if agent_name else {}
         self._endpoint_cfg = cfg.get("endpoint")
@@ -677,15 +678,23 @@ class AgentRunner:
             self._check_tool_allowed(tool.name)
             if original_sync is None:
                 raise RuntimeError(f"tool {tool.name} has no sync implementation")
-            return original_sync(*args, **kwargs)
+            self._active_tool_call_count += 1
+            try:
+                return original_sync(*args, **kwargs)
+            finally:
+                self._active_tool_call_count = max(0, self._active_tool_call_count - 1)
 
         async def _async_wrapper(*args, **kwargs):
             self._check_tool_allowed(tool.name)
-            if original_async is not None:
-                return await original_async(*args, **kwargs)
-            if original_sync is None:
+            if original_async is None and original_sync is None:
                 raise RuntimeError(f"tool {tool.name} has no implementation")
-            return original_sync(*args, **kwargs)
+            self._active_tool_call_count += 1
+            try:
+                if original_async is not None:
+                    return await original_async(*args, **kwargs)
+                return original_sync(*args, **kwargs)
+            finally:
+                self._active_tool_call_count = max(0, self._active_tool_call_count - 1)
 
         return StructuredTool.from_function(
             func=_sync_wrapper if original_sync is not None else None,
@@ -704,6 +713,12 @@ class AgentRunner:
             handle_tool_error=tool.handle_tool_error,
             handle_validation_error=tool.handle_validation_error,
         )
+
+    @property
+    def tool_call_active(self) -> bool:
+        """Return True while a wrapped tool is currently executing."""
+
+        return self._active_tool_call_count > 0
 
     def reload_llm(self) -> dict:
         """Re-read this agent's config and rebuild the LLM + executor in place.
