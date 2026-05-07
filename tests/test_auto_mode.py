@@ -357,15 +357,56 @@ class SessionAutoModeTests(unittest.IsolatedAsyncioTestCase):
             })
             self.assertEqual(event.topic, "auto.evaluator_call_metrics")
             queue = session.subscribe_events("auto.evaluator_cost_alert")
+            session.publish_event("llm.usage", {
+                "model_id": "main-model",
+                "estimated_cost_usd": 0.10,
+            })
             session.publish_event("auto.evaluator_call_metrics", {
                 "evaluator_kind": "llm",
                 "model_id": "claude-sonnet-4-6",
-                "main_agent_estimated_cost_usd": 0.10,
                 "llm_usage": {"estimated_cost_usd": 0.02},
             })
             alert = await asyncio.wait_for(queue.get(), timeout=1)
             self.assertEqual(alert.topic, "auto.evaluator_cost_alert")
             self.assertGreater(alert.payload["session_auto_evaluator_cost_usd"], 0)
+            self.assertEqual(alert.payload["session_main_agent_cost_usd"], 0.10)
+
+    async def test_agent_runner_llm_usage_event_feeds_cost_alert(self):
+        session, _runner = self._make_session([])
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.bus = None
+        runner.telemetry = session
+        runner.chat_history = []
+        runner.agent_name = "nano"
+        runner.log = _DummyLogger()
+        runner._active_llm_chat_history = []
+
+        class _Executor:
+            async def astream_events(self, _payload, version="v2"):
+                yield {
+                    "event": "on_chat_model_end",
+                    "data": {
+                        "output": type("LLMOutput", (), {
+                            "llm_output": {
+                                "token_usage": {"prompt_tokens": 1000, "completion_tokens": 100},
+                                "model_name": "main-model",
+                            }
+                        })()
+                    },
+                }
+                yield {"event": "on_chain_end", "name": "AgentExecutor", "data": {"output": {"output": "done"}}}
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch("daemon.auto_cost.db.DEFAULT_DB_PATH", Path(tmpdir) / "state.sqlite3"):
+            _events = [event async for event in runner._stream_executor(_Executor(), "go")]
+            queue = session.subscribe_events("auto.evaluator_cost_alert")
+            session.publish_event("auto.evaluator_call_metrics", {
+                "evaluator_kind": "llm",
+                "model_id": "claude-sonnet-4-6",
+                "llm_usage": {"estimated_cost_usd": 0.01},
+            })
+            alert = await asyncio.wait_for(queue.get(), timeout=1)
+            self.assertEqual(alert.topic, "auto.evaluator_cost_alert")
+            self.assertGreater(alert.payload["session_main_agent_cost_usd"], 0)
 
     async def test_evaluator_continuation_quota_exhausted_stops(self):
         session, runner = self._make_session([{"final": "No footer here."}])

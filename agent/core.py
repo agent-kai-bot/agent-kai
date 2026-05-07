@@ -69,6 +69,108 @@ def _message_content_length(message: Any) -> int:
     return len(str(content)) if content is not None else 0
 
 
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_usage_payload(event_data: dict[str, Any]) -> dict[str, object] | None:
+    """Extract non-secret LLM usage/cost metadata from a LangChain event."""
+
+    output = event_data.get("output")
+    candidates: list[Any] = []
+    if output is not None:
+        candidates.append(output)
+        llm_output = getattr(output, "llm_output", None)
+        if isinstance(llm_output, dict):
+            candidates.append(llm_output)
+        generations = getattr(output, "generations", None)
+        if isinstance(generations, list):
+            for generation_row in generations:
+                row = generation_row if isinstance(generation_row, list) else [generation_row]
+                for generation in row:
+                    message = getattr(generation, "message", None)
+                    if message is not None:
+                        candidates.append(message)
+    chunk = event_data.get("chunk")
+    if chunk is not None:
+        candidates.append(chunk)
+
+    usage: dict[str, Any] = {}
+    response_metadata: dict[str, Any] = {}
+    model_id = ""
+    for candidate in candidates:
+        candidate_usage = getattr(candidate, "usage_metadata", None)
+        if isinstance(candidate_usage, dict):
+            usage.update(candidate_usage)
+        candidate_response = getattr(candidate, "response_metadata", None)
+        if isinstance(candidate_response, dict):
+            response_metadata.update(candidate_response)
+        if isinstance(candidate, dict):
+            for key in ("usage", "token_usage", "usage_metadata"):
+                value = candidate.get(key)
+                if isinstance(value, dict):
+                    usage.update(value)
+            value = candidate.get("response_metadata")
+            if isinstance(value, dict):
+                response_metadata.update(value)
+            if not model_id:
+                model_id = str(candidate.get("model") or candidate.get("model_name") or candidate.get("model_id") or "")
+
+    for key in ("usage", "token_usage", "usage_metadata"):
+        value = response_metadata.get(key)
+        if isinstance(value, dict):
+            usage.update(value)
+    if not model_id:
+        model_id = str(
+            response_metadata.get("model_name")
+            or response_metadata.get("model")
+            or response_metadata.get("model_id")
+            or ""
+        )
+
+    input_tokens = _optional_int(
+        usage.get("input_tokens")
+        or usage.get("prompt_tokens")
+        or usage.get("prompt_token_count")
+    )
+    output_tokens = _optional_int(
+        usage.get("output_tokens")
+        or usage.get("completion_tokens")
+        or usage.get("completion_token_count")
+    )
+    total_tokens = _optional_int(usage.get("total_tokens"))
+    if input_tokens is None and output_tokens is None and total_tokens is not None:
+        input_tokens = total_tokens
+    estimated_cost = _optional_float(
+        usage.get("estimated_cost_usd")
+        or usage.get("cost_usd")
+        or response_metadata.get("estimated_cost_usd")
+        or response_metadata.get("cost_usd")
+    )
+    if input_tokens is None and output_tokens is None and estimated_cost is None:
+        return None
+    payload: dict[str, object] = {}
+    if model_id:
+        payload["model_id"] = model_id
+    if input_tokens is not None:
+        payload["input_tokens"] = input_tokens
+    if output_tokens is not None:
+        payload["output_tokens"] = output_tokens
+    if estimated_cost is not None:
+        payload["estimated_cost_usd"] = round(float(estimated_cost), 6)
+    return payload
+
+
 def create_llm(endpoint_cfg=None):
     """Build a chat model instance from an endpoint config dict.
 
@@ -414,6 +516,7 @@ class AgentRunner:
 
     def __init__(self, tools, bus=None, agent_name=None):
         self.bus = bus
+        self.telemetry = None
         self.chat_history = []
         self.agent_name = agent_name or "kai"
         self.log = get_logger(self.agent_name)
@@ -1013,6 +1116,13 @@ class AgentRunner:
                 chunk = event["data"]["chunk"]
                 if hasattr(chunk, "content") and chunk.content:
                     yield {"type": "token", "data": chunk.content}
+
+            elif kind == "on_chat_model_end":
+                usage_payload = _extract_usage_payload(event.get("data", {}))
+                if usage_payload:
+                    publish = getattr(getattr(self, "telemetry", None), "publish_event", None)
+                    if callable(publish):
+                        publish("llm.usage", usage_payload)
 
             elif kind == "on_tool_start":
                 tool_name = event.get("name", "?")

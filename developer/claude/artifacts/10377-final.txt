@@ -1,30 +1,26 @@
-Task 10377 developer fix-loop completion
+Task 10377 developer final
+
+Status: implemented and pushed for Code Review.
 
 Prior verdict addressed:
-- code-reviewer/claude/artifacts/10377-final.txt Decision: CHANGES_REQUESTED
-  1. agent/auto_loop_brain.py prompt schema omitted clarify_misread_main.
-  2. tests/test_auto_loop_brain.py prompt-injection regression expected CONTINUE.
-  3. Missing daemon integration/E2E recorded fixture coverage.
-  4. Cost dashboard/aggregation visibility not implemented.
+- code-reviewer/claude/artifacts/10377-final.txt Decision: CHANGES_REQUESTED blocking finding: cost dashboard alert path was not wired to real main-agent spend because daemon/auto_cost.py only read synthetic main_agent_estimated_cost_usd/session_main_agent_cost_usd fields from auto.evaluator_call_metrics.
 
 Changes:
-- Added clarify_misread_main to the auto-loop-brain critic prompt schema.
-- Changed prompt-injection regression to assert STOP/fail-closed and still verify no tools are passed to the client.
-- Added prompt-schema and recorded-session fixture replay tests.
-- Added daemon integration tests for LLM fallback hidden auto-reply + auto.evaluation metadata, disabled regex passthrough/kill path, and cost metric alert persistence.
-- Added daemon/auto_cost.py: best-effort durable SQLite cost event aggregation for auto.evaluator_call_metrics plus auto.evaluator_cost_alert when provided main-agent spend indicates critic spend >5%.
-- Fixed missing deque import in daemon/core.py revealed by focused auto-mode test execution.
+- Added main-agent LLM usage capture in AgentRunner from LangChain on_chat_model_end events.
+- Added Session llm.usage handling that records real per-session main-agent LLM cost telemetry.
+- Added durable main_agent_cost_events table/migration and changed evaluator cost alerts to compare critic call cost against stored session main-agent spend.
+- Kept critic telemetry free of synthetic main-agent spend fields.
+- Added regression coverage for both direct llm.usage persistence and production AgentRunner event path.
 
-Commit: 5654e46 fix(auto): harden auto-loop-brain critic coverage
+Commit: f6c261533f4fbdde4733425d64e6af824af7c8e0
 Branch: task-10377-feat-implement-auto-loop-brain-llm-critic-per-10375-spec
-Pushed: yes (origin/task-10377-feat-implement-auto-loop-brain-llm-critic-per-10375-spec)
-PR: Forgejo PR creation could not be completed because FORGEJO_URL is not configured in this runtime.
+Push: pushed to origin/task-10377-feat-implement-auto-loop-brain-llm-critic-per-10375-spec
+PR: not created by tool because FORGEJO_URL is not configured in this runtime.
 
 Tests run:
-- pytest -q tests/test_auto_evaluator.py tests/test_auto_loop_brain.py -> 20 passed, 9 subtests passed
-- /home/atc/git/claude-local-ai-agent/.venv/bin/python -m pytest -q tests/test_auto_evaluator.py tests/test_auto_loop_brain.py tests/test_auto_mode.py -> 43 passed, 1 warning
-- python3 -m py_compile agent/auto_loop_brain.py daemon/auto_cost.py daemon/core.py tests/test_auto_loop_brain.py tests/test_auto_mode.py
+- python3 -m py_compile agent/core.py daemon/core.py daemon/auto_cost.py tests/test_auto_mode.py
+- /home/atc/git/claude-local-ai-agent/.venv/bin/python -m pytest -q tests/test_auto_mode.py::SessionAutoModeTests::test_auto_loop_brain_cost_metrics_persist_and_alert tests/test_auto_mode.py::SessionAutoModeTests::test_agent_runner_llm_usage_event_feeds_cost_alert tests/test_auto_loop_brain.py tests/test_auto_evaluator.py tests/test_auto_mode.py
+  Result: 46 passed, 1 warning (pytest config warning: unknown asyncio_mode).
 
-Known follow-up / risk:
-- Running system pytest without the repo virtualenv still cannot collect tests/test_auto_mode.py because langchain is not installed globally; the repo venv path above has the required dependencies and passes.
-- Cost alert ratio uses main-agent spend fields when supplied in evaluator metrics; no broader main-agent spend ledger existed in this repository, so events are durably stored for dashboard aggregation and alert when caller provides spend context.
+Known follow-up:
+- Forgejo PR must be opened manually or by a runtime with FORGEJO_URL configured, if the existing GitHub branch is not mirrored into Forgejo automatically.
