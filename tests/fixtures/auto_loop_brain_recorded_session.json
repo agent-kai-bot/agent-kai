@@ -1,0 +1,16 @@
+{
+  "name": "recorded-sonnet-critic-malformed-footer-continuation",
+  "critic_model": "claude-sonnet-4-6",
+  "chat_history": [
+    {"role": "user", "content": "Implement the requested feature end to end and do not ask for permission for safe local tests."},
+    {"role": "assistant", "content": "I inspected the code and found the next safe test to run."}
+  ],
+  "main_response": "I found the focused pytest command to run next. Should I proceed?",
+  "llm_response": {
+    "decision": "CONTINUE",
+    "confidence": 0.93,
+    "reason": "main asked permission for an in-scope safe test step",
+    "pattern": "permission_deflection",
+    "auto_reply_template": "clarify_misread_main"
+  }
+}

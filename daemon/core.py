@@ -7,6 +7,7 @@ or multi-client support is introduced.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import fcntl
 import hashlib
 import json
@@ -31,6 +32,7 @@ from agent.auto_evaluator import (
 )
 from agent.auto_loop_brain import build_auto_response_evaluator, evaluation_metadata
 from agent.auto_prompt import parse_auto_state
+from daemon.auto_cost import record_auto_evaluator_call
 from agent.core import AgentRunner
 from agent.signal_consumer import SignalConsumer
 from agent.strategy_agent_tools import InProcessStrategyRuntime
@@ -694,7 +696,16 @@ class Session:
         topic: str,
         payload: dict[str, Any] | None = None,
     ) -> SessionEvent:
-        return self.event_bus.publish(topic, payload)
+        event = self.event_bus.publish(topic, payload)
+        if topic == "auto.evaluator_call_metrics":
+            alert_payload = record_auto_evaluator_call(
+                session_name=self.name,
+                agent_name=str(self.agent_name or ""),
+                payload=event.payload,
+            )
+            if alert_payload:
+                self.event_bus.publish("auto.evaluator_cost_alert", alert_payload)
+        return event
 
     def chart_view_payload(self) -> dict[str, Any]:
         """Return the current chart view as a JSON-ready dict."""
