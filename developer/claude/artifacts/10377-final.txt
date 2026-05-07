@@ -1,23 +1,30 @@
-Task 10377 final summary
+Task 10377 developer fix-loop completion
 
-Commit: f0461a23eede7f1e9411547dd3f44e59e18f1336
+Prior verdict addressed:
+- code-reviewer/claude/artifacts/10377-final.txt Decision: CHANGES_REQUESTED
+  1. agent/auto_loop_brain.py prompt schema omitted clarify_misread_main.
+  2. tests/test_auto_loop_brain.py prompt-injection regression expected CONTINUE.
+  3. Missing daemon integration/E2E recorded fixture coverage.
+  4. Cost dashboard/aggregation visibility not implemented.
+
+Changes:
+- Added clarify_misread_main to the auto-loop-brain critic prompt schema.
+- Changed prompt-injection regression to assert STOP/fail-closed and still verify no tools are passed to the client.
+- Added prompt-schema and recorded-session fixture replay tests.
+- Added daemon integration tests for LLM fallback hidden auto-reply + auto.evaluation metadata, disabled regex passthrough/kill path, and cost metric alert persistence.
+- Added daemon/auto_cost.py: best-effort durable SQLite cost event aggregation for auto.evaluator_call_metrics plus auto.evaluator_cost_alert when provided main-agent spend indicates critic spend >5%.
+- Fixed missing deque import in daemon/core.py revealed by focused auto-mode test execution.
+
+Commit: 5654e46 fix(auto): harden auto-loop-brain critic coverage
 Branch: task-10377-feat-implement-auto-loop-brain-llm-critic-per-10375-spec
-
-Implemented:
-- Added agent/auto_loop_brain.py with AutoLoopBrainConfig, ToollessLLMClient protocol, Anthropic no-tools client, and LLMCriticEvaluator composite wrapper.
-- Preserved evaluate(AutoEvaluationInput) -> AutoEvaluationDecision while injecting a frozen chat_history_provider snapshot.
-- Regex pre-filter returns non-STOP and decisive STOP paths unchanged; LLM escalates only unknown/malformed_footer_recoverable STOP cases when enabled and not kill-switched.
-- Added schema validation, fail-closed handling for malformed JSON, boolean confidence, tool-call attempts, provider exceptions/timeouts, readonly template rejection, min confidence, per-session cap, and consecutive critic-call drift stop.
-- Added daemon.auto_loop_brain config defaults in agent-config.json with enabled=false and model_id=claude-sonnet-4-6.
-- Extended auto.evaluation payload with evaluator metadata and emits auto.evaluator_call_metrics for LLM calls.
-- Added clarify_misread_main template without marking it readonly.
-- Added unit/integration tests for LLM decisions, malformed responses, confidence rejection, tool attempts, timeout failure, prompt-injection regression, regex passthrough/escalation, disabled config, weak model disabling, and cost caps.
+Pushed: yes (origin/task-10377-feat-implement-auto-loop-brain-llm-critic-per-10375-spec)
+PR: Forgejo PR creation could not be completed because FORGEJO_URL is not configured in this runtime.
 
 Tests run:
-- python3 -m pytest tests/test_auto_evaluator.py tests/test_auto_loop_brain.py -q (18 passed, 9 subtests passed)
-- python3 -m py_compile agent/auto_loop_brain.py daemon/core.py agent/auto_evaluator.py
-- python3 -m pytest tests/test_auto_mode.py -q (blocked: ModuleNotFoundError: No module named 'langchain_core' in this environment)
+- pytest -q tests/test_auto_evaluator.py tests/test_auto_loop_brain.py -> 20 passed, 9 subtests passed
+- /home/atc/git/claude-local-ai-agent/.venv/bin/python -m pytest -q tests/test_auto_evaluator.py tests/test_auto_loop_brain.py tests/test_auto_mode.py -> 43 passed, 1 warning
+- python3 -m py_compile agent/auto_loop_brain.py daemon/auto_cost.py daemon/core.py tests/test_auto_loop_brain.py tests/test_auto_mode.py
 
 Known follow-up / risk:
-- E2E real auto-mode cassette was not run because the local test environment lacks langchain_core.
-- LLM critic defaults to disabled; enabling requires a valid Anthropic API key and model tier claude-sonnet-4-6 or approved newer equivalent.
+- Running system pytest without the repo virtualenv still cannot collect tests/test_auto_mode.py because langchain is not installed globally; the repo venv path above has the required dependencies and passes.
+- Cost alert ratio uses main-agent spend fields when supplied in evaluator metrics; no broader main-agent spend ledger existed in this repository, so events are durably stored for dashboard aggregation and alert when caller provides spend context.

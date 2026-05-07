@@ -3,14 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import tempfile
+from pathlib import Path
 import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
 
-from langchain_core.messages import AIMessage, HumanMessage
+try:
+    from langchain_core.messages import AIMessage, HumanMessage
+except ModuleNotFoundError:  # pragma: no cover - lightweight CI fallback
+    class HumanMessage:  # type: ignore[no-redef]
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+    class AIMessage(HumanMessage):  # type: ignore[no-redef]
+        pass
 
 from agent.auto_evaluator import AutoEvaluationDecision
+from agent.auto_loop_brain import AutoLoopBrainConfig, LLMResult, TokenUsage, build_auto_response_evaluator
 from agent.core import AgentRunner
 from agent.tools import file_read, file_write, shell_exec
 from daemon.core import Session
@@ -42,6 +54,16 @@ class _StaticEvaluator:
             "main state accepted",
             "unknown",
         )
+
+
+class _FakeLLMClient:
+    def __init__(self, result: LLMResult) -> None:
+        self.result = result
+        self.calls = []
+
+    def complete_json(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.result
 
 
 class _FakeRunner:
@@ -264,6 +286,86 @@ class SessionAutoModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("auto_evaluation", [event["type"] for event in events])
         self.assertNotIn("auto_reply", [event["type"] for event in events])
         self.assertEqual(events[-1]["data"]["reason"], "missing or malformed AUTO_STATE footer")
+
+    async def test_auto_loop_brain_llm_fallback_injects_hidden_reply_and_telemetry(self):
+        session, runner = self._make_session(
+            [
+                {"final": "Proceed?"},
+                {"final": "Task complete.\n[AUTO_STATE: done]"},
+            ]
+        )
+        runner.chat_history = [HumanMessage(content="Implement the feature without asking for safe-step permission.")]
+        client = _FakeLLMClient(LLMResult(json.dumps({
+            "decision": "CONTINUE",
+            "confidence": 0.94,
+            "reason": "main asked permission for a safe in-scope next step",
+            "pattern": "permission_deflection",
+            "auto_reply_template": "clarify_misread_main",
+        }), "claude-sonnet-4-6", TokenUsage(100, 12, 0.002)))
+        session.auto_evaluator_enabled = True
+        session.auto_evaluator_shadow = False
+        session.auto_response_evaluator = build_auto_response_evaluator(
+            chat_history_provider=lambda: tuple(runner.chat_history),
+            telemetry=session,
+            config=AutoLoopBrainConfig(enabled=True),
+            llm_client=client,
+        )
+        session.start_auto_mode(max_iterations=5)
+
+        events = await _collect_events(session, "Do the task")
+
+        self.assertEqual(runner.inputs[1], "It looks like the main agent misread the request — re-read the original task and proceed with the safe next step you described.")
+        evaluation = next(event["data"] for event in events if event["type"] == "auto_evaluation")
+        self.assertEqual(evaluation["evaluator_kind"], "llm")
+        self.assertEqual(evaluation["model_id"], "claude-sonnet-4-6")
+        self.assertEqual(evaluation["escalated_from"], "unknown")
+        self.assertIn("llm_usage", evaluation)
+        self.assertIn("auto_reply", [event["type"] for event in events])
+        self.assertEqual(len(client.calls), 1)
+
+    async def test_auto_loop_brain_disabled_regex_passthrough_has_no_llm_call(self):
+        session, runner = self._make_session([{"final": "I can inspect logs next if you want."}])
+        client = _FakeLLMClient(LLMResult("{}", "claude-sonnet-4-6"))
+        session.auto_evaluator_enabled = True
+        session.auto_evaluator_shadow = False
+        session.auto_response_evaluator = build_auto_response_evaluator(
+            chat_history_provider=lambda: tuple(runner.chat_history),
+            telemetry=session,
+            config=AutoLoopBrainConfig(enabled=False),
+            llm_client=client,
+        )
+        session.start_auto_mode(max_iterations=5, readonly=True)
+
+        events = await _collect_events(session, "Analyze")
+
+        self.assertEqual(runner.inputs, ["Analyze", "Proceed with the read-only analysis you just described."])
+        evaluation = next(event["data"] for event in events if event["type"] == "auto_evaluation")
+        self.assertEqual(evaluation["evaluator_kind"], "regex")
+        self.assertEqual(client.calls, [])
+
+    async def test_auto_loop_brain_cost_metrics_persist_and_alert(self):
+        session, _runner = self._make_session([])
+        with tempfile.TemporaryDirectory() as tmpdir, patch("daemon.auto_cost.db.DEFAULT_DB_PATH", Path(tmpdir) / "state.sqlite3"):
+            event = session.publish_event("auto.evaluator_call_metrics", {
+                "evaluator_kind": "llm",
+                "model_id": "claude-sonnet-4-6",
+                "escalated_from": "unknown",
+                "latency_ms": 12,
+                "success": True,
+                "malformed": False,
+                "llm_usage": {"input_tokens": 100, "output_tokens": 10, "estimated_cost_usd": 0.01},
+            })
+            self.assertEqual(event.topic, "auto.evaluator_call_metrics")
+            queue = session.subscribe_events("auto.evaluator_cost_alert")
+            session.publish_event("auto.evaluator_call_metrics", {
+                "evaluator_kind": "llm",
+                "model_id": "claude-sonnet-4-6",
+                "main_agent_estimated_cost_usd": 0.10,
+                "llm_usage": {"estimated_cost_usd": 0.02},
+            })
+            alert = await asyncio.wait_for(queue.get(), timeout=1)
+            self.assertEqual(alert.topic, "auto.evaluator_cost_alert")
+            self.assertGreater(alert.payload["session_auto_evaluator_cost_usd"], 0)
 
     async def test_evaluator_continuation_quota_exhausted_stops(self):
         session, runner = self._make_session([{"final": "No footer here."}])
