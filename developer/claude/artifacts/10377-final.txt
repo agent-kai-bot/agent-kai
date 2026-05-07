@@ -1,22 +1,22 @@
-Task 10377 developer fix-loop summary
+Developer fix-loop summary for task 10377.
 
-Addressed code-reviewer/claude/artifacts/10377-final.txt Decision: CHANGES_REQUESTED:
-1. Fixed daemon/auto_cost.py cumulative evaluator spend alerting. The alert predicate and reported spend_ratio now use total session auto-evaluator cost divided by session main-agent spend, rather than only the current critic call.
-2. Fixed agent/auto_loop_brain.py prompt truncation. Critic prompt construction now deterministically preserves the first history message/task anchor plus latest turns and the structured AutoEvaluationInput/current main_response instead of keeping only a rightmost JSON suffix.
+Prior verdict addressed:
+- security-auditor/claude/artifacts/10377-final.txt: Blocking HIGH finding that auto_loop_brain prompt construction sent unsanitized chat history/main_response/tool summaries to the external Anthropic Messages API when enabled.
 
-Regression coverage added/updated:
-- tests/test_auto_cost.py verifies two individually sub-threshold critic calls alert when cumulative evaluator spend exceeds 5% of main-agent spend.
-- tests/test_auto_loop_brain.py verifies over-budget history still includes the original task anchor, latest assistant turn, and current main response.
-- tests/test_auto_mode.py fixture expectation updated to cumulative alert semantics.
+Changes implemented:
+- Added centralized auto-loop-brain prompt redaction helper in agent/auto_loop_brain.py.
+- Applied redaction before JSON serialization to chat history content, main_response, parsed_auto_reason, runtime_pause_reason, and turn_tool_calls/tool summary fields.
+- Redacts Authorization/Bearer headers, taskboard session UUID/token forms, TASKBOARD/KAI/ANTHROPIC/OPENAI/API key forms, HMAC/webhook secrets/signatures, signed webhook-ish fields, private-key blocks, password and common *_TOKEN/*_SECRET/*_API_KEY key/value forms.
+- Handles structured values/dataclasses and JSON-looking string payloads so serialized tool inputs with secret-like keys are redacted while preserving non-secret context.
+- Added regression tests that representative raw secrets are absent from critic prompt JSON while task context remains available.
+
+Commit:
+- 2297575e2988385ca0afe10a3f59251b0ed3b042 fix: redact auto loop brain critic prompts
 
 Tests run:
-- pytest -q tests/test_auto_loop_brain.py tests/test_auto_cost.py -q — passed (14 tests).
-- pytest -q tests/test_auto_loop_brain.py tests/test_auto_cost.py tests/test_auto_mode.py -q — blocked during collection: ModuleNotFoundError: No module named 'langchain'.
+- python3 -m pytest -q tests/test_auto_loop_brain.py --maxfail=1 -> 15 passed, 5 subtests passed.
+- /home/atc/git/claude-local-ai-agent/.venv/bin/python -m pytest -q tests/test_auto_loop_brain.py tests/test_auto_cost.py tests/test_auto_mode.py tests/test_auto_evaluator.py --maxfail=1 -> 48 passed, 1 warning (unknown pytest asyncio_mode config option).
+- /home/atc/git/claude-local-ai-agent/.venv/bin/python -m py_compile agent/auto_evaluator.py agent/auto_loop_brain.py daemon/auto_cost.py daemon/core.py -> passed.
 
-Known follow-up/risk:
-- Full auto-mode integration test should be re-run in CI/runtime with langchain installed.
-- Forgejo PR creation could not be completed from this environment because FORGEJO_URL is not configured.
-- Taskboard move/comment APIs returned 409/400 because taskboard reports the task as Backlog/not active despite the bound session token.
-
-Commit: 124251c
-Branch: task-10377-feat-implement-auto-loop-brain-llm-critic-per-10375-spec
+Known follow-up:
+- No known blocking follow-up. Redaction is conservative and may redact some benign fields with secret-like names, which is acceptable for fail-safe critic prompting.
