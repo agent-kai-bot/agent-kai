@@ -718,8 +718,11 @@ class DaemonServer:
             return False, "runtime_not_attached"
         if bool(getattr(runner, "_is_auto_continuation", False)):
             return False, "auto_continuing"
-        if bool(getattr(runner, "tool_call_active", False)):
-            return False, "tool_call_active"
+        if (
+            bool(getattr(runner, "tool_call_active", False))
+            or getattr(runner, "_active_recorder", None) is not None
+        ):
+            return False, "mid_tool_call"
         if session._heartbeat_turn_active:
             return False, "heartbeat_turn_active"
         session.prune_heartbeat_injections(tick.monotonic_seconds)

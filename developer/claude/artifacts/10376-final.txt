@@ -1,6 +1,6 @@
 Task 10376 heartbeat phase 2 implementation complete.
 
-Commit: 462486ff7f77f5999d1a1e347c072be9b7ddb61b
+Commit: see branch HEAD (amended summary commit)
 Branch: task-10376-feat-implement-heartbeat-phase-2-per-10374-spec
 
 Summary:
@@ -13,7 +13,7 @@ Summary:
 Verification:
 - python3 -m py_compile daemon/heartbeat.py daemon/core.py daemon/server.py agent/core.py agent/taskboard_dispatcher.py taskboard_gateway/app.py
 - .venv/bin/python -m pytest -q tests/test_heartbeat.py tests/test_auto_mode.py tests/test_taskboard_gateway.py --maxfail=1
-  Result: 50 passed; existing PytestConfigWarning for unknown asyncio_mode.
+  Result: 51 passed; existing PytestConfigWarning for unknown asyncio_mode.
 
 Known follow-up:
 - None.

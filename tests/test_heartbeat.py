@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import unittest
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -274,7 +275,96 @@ class DaemonHeartbeatTests(unittest.IsolatedAsyncioTestCase):
         ok, reason = server._heartbeat_injection_decision(managed, tick)
 
         self.assertFalse(ok)
-        self.assertEqual(reason, "tool_call_active")
+        self.assertEqual(reason, "mid_tool_call")
+
+    async def test_heartbeat_injection_decision_suppresses_busy_and_tool_active_states(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+
+            def scheduler_factory(*, dispatch_callback, event_bus, event_callback, **_kwargs):
+                return Scheduler(
+                    dispatch_callback=dispatch_callback,
+                    event_bus=event_bus,
+                    event_callback=event_callback,
+                    jobs_path=base_dir / "scheduler" / "jobs.json",
+                )
+
+            server = DaemonServer(
+                agent_name="kai",
+                nats_url="nats://unit-test",
+                bus_factory=_FakeBus,
+                scheduler_factory=scheduler_factory,
+                heartbeat_config=HeartbeatConfig(
+                    enabled=False,
+                    interval_seconds=60,
+                    max_injected_turns_per_hour=1,
+                ),
+            )
+            with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
+                "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
+            ):
+                await server.startup()
+                try:
+                    managed = await server.get_or_create_session(
+                        "terminal",
+                        create_if_missing=True,
+                    )
+                    runner = _HeartbeatFakeRunner()
+                    managed.session.agent_runner = runner
+                    managed.session.start_auto_mode(max_iterations=5)
+                    tick = HeartbeatTick(
+                        seq=1,
+                        emitted_at="2026-05-06T16:30:00Z",
+                        monotonic_seconds=1_000.0,
+                        interval_seconds=60,
+                    )
+
+                    async with managed.input_lock:
+                        self.assertEqual(
+                            server._heartbeat_injection_decision(managed, tick),
+                            (False, "busy"),
+                        )
+
+                    managed.current_input_task = asyncio.create_task(asyncio.sleep(60))
+                    try:
+                        self.assertEqual(
+                            server._heartbeat_injection_decision(managed, tick),
+                            (False, "busy"),
+                        )
+                    finally:
+                        managed.current_input_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await managed.current_input_task
+                        managed.current_input_task = None
+
+                    runner.tool_call_active = True
+                    self.assertEqual(
+                        server._heartbeat_injection_decision(managed, tick),
+                        (False, "mid_tool_call"),
+                    )
+                    runner.tool_call_active = False
+
+                    runner._active_recorder = object()
+                    self.assertEqual(
+                        server._heartbeat_injection_decision(managed, tick),
+                        (False, "mid_tool_call"),
+                    )
+                    runner._active_recorder = None
+
+                    runner._is_auto_continuation = True
+                    self.assertEqual(
+                        server._heartbeat_injection_decision(managed, tick),
+                        (False, "auto_continuing"),
+                    )
+                    runner._is_auto_continuation = False
+
+                    managed.session.record_heartbeat_injection(tick.monotonic_seconds)
+                    self.assertEqual(
+                        server._heartbeat_injection_decision(managed, tick),
+                        (False, "rate_limited"),
+                    )
+                finally:
+                    await server.shutdown()
 
     async def test_heartbeat_rate_limit_drops_without_queueing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
