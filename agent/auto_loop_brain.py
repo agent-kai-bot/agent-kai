@@ -36,7 +36,6 @@ DEFAULT_MAX_HISTORY_TOKENS = 16_000
 DEFAULT_MAX_LLM_CRITIC_CALLS_PER_SESSION = 20
 DEFAULT_MAX_CONSECUTIVE_LLM_CRITIC_CALLS = 5
 REDACTED_SECRET = "[REDACTED]"
-
 _SECRET_KEY_RE = re.compile(
     r'''(?ix)
     (
@@ -155,11 +154,17 @@ class OpenAICompatToollessLLMClient:
         if not self.base_url:
             raise ValueError(f"endpoint '{endpoint_name}' is missing base_url")
         api_key_env = str(self.endpoint_config.get("api_key_env") or "").strip()
-        self.api_key = os.environ.get(api_key_env, "") if api_key_env else ""
-        if not self.api_key:
-            self.api_key = str(self.endpoint_config.get("api_key") or "")
-        if not self.api_key:
-            raise RuntimeError(f"endpoint '{endpoint_name}' API key is not configured")
+        self.api_key = ""
+        if api_key_env:
+            self.api_key = os.environ.get(api_key_env, "").strip()
+            if not self.api_key:
+                raise RuntimeError(f"endpoint '{endpoint_name}' API key env var {api_key_env} is not configured")
+        else:
+            self.api_key = str(self.endpoint_config.get("api_key") or "").strip()
+            if not self.api_key:
+                raise RuntimeError(f"endpoint '{endpoint_name}' API key is not configured")
+            if _is_placeholder_api_key(self.api_key):
+                raise RuntimeError(f"endpoint '{endpoint_name}' API key is a placeholder")
         self.default_model = str(self.endpoint_config.get("default_model") or "")
         if not self.default_model:
             models = self.endpoint_config.get("models")
@@ -674,6 +679,11 @@ def _optional_int(value: Any) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _is_placeholder_api_key(value: str) -> bool:
+    normalized = value.strip().lower()
+    return normalized in {"missing-kai-api-key", "missing-api-key", "not-configured", "changeme", "change-me", "placeholder", "not-set"}
 
 
 def _config_bool(config: dict[str, Any], key: str, default: bool) -> bool:

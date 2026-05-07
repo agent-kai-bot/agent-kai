@@ -128,6 +128,17 @@ class AutoLoopBrainClientTests(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 client.complete_json(model="m", system="s", user="u", timeout=1)
 
+    def test_openai_requires_configured_env_key_when_api_key_env_is_declared(self):
+        endpoint_config = {"base_url": "http://llm", "api_key_env": "AUTO_LOOP_BRAIN_TEST_KEY", "api_key": "missing-kai-api-key"}
+        with patch.dict("os.environ", {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "AUTO_LOOP_BRAIN_TEST_KEY"):
+                OpenAICompatToollessLLMClient(endpoint_name="kai-smart", endpoint_config=endpoint_config)
+        with patch.dict("os.environ", {"AUTO_LOOP_BRAIN_TEST_KEY": "env-secret"}, clear=True):
+            client = OpenAICompatToollessLLMClient(endpoint_name="kai-smart", endpoint_config=endpoint_config)
+        self.assertEqual(client.api_key, "env-secret")
+        with self.assertRaisesRegex(RuntimeError, "placeholder"):
+            OpenAICompatToollessLLMClient(endpoint_name="kai-smart", endpoint_config={"base_url": "http://llm", "api_key": "missing-kai-api-key"})
+
     def test_anthropic_success_transport_tool_attempt_and_toolless_payload(self):
         client = AnthropicToollessLLMClient(api_key="not-secret", base_url="http://anthropic")
         body = {"model": "claude", "content": [{"type": "text", "text": '{"decision":"STOP"}'}], "usage": {"input_tokens": 3, "output_tokens": 4}}
