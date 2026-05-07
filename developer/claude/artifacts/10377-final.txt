@@ -1,0 +1,23 @@
+Task 10377 final summary
+
+Commit: f0461a23eede7f1e9411547dd3f44e59e18f1336
+Branch: task-10377-feat-implement-auto-loop-brain-llm-critic-per-10375-spec
+
+Implemented:
+- Added agent/auto_loop_brain.py with AutoLoopBrainConfig, ToollessLLMClient protocol, Anthropic no-tools client, and LLMCriticEvaluator composite wrapper.
+- Preserved evaluate(AutoEvaluationInput) -> AutoEvaluationDecision while injecting a frozen chat_history_provider snapshot.
+- Regex pre-filter returns non-STOP and decisive STOP paths unchanged; LLM escalates only unknown/malformed_footer_recoverable STOP cases when enabled and not kill-switched.
+- Added schema validation, fail-closed handling for malformed JSON, boolean confidence, tool-call attempts, provider exceptions/timeouts, readonly template rejection, min confidence, per-session cap, and consecutive critic-call drift stop.
+- Added daemon.auto_loop_brain config defaults in agent-config.json with enabled=false and model_id=claude-sonnet-4-6.
+- Extended auto.evaluation payload with evaluator metadata and emits auto.evaluator_call_metrics for LLM calls.
+- Added clarify_misread_main template without marking it readonly.
+- Added unit/integration tests for LLM decisions, malformed responses, confidence rejection, tool attempts, timeout failure, prompt-injection regression, regex passthrough/escalation, disabled config, weak model disabling, and cost caps.
+
+Tests run:
+- python3 -m pytest tests/test_auto_evaluator.py tests/test_auto_loop_brain.py -q (18 passed, 9 subtests passed)
+- python3 -m py_compile agent/auto_loop_brain.py daemon/core.py agent/auto_evaluator.py
+- python3 -m pytest tests/test_auto_mode.py -q (blocked: ModuleNotFoundError: No module named 'langchain_core' in this environment)
+
+Known follow-up / risk:
+- E2E real auto-mode cassette was not run because the local test environment lacks langchain_core.
+- LLM critic defaults to disabled; enabling requires a valid Anthropic API key and model tier claude-sonnet-4-6 or approved newer equivalent.

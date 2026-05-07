@@ -25,12 +25,12 @@ from typing import Any
 
 from agent.auto_evaluator import (
     AutoEvaluationInput,
-    AutoResponseEvaluator,
     MIN_CONTINUE_CONFIDENCE,
     ToolCallSummary,
     render_auto_reply,
     validate_auto_evaluation_decision,
 )
+from agent.auto_loop_brain import build_auto_response_evaluator, evaluation_metadata
 from agent.auto_prompt import parse_auto_state
 from agent.core import AgentRunner
 from agent.signal_consumer import SignalConsumer
@@ -654,7 +654,10 @@ class Session:
         self.auto_iterations_total: int = 0
         self.auto_start_time: float = 0.0
         self.auto_max_duration: float = DEFAULT_AUTO_MAX_DURATION_SECONDS
-        self.auto_response_evaluator = AutoResponseEvaluator()
+        self.auto_response_evaluator = build_auto_response_evaluator(
+            chat_history_provider=lambda: tuple(self.chat_history),
+            telemetry=self,
+        )
         self.auto_evaluator_enabled: bool | None = None
         self.auto_evaluator_shadow: bool | None = None
         self.auto_evaluator_min_confidence: float = _env_float(
@@ -1314,6 +1317,7 @@ class Session:
                             min_confidence=self.auto_evaluator_min_confidence,
                         )
                         evaluation_payload = evaluator_decision.to_event_payload()
+                        evaluation_payload.update(evaluation_metadata(self.auto_response_evaluator))
                         self.publish_event("auto.evaluation", evaluation_payload)
                         yield {"type": "auto_evaluation", "data": evaluation_payload}
                         log_auto_event(
