@@ -1,0 +1,20 @@
+Task 10388 developer fix-loop summary
+
+Prior verdict addressed:
+- code-reviewer/claude/artifacts/10388-final.txt: Blocking finding required OpenAI-compatible endpoint credential resolution to stop falling back from api_key_env to endpoint_config['api_key'] sentinel values such as missing-kai-api-key.
+
+Implementation:
+- Updated OpenAICompatToollessLLMClient so endpoints declaring api_key_env must resolve a non-empty value from that environment variable; missing env now raises a clear RuntimeError during client construction/startup validation.
+- Kept static api_key fallback only for endpoints without api_key_env, and reject known placeholder static keys.
+- Added regression coverage for missing api_key_env, env success, and placeholder static key rejection.
+
+Commit:
+- 7e5eb7c3f09f06976d7a4fadeef706ac3515083a fix(auto-loop-brain): require openai endpoint env keys
+
+Tests run:
+- pytest -q tests/test_auto_loop_brain.py — 21 passed, 5 subtests passed.
+
+Known follow-up / risk:
+- No live LLM provider calls were made.
+- Broader daemon collection was not re-run in this fix-loop; prior review noted this environment lacks optional langchain/pandas dependencies for broader suites.
+- Working tree contains unrelated uncommitted/untracked files from other task work (for example daemon/heartbeat.py and alert subscriber files); they were not included in this task commit.
