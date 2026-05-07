@@ -15,5 +15,8 @@ Tests run:
 
 Known follow-up/risk:
 - Full auto-mode integration test should be re-run in CI/runtime with langchain installed.
+- Forgejo PR creation could not be completed from this environment because FORGEJO_URL is not configured.
+- Taskboard move/comment APIs returned 409/400 because taskboard reports the task as Backlog/not active despite the bound session token.
 
-Commit: 8de43cd
+Commit: 124251c
+Branch: task-10377-feat-implement-auto-loop-brain-llm-critic-per-10375-spec
