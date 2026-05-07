@@ -781,7 +781,12 @@ class AgentRunner:
                 if original is not None:
                     executor.max_iterations = original
 
-    async def run(self, user_input: str) -> AsyncIterator[dict]:
+    async def run(
+        self,
+        user_input: str,
+        *,
+        pre_injected_input: bool = False,
+    ) -> AsyncIterator[dict]:
         """Stream agent events. Falls back to secondary endpoint on error."""
         self._last_auto_pause_reason = None
         self._last_auto_state = ("unknown", None)
@@ -795,9 +800,9 @@ class AgentRunner:
 
         visible_input = not getattr(self, "_is_auto_continuation", False)
         log_input = user_input if visible_input else "[AUTO_CONTINUATION]"
-        if visible_input:
+        if visible_input and not pre_injected_input:
             self.chat_history.append(HumanMessage(content=user_input))
-        else:
+        elif not visible_input:
             self.log.info("AUTO_HIDDEN_TURN")
         self.log.info("USER_INPUT agent=%s input=%s", self.agent_name, log_input[:200])
         # Render the LLM-bound history. The LangChain ``AgentExecutor`` prompt

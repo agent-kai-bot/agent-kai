@@ -599,6 +599,7 @@ class DaemonTaskboardSpawner:
             managed.session.start_auto_mode(
                 max_iterations=max_iters,
                 readonly=False,
+                heartbeat_subscribed=False,
             )
         task = asyncio.create_task(
             self.daemon_server.run_input(

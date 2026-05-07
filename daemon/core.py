@@ -14,6 +14,7 @@ import os
 import re
 import tempfile
 import time
+from collections import deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from dataclasses import asdict
@@ -662,6 +663,10 @@ class Session:
         )
         self.auto_evaluator_continuations_used: int = 0
         self.auto_evaluator_max_continuations: int = 0
+        self.heartbeat_subscribed: bool = False
+        self.heartbeat_subscription_configured: bool = False
+        self.heartbeat_injection_timestamps: deque[float] = deque()
+        self._heartbeat_turn_active: bool = False
 
         self.sub_agent_pool = SessionSubAgentPool(
             session_name=self.name,
@@ -844,12 +849,17 @@ class Session:
         *,
         max_iterations: int = DEFAULT_AUTO_MAX_ITERATIONS,
         readonly: bool = False,
+        heartbeat_subscribed: bool | None = None,
     ) -> dict[str, Any]:
         """Enable autonomous multi-turn execution for the next task."""
 
         normalized_iterations = self._normalize_auto_iterations(max_iterations)
         self.auto_mode = True
         self.auto_readonly = bool(readonly)
+        if heartbeat_subscribed is not None:
+            self.set_heartbeat_subscribed(heartbeat_subscribed)
+        elif not self.heartbeat_subscription_configured:
+            self.heartbeat_subscribed = True
         self.auto_iterations_total = normalized_iterations
         self.auto_iterations_remaining = normalized_iterations
         self.auto_start_time = time.monotonic()
@@ -876,6 +886,32 @@ class Session:
         payload = self.auto_status_payload()
         self.publish_event("auto.started", payload)
         return payload
+
+    def set_heartbeat_subscribed(self, enabled: bool) -> None:
+        """Enable or disable daemon heartbeat prompt injection for this session."""
+
+        self.heartbeat_subscribed = bool(enabled)
+        self.heartbeat_subscription_configured = True
+        self.publish_event(
+            "heartbeat.subscription",
+            {"subscribed": self.heartbeat_subscribed},
+        )
+
+    def record_heartbeat_injection(self, monotonic_seconds: float) -> None:
+        self.heartbeat_injection_timestamps.append(float(monotonic_seconds))
+
+    def prune_heartbeat_injections(
+        self,
+        now: float,
+        *,
+        window_seconds: float = 3600.0,
+    ) -> None:
+        cutoff = float(now) - float(window_seconds)
+        while (
+            self.heartbeat_injection_timestamps
+            and self.heartbeat_injection_timestamps[0] <= cutoff
+        ):
+            self.heartbeat_injection_timestamps.popleft()
 
     def stop_auto_mode(self, reason: str) -> dict[str, Any]:
         """Disable autonomous mode and publish the stop reason."""
@@ -978,6 +1014,8 @@ class Session:
             "chat_history": serialize_messages(self.chat_history),
             "input_queue": list(self.input_queue),
             "ui_state": asdict(self.ui_state),
+            "heartbeat_subscribed": self.heartbeat_subscribed,
+            "heartbeat_subscription_configured": self.heartbeat_subscription_configured,
         }
         _load_merge_write_json(self.paths.state_path, state_patch)
         for name, state in self.sub_agent_pool.items():
@@ -1023,6 +1061,11 @@ class Session:
             self.input_queue[:] = [item for item in queue_items if isinstance(item, str)]
 
         self.agent_name = state.get("agent_name") or self.agent_name
+        if "heartbeat_subscribed" in state:
+            self.heartbeat_subscribed = bool(state.get("heartbeat_subscribed"))
+            self.heartbeat_subscription_configured = bool(
+                state.get("heartbeat_subscription_configured", True)
+            )
 
         for name, sub_agent_state in self.sub_agent_pool.items():
             payload = _read_json_dict(sub_agent_state.buffer_path)
@@ -1045,6 +1088,8 @@ class Session:
         source: str = "user",
         job_id: str | None = None,
         tool_budget: int | None = None,
+        single_auto_iteration: bool = False,
+        pre_injected_input: bool = False,
     ):
         """Stream agent events through the session bus."""
         if self.agent_runner is None:
@@ -1104,7 +1149,10 @@ class Session:
                         if isinstance(getattr(self, "taskboard_dispatcher", None), dict):
                             worktree_path = str(self.taskboard_dispatcher.get("worktree_path") or "")
                         with session_worktree_context(worktree_path or None):
-                            async for event in self.agent_runner.run(current_input):
+                            async for event in self.agent_runner.run(
+                                current_input,
+                                pre_injected_input=pre_injected_input and not is_auto_continuation,
+                            ):
                                 etype = event.get("type", "unknown")
                                 data = event.get("data")
                                 if etype == "final":
@@ -1130,6 +1178,31 @@ class Session:
                     progress_payload = self.publish_auto_progress()
                     yield {"type": "auto_progress", "data": progress_payload}
                     if not self.auto_mode:
+                        break
+
+                    if single_auto_iteration:
+                        auto_state, auto_reason = parse_auto_state(turn_final_text)
+                        log_auto_event(
+                            self,
+                            "AUTO_STATE",
+                            [
+                                f"state={auto_state}",
+                                f"reason={auto_reason or '<none>'}",
+                                "single_iteration=true",
+                            ],
+                        )
+                        if self.auto_iterations_remaining <= 0:
+                            stopped = self.stop_auto_mode("iteration budget exhausted")
+                            yield {"type": "auto_stopped", "data": stopped}
+                        elif runtime_pause_reason:
+                            stopped = self.stop_auto_mode(runtime_pause_reason)
+                            yield {"type": "auto_stopped", "data": stopped}
+                        elif auto_state == "done":
+                            stopped = self.stop_auto_mode(auto_reason or "task complete")
+                            yield {"type": "auto_stopped", "data": stopped}
+                        elif auto_state == "pause":
+                            stopped = self.stop_auto_mode(auto_reason or "paused")
+                            yield {"type": "auto_stopped", "data": stopped}
                         break
 
                     if runtime_pause_reason:

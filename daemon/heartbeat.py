@@ -1,8 +1,4 @@
-"""Daemon-owned heartbeat tick service.
-
-Phase 1 intentionally publishes internal ticks only.  It does not trigger
-agent runs and it does not treat WebSocket client heartbeats as work.
-"""
+"""Daemon-owned heartbeat tick service."""
 
 from __future__ import annotations
 
@@ -12,6 +8,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 
@@ -57,11 +54,60 @@ class HeartbeatTick:
 
 @dataclass(frozen=True)
 class HeartbeatConfig:
-    """Runtime configuration for the phase-1 heartbeat service."""
+    """Runtime configuration for the daemon heartbeat service."""
 
     enabled: bool = True
-    interval_seconds: float = 60.0
+    interval_seconds: float = 1800.0
     publish_session_events: bool = True
+    prompt_template_path: str = "prompts/heartbeat/main.md.tmpl"
+    max_injected_turns_per_hour: int = 0
+
+
+class SafeFormatDict(dict):
+    """Format mapping that keeps unknown placeholders visible."""
+
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+@dataclass(frozen=True)
+class HeartbeatPromptTemplate:
+    """Git-tracked prompt template rendered for heartbeat turns."""
+
+    name: str
+    path: Path
+    content: str
+
+    @classmethod
+    def load(cls, template_path: str | Path) -> "HeartbeatPromptTemplate":
+        path = Path(template_path)
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parent.parent / path
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise FileNotFoundError(
+                f"heartbeat prompt template is not readable: {path}"
+            ) from exc
+        return cls(name=path.name, path=path, content=content)
+
+    def render(
+        self,
+        tick: HeartbeatTick,
+        *,
+        session_name: str,
+        agent_name: str | None,
+    ) -> str:
+        values = SafeFormatDict(
+            seq=tick.seq,
+            emitted_at=tick.emitted_at,
+            interval_seconds=tick.interval_seconds,
+            session_name=session_name,
+            agent_name=agent_name or "",
+            source=tick.source,
+            reason=tick.reason,
+        )
+        return self.content.format_map(values)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -83,9 +129,18 @@ def load_heartbeat_config(config: dict[str, Any] | None = None) -> HeartbeatConf
     enabled = bool(heartbeat.get("enabled", True))
     publish_session_events = bool(heartbeat.get("publish_session_events", True))
     try:
-        interval_seconds = float(heartbeat.get("interval_seconds", 60.0))
+        interval_seconds = float(heartbeat.get("interval_seconds", 1800.0))
     except (TypeError, ValueError):
-        interval_seconds = 60.0
+        interval_seconds = 1800.0
+    prompt_template_path = str(
+        heartbeat.get("prompt_template_path") or "prompts/heartbeat/main.md.tmpl"
+    )
+    try:
+        max_injected_turns_per_hour = int(
+            heartbeat.get("max_injected_turns_per_hour", 0)
+        )
+    except (TypeError, ValueError):
+        max_injected_turns_per_hour = 0
 
     enabled = _env_bool("KAI_HEARTBEAT_ENABLED", enabled)
     publish_session_events = _env_bool(
@@ -98,11 +153,26 @@ def load_heartbeat_config(config: dict[str, Any] | None = None) -> HeartbeatConf
             interval_seconds = float(env_interval)
         except ValueError:
             pass
+    env_template = os.getenv("KAI_HEARTBEAT_PROMPT_TEMPLATE_PATH")
+    if env_template:
+        prompt_template_path = env_template
+    env_max = os.getenv("KAI_HEARTBEAT_MAX_INJECTED_TURNS_PER_HOUR")
+    if env_max is not None:
+        try:
+            max_injected_turns_per_hour = int(env_max)
+        except ValueError:
+            pass
+    if _env_bool("KAI_HEARTBEAT_INJECTION_KILL_SWITCH", False):
+        max_injected_turns_per_hour = 0
+
     interval_seconds = max(0.1, interval_seconds)
+    max_injected_turns_per_hour = max(0, max_injected_turns_per_hour)
     return HeartbeatConfig(
         enabled=enabled,
         interval_seconds=interval_seconds,
         publish_session_events=publish_session_events,
+        prompt_template_path=prompt_template_path,
+        max_injected_turns_per_hour=max_injected_turns_per_hour,
     )
 
 

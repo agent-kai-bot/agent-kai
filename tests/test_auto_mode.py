@@ -64,7 +64,7 @@ class _FakeRunner:
     def override_max_iterations(self, _limit):
         yield
 
-    async def run(self, user_input: str):
+    async def run(self, user_input: str, *, pre_injected_input: bool = False):
         index = len(self.inputs)
         self.inputs.append(user_input)
         self.continuation_flags.append(bool(self._is_auto_continuation))
@@ -98,6 +98,24 @@ class SessionAutoModeTests(unittest.IsolatedAsyncioTestCase):
         runner = _FakeRunner(turns)
         session.agent_runner = runner
         return session, runner
+
+    async def test_single_auto_iteration_does_not_inject_hidden_continuation(self):
+        session, runner = self._make_session(
+            [{"final": "Step one complete.\n[AUTO_STATE: continue]"}]
+        )
+        session.start_auto_mode(max_iterations=5)
+
+        events = [
+            event
+            async for event in session.stream_agent_events(
+                "Heartbeat",
+                single_auto_iteration=True,
+            )
+        ]
+
+        self.assertEqual(runner.inputs, ["Heartbeat"])
+        self.assertEqual([event["type"] for event in events].count("auto_progress"), 1)
+        self.assertTrue(session.auto_mode)
 
     async def test_continue_footer_injects_hidden_continuation(self):
         session, runner = self._make_session(

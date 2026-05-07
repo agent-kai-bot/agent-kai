@@ -19,6 +19,7 @@ from typing import Any
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from langchain_core.messages import HumanMessage
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -99,6 +100,7 @@ from daemon.core import (
 )
 from daemon.heartbeat import (
     HeartbeatConfig,
+    HeartbeatPromptTemplate,
     HeartbeatService,
     HeartbeatTick,
     load_heartbeat_config,
@@ -564,6 +566,9 @@ class DaemonServer:
         self.heartbeat_config = heartbeat_config or load_heartbeat_config(
             get_agent_config(agent_name)
         )
+        self.heartbeat_prompt_template = HeartbeatPromptTemplate.load(
+            self.heartbeat_config.prompt_template_path
+        )
         self.heartbeat_service: HeartbeatService | None = None
         self.daemon_token = ""
         self.started_at_monotonic: float | None = None
@@ -653,19 +658,134 @@ class DaemonServer:
             self.bus = None
 
     async def _handle_heartbeat_tick(self, tick: HeartbeatTick) -> None:
-        """Fan out one daemon-owned heartbeat tick without waking the agent."""
+        """Fan out one daemon-owned heartbeat tick, then wake eligible sessions."""
 
         payload = tick.to_event_payload()
         await self.event_bus.publish("heartbeat", payload)
-        if not self.heartbeat_config.publish_session_events:
-            return
-        session_payload = {
-            **payload,
-            "pending": False,
-            "agent_wakeup_enabled": False,
-        }
+        if self.heartbeat_config.publish_session_events:
+            session_payload = {
+                **payload,
+                "pending": False,
+                "agent_wakeup_enabled": False,
+            }
+            for managed in list(self.sessions.values()):
+                managed.session.publish_event("heartbeat.tick", session_payload)
+
         for managed in list(self.sessions.values()):
-            managed.session.publish_event("heartbeat.tick", session_payload)
+            ok, reason = self._heartbeat_injection_decision(managed, tick)
+            if not ok:
+                self._publish_heartbeat_drop(managed, tick, reason)
+                continue
+            managed.session._heartbeat_turn_active = True
+            task = asyncio.create_task(
+                self._run_heartbeat_turn(managed, tick),
+                name=f"heartbeat-{managed.session.name}-{tick.seq}",
+            )
+            task.add_done_callback(self._consume_background_task_exception)
+
+    @staticmethod
+    def _consume_background_task_exception(task: asyncio.Task[Any]) -> None:
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            return
+
+    def heartbeat_subscribers_count(self) -> int:
+        return sum(
+            1
+            for managed in self.sessions.values()
+            if managed.session.heartbeat_subscribed and managed.session.auto_mode
+        )
+
+    def _heartbeat_injection_decision(
+        self,
+        managed: ManagedSession,
+        tick: HeartbeatTick,
+    ) -> tuple[bool, str]:
+        session = managed.session
+        if not session.heartbeat_subscribed:
+            return False, "not_subscribed"
+        if not session.auto_mode:
+            return False, "auto_mode_disabled"
+        if self.heartbeat_config.max_injected_turns_per_hour <= 0:
+            return False, "rate_limit_disabled"
+        if managed.input_lock.locked() or (
+            managed.current_input_task is not None and not managed.current_input_task.done()
+        ):
+            return False, "busy"
+        runner = session.agent_runner
+        if runner is None:
+            return False, "runtime_not_attached"
+        if bool(getattr(runner, "_is_auto_continuation", False)):
+            return False, "auto_continuing"
+        if session._heartbeat_turn_active:
+            return False, "heartbeat_turn_active"
+        session.prune_heartbeat_injections(tick.monotonic_seconds)
+        if (
+            len(session.heartbeat_injection_timestamps)
+            >= self.heartbeat_config.max_injected_turns_per_hour
+        ):
+            return False, "rate_limited"
+        return True, "ok"
+
+    def _publish_heartbeat_drop(
+        self,
+        managed: ManagedSession,
+        tick: HeartbeatTick,
+        reason: str,
+    ) -> None:
+        if reason in {"not_subscribed", "auto_mode_disabled"}:
+            return
+        managed.session.publish_event(
+            "auto.heartbeat_dropped",
+            {"seq": tick.seq, "reason": reason},
+        )
+
+    async def _run_heartbeat_turn(
+        self,
+        managed: ManagedSession,
+        tick: HeartbeatTick,
+    ) -> None:
+        session = managed.session
+        if managed.input_lock.locked() or (
+            managed.current_input_task is not None and not managed.current_input_task.done()
+        ):
+            self._publish_heartbeat_drop(managed, tick, "busy")
+            session._heartbeat_turn_active = False
+            return
+        try:
+            prompt = self.heartbeat_prompt_template.render(
+                tick,
+                session_name=session.name,
+                agent_name=session.agent_name or self.agent_name,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("heartbeat prompt render failed for %s: %s", session.name, exc)
+            self._publish_heartbeat_drop(managed, tick, "template_render_failed")
+            return
+
+        session.chat_history.append(HumanMessage(content=prompt))
+        session.agent_runner.chat_history = session.chat_history
+        session.record_heartbeat_injection(tick.monotonic_seconds)
+        session.publish_event(
+            "auto.heartbeat_injected",
+            {
+                "seq": tick.seq,
+                "template_name": self.heartbeat_prompt_template.name,
+                "chars_injected": len(prompt),
+            },
+        )
+        try:
+            await self.run_input(
+                managed,
+                prompt,
+                source="heartbeat",
+                job_id=f"heartbeat:{tick.seq}",
+                single_auto_iteration=True,
+                pre_injected_input=True,
+            )
+        finally:
+            session._heartbeat_turn_active = False
 
     async def _start_taskboard_dispatcher(self) -> None:
         if not self.taskboard_dispatcher_enabled:
@@ -776,6 +896,9 @@ class DaemonServer:
                 ),
                 "interval_seconds": self.heartbeat_config.interval_seconds,
                 "publish_session_events": self.heartbeat_config.publish_session_events,
+                "subscribers_count": self.heartbeat_subscribers_count(),
+                "max_injected_turns_per_hour": self.heartbeat_config.max_injected_turns_per_hour,
+                "prompt_template_name": self.heartbeat_prompt_template.name,
                 "tick_count": (
                     self.heartbeat_service.tick_count
                     if self.heartbeat_service is not None
@@ -914,6 +1037,8 @@ class DaemonServer:
         source: str = "user",
         job_id: str | None = None,
         tool_budget: int | None = None,
+        single_auto_iteration: bool = False,
+        pre_injected_input: bool = False,
     ) -> InputRunResult:
         """Run one input turn through the target session."""
         result = InputRunResult()
@@ -926,6 +1051,8 @@ class DaemonServer:
                     source=source,
                     job_id=job_id,
                     tool_budget=tool_budget,
+                    single_auto_iteration=single_auto_iteration,
+                    pre_injected_input=pre_injected_input,
                 ):
                     etype = event.get("type")
                     if etype == "final":
