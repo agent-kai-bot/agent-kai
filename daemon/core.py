@@ -32,7 +32,7 @@ from agent.auto_evaluator import (
 )
 from agent.auto_loop_brain import build_auto_response_evaluator, evaluation_metadata
 from agent.auto_prompt import parse_auto_state
-from daemon.auto_cost import record_auto_evaluator_call
+from daemon.auto_cost import record_auto_evaluator_call, record_main_agent_llm_usage
 from agent.core import AgentRunner
 from agent.signal_consumer import SignalConsumer
 from agent.strategy_agent_tools import InProcessStrategyRuntime
@@ -697,7 +697,13 @@ class Session:
         payload: dict[str, Any] | None = None,
     ) -> SessionEvent:
         event = self.event_bus.publish(topic, payload)
-        if topic == "auto.evaluator_call_metrics":
+        if topic == "llm.usage":
+            record_main_agent_llm_usage(
+                session_name=self.name,
+                agent_name=str(self.agent_name or ""),
+                payload=event.payload,
+            )
+        elif topic == "auto.evaluator_call_metrics":
             alert_payload = record_auto_evaluator_call(
                 session_name=self.name,
                 agent_name=str(self.agent_name or ""),
@@ -965,6 +971,7 @@ class Session:
             bus=bus,
             agent_name=agent_name,
         )
+        self.agent_runner.telemetry = self
         self.agent_runner.chat_history = self.chat_history
         if self.auto_mode:
             self.agent_runner._auto_readonly = self.auto_readonly
