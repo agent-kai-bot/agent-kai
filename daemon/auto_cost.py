@@ -120,10 +120,8 @@ def record_auto_evaluator_call(
                 table="main_agent_cost_events",
                 session_name=session_name,
             )
-            if (
-                main_agent_spend > 0
-                and estimated_cost / main_agent_spend > AUTO_EVALUATOR_COST_ALERT_RATIO
-            ):
+            spend_ratio = total / main_agent_spend if main_agent_spend > 0 else 0.0
+            if spend_ratio > AUTO_EVALUATOR_COST_ALERT_RATIO:
                 return {
                     "session_name": session_name,
                     "agent_name": agent_name,
@@ -131,7 +129,7 @@ def record_auto_evaluator_call(
                     "estimated_cost_usd": round(estimated_cost, 6),
                     "session_auto_evaluator_cost_usd": round(total, 6),
                     "session_main_agent_cost_usd": round(main_agent_spend, 6),
-                    "spend_ratio": round(estimated_cost / main_agent_spend, 6),
+                    "spend_ratio": round(spend_ratio, 6),
                     "threshold_ratio": AUTO_EVALUATOR_COST_ALERT_RATIO,
                 }
         finally:

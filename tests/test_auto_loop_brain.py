@@ -168,6 +168,23 @@ class AutoLoopBrainTests(unittest.TestCase):
         self.assertIn("clarify_misread_main", system)
         self.assertIn("original user task", user)
 
+
+    def test_prompt_truncation_preserves_task_anchor_and_latest_turn(self):
+        history = [
+            HumanLikeMessage("ORIGINAL TASK: implement the requested feature"),
+            *[HumanLikeMessage(f"middle turn {idx} " + ("x" * 500)) for idx in range(20)],
+            HumanLikeMessage("LATEST ASSISTANT TURN: I can continue if you want"),
+        ]
+        _, user = _build_critic_prompt(
+            self._input(main_response="Current response asks for permission"),
+            history,
+            AutoEvaluationDecision("STOP", 1.0, "regex stopped", "unknown"),
+            max_chars=1800,
+        )
+        self.assertIn("ORIGINAL TASK: implement the requested feature", user)
+        self.assertIn("LATEST ASSISTANT TURN: I can continue if you want", user)
+        self.assertIn("Current response asks for permission", user)
+
     def test_recorded_session_fixture_replays_llm_critic(self):
         fixture = json.loads(Path("tests/fixtures/auto_loop_brain_recorded_session.json").read_text())
         messages = [HumanLikeMessage(item["content"]) for item in fixture["chat_history"]]

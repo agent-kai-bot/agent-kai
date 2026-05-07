@@ -1,26 +1,19 @@
-Task 10377 developer final
+Task 10377 developer fix-loop summary
 
-Status: implemented and pushed for Code Review.
+Addressed code-reviewer/claude/artifacts/10377-final.txt Decision: CHANGES_REQUESTED:
+1. Fixed daemon/auto_cost.py cumulative evaluator spend alerting. The alert predicate and reported spend_ratio now use total session auto-evaluator cost divided by session main-agent spend, rather than only the current critic call.
+2. Fixed agent/auto_loop_brain.py prompt truncation. Critic prompt construction now deterministically preserves the first history message/task anchor plus latest turns and the structured AutoEvaluationInput/current main_response instead of keeping only a rightmost JSON suffix.
 
-Prior verdict addressed:
-- code-reviewer/claude/artifacts/10377-final.txt Decision: CHANGES_REQUESTED blocking finding: cost dashboard alert path was not wired to real main-agent spend because daemon/auto_cost.py only read synthetic main_agent_estimated_cost_usd/session_main_agent_cost_usd fields from auto.evaluator_call_metrics.
-
-Changes:
-- Added main-agent LLM usage capture in AgentRunner from LangChain on_chat_model_end events.
-- Added Session llm.usage handling that records real per-session main-agent LLM cost telemetry.
-- Added durable main_agent_cost_events table/migration and changed evaluator cost alerts to compare critic call cost against stored session main-agent spend.
-- Kept critic telemetry free of synthetic main-agent spend fields.
-- Added regression coverage for both direct llm.usage persistence and production AgentRunner event path.
-
-Commit: f6c261533f4fbdde4733425d64e6af824af7c8e0
-Branch: task-10377-feat-implement-auto-loop-brain-llm-critic-per-10375-spec
-Push: pushed to origin/task-10377-feat-implement-auto-loop-brain-llm-critic-per-10375-spec
-PR: not created by tool because FORGEJO_URL is not configured in this runtime.
+Regression coverage added/updated:
+- tests/test_auto_cost.py verifies two individually sub-threshold critic calls alert when cumulative evaluator spend exceeds 5% of main-agent spend.
+- tests/test_auto_loop_brain.py verifies over-budget history still includes the original task anchor, latest assistant turn, and current main response.
+- tests/test_auto_mode.py fixture expectation updated to cumulative alert semantics.
 
 Tests run:
-- python3 -m py_compile agent/core.py daemon/core.py daemon/auto_cost.py tests/test_auto_mode.py
-- /home/atc/git/claude-local-ai-agent/.venv/bin/python -m pytest -q tests/test_auto_mode.py::SessionAutoModeTests::test_auto_loop_brain_cost_metrics_persist_and_alert tests/test_auto_mode.py::SessionAutoModeTests::test_agent_runner_llm_usage_event_feeds_cost_alert tests/test_auto_loop_brain.py tests/test_auto_evaluator.py tests/test_auto_mode.py
-  Result: 46 passed, 1 warning (pytest config warning: unknown asyncio_mode).
+- pytest -q tests/test_auto_loop_brain.py tests/test_auto_cost.py -q — passed (14 tests).
+- pytest -q tests/test_auto_loop_brain.py tests/test_auto_cost.py tests/test_auto_mode.py -q — blocked during collection: ModuleNotFoundError: No module named 'langchain'.
 
-Known follow-up:
-- Forgejo PR must be opened manually or by a runtime with FORGEJO_URL configured, if the existing GitHub branch is not mirrored into Forgejo automatically.
+Known follow-up/risk:
+- Full auto-mode integration test should be re-run in CI/runtime with langchain installed.
+
+Commit: 8de43cd

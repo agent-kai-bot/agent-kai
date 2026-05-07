@@ -335,7 +335,7 @@ class SessionAutoModeTests(unittest.IsolatedAsyncioTestCase):
                 "latency_ms": 12,
                 "success": True,
                 "malformed": False,
-                "llm_usage": {"input_tokens": 100, "output_tokens": 10, "estimated_cost_usd": 0.01},
+                "llm_usage": {"input_tokens": 100, "output_tokens": 10},
             })
             self.assertEqual(event.topic, "auto.evaluator_call_metrics")
             queue = session.subscribe_events("auto.evaluator_cost_alert")
@@ -343,15 +343,23 @@ class SessionAutoModeTests(unittest.IsolatedAsyncioTestCase):
                 "model_id": "main-model",
                 "estimated_cost_usd": 0.10,
             })
+            # Two critic calls are individually below 5% of main-agent spend,
+            # but cumulative evaluator spend is above the session threshold.
             session.publish_event("auto.evaluator_call_metrics", {
                 "evaluator_kind": "llm",
                 "model_id": "claude-sonnet-4-6",
-                "llm_usage": {"estimated_cost_usd": 0.02},
+                "llm_usage": {"estimated_cost_usd": 0.004},
+            })
+            session.publish_event("auto.evaluator_call_metrics", {
+                "evaluator_kind": "llm",
+                "model_id": "claude-sonnet-4-6",
+                "llm_usage": {"estimated_cost_usd": 0.002},
             })
             alert = await asyncio.wait_for(queue.get(), timeout=1)
             self.assertEqual(alert.topic, "auto.evaluator_cost_alert")
-            self.assertGreater(alert.payload["session_auto_evaluator_cost_usd"], 0)
+            self.assertAlmostEqual(alert.payload["session_auto_evaluator_cost_usd"], 0.00615)
             self.assertEqual(alert.payload["session_main_agent_cost_usd"], 0.10)
+            self.assertAlmostEqual(alert.payload["spend_ratio"], 0.0615)
 
     async def test_agent_runner_llm_usage_event_feeds_cost_alert(self):
         session, _runner = self._make_session([])
