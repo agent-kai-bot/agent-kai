@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import logging
 import os
 import shutil
 import subprocess
@@ -12,6 +13,8 @@ from html.parser import HTMLParser
 
 import requests
 from langchain_core.tools import StructuredTool
+
+LOGGER = logging.getLogger("agent.tools")
 
 from config import (
     DOCKER_SANDBOX_ALLOWED_NETWORKS,
@@ -634,7 +637,17 @@ def create_nats_request_tool(bus):
             result = future.result(timeout=timeout + 5)
             return result.get("response", str(result))
         except Exception as e:
-            return f"Error requesting from agent '{agent_name}': {e}"
+            # Log the raw exception class+message so we can root-cause from
+            # the daemon log instead of relying on the LLM's paraphrase.
+            # Common case: NoRespondersError == sub-agent never spawned /
+            # subscription not active yet.
+            LOGGER.warning(
+                "nats_request to agent=%s failed: %s: %s",
+                agent_name,
+                type(e).__name__,
+                e,
+            )
+            return f"Error requesting from agent '{agent_name}': {type(e).__name__}: {e}"
 
     async def _nats_request_async(
         agent_name: str,
@@ -650,7 +663,13 @@ def create_nats_request_tool(bus):
             )
             return result.get("response", str(result))
         except Exception as e:
-            return f"Error requesting from agent '{agent_name}': {e}"
+            LOGGER.warning(
+                "nats_request to agent=%s failed: %s: %s",
+                agent_name,
+                type(e).__name__,
+                e,
+            )
+            return f"Error requesting from agent '{agent_name}': {type(e).__name__}: {e}"
 
     return StructuredTool.from_function(
         func=_nats_request_sync,
@@ -707,13 +726,25 @@ def create_spawn_agent_tool(sub_agent_manager):
             )
             return future.result(timeout=10)
         except Exception as e:
-            return f"Error spawning agent: {e}"
+            LOGGER.warning(
+                "spawn_agent name=%s failed: %s: %s",
+                name,
+                type(e).__name__,
+                e,
+            )
+            return f"Error spawning agent: {type(e).__name__}: {e}"
 
     async def _spawn_async(name: str) -> str:
         try:
             return await sub_agent_manager.spawn(name)
         except Exception as e:
-            return f"Error spawning agent: {e}"
+            LOGGER.warning(
+                "spawn_agent name=%s failed: %s: %s",
+                name,
+                type(e).__name__,
+                e,
+            )
+            return f"Error spawning agent: {type(e).__name__}: {e}"
 
     return StructuredTool.from_function(
         func=_spawn_sync,
