@@ -19,6 +19,7 @@ AutoReplyTemplate = Literal[
     "continue_next_safe_step",
     "proceed_readonly_analysis",
     "finish_requested_artifact",
+    "clarify_misread_main",
 ]
 
 DECISIONS = frozenset({"STOP", "CONTINUE", "PAUSE", "ACCEPT_MAIN_STATE"})
@@ -38,6 +39,7 @@ AUTO_REPLY_TEMPLATE_NAMES = frozenset(
         "continue_next_safe_step",
         "proceed_readonly_analysis",
         "finish_requested_artifact",
+        "clarify_misread_main",
     }
 )
 READONLY_AUTO_REPLY_TEMPLATES = frozenset({"proceed_readonly_analysis"})
@@ -96,6 +98,10 @@ AUTO_REPLY_TEMPLATES: dict[AutoReplyTemplate, str] = {
     "continue_next_safe_step": "Continue with the next safe step.",
     "proceed_readonly_analysis": "Proceed with the read-only analysis you just described.",
     "finish_requested_artifact": "Finish the artifact or final answer requested by the task.",
+    "clarify_misread_main": (
+        "It looks like the main agent misread the request — re-read the original task "
+        "and proceed with the safe next step you described."
+    ),
 }
 
 MIN_CONTINUE_CONFIDENCE = 0.85

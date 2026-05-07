@@ -364,5 +364,18 @@
       "run_as_user": "65534:65534",
       "mount_workspace_by_default": true
     }
+  },
+  "daemon": {
+    "auto_loop_brain": {
+      "enabled": false,
+      "model_id": "claude-sonnet-4-6",
+      "max_history_tokens": 16000,
+      "temperature": 0.0,
+      "min_continue_confidence": 0.85,
+      "timeout_seconds": 20.0,
+      "max_output_tokens": 512,
+      "max_llm_critic_calls_per_session": 20,
+      "max_consecutive_llm_critic_calls": 5
+    }
   }
 }
