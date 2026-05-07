@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol, Sequence
@@ -28,7 +29,9 @@ from agent.auto_evaluator import (
 from config import load_config
 
 INDECISIVE_STOP_PATTERNS = frozenset({"unknown", "malformed_footer_recoverable"})
-DEFAULT_CRITIC_MODEL = "claude-sonnet-4-6"
+VALID_AUTO_LOOP_BRAIN_CLIENTS = ("claude-cli", "openai", "anthropic")
+DEFAULT_AUTO_LOOP_BRAIN_CLIENT = "claude-cli"
+DEFAULT_CRITIC_MODEL = "sonnet"
 DEFAULT_MAX_HISTORY_TOKENS = 16_000
 DEFAULT_MAX_LLM_CRITIC_CALLS_PER_SESSION = 20
 DEFAULT_MAX_CONSECUTIVE_LLM_CRITIC_CALLS = 5
@@ -117,6 +120,82 @@ class ToollessLLMClient(Protocol):
     ) -> LLMResult: ...
 
 
+class ClaudeCLIToollessLLMClient:
+    """Local Claude CLI client that uses no tool configuration flags."""
+
+    def __init__(self, *, executable: str = "claude") -> None:
+        self.executable = executable
+
+    def build_command(self, *, model: str, system: str, user: str) -> list[str]:
+        command = [self.executable, "-p", "--append-system-prompt", system]
+        if model:
+            command.extend(["--model", model])
+        command.append(user)
+        return command
+
+    def complete_json(self, *, model: str, system: str, user: str, timeout: float, temperature: float = 0.0, max_output_tokens: int = 512) -> LLMResult:
+        try:
+            completed = subprocess.run(self.build_command(model=model, system=system, user=user), capture_output=True, text=True, timeout=timeout, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"claude CLI timed out after {timeout} seconds") from exc
+        if completed.stderr.strip():
+            raise RuntimeError(completed.stderr.strip())
+        if completed.returncode != 0:
+            raise RuntimeError(f"claude CLI exited with status {completed.returncode}")
+        return LLMResult(text=completed.stdout.strip(), model_id=model, usage=TokenUsage())
+
+
+class OpenAICompatToollessLLMClient:
+    """OpenAI-compatible chat completions client that never sends tools."""
+
+    def __init__(self, *, endpoint_name: str, endpoint_config: dict[str, Any]) -> None:
+        self.endpoint_name = endpoint_name
+        self.endpoint_config = dict(endpoint_config)
+        self.base_url = str(self.endpoint_config.get("base_url") or "").rstrip("/")
+        if not self.base_url:
+            raise ValueError(f"endpoint '{endpoint_name}' is missing base_url")
+        api_key_env = str(self.endpoint_config.get("api_key_env") or "").strip()
+        self.api_key = os.environ.get(api_key_env, "") if api_key_env else ""
+        if not self.api_key:
+            self.api_key = str(self.endpoint_config.get("api_key") or "")
+        if not self.api_key:
+            raise RuntimeError(f"endpoint '{endpoint_name}' API key is not configured")
+        self.default_model = str(self.endpoint_config.get("default_model") or "")
+        if not self.default_model:
+            models = self.endpoint_config.get("models")
+            if isinstance(models, dict) and models:
+                self.default_model = str(next(iter(models)))
+
+    def build_payload(self, *, model: str, system: str, user: str, temperature: float = 0.0, max_output_tokens: int = 512) -> dict[str, Any]:
+        return {
+            "model": model or self.default_model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "temperature": float(temperature),
+            "max_tokens": int(max_output_tokens),
+        }
+
+    def complete_json(self, *, model: str, system: str, user: str, timeout: float, temperature: float = 0.0, max_output_tokens: int = 512) -> LLMResult:
+        payload = self.build_payload(model=model, system=system, user=user, temperature=temperature, max_output_tokens=max_output_tokens)
+        chat_completions_url = f"{self.base_url}/chat/completions" if self.base_url.endswith("/v1") else f"{self.base_url}/v1/chat/completions"
+        response = requests.post(chat_completions_url, headers={"authorization": f"Bearer {self.api_key}", "content-type": "application/json"}, json=payload, timeout=timeout)
+        response.raise_for_status()
+        body = response.json()
+        choice = _first_choice(body)
+        message = choice.get("message") if isinstance(choice, dict) else None
+        text = ""
+        tool_call_attempted = False
+        if isinstance(message, dict):
+            text = _stringify_openai_content(message.get("content"))
+            tool_call_attempted = any(key in message for key in ("tool_calls", "function_call"))
+        if isinstance(choice, dict) and choice.get("finish_reason") in {"tool_calls", "function_call"}:
+            tool_call_attempted = True
+        usage_payload = body.get("usage") if isinstance(body, dict) else None
+        usage = None
+        if isinstance(usage_payload, dict):
+            usage = TokenUsage(input_tokens=_optional_int(usage_payload.get("prompt_tokens")), output_tokens=_optional_int(usage_payload.get("completion_tokens")))
+        return LLMResult(text=text.strip(), model_id=str(body.get("model") or payload["model"]) if isinstance(body, dict) else str(payload["model"]), usage=usage, tool_call_attempted=tool_call_attempted)
+
+
 class AnthropicToollessLLMClient:
     """Direct Anthropic Messages API client that never sends tool definitions."""
 
@@ -185,6 +264,8 @@ class AutoLoopBrainConfig:
     """Configuration for the composite regex + LLM auto-loop evaluator."""
 
     enabled: bool = False
+    client: str = DEFAULT_AUTO_LOOP_BRAIN_CLIENT
+    endpoint: str | None = None
     model_id: str = DEFAULT_CRITIC_MODEL
     max_history_tokens: int = DEFAULT_MAX_HISTORY_TOKENS
     temperature: float = 0.0
@@ -207,11 +288,16 @@ class AutoLoopBrainConfig:
         if not isinstance(brain_config, dict):
             brain_config = {}
         enabled = _env_bool("KAI_AUTO_LOOP_BRAIN_ENABLED", _config_bool(brain_config, "enabled", False))
+        client = os.environ.get("KAI_AUTO_LOOP_BRAIN_CLIENT", str(brain_config.get("client") or DEFAULT_AUTO_LOOP_BRAIN_CLIENT)).strip().lower()
+        endpoint = os.environ.get("KAI_AUTO_LOOP_BRAIN_ENDPOINT", brain_config.get("endpoint"))
+        endpoint = str(endpoint).strip() if endpoint is not None and str(endpoint).strip() else None
         model_id = os.environ.get("KAI_AUTO_LOOP_BRAIN_MODEL_ID", str(brain_config.get("model_id") or DEFAULT_CRITIC_MODEL))
         if _env_bool("KAI_AUTO_LOOP_BRAIN_KILL_SWITCH", False) or not _model_meets_minimum_tier(model_id):
             enabled = False
         return cls(
             enabled=enabled,
+            client=client,
+            endpoint=endpoint,
             model_id=model_id,
             max_history_tokens=_env_int("KAI_AUTO_LOOP_BRAIN_MAX_HISTORY_TOKENS", _config_int(brain_config, "max_history_tokens", DEFAULT_MAX_HISTORY_TOKENS)),
             temperature=_env_float("KAI_AUTO_LOOP_BRAIN_TEMPERATURE", _config_float(brain_config, "temperature", 0.0)),
@@ -374,10 +460,32 @@ def build_auto_response_evaluator(
     resolved_config = config or AutoLoopBrainConfig.from_sources()
     return LLMCriticEvaluator(
         chat_history_provider=lambda: tuple(chat_history_provider()),
-        llm_client=llm_client or AnthropicToollessLLMClient(),
+        llm_client=llm_client or build_toolless_llm_client(resolved_config),
         config=resolved_config,
         telemetry=telemetry,
     )
+
+
+def build_toolless_llm_client(config: AutoLoopBrainConfig, *, raw_config: dict[str, Any] | None = None) -> ToollessLLMClient:
+    """Instantiate the configured tool-less LLM client, validating routing."""
+    client = (config.client or DEFAULT_AUTO_LOOP_BRAIN_CLIENT).strip().lower()
+    valid = ", ".join(VALID_AUTO_LOOP_BRAIN_CLIENTS)
+    if client not in VALID_AUTO_LOOP_BRAIN_CLIENTS:
+        raise ValueError(f"unknown auto_loop_brain client '{config.client}'; valid choices: {valid}")
+    if client == "claude-cli":
+        return ClaudeCLIToollessLLMClient()
+    if client == "anthropic":
+        return AnthropicToollessLLMClient()
+    if not config.endpoint:
+        raise ValueError("auto_loop_brain client 'openai' requires daemon.auto_loop_brain.endpoint")
+    endpoints = (raw_config or load_config()).get("endpoints", {})
+    if not isinstance(endpoints, dict) or config.endpoint not in endpoints:
+        available = ", ".join(sorted(endpoints)) if isinstance(endpoints, dict) else ""
+        raise ValueError(f"auto_loop_brain endpoint '{config.endpoint}' not found in agent-config.json endpoints" + (f"; available: {available}" if available else ""))
+    endpoint_config = endpoints[config.endpoint]
+    if not isinstance(endpoint_config, dict):
+        raise ValueError(f"auto_loop_brain endpoint '{config.endpoint}' must be an object")
+    return OpenAICompatToollessLLMClient(endpoint_name=config.endpoint, endpoint_config=endpoint_config)
 
 
 def evaluation_metadata(evaluator: object) -> dict[str, object]:
@@ -475,7 +583,7 @@ def _truncate_text(value: str, *, limit: int, keep_end: bool = False) -> str:
 
 def _model_meets_minimum_tier(model_id: str) -> bool:
     normalized = str(model_id or "").lower()
-    return "sonnet-4-6" in normalized or "opus-4-7" in normalized or "sonnet-4.6" in normalized or "opus-4.7" in normalized
+    return normalized in {"sonnet", "opus"} or "sonnet-4-6" in normalized or "opus-4-7" in normalized or "sonnet-4.6" in normalized or "opus-4.7" in normalized
 
 
 def _message_to_prompt_item(item: Any) -> dict[str, str]:
@@ -536,6 +644,29 @@ def _redact_prompt_text(text: str) -> str:
     redacted = _SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group('prefix')}{match.group('quote')}{REDACTED_SECRET}{match.group('quote')}", redacted)
     redacted = _BEARER_RE.sub(f"Bearer {REDACTED_SECRET}", redacted)
     return redacted
+
+
+def _first_choice(body: Any) -> dict[str, Any]:
+    if not isinstance(body, dict):
+        return {}
+    choices = body.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        return choices[0]
+    return {}
+
+
+def _stringify_openai_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("text") is not None:
+                parts.append(str(item.get("text")))
+            elif item is not None and not isinstance(item, dict):
+                parts.append(str(item))
+        return "\n".join(parts)
+    return "" if content is None else str(content)
 
 
 def _optional_int(value: Any) -> int | None:
