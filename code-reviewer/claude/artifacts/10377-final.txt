@@ -1,0 +1,15 @@
+Decision: CHANGES_REQUESTED
+
+Summary:
+Reviewed the post-fix-loop implementation for task 10377 against docs/architecture/10375-auto-loop-brain.md and the prior review findings. The clarify_misread_main prompt/schema issue, prompt-injection regression assertion, daemon fallback coverage, and recorded fixture coverage are now largely addressed, and focused tests pass in the repo venv. One acceptance item remains materially incomplete.
+
+Blocking finding:
+1. SHOULD FIX — Cost dashboard alert is not actually wired to main-agent spend, so the >5% alert requirement will not fire in real sessions. daemon/auto_cost.py:67-76 only checks main_agent_estimated_cost_usd/session_main_agent_cost_usd if those fields are present in the auto.evaluator_call_metrics payload. However LLMCriticEvaluator._publish_call_metrics never emits either field, and grep found no producer for those keys elsewhere. As implemented, real critic calls are only persisted; auto.evaluator_cost_alert is unreachable unless a test or hypothetical caller manually injects spend into the critic metric payload. Fix by wiring record_auto_evaluator_call to an existing main-agent spend/cost source, adding a session/agent cost accumulator that is populated by main-agent LLM telemetry, or changing the evaluator metrics publisher to include a real computed session main-agent spend value. Add a test that exercises the production path rather than manually publishing a payload with synthetic main_agent_estimated_cost_usd.
+
+Tests reviewed:
+- /home/atc/git/claude-local-ai-agent/.venv/bin/python -m pytest -q tests/test_auto_evaluator.py tests/test_auto_loop_brain.py tests/test_auto_mode.py — 44 passed, 1 warning.
+- python3 -m py_compile agent/auto_loop_brain.py daemon/auto_cost.py daemon/core.py tests/test_auto_loop_brain.py tests/test_auto_mode.py — passed.
+- Global pytest still cannot collect tests/test_auto_mode.py because langchain is not installed globally; repo venv passes.
+
+Residual risk:
+The feature is default-disabled and fail-closed, so runtime blast radius is limited. The remaining blocker is observability/cost governance: enabling this without a real main-agent spend linkage would silently miss the required >5% spend alert.
