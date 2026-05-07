@@ -17,7 +17,7 @@ from daemon.alert_subscriber import (
 class AlertSubscriberConfigTests(unittest.TestCase):
     def test_defaults_include_disabled_polymarket_subscription(self):
         config = load_alert_subscriber_config({})
-        self.assertTrue(config.enabled)
+        self.assertFalse(config.enabled)
         self.assertFalse(config.kill_switch)
         sub = config.subscriptions[0]
         self.assertEqual(sub.subject_pattern, "polymarket.alpha.alarm.>")
@@ -106,9 +106,11 @@ class AlertSubscriberTemplateTests(unittest.TestCase):
         self.assertIn("Subject: polymarket.alpha.alarm.large", prompt)
         self.assertIn("YES odds moved quickly", prompt)
 
-    def test_malformed_payload_drops(self):
+    def test_malformed_payload_drops_and_logs(self):
         sub = AlertSubscriptionConfig()
-        self.assertIsNone(render_alert_prompt(sub, "polymarket.alpha.alarm.large", {"raw": "not json"}))
+        with self.assertLogs("daemon.alert_subscriber", level="WARNING") as logs:
+            self.assertIsNone(render_alert_prompt(sub, "polymarket.alpha.alarm.large", {"raw": "not json"}))
+        self.assertIn("dropping malformed alert payload", "\n".join(logs.output))
         with self.assertRaises(MalformedAlertPayload):
             normalize_alert_event(sub, "polymarket.alpha.alarm.large", {"data": []})
 

@@ -385,7 +385,7 @@
       "max_injected_turns_per_hour": 0
     },
     "alert_subscriber": {
-      "enabled": true,
+      "enabled": false,
       "kill_switch": false,
       "alerts_yaml_path": "alerts.yaml",
       "subscriptions": [

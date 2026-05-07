@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -11,6 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from daemon.event_injector import EventInjectionTemplate, stable_json
+
+log = logging.getLogger(__name__)
 
 DEFAULT_POLYMARKET_SUBSCRIPTION_NAME = "polymarket-default"
 DEFAULT_POLYMARKET_TEMPLATE = "prompts/alerts/polymarket.md.tmpl"
@@ -29,7 +32,7 @@ class AlertSubscriptionConfig:
 
 @dataclass(frozen=True)
 class AlertSubscriberConfig:
-    enabled: bool = True
+    enabled: bool = False
     kill_switch: bool = False
     alerts_yaml_path: str | None = "alerts.yaml"
     subscriptions: tuple[AlertSubscriptionConfig, ...] = ()
@@ -165,7 +168,7 @@ def load_alert_subscriber_config(config: dict[str, Any] | None = None) -> AlertS
     if not any(sub.name == default_sub.name for sub in subscriptions):
         subscriptions.append(default_sub)
 
-    enabled = bool(block.get("enabled", True))
+    enabled = bool(block.get("enabled", False))
     kill_switch = bool(block.get("kill_switch", False))
     alerts_yaml_path = block.get("alerts_yaml_path", "alerts.yaml")
     alerts_yaml_path = str(alerts_yaml_path) if alerts_yaml_path is not None else None
@@ -218,7 +221,7 @@ def load_alert_subscriber_config(config: dict[str, Any] | None = None) -> AlertS
 def validate_alert_subscriber_config(config: AlertSubscriberConfig) -> None:
     """Fail fast when enabled subscriptions reference unreadable templates."""
 
-    if not config.enabled:
+    if not config.enabled or config.kill_switch:
         return
     for sub in config.subscriptions:
         if not sub.enabled:
@@ -285,7 +288,13 @@ def render_alert_prompt(subscription: AlertSubscriptionConfig, subject: str, pay
 
     try:
         event = normalize_alert_event(subscription, subject, payload)
-    except MalformedAlertPayload:
+    except MalformedAlertPayload as exc:
+        log.warning(
+            "dropping malformed alert payload for subscription=%s subject=%s reason=%s",
+            subscription.name,
+            subject,
+            exc,
+        )
         return None
     template = EventInjectionTemplate.load(subscription.prompt_template_path)
     return template.render(event)

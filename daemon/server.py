@@ -97,6 +97,7 @@ from daemon.core import (
     remove_indexed_session,
     serialize_messages,
 )
+from daemon.alert_subscriber import AlertSubscriberConfig, load_alert_subscriber_config
 from daemon.event_injector import (
     EventInjectionPolicy,
     EventInjectionRequest,
@@ -567,9 +568,11 @@ class DaemonServer:
         self.event_bus = DaemonEventBus()
         self.signal_consumer = SignalConsumer()
         self.scheduler: Scheduler | None = None
-        self.heartbeat_config = heartbeat_config or load_heartbeat_config(
-            get_agent_config(agent_name)
+        agent_config = get_agent_config(agent_name)
+        self.alert_subscriber_config: AlertSubscriberConfig = load_alert_subscriber_config(
+            agent_config
         )
+        self.heartbeat_config = heartbeat_config or load_heartbeat_config(agent_config)
         self.heartbeat_prompt_template = HeartbeatPromptTemplate.load(
             self.heartbeat_config.prompt_template_path
         )
