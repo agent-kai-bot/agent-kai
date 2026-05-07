@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent.auto_evaluator import AutoEvaluationDecision, AutoEvaluationInput, AutoResponseEvaluator, ToolCallSummary, render_auto_reply
-from agent.auto_loop_brain import AutoLoopBrainConfig, LLMCriticEvaluator, LLMResult, TokenUsage, build_auto_response_evaluator, _build_critic_prompt
+from agent.auto_loop_brain import AutoLoopBrainConfig, LLMCriticEvaluator, LLMResult, TokenUsage, build_auto_response_evaluator, _build_critic_prompt, redact_prompt_secrets
 
 
 @dataclass
@@ -184,6 +184,63 @@ class AutoLoopBrainTests(unittest.TestCase):
         self.assertIn("ORIGINAL TASK: implement the requested feature", user)
         self.assertIn("LATEST ASSISTANT TURN: I can continue if you want", user)
         self.assertIn("Current response asks for permission", user)
+
+
+    def test_prompt_redacts_secrets_before_llm_call(self):
+        raw_secrets = {
+            "bearer": "bearer-secret-abc123",
+            "session": "428efc6b-06d4-4901-82b5-365f731f688e",
+            "taskboard": "taskboard-token-abc123",
+            "kai": "kai-key-abc123",
+            "anthropic": "anthropic-key-abc123",
+            "openai": "openai-key-abc123",
+            "hmac": "hmac-secret-abc123",
+            "password": "p@ssw0rd-abc123",
+            "signature": "sha256=abc123secret",
+            "private": "-----BEGIN PRIVATE KEY-----\nabc123secret\n-----END PRIVATE KEY-----",
+        }
+        history = [HumanLikeMessage(
+            "Original task context stays. "
+            "Authorization: Bearer bearer-secret-abc123\n"
+            "TASKBOARD_SESSION_TOKEN=428efc6b-06d4-4901-82b5-365f731f688e\n"
+            "TASKBOARD_AGENT_TOKEN_DEVELOPER=taskboard-token-abc123\n"
+            "KAI_API_KEY=kai-key-abc123 ANTHROPIC_API_KEY=anthropic-key-abc123 OPENAI_API_KEY=openai-key-abc123\n"
+            "KAI_TASKBOARD_WEBHOOK_SECRET=hmac-secret-abc123 X-Hub-Signature-256: sha256=abc123secret\n"
+            "password=p@ssw0rd-abc123\n"
+            "-----BEGIN PRIVATE KEY-----\nabc123secret\n-----END PRIVATE KEY-----"
+        )]
+        _, user = _build_critic_prompt(
+            self._input(
+                main_response="Next safe step remains visible. Authorization: Bearer bearer-secret-abc123",
+                parsed_auto_reason="taskboard_session_token=428efc6b-06d4-4901-82b5-365f731f688e",
+                runtime_pause_reason="OPENAI_API_KEY=openai-key-abc123",
+                turn_tool_calls=[ToolCallSummary("file_read", "{\"ANTHROPIC_API_KEY\": \"anthropic-key-abc123\"}")],
+            ),
+            history,
+            AutoEvaluationDecision("STOP", 1.0, "regex stopped", "unknown"),
+            max_chars=6000,
+        )
+
+        self.assertIn("Original task context stays", user)
+        self.assertIn("Next safe step remains visible", user)
+        self.assertIn("[REDACTED]", user)
+        for secret in raw_secrets.values():
+            self.assertNotIn(secret, user)
+
+    def test_redact_prompt_secrets_redacts_structured_secret_keys(self):
+        redacted = redact_prompt_secrets({
+            "normal": "keep me",
+            "TASKBOARD_BEARER_TOKEN": "raw-taskboard-token",
+            "nested": {"webhook_secret": "raw-webhook-secret", "detail": "safe detail"},
+            "tool_input": "Authorization: Bearer raw-bearer-token",
+        })
+        text = json.dumps(redacted, sort_keys=True)
+        self.assertIn("keep me", text)
+        self.assertIn("safe detail", text)
+        self.assertNotIn("raw-taskboard-token", text)
+        self.assertNotIn("raw-webhook-secret", text)
+        self.assertNotIn("raw-bearer-token", text)
+        self.assertGreaterEqual(text.count("[REDACTED]"), 3)
 
     def test_recorded_session_fixture_replays_llm_critic(self):
         fixture = json.loads(Path("tests/fixtures/auto_loop_brain_recorded_session.json").read_text())
