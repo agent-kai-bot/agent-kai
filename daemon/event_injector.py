@@ -164,28 +164,27 @@ class EventInjector:
     async def run_turn(self, managed: Any, request: EventInjectionRequest) -> None:
         session = managed.session
         policy = request.policy
-        if managed.input_lock.locked() or (
-            managed.current_input_task is not None and not managed.current_input_task.done()
-        ):
-            self.publish_drop(managed, request, policy.busy_reason)
-            setattr(session, policy.active_attr, False)
-            return
         try:
-            prompt = request.template.render_map(request.render_values)
-        except Exception as exc:  # noqa: BLE001
-            self.log.warning("%s prompt render failed for %s: %s", policy.source, session.name, exc)
-            self.publish_drop(managed, request, "template_render_failed")
-            return
+            if managed.input_lock.locked() or (
+                managed.current_input_task is not None and not managed.current_input_task.done()
+            ):
+                self.publish_drop(managed, request, policy.busy_reason)
+                return
+            try:
+                prompt = request.template.render_map(request.render_values)
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("%s prompt render failed for %s: %s", policy.source, session.name, exc)
+                self.publish_drop(managed, request, "template_render_failed")
+                return
 
-        session.chat_history.append(HumanMessage(content=prompt))
-        session.agent_runner.chat_history = session.chat_history
-        self._record_injection(session, policy.timestamp_attr, request.monotonic_seconds)
-        injected_payload = {**request.injected_payload}
-        injected_payload.setdefault("seq", request.seq)
-        injected_payload.setdefault("template_name", request.template.name)
-        injected_payload.setdefault("chars_injected", len(prompt))
-        session.publish_event(policy.injected_topic, injected_payload)
-        try:
+            session.chat_history.append(HumanMessage(content=prompt))
+            session.agent_runner.chat_history = session.chat_history
+            self._record_injection(session, policy.timestamp_attr, request.monotonic_seconds)
+            injected_payload = {**request.injected_payload}
+            injected_payload.setdefault("seq", request.seq)
+            injected_payload.setdefault("template_name", request.template.name)
+            injected_payload.setdefault("chars_injected", len(prompt))
+            session.publish_event(policy.injected_topic, injected_payload)
             await self._run_input(
                 managed,
                 prompt,
