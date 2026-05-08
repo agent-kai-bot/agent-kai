@@ -1,4 +1,6 @@
 import type {
+  AutoLoopBrainConfig,
+  AutoLoopBrainHealth,
   CandleBar,
   ChartViewPatch,
   ChartViewResponse,
@@ -89,6 +91,51 @@ function dedupeSymbols(symbols: string[]): string[] {
     normalized.push(symbol);
   }
   return normalized;
+}
+
+function asBoolean(value: unknown, fallback = false): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function asString(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function asNumber(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function normalizeAutoLoopBrainHealth(payload: Partial<AutoLoopBrainHealth>): AutoLoopBrainHealth {
+  return {
+    enabled: asBoolean(payload.enabled),
+    effective_client: asString(payload.effective_client, "unknown"),
+    effective_model: asString(payload.effective_model, "unknown"),
+    kill_switch_active: asBoolean(payload.kill_switch_active),
+    boot_probe_last_at: payload.boot_probe_last_at ?? null,
+    boot_probe_last_ok: typeof payload.boot_probe_last_ok === "boolean"
+      ? payload.boot_probe_last_ok
+      : null,
+    calls_total: asNumber(payload.calls_total),
+    escalations_total: asNumber(payload.escalations_total),
+  };
+}
+
+function normalizeAutoLoopBrainConfig(payload: Partial<AutoLoopBrainConfig>): AutoLoopBrainConfig {
+  return {
+    enabled: asBoolean(payload.enabled),
+    client: asString(payload.client, "unknown"),
+    endpoint: payload.endpoint ?? null,
+    model_id: asString(payload.model_id, "unknown"),
+    codex_reasoning_effort: asString(payload.codex_reasoning_effort, "medium"),
+    max_history_tokens: asNumber(payload.max_history_tokens),
+    temperature: asNumber(payload.temperature),
+    min_continue_confidence: asNumber(payload.min_continue_confidence),
+    timeout_seconds: asNumber(payload.timeout_seconds),
+    max_output_tokens: asNumber(payload.max_output_tokens),
+    max_llm_critic_calls_per_session: asNumber(payload.max_llm_critic_calls_per_session),
+    max_consecutive_llm_critic_calls: asNumber(payload.max_consecutive_llm_critic_calls),
+    kill_switch_active: asBoolean(payload.kill_switch_active),
+  };
 }
 
 export class DaemonConnection {
@@ -253,6 +300,34 @@ export class DaemonClient {
       agents: Array.isArray(payload.agents) ? payload.agents : [],
       endpoints: Array.isArray(payload.endpoints) ? payload.endpoints : [],
     };
+  }
+
+  async fetchAutoLoopBrainHealth(token = ""): Promise<AutoLoopBrainHealth> {
+    const payload = (await this.requestJson(
+      "/api/health.auto_loop_brain",
+      token,
+    )) as Partial<AutoLoopBrainHealth>;
+    return normalizeAutoLoopBrainHealth(payload);
+  }
+
+  async fetchAutoLoopBrainConfig(token = ""): Promise<AutoLoopBrainConfig> {
+    const payload = (await this.requestJson(
+      "/api/daemon/config/auto_loop_brain",
+      token,
+    )) as Partial<AutoLoopBrainConfig>;
+    return normalizeAutoLoopBrainConfig(payload);
+  }
+
+  async updateAutoLoopBrainConfig(
+    enabled: boolean,
+    token = "",
+  ): Promise<AutoLoopBrainConfig> {
+    const payload = (await this.patchJson(
+      "/api/daemon/config/auto_loop_brain",
+      { enabled },
+      token,
+    )) as Partial<AutoLoopBrainConfig>;
+    return normalizeAutoLoopBrainConfig(payload);
   }
 
   async switchAgentModel(

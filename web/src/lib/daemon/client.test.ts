@@ -274,6 +274,63 @@ describe("daemon client helpers", () => {
       { method: "POST", headers: { Authorization: "Bearer secret" } },
     );
   });
+
+  it("loads and toggles auto-loop-brain runtime config through daemon REST API", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            enabled: false,
+            effective_client: "codex-cli",
+            effective_model: "gpt-5.5",
+            kill_switch_active: false,
+            calls_total: 2,
+            escalations_total: 2,
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            enabled: true,
+            client: "codex-cli",
+            model_id: "gpt-5.5",
+            kill_switch_active: false,
+          }),
+        ),
+      );
+
+    const client = new DaemonClient({
+      baseHttpUrl: "http://127.0.0.1:8765",
+      fetchImpl,
+      webSocketFactory: vi.fn() as never,
+    });
+
+    const health = await client.fetchAutoLoopBrainHealth("secret");
+    const config = await client.updateAutoLoopBrainConfig(true, "secret");
+
+    expect(health.enabled).toBe(false);
+    expect(health.effective_client).toBe("codex-cli");
+    expect(config.enabled).toBe(true);
+    expect(fetchImpl).toHaveBeenNthCalledWith(
+      1,
+      "http://127.0.0.1:8765/api/health.auto_loop_brain",
+      { headers: { Authorization: "Bearer secret" } },
+    );
+    expect(fetchImpl).toHaveBeenNthCalledWith(
+      2,
+      "http://127.0.0.1:8765/api/daemon/config/auto_loop_brain",
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: "Bearer secret",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ enabled: true }),
+      },
+    );
+  });
 });
 
 describe("daemon attach handshake", () => {
