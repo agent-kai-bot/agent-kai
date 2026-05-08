@@ -10,7 +10,13 @@ from agent_logger import get_logger
 from .dedup_table import RouterDedupTable
 from .domain_model import ActionDescriptor, Channel, Route
 from .feature_flags import SignalRouterMode, kill_switch_active, resolve_mode
-from .route_decision import RouteDecision
+from .route_decision import MatchResult, RouteDecision
+
+try:
+    from agent.signal_handlers import SignalHandler, matches as legacy_signal_matches
+except Exception:  # pragma: no cover - import should be available in daemon runtime
+    SignalHandler = None  # type: ignore[assignment]
+    legacy_signal_matches = None  # type: ignore[assignment]
 
 
 class SignalRouter:
@@ -24,6 +30,8 @@ class SignalRouter:
         self,
         config: dict[str, Any] | None = None,
         *,
+        routes: list[Route] | None = None,
+        channels: list[Channel] | None = None,
         dedup_table: RouterDedupTable | None = None,
         log_info: Callable[[str], None] | None = None,
         log_debug: Callable[[str], None] | None = None,
@@ -37,7 +45,11 @@ class SignalRouter:
         self.log_info = log_info or (lambda message: self.log.info("%s", message))
         self.log_debug = log_debug or (lambda message: self.log.debug("%s", message))
         self.channels: dict[str, Channel] = self._load_channels(self.config)
+        if channels:
+            self.channels.update({channel.name: channel for channel in channels})
         self.routes: dict[str, Route] = self._load_routes(self.config)
+        if routes:
+            self.routes.update({route.name: route for route in routes})
         self.log_info(
             "signal_router loaded "
             f"mode={self.mode.value} routes={len(self.routes)} "
@@ -57,6 +69,19 @@ class SignalRouter:
             if any(_subject_matches(pattern, subject) for pattern in channel.subjects):
                 return channel
         return None
+
+    def match_route(self, route: Route, payload: Any) -> MatchResult:
+        """Evaluate a route match expression with legacy signal-handler parity."""
+
+        try:
+            matched = route_matches(route, payload)
+        except Exception as exc:  # noqa: BLE001
+            return MatchResult(False, "match_error", {"error": str(exc)})
+        return MatchResult(
+            matched,
+            "matched" if matched else "match_failed",
+            {"route_name": route.name},
+        )
 
     def health_payload(self) -> dict[str, Any]:
         """Return the Phase 1 health shape."""
@@ -118,6 +143,23 @@ class SignalRouter:
                     else None
                 ),
                 enabled=bool(raw_route.get("enabled", True)),
+                cooldown_seconds=int(raw_route.get("cooldown_seconds", 0) or 0),
+                requires_autotrade=bool(raw_route.get("requires_autotrade", False)),
+                config={
+                    key: value
+                    for key, value in raw_route.items()
+                    if key
+                    not in {
+                        "name",
+                        "channel",
+                        "match",
+                        "actions",
+                        "pre_action",
+                        "enabled",
+                        "cooldown_seconds",
+                        "requires_autotrade",
+                    }
+                },
             )
         return routes
 
@@ -141,6 +183,21 @@ def _action_from_config(raw_action: dict[str, Any]) -> ActionDescriptor:
         ),
         params=params,
     )
+
+
+def route_matches(route: Route, payload: Any) -> bool:
+    """Return whether payload matches route.match using the legacy matcher."""
+
+    if legacy_signal_matches is None or SignalHandler is None:
+        raise RuntimeError("legacy signal matcher is unavailable")
+    handler = SignalHandler(name=route.name, match=route.match)
+    return bool(legacy_signal_matches(handler, payload))
+
+
+def legacy_cooldown_key(route_name: str, symbol: str | None) -> tuple[str, str]:
+    """Return the legacy per-handler cooldown key shape."""
+
+    return (route_name, (symbol or "").upper())
 
 
 def _subject_matches(pattern: str, subject: str) -> bool:

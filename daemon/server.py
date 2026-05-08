@@ -117,7 +117,13 @@ from daemon.heartbeat import (
 )
 from daemon.runtime_config_store import RuntimeConfigStore
 from daemon.scheduler import DaemonEventBus, Scheduler
-from daemon.signal_router import SignalRouter
+from daemon.signal_router import SignalRouter, resolve_mode
+from daemon.signal_router.shim_alert_subscriber import translate_alert_subscriber_config
+from daemon.signal_router.shim_signal_handlers import (
+    log_shim_errors,
+    raise_for_startup_errors,
+    translate_signal_handlers_config,
+)
 from daemon.protocol import (
     AttachEnvelope,
     AutoProgressEnvelope,
@@ -616,7 +622,25 @@ class DaemonServer:
         self.signal_router_config = dict(
             (agent_config.get("daemon") or {}).get("signal_router") or {}
         )
-        self.signal_router = SignalRouter(self.signal_router_config)
+        signal_router_mode = resolve_mode(self.signal_router_config).value
+        signal_routes, signal_errors = translate_signal_handlers_config(
+            agent_config,
+            mode=signal_router_mode,
+        )
+        alert_routes = []
+        alert_errors = []
+        if isinstance((agent_config.get("daemon") or {}).get("alert_subscriber"), dict):
+            alert_routes, alert_errors = translate_alert_subscriber_config(
+                self.alert_subscriber_config,
+                mode=signal_router_mode,
+            )
+        shim_errors = [*signal_errors, *alert_errors]
+        log_shim_errors(shim_errors, get_logger("daemon.signal_router.shim"))
+        raise_for_startup_errors(shim_errors, signal_router_mode)
+        self.signal_router = SignalRouter(
+            self.signal_router_config,
+            routes=[*signal_routes, *alert_routes],
+        )
         self.services: list[Any] = [self.signal_router]
         self.heartbeat_config = heartbeat_config or load_heartbeat_config(agent_config)
         self.heartbeat_prompt_template = HeartbeatPromptTemplate.load(
