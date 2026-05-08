@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol, Sequence
@@ -28,7 +30,9 @@ from agent.auto_evaluator import (
 from config import load_config
 
 INDECISIVE_STOP_PATTERNS = frozenset({"unknown", "malformed_footer_recoverable"})
-DEFAULT_CRITIC_MODEL = "claude-sonnet-4-6"
+DEFAULT_CRITIC_MODEL = "sonnet"
+DEFAULT_AUTO_LOOP_BRAIN_CLIENT = "claude-cli"
+VALID_AUTO_LOOP_BRAIN_CLIENTS = frozenset({"claude-cli", "openai", "anthropic"})
 DEFAULT_MAX_HISTORY_TOKENS = 16_000
 DEFAULT_MAX_LLM_CRITIC_CALLS_PER_SESSION = 20
 DEFAULT_MAX_CONSECUTIVE_LLM_CRITIC_CALLS = 5
@@ -180,11 +184,136 @@ class AnthropicToollessLLMClient:
         )
 
 
+class ClaudeCLIToollessLLMClient:
+    """Local Claude CLI wrapper for a single non-interactive prompt call."""
+
+    def __init__(self, *, command: str = "claude") -> None:
+        self.command = command
+
+    def complete_json(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        timeout: float,
+        temperature: float = 0.0,
+        max_output_tokens: int = 512,
+    ) -> LLMResult:
+        del temperature, max_output_tokens
+        argv = [
+            self.command,
+            "-p",
+            "--model",
+            str(model),
+            "--append-system-prompt",
+            system,
+            user,
+        ]
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            detail = f": {stderr[:200]}" if stderr else ""
+            raise RuntimeError(f"claude CLI failed with exit code {result.returncode}{detail}")
+        text = (result.stdout or "").strip()
+        if not text:
+            raise RuntimeError("claude CLI returned empty output")
+        return LLMResult(text=text, model_id=str(model), usage=TokenUsage(0, 0))
+
+
+class OpenAICompatToollessLLMClient:
+    """OpenAI-compatible chat completions client that never sends tool fields."""
+
+    def __init__(self, *, endpoint_name: str, endpoint_config: dict[str, Any]) -> None:
+        self.endpoint_name = endpoint_name
+        self.endpoint_config = dict(endpoint_config)
+        self.base_url = str(self.endpoint_config.get("base_url") or "").rstrip("/")
+        if not self.base_url:
+            raise ValueError(f"agent-config.json endpoint '{endpoint_name}' is missing base_url")
+
+    def complete_json(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        timeout: float,
+        temperature: float = 0.0,
+        max_output_tokens: int = 512,
+    ) -> LLMResult:
+        api_key = _resolve_endpoint_api_key(self.endpoint_config)
+        model_id = _resolve_openai_endpoint_model(str(model or ""), self.endpoint_config)
+        headers = {"content-type": "application/json"}
+        if api_key and api_key != "not-needed":
+            headers["authorization"] = f"Bearer {api_key}"
+        payload = {
+            "model": model_id,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": float(temperature),
+            "max_tokens": int(max_output_tokens),
+        }
+        response = requests.post(
+            f"{self.base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict):
+            raise RuntimeError("OpenAI-compatible endpoint returned non-object JSON")
+        choices = body.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("OpenAI-compatible endpoint returned no choices")
+        first = choices[0]
+        if not isinstance(first, dict):
+            raise RuntimeError("OpenAI-compatible endpoint returned malformed choice")
+        message = first.get("message")
+        if not isinstance(message, dict):
+            raise RuntimeError("OpenAI-compatible endpoint returned malformed message")
+        tool_call_attempted = bool(message.get("tool_calls") or message.get("function_call"))
+        content = message.get("content")
+        if isinstance(content, list):
+            text = "\n".join(
+                str(part.get("text") or "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") in {None, "text"}
+            ).strip()
+        else:
+            text = str(content or "").strip()
+        if not text and not tool_call_attempted:
+            raise RuntimeError("OpenAI-compatible endpoint returned empty content")
+        usage_payload = body.get("usage")
+        usage = None
+        if isinstance(usage_payload, dict):
+            usage = TokenUsage(
+                input_tokens=_optional_int(usage_payload.get("prompt_tokens")),
+                output_tokens=_optional_int(usage_payload.get("completion_tokens")),
+            )
+        return LLMResult(
+            text=text,
+            model_id=str(body.get("model") or model_id),
+            usage=usage,
+            tool_call_attempted=tool_call_attempted,
+        )
+
+
 @dataclass(frozen=True)
 class AutoLoopBrainConfig:
     """Configuration for the composite regex + LLM auto-loop evaluator."""
 
     enabled: bool = False
+    client: str = DEFAULT_AUTO_LOOP_BRAIN_CLIENT
+    endpoint: str | None = None
     model_id: str = DEFAULT_CRITIC_MODEL
     max_history_tokens: int = DEFAULT_MAX_HISTORY_TOKENS
     temperature: float = 0.0
@@ -207,11 +336,22 @@ class AutoLoopBrainConfig:
         if not isinstance(brain_config, dict):
             brain_config = {}
         enabled = _env_bool("KAI_AUTO_LOOP_BRAIN_ENABLED", _config_bool(brain_config, "enabled", False))
+        client = os.environ.get(
+            "KAI_AUTO_LOOP_BRAIN_CLIENT",
+            str(brain_config.get("client") or DEFAULT_AUTO_LOOP_BRAIN_CLIENT),
+        ).strip().lower()
+        endpoint = os.environ.get(
+            "KAI_AUTO_LOOP_BRAIN_ENDPOINT",
+            _optional_str(brain_config.get("endpoint")),
+        )
+        endpoint = endpoint.strip() if isinstance(endpoint, str) and endpoint.strip() else None
         model_id = os.environ.get("KAI_AUTO_LOOP_BRAIN_MODEL_ID", str(brain_config.get("model_id") or DEFAULT_CRITIC_MODEL))
-        if _env_bool("KAI_AUTO_LOOP_BRAIN_KILL_SWITCH", False) or not _model_meets_minimum_tier(model_id):
+        if _env_bool("KAI_AUTO_LOOP_BRAIN_KILL_SWITCH", False) or not _model_meets_minimum_tier(client, model_id):
             enabled = False
         return cls(
             enabled=enabled,
+            client=client,
+            endpoint=endpoint,
             model_id=model_id,
             max_history_tokens=_env_int("KAI_AUTO_LOOP_BRAIN_MAX_HISTORY_TOKENS", _config_int(brain_config, "max_history_tokens", DEFAULT_MAX_HISTORY_TOKENS)),
             temperature=_env_float("KAI_AUTO_LOOP_BRAIN_TEMPERATURE", _config_float(brain_config, "temperature", 0.0)),
@@ -257,6 +397,8 @@ class LLMCriticEvaluator:
             self.last_metadata = {
                 "evaluator_kind": "regex",
                 "escalated_from": None,
+                "client": self.config.client,
+                "endpoint": self.config.endpoint,
             }
             return regex_decision
 
@@ -264,6 +406,8 @@ class LLMCriticEvaluator:
             self.last_metadata = {
                 "evaluator_kind": "regex",
                 "escalated_from": None,
+                "client": self.config.client,
+                "endpoint": self.config.endpoint,
                 "model_id": self.config.model_id,
             }
             return regex_decision
@@ -314,6 +458,8 @@ class LLMCriticEvaluator:
         latency_ms = int((time.monotonic() - started) * 1000)
         self.last_metadata = {
             "evaluator_kind": "llm",
+            "client": self.config.client,
+            "endpoint": self.config.endpoint,
             "model_id": model_id,
             "escalated_from": regex_decision.pattern,
         }
@@ -332,6 +478,8 @@ class LLMCriticEvaluator:
     def _forced_stop(self, reason: str, regex_decision: AutoEvaluationDecision) -> AutoEvaluationDecision:
         self.last_metadata = {
             "evaluator_kind": "llm",
+            "client": self.config.client,
+            "endpoint": self.config.endpoint,
             "model_id": self.config.model_id,
             "escalated_from": regex_decision.pattern,
         }
@@ -351,6 +499,7 @@ class LLMCriticEvaluator:
             return
         payload: dict[str, object] = {
             "evaluator_kind": "llm",
+            "client": self.config.client,
             "model_id": model_id,
             "escalated_from": escalated_from,
             "latency_ms": latency_ms,
@@ -359,6 +508,8 @@ class LLMCriticEvaluator:
             "calls_this_session": self._llm_calls_this_session,
             "consecutive_llm_critic_calls": self._consecutive_llm_calls,
         }
+        if self.config.endpoint:
+            payload["endpoint"] = self.config.endpoint
         if usage:
             payload["llm_usage"] = usage
         self.telemetry.publish_event("auto.evaluator_call_metrics", payload)
@@ -372,9 +523,10 @@ def build_auto_response_evaluator(
     llm_client: ToollessLLMClient | None = None,
 ) -> LLMCriticEvaluator:
     resolved_config = config or AutoLoopBrainConfig.from_sources()
+    selected_client = llm_client or _build_toolless_llm_client(resolved_config)
     return LLMCriticEvaluator(
         chat_history_provider=lambda: tuple(chat_history_provider()),
-        llm_client=llm_client or AnthropicToollessLLMClient(),
+        llm_client=selected_client,
         config=resolved_config,
         telemetry=telemetry,
     )
@@ -383,6 +535,152 @@ def build_auto_response_evaluator(
 def evaluation_metadata(evaluator: object) -> dict[str, object]:
     metadata = getattr(evaluator, "last_metadata", None)
     return dict(metadata) if isinstance(metadata, dict) else {"evaluator_kind": "regex"}
+
+
+def validate_auto_loop_brain_config(
+    config: AutoLoopBrainConfig | None = None,
+    *,
+    raw_config: dict[str, Any] | None = None,
+    endpoints: dict[str, Any] | None = None,
+    require_runtime: bool | None = None,
+) -> AutoLoopBrainConfig:
+    """Validate auto-loop-brain routing and selected runtime prerequisites."""
+
+    resolved = config or AutoLoopBrainConfig.from_sources(raw_config)
+    if resolved.client not in VALID_AUTO_LOOP_BRAIN_CLIENTS:
+        expected = ", ".join(sorted(VALID_AUTO_LOOP_BRAIN_CLIENTS))
+        raise ValueError(
+            f"Unsupported daemon.auto_loop_brain.client={resolved.client!r}. "
+            f"Expected one of: {expected}."
+        )
+    if not resolved.enabled:
+        return resolved
+    if not _model_meets_minimum_tier(resolved.client, resolved.model_id):
+        raise ValueError(
+            "daemon.auto_loop_brain.model_id does not meet the minimum tier "
+            f"for client={resolved.client!r}: {resolved.model_id!r}"
+        )
+    runtime_required = resolved.enabled if require_runtime is None else bool(require_runtime)
+    if resolved.client == "claude-cli":
+        if runtime_required and shutil.which("claude") is None:
+            raise ValueError(
+                "daemon.auto_loop_brain.client='claude-cli' requires the 'claude' "
+                "CLI on PATH when enabled."
+            )
+        return resolved
+    if resolved.client == "anthropic":
+        if runtime_required and not os.environ.get("ANTHROPIC_API_KEY"):
+            raise ValueError(
+                "daemon.auto_loop_brain.client='anthropic' requires ANTHROPIC_API_KEY when enabled."
+            )
+        return resolved
+
+    endpoint_config = _resolve_auto_loop_brain_endpoint_config(
+        resolved.endpoint,
+        endpoints=endpoints,
+        raw_config=raw_config,
+    )
+    if str(endpoint_config.get("provider") or "openai").lower() != "openai":
+        raise ValueError(
+            f"daemon.auto_loop_brain.endpoint={resolved.endpoint!r} is not OpenAI-compatible; "
+            "expected an agent-config.json endpoint with provider='openai'."
+        )
+    if runtime_required:
+        _require_openai_endpoint_auth(resolved.endpoint or "", endpoint_config)
+    return resolved
+
+
+def _build_toolless_llm_client(config: AutoLoopBrainConfig) -> ToollessLLMClient:
+    validate_auto_loop_brain_config(config, require_runtime=False)
+    if not config.enabled:
+        if config.client == "openai" and config.endpoint:
+            endpoint_config = _resolve_auto_loop_brain_endpoint_config(config.endpoint)
+            return OpenAICompatToollessLLMClient(
+                endpoint_name=config.endpoint,
+                endpoint_config=endpoint_config,
+            )
+        if config.client == "anthropic":
+            return AnthropicToollessLLMClient()
+        return ClaudeCLIToollessLLMClient()
+
+    validate_auto_loop_brain_config(config)
+    if config.client == "claude-cli":
+        return ClaudeCLIToollessLLMClient()
+    if config.client == "anthropic":
+        return AnthropicToollessLLMClient()
+    endpoint_config = _resolve_auto_loop_brain_endpoint_config(config.endpoint)
+    return OpenAICompatToollessLLMClient(
+        endpoint_name=config.endpoint or "",
+        endpoint_config=endpoint_config,
+    )
+
+
+def _resolve_auto_loop_brain_endpoint_config(
+    endpoint: str | None,
+    *,
+    endpoints: dict[str, Any] | None = None,
+    raw_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not endpoint:
+        raise ValueError(
+            "daemon.auto_loop_brain.endpoint is required when client='openai'."
+        )
+    registry = endpoints
+    if registry is None:
+        source = raw_config if raw_config is not None else load_config()
+        registry = source.get("endpoints", {}) if isinstance(source, dict) else {}
+    if not isinstance(registry, dict) or endpoint not in registry:
+        raise ValueError(
+            f"daemon.auto_loop_brain.endpoint={endpoint!r} was not found in agent-config.json endpoints."
+        )
+    endpoint_config = registry[endpoint]
+    if not isinstance(endpoint_config, dict):
+        raise ValueError(
+            f"daemon.auto_loop_brain.endpoint={endpoint!r} must reference an object endpoint config."
+        )
+    return dict(endpoint_config)
+
+
+def _resolve_endpoint_api_key(endpoint_config: dict[str, Any]) -> str:
+    api_key_env = endpoint_config.get("api_key_env")
+    if api_key_env:
+        env_value = os.environ.get(str(api_key_env))
+        if env_value:
+            return env_value
+    api_key = str(endpoint_config.get("api_key") or "")
+    return api_key
+
+
+def _resolve_openai_endpoint_model(model: str, endpoint_config: dict[str, Any]) -> str:
+    if model.strip():
+        return model.strip()
+    default_model = endpoint_config.get("default_model") or endpoint_config.get("model")
+    if default_model:
+        return str(default_model)
+    models = endpoint_config.get("models")
+    if isinstance(models, dict) and models:
+        return str(next(iter(models)))
+    raise RuntimeError("OpenAI-compatible endpoint requires daemon.auto_loop_brain.model_id")
+
+
+def _require_openai_endpoint_auth(endpoint_name: str, endpoint_config: dict[str, Any]) -> None:
+    api_key_env = endpoint_config.get("api_key_env")
+    api_key = _resolve_endpoint_api_key(endpoint_config)
+    if api_key and not _is_missing_api_key_placeholder(api_key):
+        return
+    if api_key_env:
+        raise ValueError(
+            f"daemon.auto_loop_brain.endpoint={endpoint_name!r} requires environment variable "
+            f"{api_key_env} when enabled."
+        )
+    raise ValueError(
+        f"daemon.auto_loop_brain.endpoint={endpoint_name!r} is missing an API key."
+    )
+
+
+def _is_missing_api_key_placeholder(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    return not normalized or normalized.startswith("missing-")
 
 
 def _build_critic_prompt(
@@ -473,7 +771,9 @@ def _truncate_text(value: str, *, limit: int, keep_end: bool = False) -> str:
     return text[:keep] + marker
 
 
-def _model_meets_minimum_tier(model_id: str) -> bool:
+def _model_meets_minimum_tier(client: str, model_id: str) -> bool:
+    if client != "anthropic":
+        return True
     normalized = str(model_id or "").lower()
     return "sonnet-4-6" in normalized or "opus-4-7" in normalized or "sonnet-4.6" in normalized or "opus-4.7" in normalized
 
@@ -543,6 +843,13 @@ def _optional_int(value: Any) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _config_bool(config: dict[str, Any], key: str, default: bool) -> bool:

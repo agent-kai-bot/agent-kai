@@ -452,6 +452,43 @@ class DaemonServerTests(unittest.TestCase):
                 self.assertIn("attach envelope", error["message"])
 
 
+class DaemonServerAutoLoopBrainStartupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_rejects_enabled_auto_loop_brain_missing_claude_cli(self):
+        server = DaemonServer(
+            agent_name="kai",
+            nats_url="nats://unit-test",
+            bus_factory=None,
+            taskboard_dispatcher_enabled=False,
+        )
+        with mock.patch.dict(
+            "os.environ",
+            {"KAI_AUTO_LOOP_BRAIN_ENABLED": "1", "KAI_AUTO_LOOP_BRAIN_CLIENT": "claude-cli"},
+            clear=False,
+        ), mock.patch("agent.auto_loop_brain.shutil.which", return_value=None):
+            with self.assertRaisesRegex(ValueError, "requires the 'claude' CLI"):
+                await server.startup()
+
+    async def test_startup_rejects_enabled_auto_loop_brain_non_openai_endpoint(self):
+        server = DaemonServer(
+            agent_name="kai",
+            nats_url="nats://unit-test",
+            bus_factory=None,
+            taskboard_dispatcher_enabled=False,
+        )
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "KAI_AUTO_LOOP_BRAIN_ENABLED": "1",
+                "KAI_AUTO_LOOP_BRAIN_CLIENT": "openai",
+                "KAI_AUTO_LOOP_BRAIN_ENDPOINT": "codex-cli",
+                "KAI_AUTO_LOOP_BRAIN_MODEL_ID": "gpt-5.5",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "not OpenAI-compatible"):
+                await server.startup()
+
+
 class DaemonServerIndexTests(unittest.IsolatedAsyncioTestCase):
     """Validate Phase 3 session lookup through the persisted index."""
 

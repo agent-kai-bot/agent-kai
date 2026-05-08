@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agent_logger import get_logger, log_slash_command
 from agent.agent_runs_client import AgentRunsClient
+from agent.auto_loop_brain import AutoLoopBrainConfig, validate_auto_loop_brain_config
 from agent.taskboard_dispatcher import (
     DaemonTaskboardSpawner,
     TaskboardDispatcher,
@@ -582,6 +583,11 @@ class DaemonServer:
         """Connect shared resources used by daemon-backed sessions."""
         self.daemon_token = ensure_daemon_token(self.token_path)
         self.started_at_monotonic = time.monotonic()
+        try:
+            validate_auto_loop_brain_config(AutoLoopBrainConfig.from_sources())
+        except ValueError as exc:
+            self.log.error("auto-loop-brain configuration invalid: %s", exc)
+            raise
         try:
             apply_migrations(self.db_path)
         except Exception as exc:  # noqa: BLE001

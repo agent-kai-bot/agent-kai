@@ -7,9 +7,22 @@ from pathlib import Path
 import unittest
 from dataclasses import dataclass
 from typing import Any
+from unittest import mock
 
 from agent.auto_evaluator import AutoEvaluationDecision, AutoEvaluationInput, AutoResponseEvaluator, ToolCallSummary, render_auto_reply
-from agent.auto_loop_brain import AutoLoopBrainConfig, LLMCriticEvaluator, LLMResult, TokenUsage, build_auto_response_evaluator, _build_critic_prompt, redact_prompt_secrets
+from agent.auto_loop_brain import (
+    AnthropicToollessLLMClient,
+    AutoLoopBrainConfig,
+    ClaudeCLIToollessLLMClient,
+    LLMCriticEvaluator,
+    LLMResult,
+    OpenAICompatToollessLLMClient,
+    TokenUsage,
+    build_auto_response_evaluator,
+    validate_auto_loop_brain_config,
+    _build_critic_prompt,
+    redact_prompt_secrets,
+)
 
 
 @dataclass
@@ -37,6 +50,19 @@ class FakeTelemetry:
 
     def publish_event(self, topic: str, payload: dict[str, object]) -> None:
         self.events.append((topic, payload))
+
+
+class FakeResponse:
+    def __init__(self, payload: dict[str, Any], status_error: Exception | None = None) -> None:
+        self.payload = payload
+        self.status_error = status_error
+
+    def raise_for_status(self) -> None:
+        if self.status_error is not None:
+            raise self.status_error
+
+    def json(self) -> dict[str, Any]:
+        return self.payload
 
 
 class AlwaysStopEvaluator(AutoResponseEvaluator):
@@ -279,8 +305,164 @@ class AutoLoopBrainTests(unittest.TestCase):
         self.assertEqual(evaluator.evaluate(self._input()).decision, "CONTINUE")
         self.assertEqual(evaluator.last_metadata["evaluator_kind"], "regex")
         self.assertEqual(client.calls, [])
-        cfg = AutoLoopBrainConfig.from_sources({"daemon": {"auto_loop_brain": {"enabled": True, "model_id": "claude-haiku-3"}}})
+        cfg = AutoLoopBrainConfig.from_sources({"daemon": {"auto_loop_brain": {"enabled": True, "client": "anthropic", "model_id": "claude-haiku-3"}}})
         self.assertFalse(cfg.enabled)
+
+    def test_config_defaults_and_env_client_endpoint_overrides(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            cfg = AutoLoopBrainConfig.from_sources({"daemon": {"auto_loop_brain": {}}})
+        self.assertFalse(cfg.enabled)
+        self.assertEqual(cfg.client, "claude-cli")
+        self.assertEqual(cfg.model_id, "sonnet")
+        self.assertIsNone(cfg.endpoint)
+
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "KAI_AUTO_LOOP_BRAIN_CLIENT": " OPENAI ",
+                "KAI_AUTO_LOOP_BRAIN_ENDPOINT": "kai-local",
+            },
+            clear=True,
+        ):
+            cfg = AutoLoopBrainConfig.from_sources(
+                {"daemon": {"auto_loop_brain": {"client": "anthropic", "endpoint": None}}}
+            )
+        self.assertEqual(cfg.client, "openai")
+        self.assertEqual(cfg.endpoint, "kai-local")
+
+    def test_config_validation_rejects_unknown_client_and_bad_openai_endpoint(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported daemon.auto_loop_brain.client='bogus'"):
+            validate_auto_loop_brain_config(AutoLoopBrainConfig(enabled=True, client="bogus"))
+
+        with self.assertRaisesRegex(ValueError, "endpoint is required"):
+            validate_auto_loop_brain_config(AutoLoopBrainConfig(enabled=True, client="openai"))
+
+        raw_config = {"endpoints": {"codex-cli": {"provider": "codex-cli", "base_url": "https://example.test/v1"}}}
+        with self.assertRaisesRegex(ValueError, "not OpenAI-compatible"):
+            validate_auto_loop_brain_config(
+                AutoLoopBrainConfig(enabled=True, client="openai", endpoint="codex-cli"),
+                raw_config=raw_config,
+                require_runtime=False,
+            )
+
+    def test_factory_routes_all_supported_clients(self):
+        with mock.patch("agent.auto_loop_brain.shutil.which", return_value="/usr/bin/claude"):
+            evaluator = build_auto_response_evaluator(
+                chat_history_provider=tuple,
+                config=AutoLoopBrainConfig(enabled=True, client="claude-cli"),
+            )
+        self.assertIsInstance(evaluator.llm_client, ClaudeCLIToollessLLMClient)
+
+        evaluator = build_auto_response_evaluator(
+            chat_history_provider=tuple,
+            config=AutoLoopBrainConfig(enabled=False, client="anthropic", model_id="claude-sonnet-4-6"),
+        )
+        self.assertIsInstance(evaluator.llm_client, AnthropicToollessLLMClient)
+
+        raw_endpoint = {
+            "provider": "openai",
+            "base_url": "http://localhost:8000/v1",
+            "api_key": "not-needed",
+        }
+        with mock.patch("agent.auto_loop_brain.load_config", return_value={"endpoints": {"kai-local": raw_endpoint}}):
+            evaluator = build_auto_response_evaluator(
+                chat_history_provider=tuple,
+                config=AutoLoopBrainConfig(enabled=True, client="openai", endpoint="kai-local"),
+            )
+        self.assertIsInstance(evaluator.llm_client, OpenAICompatToollessLLMClient)
+
+    def test_factory_explicit_llm_client_bypasses_routing(self):
+        client = FakeLLMClient(LLMResult("{}", "test-model"))
+        evaluator = build_auto_response_evaluator(
+            chat_history_provider=tuple,
+            llm_client=client,
+            config=AutoLoopBrainConfig(enabled=True, client="openai"),
+        )
+        self.assertIs(evaluator.llm_client, client)
+
+    @mock.patch("agent.auto_loop_brain.subprocess.run")
+    def test_claude_cli_client_uses_prompt_mode_without_shell(self, run):
+        run.return_value = mock.Mock(returncode=0, stdout='{"decision":"STOP"}\n', stderr="")
+        client = ClaudeCLIToollessLLMClient(command="claude")
+        result = client.complete_json(
+            model="sonnet",
+            system="system text",
+            user="user text",
+            timeout=3,
+        )
+        self.assertEqual(result.text, '{"decision":"STOP"}')
+        self.assertEqual(result.model_id, "sonnet")
+        self.assertEqual(result.usage, TokenUsage(0, 0))
+        argv = run.call_args.args[0]
+        self.assertEqual(argv, ["claude", "-p", "--model", "sonnet", "--append-system-prompt", "system text", "user text"])
+        self.assertNotIn("shell", run.call_args.kwargs)
+
+    @mock.patch("agent.auto_loop_brain.subprocess.run")
+    def test_claude_cli_client_nonzero_and_empty_output_fail(self, run):
+        client = ClaudeCLIToollessLLMClient()
+        run.return_value = mock.Mock(returncode=2, stdout="", stderr="bad")
+        with self.assertRaisesRegex(RuntimeError, "claude CLI failed"):
+            client.complete_json(model="sonnet", system="s", user="u", timeout=1)
+        run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        with self.assertRaisesRegex(RuntimeError, "empty output"):
+            client.complete_json(model="sonnet", system="s", user="u", timeout=1)
+
+    @mock.patch("agent.auto_loop_brain.requests.post")
+    def test_openai_compat_client_posts_chat_completion_without_tool_fields(self, post):
+        post.return_value = FakeResponse({
+            "model": "kai-smart",
+            "choices": [{"message": {"content": '{"decision":"STOP"}'}}],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+        })
+        with mock.patch.dict("os.environ", {"AGENT_KAI_API_KEY": "secret-key"}, clear=True):
+            client = OpenAICompatToollessLLMClient(
+                endpoint_name="kai-smart",
+                endpoint_config={
+                    "provider": "openai",
+                    "base_url": "https://agent-k.ai/v1/",
+                    "api_key_env": "AGENT_KAI_API_KEY",
+                },
+            )
+            result = client.complete_json(model="kai-smart", system="sys", user="usr", timeout=2)
+        self.assertEqual(result.text, '{"decision":"STOP"}')
+        self.assertEqual(result.usage, TokenUsage(11, 7))
+        self.assertEqual(post.call_args.args[0], "https://agent-k.ai/v1/chat/completions")
+        body = post.call_args.kwargs["json"]
+        self.assertEqual(body["messages"][0], {"role": "system", "content": "sys"})
+        self.assertEqual(body["messages"][1], {"role": "user", "content": "usr"})
+        self.assertNotIn("tools", body)
+        self.assertNotIn("functions", body)
+        self.assertNotIn("tool_choice", body)
+        self.assertEqual(post.call_args.kwargs["headers"]["authorization"], "Bearer secret-key")
+
+    @mock.patch("agent.auto_loop_brain.requests.post")
+    def test_openai_compat_client_detects_tool_calls_and_malformed_responses(self, post):
+        client = OpenAICompatToollessLLMClient(
+            endpoint_name="kai-local",
+            endpoint_config={"provider": "openai", "base_url": "http://localhost:8000/v1", "api_key": "not-needed"},
+        )
+        post.return_value = FakeResponse({"choices": [{"message": {"tool_calls": [{"id": "x"}]}}]})
+        result = client.complete_json(model="qwen", system="sys", user="usr", timeout=2)
+        self.assertTrue(result.tool_call_attempted)
+        self.assertNotIn("authorization", post.call_args.kwargs["headers"])
+
+        post.return_value = FakeResponse({"choices": []})
+        with self.assertRaisesRegex(RuntimeError, "no choices"):
+            client.complete_json(model="qwen", system="sys", user="usr", timeout=2)
+
+    @mock.patch("agent.auto_loop_brain.requests.post")
+    def test_anthropic_client_still_sends_no_tool_fields_and_maps_usage(self, post):
+        post.return_value = FakeResponse({
+            "model": "claude-sonnet-4-6",
+            "content": [{"type": "text", "text": '{"decision":"STOP"}'}],
+            "usage": {"input_tokens": 5, "output_tokens": 3},
+        })
+        client = AnthropicToollessLLMClient(api_key="anthropic-secret", base_url="https://api.anthropic.test")
+        result = client.complete_json(model="claude-sonnet-4-6", system="sys", user="usr", timeout=2)
+        self.assertEqual(result.usage, TokenUsage(5, 3))
+        body = post.call_args.kwargs["json"]
+        self.assertNotIn("tools", body)
+        self.assertNotIn("tool_choice", body)
 
     def test_cost_caps_force_stop(self):
         evaluator, client, _, _ = self._evaluator()
