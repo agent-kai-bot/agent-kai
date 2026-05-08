@@ -724,6 +724,10 @@ def get_agent_config(agent_name):
         "cooldown_seconds": health_cfg.cooldown_seconds,
         "default_executor": health_cfg.default_executor,
         "overflow_executor": health_cfg.overflow_executor,
+        # Compatibility shims need the raw top-level routing config while the
+        # daemon still consumes this normalized per-agent shape.
+        "agents": _config.get("agents", {}),
+        "signal_handlers": _config.get("signal_handlers", []),
         # Preserve daemon-scoped settings from agent-config.json for runtime
         # consumers that receive this normalized config dict.  In particular,
         # DaemonServer loads its HeartbeatService settings from the documented
