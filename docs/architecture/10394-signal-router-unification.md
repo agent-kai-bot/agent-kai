@@ -261,10 +261,11 @@ The router should expose exactly these eight action kinds in the public config A
 
 8. `spawn_agent`
    - Target: an agent-pack name, represented explicitly as `pack`.
-   - Resolves to `$AGENTKAI_HOME/agent-packs/<name>/`.
-   - Starts a fresh autonomous agent process per matched alarm/event rather than injecting into an existing session.
-   - Uses full shell/tool access by design; tool-less or approval-gated guarantees do not apply to this action kind.
-   - Primary params: `pack`, `executor`, `model`, `reasoning_effort`, `bypass_approvals`, `timeout_seconds`, `cooldown_key_template`, `cooldown_seconds`, `daily_cap`, `hourly_cap`, `audit_path_template`, `env_passthrough`.
+   - Resolves to `$AGENTKAI_HOME/agent-packs/<name>/` and to a registered sub-agent role in `agent-config.json.agents`.
+   - Delegates to `SubAgentManager.spawn(role_name)`, the same code path used by KAI's existing `spawn_agent(name)` tool.
+   - Starts a fresh autonomous sub-agent per matched alarm/event, then sends the rendered alarm context with `nats_request(role_name, payload)`.
+   - Uses the same full tool set as KAI by design: file IO, shell, python, docker sandbox, web fetch, NATS messaging, and related tools.
+   - Primary params: `pack`, `timeout_seconds`, `cooldown_key_template`, `cooldown_seconds`, `daily_cap`, `hourly_cap`, `audit_path_template`, `env_passthrough`.
 
 Canonical agent-pack structure:
 
@@ -369,7 +370,6 @@ daemon:
         actions:
           - kind: spawn_agent
             pack: kai-alert-response
-            executor: codex-cli
             timeout_seconds: 300
             cooldown_key_template: "{rule_id}:{token_id}"
             cooldown_seconds: 600
@@ -451,7 +451,7 @@ If channel inference is ambiguous, default legacy handlers to `trade_signals` un
 
 ### 5.4 Example: polymarket alarm-response route
 
-The operator-confirmed polymarket route is not `inject_session`. It spawns a fresh autonomous process per unsuppressed alarm and hands that process the alarm payload plus the `kai-alert-response` agent pack.
+The operator-confirmed polymarket route is not `inject_session`. It spawns a fresh autonomous sub-agent per unsuppressed alarm through `SubAgentManager.spawn()`, then sends that role the alarm payload plus rendered router context as its first task.
 
 ```yaml
 daemon:
@@ -463,10 +463,6 @@ daemon:
         actions:
           - kind: spawn_agent
             pack: kai-alert-response
-            executor: codex-cli
-            model: gpt-5.5
-            reasoning_effort: high
-            bypass_approvals: true
             timeout_seconds: 300
             cooldown_key_template: "{rule_id}:{token_id}"
             cooldown_seconds: 600
@@ -802,17 +798,13 @@ Rules:
 
 ### 9.5 `spawn_agent`
 
-`spawn_agent` starts a fresh process for each unsuppressed route action. This is intentionally different from `inject_session`: no existing KAI session receives a human message, and no prior conversational state is reused.
+`spawn_agent` starts a fresh autonomous sub-agent for each unsuppressed route action. This is intentionally different from `inject_session`: no existing KAI session receives a human message, and no prior conversational state is reused.
 
 Action params:
 
 ```yaml
 - kind: spawn_agent
   pack: kai-alert-response
-  executor: codex-cli
-  model: gpt-5.5
-  reasoning_effort: high
-  bypass_approvals: true
   timeout_seconds: 300
   cooldown_key_template: "{rule_id}:{token_id}"
   cooldown_seconds: 600
@@ -825,17 +817,15 @@ Action params:
 Parameter contract:
 
 - `pack: string` resolves to `$AGENTKAI_HOME/agent-packs/<name>/`.
-- `executor: string` is `codex-cli | claude-cli | openai | anthropic`; default `codex-cli`.
-- `model: string` defaults to the executor's default model.
-- `reasoning_effort: string` is `medium | high | xhigh` and applies to `codex-cli` only.
-- `bypass_approvals: bool` defaults to `true`. This follows Dan's autonomy-by-design rule for this product path.
-- `timeout_seconds: int` hard-kills the spawned process; default `300`.
+- The pack must map to a registered sub-agent role in `agent-config.json.agents`. Action-time validation fails if the role does not exist.
+- The role's `system_prompt` field should point at the pack, or the route loader should concatenate the pack content and store it in the role.
+- `timeout_seconds: int` bounds the router-owned wait for the spawned sub-agent lifecycle; default `300`.
 - `cooldown_key_template: string` is a Jinja-style field template that renders the action dedup key, e.g. `{rule_id}:{token_id}`.
 - `cooldown_seconds: int` defaults to `0`; polymarket uses `600`.
 - `daily_cap: int` defaults to `0` unlimited; polymarket uses `50`.
 - `hourly_cap: int` defaults to `0` unlimited; polymarket uses `10`.
 - `audit_path_template: string` controls where decisions are written.
-- `env_passthrough: list[string]` forwards only named environment variables into the child.
+- `env_passthrough: list[string]` exposes only named environment variables to the sub-agent execution context.
 
 Pack loading:
 
@@ -843,15 +833,22 @@ Pack loading:
 - Append `decision_logic.md` and `tools_reference.md` if present.
 - Validate the inbound payload against `nats_payload_schema.json` if present before spawning.
 - Do not load `README.md` or `example_alarms/` into the prompt.
-- The user message to the spawned process contains subject, route name, rendered event payload, and router metadata.
+- `tools_reference.md` is informational; it documents the expected tool posture but does not define a reduced tool sandbox.
+- The NATS request to the spawned sub-agent contains subject, route name, rendered event payload, and router metadata.
 
-Process semantics:
+Lifecycle semantics:
 
 - Spawn outside the NATS callback.
-- Enforce `RouterDedupTable` cooldown and cap checks before process creation.
+- Enforce `RouterDedupTable` cooldown and cap checks before calling `SubAgentManager.spawn()`.
+- Route load resolves `pack` to a registered role name. At alarm fire, the action calls `SubAgentManager.spawn(role_name)`.
+- `SubAgentManager.spawn(role_name)` returns when the sub-agent is ready. It does not dispatch the initial task.
+- After spawn readiness, the router sends `nats_request(role_name, alarm_payload_with_render)` to deliver the alarm context as the sub-agent's first task.
+- The sub-agent uses `agent.prompts.build_sub_agent_system_prompt()` plus the role-specific prompt backed by the pack content.
+- The per-alarm lifecycle is `spawn -> nats_request alarm -> sub-agent runs decision-tree -> sub-agent terminates`.
 - Shadow mode must not spawn. It records would-have-fired `spawn_agent` decisions only.
-- Tool-less guarantees do not apply. `spawn_agent` is a full-tools, full-shell autonomous agent by design, with per-step approvals bypassed when configured.
-- The spawned process inherits the daemon host filesystem and can import `/home/atc/git/OPS/vpn-stack/scripts/lib/local_first.py`, read sentinel/audit files, reach `nats://localhost:4222`, and run local shell commands subject to daemon process permissions.
+- Tool-less guarantees do not apply. `spawn_agent` is a full-tools, full-shell autonomous agent by design.
+- Approval bypass is not a spawn-boundary flag. It applies only when KAI's tools invoke `codex_exec` or `claude_exec` from inside the sub-agent.
+- The spawned sub-agent has the same tool set as KAI itself, including `file_read`, `shell_exec`, `python_exec`, `docker_sandbox`, `web_fetch`, and NATS messaging. It can read sentinel/audit files, reach `nats://localhost:4222`, call Pushover/ntfy through HTTP tooling, and run local shell commands subject to daemon process permissions.
 
 Telemetry:
 
@@ -957,6 +954,24 @@ Kill-switch behavior:
 - During transitional releases, keeps legacy `AlertSubscriber` behavior at its current default-disabled setting if that service still exists.
 - Prevents all router-only effects, including `spawn_agent`.
 - Emits a clear health/metrics field: `signal_router.kill_switch_active=true`.
+
+### Global live-trades / dry-run gate
+
+```yaml
+daemon:
+  signal_router:
+    live_trades_enabled: false   # default false = no live trades
+```
+
+`daemon.signal_router.live_trades_enabled` is the global router-side gate for direct `trade` actions. The default is `false`, which means the router is in dry-run for buy/sell execution even when `mode: new` is active.
+
+Behavior:
+
+- When `live_trades_enabled=false`, `trade` actions are suppressed before the execution adapter is called.
+- Suppressed `trade` actions emit `auto.signal_router.trade.dry_run` with route, action, subject, and rendered order context, and write the normal audit row.
+- All non-`trade` actions still flow when mode allows them: `notify`, `log`, `alert`, `audit`, `ui_panel`, `inject_session`, and `spawn_agent`.
+- When `live_trades_enabled=true`, `trade` actions may execute for real, still subject to `/autotrade`, risk controls, route enabled state, dedup, and kill-switch behavior.
+- The kill switch blocks router-only effects and should make runtime route/live-trade toggles read-only or rejected until the operator clears it.
 
 ### Phase A: Land router code path + shim, no behavior change
 
@@ -1309,17 +1324,19 @@ ETA: 5-7 developer days.
 
 Scope:
 
-- Implement `spawn_agent` executor for `codex-cli` first, with executor interface for `claude-cli`, `openai`, and `anthropic`.
-- Implement agent-pack loader and validation.
+- Implement `spawn_agent` as `SubAgentManager.spawn(role_name)` delegation, not a `codex-cli`/`claude-cli` subprocess executor.
+- Implement agent-pack loader, validation, and pack -> registered role resolution through `agent-config.json.agents`.
 - Stage or symlink `kai-alert-response` into `$AGENTKAI_HOME/agent-packs/kai-alert-response/`.
-- Enforce cooldown, daily cap, hourly cap, timeout, audit, and env passthrough.
+- Register the pack-backed role so it uses `agent.prompts.build_sub_agent_system_prompt()` plus the role-specific pack prompt.
+- Deliver the first task after spawn readiness with `nats_request(role_name, alarm_payload_with_render)`.
+- Enforce cooldown, daily cap, hourly cap, timeout, audit, and env passthrough outside the sub-agent in router state.
 - Add polymarket fixture tests from the bundle.
 
 Decision criteria:
 
-- Mock subprocess tests prove args/env/timeout/exit telemetry.
+- Mock `SubAgentManager.spawn()` and NATS request tests prove role resolution, first-task delivery, timeout, and telemetry.
 - Shadow mode never spawns.
-- Polymarket fixture would spawn exactly once, then suppresses on cooldown.
+- Polymarket fixture would spawn exactly once, sends exactly one first-task NATS request, then suppresses on cooldown.
 
 ETA: 5-7 developer days.
 
@@ -1350,13 +1367,22 @@ Scope:
 - Router becomes authoritative.
 - Legacy path retained behind kill switch.
 - Polymarket `spawn_agent` route enabled.
+- Extend `RuntimeConfigStore` for `daemon.signal_router.live_trades_enabled` and per-route `enabled` overrides.
+- Add `GET /api/daemon/config/signal_router` returning effective config, route status, fire/suppress counters, recent decisions, dedup stats, and kill-switch state.
+- Add `PATCH /api/daemon/config/signal_router` supporting `{live_trades_enabled: bool}` and `{routes: {<name>: {enabled: bool}}}`.
+- Add a Svelte management page at `web/src/routes/router/+page.svelte`, or an equivalent settings tab, listing routes with per-route enable toggles, fire/suppress counters, recent decisions, dedup stats, kill-switch state, and the global live-trades toggle.
+- Poll `/api/health.signal_router` every 5 seconds from the management page.
+- Emit `auto.signal_router.live_trades_toggle` whenever the global live-trades flag changes.
+- Add tests for valid/invalid API patches, kill-switch-blocked toggles, dry-run suppression of `trade` actions, and persistence across daemon restart.
 
 Decision criteria:
 
 - Phase 5 thresholds met: zero critical diffs, zero shim errors, zero overlap errors, non-critical diff rate <0.1% and explained, p95 decision latency <5 ms.
 - Rollback documented and tested.
+- With `live_trades_enabled=false`, direct `trade` actions emit `auto.signal_router.trade.dry_run` and do not call execution adapters while other route actions continue.
+- Runtime toggles persist across daemon restart and cannot bypass kill-switch behavior.
 
-ETA: 2-4 developer days, after N-day operator shadow validation.
+ETA: 7-9 developer days, after N-day operator shadow validation.
 
 ### Phase 7 — AlertSubscriber deprecation + delete
 
@@ -1539,4 +1565,5 @@ A future implementation should be considered complete only when:
 
 ## Spec revision history
 
+- 2026-05-08 — codex xhigh — spawn_agent delegates to SubAgentManager.spawn (not subprocess); Phase 6 UI page + global DRY-RUN toggle (default OFF = no live trades).
 - 2026-05-08 — codex xhigh — added `spawn_agent` action kind, deprecated AlertSubscriber, cooldown subsystem details, polymarket route migration; per operator-confirmed details from kai-alert-response bundle.
