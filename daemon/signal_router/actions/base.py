@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from daemon.event_injector import SafeFormatDict, stable_json
 from daemon.signal_router.domain_model import ActionDescriptor
 
 
@@ -75,6 +75,19 @@ class ActionExecutor(Protocol):
         context: ExecutionContext,
     ) -> ActionResult:
         """Execute or dry-run one action."""
+
+
+class SafeFormatDict(dict):
+    """Format mapping that keeps unknown placeholders visible."""
+
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+def stable_json(value: Any) -> str:
+    """Return deterministic JSON for template payload fields."""
+
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
 def event_payload(envelope: dict[str, Any]) -> dict[str, Any]:

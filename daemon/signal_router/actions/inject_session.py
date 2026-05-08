@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from daemon.event_injector import (
-    EventInjectionPolicy,
-    EventInjectionRequest,
-    EventInjectionTemplate,
-)
 from daemon.signal_router.domain_model import ActionDescriptor
 
 from .base import (
@@ -30,12 +26,22 @@ ACTIVE_ATTR = "_signal_router_event_turn_active"
 TIMESTAMPS_ATTR = "signal_router_event_injection_timestamps"
 
 
-class InlineEventInjectionTemplate(EventInjectionTemplate):
+@dataclass(frozen=True)
+class InlineEventInjectionTemplate:
     """Inline prompt template using EventInjector's render behavior."""
+
+    name: str
+    path: Path
+    content: str
 
     @classmethod
     def from_content(cls, content: str) -> "InlineEventInjectionTemplate":
         return cls(name="inline", path=Path("<inline>"), content=content)
+
+    def render_map(self, values: dict[str, Any]) -> str:
+        from .base import SafeFormatDict
+
+        return self.content.format_map(SafeFormatDict(values))
 
 
 class InjectSessionExecutor:
@@ -142,7 +148,9 @@ class InjectSessionExecutor:
         action: ActionDescriptor,
         envelope: dict[str, Any],
         context: ExecutionContext,
-    ) -> EventInjectionRequest:
+    ) -> Any:
+        from daemon.event_injector import EventInjectionPolicy, EventInjectionRequest
+
         payload = event_payload(envelope)
         channel = context.channel or envelope.get("channel") or "unknown"
         return EventInjectionRequest(
@@ -172,9 +180,11 @@ class InjectSessionExecutor:
             },
         )
 
-    def _template(self, action: ActionDescriptor) -> EventInjectionTemplate:
+    def _template(self, action: ActionDescriptor) -> Any:
         if action.params.get("template_inline"):
             return InlineEventInjectionTemplate.from_content(str(action.params["template_inline"]))
+        from daemon.event_injector import EventInjectionTemplate
+
         return EventInjectionTemplate.load(str(action.params["template"]))
 
     @staticmethod
