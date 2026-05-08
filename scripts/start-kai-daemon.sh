@@ -61,7 +61,7 @@ done
 if [[ ${#missing[@]} -gt 0 ]]; then
   echo "Missing required env: ${missing[*]}" >&2
   echo "Hint: source the env from the prior daemon, e.g." >&2
-  echo "  set -a; source <(grep -E '^(KAI_|TASKBOARD_|FORGEJO_|OPENCLAW_)' /tmp/kai-daemon.env); set +a" >&2
+  echo "  set -a; source <(grep -E '^(KAI_|TASKBOARD_|FORGEJO_|AGENTKAI_)' /tmp/kai-daemon.env); set +a" >&2
   exit 2
 fi
 
