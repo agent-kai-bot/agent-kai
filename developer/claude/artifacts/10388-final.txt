@@ -1,20 +1,15 @@
-Task 10388 developer fix-loop summary
+Task 10388 final summary
 
-Prior verdict addressed:
-- code-reviewer/claude/artifacts/10388-final.txt: Decision CHANGES_REQUESTED found OpenAI-compatible routing sent the auto-loop-brain default model_id (`sonnet`) to endpoints like `kai-local`, instead of using the endpoint-declared model (`qwen35-gptq`).
+Commit: 476302e fix(auto-loop-brain): validate openai endpoint provider
+Branch: task-10388-feat-implement-auto-loop-brain-client-redesign-per-10381-spec-phase-1
 
-Implementation:
-- Updated OpenAICompatToollessLLMClient to resolve the endpoint model when the incoming model is the Claude-oriented default (`sonnet`) or empty.
-- Preserved explicit operator model overrides: non-default model_id values are still sent unchanged.
-- Added regressions proving `kai-local`-style endpoint config sends `qwen35-gptq`, not `sonnet`, while preserving the tool-less request payload guarantee.
-- Added factory coverage proving OpenAI client creation uses the endpoint-declared model for default config.
-
-Commit:
-- acf81de3a792116d6325e25b46ed6dd275b804f3 fix(auto-loop-brain): use endpoint model for openai default
+Prior review addressed:
+- code-reviewer/claude/artifacts/10388-final.txt: provider routing gap for client=openai. Added provider == "openai" validation in build_toolless_llm_client with a clear daemon.auto_loop_brain.endpoint error, plus tests for codex-cli and missing provider endpoints.
+- code-reviewer/claude/artifacts/10388-final.txt: disabled rollout fragility. build_auto_response_evaluator now validates only the client choice when disabled and wraps backend creation in DeferredToollessLLMClient so missing OpenAI endpoint/API-key cannot break normal disabled session construction.
 
 Tests run:
-- pytest -q tests/test_auto_loop_brain.py — 22 passed, 5 subtests passed.
+- pytest -q tests/test_auto_loop_brain.py -q (27 passed)
+- pytest -q tests/test_auto_loop_brain.py tests/test_auto_mode.py -q (blocked during collection: ModuleNotFoundError: No module named 'langchain')
 
-Known follow-up / risk:
-- No live LLM provider calls were made.
-- Broader suites were not re-run in this fix-loop; prior review noted optional dependency gaps in this environment for some broader collections.
+Known follow-up/risk:
+- Broader auto-mode suite still needs the environment dependency set that includes langchain.
