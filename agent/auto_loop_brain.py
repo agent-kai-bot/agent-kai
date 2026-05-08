@@ -475,20 +475,67 @@ def build_auto_response_evaluator(
     llm_client: ToollessLLMClient | None = None,
 ) -> LLMCriticEvaluator:
     resolved_config = config or AutoLoopBrainConfig.from_sources()
+    _validate_auto_loop_brain_client_choice(resolved_config)
+    if llm_client is None:
+        # Keep the default-disabled rollout robust: constructing the composite
+        # evaluator for normal sessions must not require endpoint/API-key
+        # material until the feature is actually enabled and able to escalate.
+        llm_client = (
+            build_toolless_llm_client(resolved_config)
+            if resolved_config.enabled
+            else DeferredToollessLLMClient(lambda: build_toolless_llm_client(resolved_config))
+        )
     return LLMCriticEvaluator(
         chat_history_provider=lambda: tuple(chat_history_provider()),
-        llm_client=llm_client or build_toolless_llm_client(resolved_config),
+        llm_client=llm_client,
         config=resolved_config,
         telemetry=telemetry,
     )
 
 
-def build_toolless_llm_client(config: AutoLoopBrainConfig, *, raw_config: dict[str, Any] | None = None) -> ToollessLLMClient:
-    """Instantiate the configured tool-less LLM client, validating routing."""
+class DeferredToollessLLMClient:
+    """Lazy client proxy used while auto-loop-brain is configured off."""
+
+    def __init__(self, factory: Callable[[], ToollessLLMClient]) -> None:
+        self._factory = factory
+        self._client: ToollessLLMClient | None = None
+
+    def _get_client(self) -> ToollessLLMClient:
+        if self._client is None:
+            self._client = self._factory()
+        return self._client
+
+    def complete_json(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        timeout: float,
+        temperature: float = 0.0,
+        max_output_tokens: int = 512,
+    ) -> LLMResult:
+        return self._get_client().complete_json(
+            model=model,
+            system=system,
+            user=user,
+            timeout=timeout,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
+
+
+def _validate_auto_loop_brain_client_choice(config: AutoLoopBrainConfig) -> str:
     client = (config.client or DEFAULT_AUTO_LOOP_BRAIN_CLIENT).strip().lower()
     valid = ", ".join(VALID_AUTO_LOOP_BRAIN_CLIENTS)
     if client not in VALID_AUTO_LOOP_BRAIN_CLIENTS:
         raise ValueError(f"unknown auto_loop_brain client '{config.client}'; valid choices: {valid}")
+    return client
+
+
+def build_toolless_llm_client(config: AutoLoopBrainConfig, *, raw_config: dict[str, Any] | None = None) -> ToollessLLMClient:
+    """Instantiate the configured tool-less LLM client, validating routing."""
+    client = _validate_auto_loop_brain_client_choice(config)
     if client == "claude-cli":
         return ClaudeCLIToollessLLMClient()
     if client == "anthropic":
@@ -502,6 +549,12 @@ def build_toolless_llm_client(config: AutoLoopBrainConfig, *, raw_config: dict[s
     endpoint_config = endpoints[config.endpoint]
     if not isinstance(endpoint_config, dict):
         raise ValueError(f"auto_loop_brain endpoint '{config.endpoint}' must be an object")
+    provider = str(endpoint_config.get("provider") or "").strip().lower()
+    if provider != "openai":
+        raise ValueError(
+            f"daemon.auto_loop_brain.endpoint '{config.endpoint}' has provider '{provider or '<missing>'}'; "
+            "expected provider 'openai' for client 'openai'"
+        )
     return OpenAICompatToollessLLMClient(endpoint_name=config.endpoint, endpoint_config=endpoint_config)
 
 

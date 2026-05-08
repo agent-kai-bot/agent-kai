@@ -13,7 +13,7 @@ from unittest.mock import patch
 from agent.auto_evaluator import AutoEvaluationDecision, AutoEvaluationInput, AutoResponseEvaluator, ToolCallSummary, render_auto_reply
 from agent.auto_loop_brain import (
     AnthropicToollessLLMClient, AutoLoopBrainConfig, ClaudeCLIToollessLLMClient,
-    LLMCriticEvaluator, LLMResult, OpenAICompatToollessLLMClient, TokenUsage,
+    DeferredToollessLLMClient, LLMCriticEvaluator, LLMResult, OpenAICompatToollessLLMClient, TokenUsage,
     build_auto_response_evaluator, build_toolless_llm_client, _build_critic_prompt, redact_prompt_secrets,
 )
 
@@ -404,7 +404,11 @@ class AutoLoopBrainTests(unittest.TestCase):
         self.assertFalse(cfg.enabled)
 
     def test_factory_routes_configured_clients_and_rejects_bad_openai_config(self):
-        raw_config = {"endpoints": {"local": {"base_url": "http://llm", "api_key": "not-secret", "models": {"endpoint-model": {}}}}}
+        raw_config = {"endpoints": {
+            "local": {"provider": "openai", "base_url": "http://llm", "api_key": "not-secret", "models": {"endpoint-model": {}}},
+            "codex-cli": {"provider": "codex-cli", "base_url": "http://llm", "api_key": "not-secret"},
+            "legacy": {"base_url": "http://llm", "api_key": "not-secret"},
+        }}
         self.assertIsInstance(build_toolless_llm_client(AutoLoopBrainConfig(client="claude-cli"), raw_config=raw_config), ClaudeCLIToollessLLMClient)
         self.assertIsInstance(build_toolless_llm_client(AutoLoopBrainConfig(client="anthropic"), raw_config=raw_config), AnthropicToollessLLMClient)
         openai_client = build_toolless_llm_client(AutoLoopBrainConfig(client="openai", endpoint="local"), raw_config=raw_config)
@@ -416,6 +420,19 @@ class AutoLoopBrainTests(unittest.TestCase):
             build_toolless_llm_client(AutoLoopBrainConfig(client="openai"), raw_config=raw_config)
         with self.assertRaisesRegex(ValueError, "not found"):
             build_toolless_llm_client(AutoLoopBrainConfig(client="openai", endpoint="missing"), raw_config=raw_config)
+        with self.assertRaisesRegex(ValueError, "expected provider 'openai'"):
+            build_toolless_llm_client(AutoLoopBrainConfig(client="openai", endpoint="codex-cli"), raw_config=raw_config)
+        with self.assertRaisesRegex(ValueError, "expected provider 'openai'"):
+            build_toolless_llm_client(AutoLoopBrainConfig(client="openai", endpoint="legacy"), raw_config=raw_config)
+
+    def test_disabled_factory_defers_external_client_construction(self):
+        evaluator = build_auto_response_evaluator(
+            chat_history_provider=tuple,
+            config=AutoLoopBrainConfig(enabled=False, client="openai"),
+        )
+        self.assertIsInstance(evaluator.llm_client, DeferredToollessLLMClient)
+        with self.assertRaisesRegex(ValueError, "valid choices"):
+            build_auto_response_evaluator(chat_history_provider=tuple, config=AutoLoopBrainConfig(enabled=False, client="bogus"))
 
     def test_config_client_endpoint_env_overrides(self):
         raw = {"daemon": {"auto_loop_brain": {"client": "anthropic", "endpoint": "old"}}}
