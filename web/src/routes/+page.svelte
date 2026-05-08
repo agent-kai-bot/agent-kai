@@ -40,6 +40,7 @@
     SessionSummary,
     WatchlistQuote,
   } from "$lib/daemon/types";
+  import AutoLoopBrainToggle from "$lib/components/AutoLoopBrainToggle.svelte";
   import ChartPanel from "$lib/components/ChartPanel.svelte";
   import ChatPanel from "$lib/components/ChatPanel.svelte";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
@@ -1194,6 +1195,7 @@
         </section>
 
         <div class="dashboard-actions">
+          <AutoLoopBrainToggle {client} {token} />
           <div class="model-picker">
             <select
               aria-label="Agent"

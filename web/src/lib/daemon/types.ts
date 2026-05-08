@@ -107,6 +107,33 @@ export type ModelSwitchResponse = {
   }>;
 };
 
+export type AutoLoopBrainConfig = {
+  enabled: boolean;
+  client: string;
+  endpoint?: string | null;
+  model_id: string;
+  codex_reasoning_effort?: string;
+  max_history_tokens?: number;
+  temperature?: number;
+  min_continue_confidence?: number;
+  timeout_seconds?: number;
+  max_output_tokens?: number;
+  max_llm_critic_calls_per_session?: number;
+  max_consecutive_llm_critic_calls?: number;
+  kill_switch_active?: boolean;
+};
+
+export type AutoLoopBrainHealth = {
+  enabled: boolean;
+  effective_client: string;
+  effective_model: string;
+  kill_switch_active: boolean;
+  boot_probe_last_at?: string | null;
+  boot_probe_last_ok?: boolean | null;
+  calls_total: number;
+  escalations_total: number;
+};
+
 export type ChartViewState = {
   chart_symbol: string;
   chart_timeframe: string;
