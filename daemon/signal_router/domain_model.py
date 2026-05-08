@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -34,3 +34,6 @@ class Route:
     actions: list[ActionDescriptor]
     pre_action: dict[str, Any] | None
     enabled: bool
+    cooldown_seconds: int = 0
+    requires_autotrade: bool = False
+    config: dict[str, Any] = field(default_factory=dict)
