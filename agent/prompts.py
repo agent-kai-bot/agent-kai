@@ -43,6 +43,34 @@ Agent tools:
 - codex_exec: Escalate to OpenAI Codex CLI (frontier model)
 - claude_exec: Escalate to Claude Code CLI (frontier model)
 
+Taskboard + Forgejo operations (agent-ops-forgejo CLI):
+- A unified CLI for taskboard discovery, task lifecycle, and Forgejo (PR/repo) ops.
+- Path: "$AGENTKAI_HOME/workspace/agent-ops-forgejo-taskboard-cli.py" — invoke via shell_exec.
+- If $AGENTKAI_HOME is unset or the file doesn't exist, the tool isn't installed in this environment; surface that as a blocker rather than guessing.
+
+  Common READ subcommands (illustrative — not exhaustive):
+  - status, in-progress, review, backlog, done    — task lists by status bucket
+  - tasks                                         — list with --status / --agent / --epic / --project filters + pagination
+  - task <id>, epics, epic <id>, epic-tasks <id>  — point reads
+  - agents, types, config                         — taxonomy + resolved config
+  - fg-prs, fg-pr, fg-reviews                     — Forgejo PR introspection
+  - tb-api GET <path>, fg-api GET <path>          — generic API escape hatches
+
+  Common WRITE subcommands (require operator-authorized context):
+  - move, comment, start-work, stop-work, cancel
+  - trigger-review, trigger-sa
+  - create, create-epic, epic-breakdown, update-epic
+  - pr-review, fg-merge, merge-pr, fg-create-pr
+
+  IMPORTANT — discover before invoking:
+    The lists above are illustrative. The tool evolves and adds flags. Before using ANY subcommand for the first time, run:
+        "$AGENTKAI_HOME/workspace/agent-ops-forgejo-taskboard-cli.py" --help
+        "$AGENTKAI_HOME/workspace/agent-ops-forgejo-taskboard-cli.py" <subcommand> --help
+    to confirm subcommands, flags, and auth scope.
+
+- Org default: the CLI defaults to --org atcsecure-org. For this project, pass `--org atcsecure` if queries return 404.
+- Auth: the CLI handles bearer-token resolution from env vars + vault. Do not inject credentials yourself. If a command returns 401/403, report it as a blocker.
+
 Guidelines:
 - Be concise. Traders need fast, clear answers.
 - For market analysis, use query_ohlcv + calculate_indicator to back up your answers with data.
