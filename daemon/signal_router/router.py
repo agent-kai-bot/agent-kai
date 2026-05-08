@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any
 
 from agent_logger import get_logger
@@ -62,10 +63,46 @@ class SignalRouter:
         self.action_executors = dict(EXECUTORS)
 
     def route(self, envelope: dict[str, Any]) -> RouteDecision | None:
-        """Phase 1 stub. Phase 2 adds shim-backed routing."""
+        """Return the first matched route decision for compatibility callers."""
 
-        self.log_debug(f"signal_router route stub ignored envelope={bool(envelope)}")
-        return None
+        decisions = self.decide(envelope)
+        return decisions[0] if decisions else None
+
+    def decide(self, envelope: dict[str, Any]) -> list[RouteDecision]:
+        """Evaluate configured routes for one normalized envelope."""
+
+        payload = envelope.get("payload")
+        if payload is None:
+            payload = envelope
+        subject = str(envelope.get("subject") or "")
+        explicit_channel = envelope.get("channel")
+        found_channel = self.find_channel_for_subject(subject) if subject else None
+        inferred_channel = (
+            str(explicit_channel)
+            if explicit_channel
+            else (found_channel.name if found_channel is not None else None)
+        )
+        decisions: list[RouteDecision] = []
+        for route in self.routes.values():
+            if not route.enabled:
+                continue
+            if not self._route_accepts_envelope(route, subject, inferred_channel):
+                continue
+            match_result = self.match_route(route, payload)
+            if not match_result.matched:
+                continue
+            decisions.append(
+                RouteDecision(
+                    route_name=route.name,
+                    channel=inferred_channel or route.channel,
+                    match_result=match_result,
+                    actions=list(route.actions),
+                    decided_at=datetime.now(timezone.utc),
+                    dedup_key=None,
+                    dedup_status=None,
+                )
+            )
+        return decisions
 
     def find_channel_for_subject(self, subject: str) -> Channel | None:
         """Return the first configured channel whose NATS pattern matches subject."""
@@ -151,6 +188,19 @@ class SignalRouter:
             "dedup_keys_count": self.dedup_table.count_keys(),
             "kill_switch_active": kill_switch_active(),
         }
+
+    @staticmethod
+    def _route_accepts_envelope(
+        route: Route,
+        subject: str,
+        channel: str | None,
+    ) -> bool:
+        if channel and route.channel == channel:
+            return True
+        subject_pattern = route.config.get("subject_pattern")
+        if subject and isinstance(subject_pattern, str):
+            return _subject_matches(subject_pattern, subject)
+        return bool(channel is None and not route.channel)
 
     def _load_channels(self, config: dict[str, Any]) -> dict[str, Channel]:
         raw_channels = config.get("channels", {})
