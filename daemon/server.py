@@ -117,7 +117,13 @@ from daemon.heartbeat import (
 )
 from daemon.runtime_config_store import RuntimeConfigStore
 from daemon.scheduler import DaemonEventBus, Scheduler
-from daemon.signal_router import SignalRouter, resolve_mode
+from daemon.signal_router import (
+    ExecutionContext,
+    SignalRouter,
+    SignalRouterMode,
+    resolve_mode,
+)
+from daemon.signal_router.shadow import ShadowRunner
 from daemon.signal_router.shim_alert_subscriber import translate_alert_subscriber_config
 from daemon.signal_router.shim_signal_handlers import (
     log_shim_errors,
@@ -641,6 +647,16 @@ class DaemonServer:
             self.signal_router_config,
             routes=[*signal_routes, *alert_routes],
         )
+        self.shadow_runner: ShadowRunner | None = None
+        if self.signal_router.mode == SignalRouterMode.SHADOW:
+            self.shadow_runner = ShadowRunner(
+                self.signal_router,
+                telemetry_emitter=lambda topic, payload: self.publish_daemon_event(
+                    topic,
+                    payload,
+                ),
+                context_factory=self._signal_router_execution_context,
+            )
         self.services: list[Any] = [self.signal_router]
         self.heartbeat_config = heartbeat_config or load_heartbeat_config(agent_config)
         self.heartbeat_prompt_template = HeartbeatPromptTemplate.load(
@@ -705,7 +721,30 @@ class DaemonServer:
         }
 
     def _signal_router_health(self) -> dict[str, Any]:
-        return self.signal_router.health_payload()
+        payload = self.signal_router.health_payload()
+        payload["shadow_running"] = bool(
+            self.shadow_runner is not None and self.shadow_runner.running
+        )
+        payload["diff_metrics"] = (
+            self.shadow_runner.diff_store.snapshot()
+            if self.shadow_runner is not None
+            else {}
+        )
+        return payload
+
+    def _signal_router_execution_context(
+        self,
+        envelope: dict[str, Any],
+    ) -> ExecutionContext:
+        return ExecutionContext(
+            dry_run=True,
+            channel=envelope.get("channel"),
+            subject=envelope.get("subject"),
+            sessions=self.sessions,
+            dedup_table=self.signal_router.dedup_table,
+            event_injector=self.event_injector,
+            autotrade_enabled=lambda: False,
+        )
 
     def _refresh_session_auto_loop_brain_evaluator(
         self,
@@ -783,7 +822,11 @@ class DaemonServer:
                 self.log.warning(
                     "forgejo webhook secret provider not configured: %s", exc
                 )
-        self.signal_consumer.on_signal = self._handle_signal
+        self.signal_consumer.on_signal = (
+            self._handle_signal_shadow_tap
+            if self.shadow_runner is not None and self.shadow_runner.running
+            else self._handle_signal
+        )
         if self.bus_factory is None:
             self.bus = None
         else:
@@ -1816,6 +1859,18 @@ class DaemonServer:
         except RuntimeError:
             return
         loop.create_task(self.publish_daemon_event("signals", payload))
+
+    def _handle_signal_shadow_tap(self, signal: Signal) -> None:
+        """Run legacy signal fanout and router shadow evaluation together."""
+        if self.shadow_runner is None:
+            self._handle_signal(signal)
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self.shadow_runner.process_signal(signal, self._handle_signal))
+            return
+        loop.create_task(self.shadow_runner.process_signal(signal, self._handle_signal))
 
     def _handle_nats_message(self, direction: str, subject: str, payload: dict[str, Any]) -> None:
         """Mirror shared NATS traffic into each live session bus."""
