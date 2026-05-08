@@ -402,6 +402,9 @@ class AutoLoopBrainTests(unittest.TestCase):
         self.assertEqual(client.calls, [])
         cfg = AutoLoopBrainConfig.from_sources({"daemon": {"auto_loop_brain": {"enabled": True, "model_id": "claude-haiku-3"}}})
         self.assertFalse(cfg.enabled)
+        openai_cfg = AutoLoopBrainConfig.from_sources({"daemon": {"auto_loop_brain": {"enabled": True, "client": "openai", "endpoint": "local", "model_id": "qwen35-gptq"}}})
+        self.assertTrue(openai_cfg.enabled)
+        self.assertEqual(openai_cfg.model_id, "qwen35-gptq")
 
     def test_factory_routes_configured_clients_and_rejects_bad_openai_config(self):
         raw_config = {"endpoints": {
