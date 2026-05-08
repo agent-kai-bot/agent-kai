@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from agent_logger import get_logger
 
+from .actions import EXECUTORS, ActionResult, ExecutionContext
+from .actions.base import ACTION_STATUS_FAILED
 from .dedup_table import RouterDedupTable
 from .domain_model import ActionDescriptor, Channel, Route
 from .feature_flags import SignalRouterMode, kill_switch_active, resolve_mode
@@ -55,6 +58,7 @@ class SignalRouter:
             f"mode={self.mode.value} routes={len(self.routes)} "
             f"channels={len(self.channels)}"
         )
+        self.action_executors = dict(EXECUTORS)
 
     def route(self, envelope: dict[str, Any]) -> RouteDecision | None:
         """Phase 1 stub. Phase 2 adds shim-backed routing."""
@@ -82,6 +86,59 @@ class SignalRouter:
             "matched" if matched else "match_failed",
             {"route_name": route.name},
         )
+
+    def execute_actions(
+        self,
+        decision: RouteDecision,
+        envelope: dict[str, Any],
+        context: ExecutionContext | None = None,
+    ) -> list[ActionResult]:
+        """Execute route actions according to router cutover mode."""
+
+        if self.mode == SignalRouterMode.LEGACY:
+            return []
+
+        execution_context = context or ExecutionContext()
+        execution_context = replace(
+            execution_context,
+            dry_run=self.mode == SignalRouterMode.SHADOW,
+            channel=execution_context.channel or decision.channel,
+            route_name=execution_context.route_name or decision.route_name,
+            subject=execution_context.subject or envelope.get("subject"),
+            dedup_table=execution_context.dedup_table or self.dedup_table,
+        )
+        results: list[ActionResult] = []
+        for action in decision.actions:
+            executor = self.action_executors.get(action.kind)
+            if executor is None:
+                result = ActionResult(
+                    kind=action.kind,
+                    target=action.target,
+                    status=ACTION_STATUS_FAILED,
+                    detail=f"unknown signal_router action kind: {action.kind}",
+                    metrics={},
+                )
+                results.append(result)
+                continue
+            try:
+                result = executor.execute(action, envelope, execution_context)
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning(
+                    "signal_router action failed route=%s kind=%s target=%s error=%s",
+                    decision.route_name,
+                    action.kind,
+                    action.target,
+                    exc,
+                )
+                result = ActionResult(
+                    kind=action.kind,
+                    target=action.target,
+                    status=ACTION_STATUS_FAILED,
+                    detail=str(exc),
+                    metrics={},
+                )
+            results.append(result)
+        return results
 
     def health_payload(self) -> dict[str, Any]:
         """Return the Phase 1 health shape."""
