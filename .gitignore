@@ -39,6 +39,21 @@ workspaces/**/monitor_state.json
 workspaces/**/workspaces/terminal/
 workspaces/scheduler/
 workspaces/sessions/
+workspaces/run_outcome_reaper.sqlite3
+workspaces/taskboard-runs/
+workspaces/task-*/
+workspaces/**/*.log
+
+# Per-role review/QA artifacts (committed only via PR if needed)
+architect/
+developer/
+code-reviewer/
+security-auditor/
+qa-agent/
+qa/
+
+# Stray screenshots not yet routed to docs/
+/agent-kai-webui.png
 
 # Internal design proposals — drafts, not part of published docs
 docs/proposals/
