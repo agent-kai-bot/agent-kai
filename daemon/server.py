@@ -117,6 +117,7 @@ from daemon.heartbeat import (
 )
 from daemon.runtime_config_store import RuntimeConfigStore
 from daemon.scheduler import DaemonEventBus, Scheduler
+from daemon.signal_router import SignalRouter
 from daemon.protocol import (
     AttachEnvelope,
     AutoProgressEnvelope,
@@ -612,6 +613,11 @@ class DaemonServer:
         self.alert_subscriber_config: AlertSubscriberConfig = load_alert_subscriber_config(
             agent_config
         )
+        self.signal_router_config = dict(
+            (agent_config.get("daemon") or {}).get("signal_router") or {}
+        )
+        self.signal_router = SignalRouter(self.signal_router_config)
+        self.services: list[Any] = [self.signal_router]
         self.heartbeat_config = heartbeat_config or load_heartbeat_config(agent_config)
         self.heartbeat_prompt_template = HeartbeatPromptTemplate.load(
             self.heartbeat_config.prompt_template_path
@@ -673,6 +679,9 @@ class DaemonServer:
             "calls_total": calls_total,
             "escalations_total": calls_total,
         }
+
+    def _signal_router_health(self) -> dict[str, Any]:
+        return self.signal_router.health_payload()
 
     def _refresh_session_auto_loop_brain_evaluator(
         self,
@@ -1032,6 +1041,7 @@ class DaemonServer:
                 ),
                 "last_tick": heartbeat_last_tick,
             },
+            "signal_router": self._signal_router_health(),
             "auto_loop_brain": self._auto_loop_brain_health(),
             "process": {
                 "pid": os.getpid(),
@@ -1068,6 +1078,7 @@ class DaemonServer:
             "agent_queue_depth": metrics["sessions"]["queue_depth"]["total"],
             "scheduler_job_count": metrics["scheduler"]["job_count"],
             "heartbeat": metrics["heartbeat"],
+            "signal_router": metrics["signal_router"],
             "auto_loop_brain": metrics["auto_loop_brain"],
         }
 
@@ -2765,6 +2776,11 @@ def create_app(
     async def auto_loop_brain_health_endpoint(request: Request) -> dict[str, Any]:
         daemon_server.require_http_auth(request)
         return daemon_server._auto_loop_brain_health()
+
+    @app.get("/api/health.signal_router")
+    async def signal_router_health_endpoint(request: Request) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
+        return daemon_server._signal_router_health()
 
     @app.get("/api/daemon/config/auto_loop_brain")
     async def get_auto_loop_brain_config_endpoint(request: Request) -> dict[str, Any]:

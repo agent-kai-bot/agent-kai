@@ -1,0 +1,31 @@
+Task: #10397 DEV Phase 1 signal_router skeleton
+Branch: feat/10394-phase-1-router-skeleton
+Final commit SHA: bbf529b9347d8a319a61a0c6a94a370c0328a2c9
+
+Files added:
+- daemon/signal_router/__init__.py
+- daemon/signal_router/dedup_table.py
+- daemon/signal_router/domain_model.py
+- daemon/signal_router/feature_flags.py
+- daemon/signal_router/route_decision.py
+- daemon/signal_router/router.py
+- tests/test_feature_flags.py
+- tests/test_route_decision.py
+- tests/test_router_dedup_table.py
+- tests/test_router_shim_harness.py
+- tests/test_signal_router_skeleton.py
+
+Files modified:
+- agent-config.json
+- daemon/server.py
+
+Tests and checks run:
+- python3 -m py_compile daemon/server.py daemon/signal_router/__init__.py daemon/signal_router/domain_model.py daemon/signal_router/route_decision.py daemon/signal_router/feature_flags.py daemon/signal_router/dedup_table.py daemon/signal_router/router.py tests/test_router_shim_harness.py tests/test_route_decision.py tests/test_router_dedup_table.py tests/test_feature_flags.py tests/test_signal_router_skeleton.py: PASS
+- .venv/bin/python -m pytest -q tests/test_route_decision.py tests/test_router_dedup_table.py tests/test_feature_flags.py tests/test_signal_router_skeleton.py: PASS, 15 passed, 1 pytest config warning
+- .venv/bin/python -m pytest -q tests/test_heartbeat.py tests/test_auto_loop_brain.py: PASS, 37 passed, 1 pytest config warning
+- python3 -c "from daemon.signal_router import SignalRouter, SignalRouterMode, RouterDedupTable; print('imports ok')": PASS, imports ok
+
+Deviations / caveats:
+- No deviations from the requested Phase 1 implementation scope.
+- Could not verify parent epic #10040 with `agent-ops-forgejo epic 10040` because `agent-ops-forgejo` is not installed in this environment.
+- Pytest emits the pre-existing warning `Unknown config option: asyncio_mode`; it does not affect these test results.

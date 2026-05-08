@@ -380,6 +380,12 @@
       "max_llm_critic_calls_per_session": 20,
       "max_consecutive_llm_critic_calls": 5
     },
+    "signal_router": {
+      "mode": "legacy",
+      "channels": {},
+      "routes": [],
+      "dedup_table_path": "${AGENTKAI_HOME}/router_dedup.sqlite3"
+    },
     "heartbeat": {
       "enabled": true,
       "interval_seconds": 1800,
