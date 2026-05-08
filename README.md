@@ -2,7 +2,7 @@
 
 Daemon-backed crypto analysis and paper-trading terminal with shared terminal and web clients, persistent sessions, scheduler jobs, and a real sub-agent runtime powered by [`agent-k.ai`](https://agent-k.ai).
 
-![Agent KAI terminal screenshot](docs/agent-kai-tui.png)
+![Agent KAI web UI](docs/agent-kai-webui.png)
 
 ## What it is
 
