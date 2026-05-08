@@ -24,6 +24,15 @@ def default_dedup_table_path() -> Path:
     return _default_agentkai_home() / "router_dedup.sqlite3"
 
 
+def _resolve_db_path(db_path: str | Path | None) -> Path:
+    if db_path is None:
+        return default_dedup_table_path()
+    raw_path = str(db_path)
+    if "${AGENTKAI_HOME}" in raw_path and "AGENTKAI_HOME" not in os.environ:
+        raw_path = raw_path.replace("${AGENTKAI_HOME}", str(_default_agentkai_home()))
+    return Path(os.path.expandvars(raw_path)).expanduser()
+
+
 class RouterDedupTable:
     """Durable router cooldown and route-cap table."""
 
@@ -33,7 +42,7 @@ class RouterDedupTable:
         *,
         now_fn: Callable[[], datetime] | None = None,
     ) -> None:
-        self.db_path = Path(db_path) if db_path is not None else default_dedup_table_path()
+        self.db_path = _resolve_db_path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self._lock = threading.RLock()
