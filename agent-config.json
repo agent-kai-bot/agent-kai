@@ -368,9 +368,10 @@
   "daemon": {
     "auto_loop_brain": {
       "enabled": false,
-      "client": "claude-cli",
+      "client": "codex-cli",
       "endpoint": null,
-      "model_id": "sonnet",
+      "model_id": "gpt-5.5",
+      "codex_reasoning_effort": "medium",
       "max_history_tokens": 16000,
       "temperature": 0.0,
       "min_continue_confidence": 0.85,

@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from agent.auto_evaluator import AutoEvaluationDecision, AutoEvaluationInput, AutoResponseEvaluator, ToolCallSummary, render_auto_reply
 from agent.auto_loop_brain import (
-    AnthropicToollessLLMClient, AutoLoopBrainConfig, ClaudeCLIToollessLLMClient,
+    AnthropicToollessLLMClient, AutoLoopBrainConfig, ClaudeCLIToollessLLMClient, CodexCLIToollessLLMClient,
     DeferredToollessLLMClient, LLMCriticEvaluator, LLMResult, OpenAICompatToollessLLMClient, TokenUsage,
     build_auto_response_evaluator, build_toolless_llm_client, _build_critic_prompt, redact_prompt_secrets,
 )
@@ -110,6 +110,46 @@ class AutoLoopBrainClientTests(unittest.TestCase):
             run.return_value = subprocess.CompletedProcess(command, 1, stdout="", stderr="boom")
             with self.assertRaises(RuntimeError):
                 client.complete_json(model="sonnet", system="sys", user="user", timeout=1)
+
+    def test_codex_cli_success_timeout_transport_empty_stdout_and_toolless_command(self):
+        client = CodexCLIToollessLLMClient(reasoning_effort="xhigh")
+        command = client.build_command(model="gpt-5.5", system="sys", user="user")
+        self.assertEqual(
+            command,
+            [
+                "codex",
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-c",
+                "model_reasoning_effort=xhigh",
+                "-c",
+                'model="gpt-5.5"',
+                "<System instructions>\nsys\n\n<User payload>\nuser",
+            ],
+        )
+        forbidden_flags = {"--tool", "--tools", "--mcp", "mcp", "--append-system-prompt", "--output-last-message"}
+        self.assertFalse(any(part.lower() in forbidden_flags for part in command[:-1]))
+        with patch("agent.auto_loop_brain.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(command, 0, stdout='{"decision":"STOP"}\n', stderr="")
+            result = client.complete_json(model="gpt-5.5", system="sys", user="user", timeout=1)
+        self.assertEqual(result.text, '{"decision":"STOP"}')
+        self.assertIsNone(result.usage.input_tokens if result.usage else None)
+        self.assertNotIn("input", run.call_args.kwargs)
+        self.assertEqual(run.call_args.kwargs["timeout"], 1)
+        self.assertFalse(run.call_args.kwargs.get("shell", False))
+        with patch("agent.auto_loop_brain.subprocess.run", side_effect=subprocess.TimeoutExpired(command, 1)):
+            with self.assertRaises(TimeoutError):
+                client.complete_json(model="gpt-5.5", system="sys", user="user", timeout=1)
+        with patch("agent.auto_loop_brain.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(command, 1, stdout="", stderr="boom")
+            with self.assertRaises(RuntimeError):
+                client.complete_json(model="gpt-5.5", system="sys", user="user", timeout=1)
+        with patch("agent.auto_loop_brain.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            with self.assertRaisesRegex(RuntimeError, "empty stdout"):
+                client.complete_json(model="gpt-5.5", system="sys", user="user", timeout=1)
+        with self.assertRaisesRegex(ValueError, "valid choices"):
+            CodexCLIToollessLLMClient(reasoning_effort="low")
 
     def test_openai_success_transport_tool_attempt_and_toolless_payload(self):
         client = OpenAICompatToollessLLMClient(endpoint_name="kai-local", endpoint_config={"base_url": "http://llm", "api_key": "not-secret"})
@@ -400,11 +440,16 @@ class AutoLoopBrainTests(unittest.TestCase):
         self.assertEqual(evaluator.evaluate(self._input()).decision, "CONTINUE")
         self.assertEqual(evaluator.last_metadata["evaluator_kind"], "regex")
         self.assertEqual(client.calls, [])
-        cfg = AutoLoopBrainConfig.from_sources({"daemon": {"auto_loop_brain": {"enabled": True, "model_id": "claude-haiku-3"}}})
+        cfg = AutoLoopBrainConfig.from_sources({"daemon": {"auto_loop_brain": {"enabled": True, "client": "claude-cli", "model_id": "claude-haiku-3"}}})
         self.assertFalse(cfg.enabled)
         openai_cfg = AutoLoopBrainConfig.from_sources({"daemon": {"auto_loop_brain": {"enabled": True, "client": "openai", "endpoint": "local", "model_id": "qwen35-gptq"}}})
         self.assertTrue(openai_cfg.enabled)
         self.assertEqual(openai_cfg.model_id, "qwen35-gptq")
+        codex_cfg = AutoLoopBrainConfig.from_sources({"daemon": {"auto_loop_brain": {"enabled": True, "client": "codex-cli", "model_id": "gpt-5.5", "codex_reasoning_effort": "high"}}})
+        self.assertTrue(codex_cfg.enabled)
+        self.assertEqual(codex_cfg.codex_reasoning_effort, "high")
+        with self.assertRaisesRegex(ValueError, "reasoning effort"):
+            AutoLoopBrainConfig.from_sources({"daemon": {"auto_loop_brain": {"codex_reasoning_effort": "low"}}})
 
     def test_factory_routes_configured_clients_and_rejects_bad_openai_config(self):
         raw_config = {"endpoints": {
@@ -413,6 +458,9 @@ class AutoLoopBrainTests(unittest.TestCase):
             "legacy": {"base_url": "http://llm", "api_key": "not-secret"},
         }}
         self.assertIsInstance(build_toolless_llm_client(AutoLoopBrainConfig(client="claude-cli"), raw_config=raw_config), ClaudeCLIToollessLLMClient)
+        codex_client = build_toolless_llm_client(AutoLoopBrainConfig(client="codex-cli", codex_reasoning_effort="high"), raw_config=raw_config)
+        self.assertIsInstance(codex_client, CodexCLIToollessLLMClient)
+        self.assertEqual(codex_client.reasoning_effort, "high")
         self.assertIsInstance(build_toolless_llm_client(AutoLoopBrainConfig(client="anthropic"), raw_config=raw_config), AnthropicToollessLLMClient)
         openai_client = build_toolless_llm_client(AutoLoopBrainConfig(client="openai", endpoint="local"), raw_config=raw_config)
         self.assertIsInstance(openai_client, OpenAICompatToollessLLMClient)

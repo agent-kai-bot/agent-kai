@@ -29,9 +29,11 @@ from agent.auto_evaluator import (
 from config import load_config
 
 INDECISIVE_STOP_PATTERNS = frozenset({"unknown", "malformed_footer_recoverable"})
-VALID_AUTO_LOOP_BRAIN_CLIENTS = ("claude-cli", "openai", "anthropic")
-DEFAULT_AUTO_LOOP_BRAIN_CLIENT = "claude-cli"
-DEFAULT_CRITIC_MODEL = "sonnet"
+VALID_AUTO_LOOP_BRAIN_CLIENTS = ("claude-cli", "openai", "anthropic", "codex-cli")
+DEFAULT_AUTO_LOOP_BRAIN_CLIENT = "codex-cli"
+DEFAULT_CRITIC_MODEL = "gpt-5.5"
+DEFAULT_CODEX_REASONING_EFFORT = "medium"
+VALID_CODEX_REASONING_EFFORTS = ("medium", "high", "xhigh")
 DEFAULT_MAX_HISTORY_TOKENS = 16_000
 DEFAULT_MAX_LLM_CRITIC_CALLS_PER_SESSION = 20
 DEFAULT_MAX_CONSECUTIVE_LLM_CRITIC_CALLS = 5
@@ -144,6 +146,65 @@ class ClaudeCLIToollessLLMClient:
         return LLMResult(text=completed.stdout.strip(), model_id=model, usage=TokenUsage())
 
 
+class CodexCLIToollessLLMClient:
+    """Local Codex CLI client for one non-interactive JSON classifier call.
+
+    Phase 0 dev note: the target runtime flag set was checked against
+    ~/git/CODEX-AGENT-USAGE.md: ``codex exec
+    --dangerously-bypass-approvals-and-sandbox -c
+    model_reasoning_effort=<level> -c model="<model>" "<prompt>"``.
+    v1 uses stdout as the response channel instead of
+    ``--output-last-message`` so the transport stays equivalent to the
+    existing claude-cli client and avoids temporary verdict-file handling.
+    No checked-in JSON schema is needed for v1; the system prompt instructs
+    structured JSON output as with the other tool-less clients.
+    """
+
+    def __init__(self, *, executable: str = "codex", reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT) -> None:
+        self.executable = executable
+        self.reasoning_effort = _validate_codex_reasoning_effort(reasoning_effort)
+
+    def build_prompt(self, *, system: str, user: str) -> str:
+        return f"<System instructions>\n{system}\n\n<User payload>\n{user}"
+
+    def build_command(self, *, model: str, system: str, user: str) -> list[str]:
+        command = [
+            self.executable,
+            "exec",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-c",
+            f"model_reasoning_effort={self.reasoning_effort}",
+        ]
+        if model:
+            command.extend(["-c", f"model={json.dumps(model)}"])
+        command.append(self.build_prompt(system=system, user=user))
+        return command
+
+    def complete_json(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        timeout: float,
+        temperature: float = 0.0,
+        max_output_tokens: int = 512,
+    ) -> LLMResult:
+        command = self.build_command(model=model, system=system, user=user)
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"codex CLI timed out after {timeout} seconds") from exc
+        if completed.stderr.strip():
+            raise RuntimeError(completed.stderr.strip())
+        if completed.returncode != 0:
+            raise RuntimeError(f"codex CLI exited with status {completed.returncode}")
+        text = completed.stdout.strip()
+        if not text:
+            raise RuntimeError("codex CLI returned empty stdout")
+        return LLMResult(text=text, model_id=model, usage=TokenUsage())
+
+
 class OpenAICompatToollessLLMClient:
     """OpenAI-compatible chat completions client that never sends tools."""
 
@@ -179,7 +240,7 @@ class OpenAICompatToollessLLMClient:
         unless the operator explicitly supplied a different model_id override.
         """
         requested_model = str(model or "").strip()
-        if requested_model and requested_model != DEFAULT_CRITIC_MODEL:
+        if requested_model and requested_model not in {DEFAULT_CRITIC_MODEL, "sonnet"}:
             return requested_model
         return self.default_model or requested_model
 
@@ -284,6 +345,7 @@ class AutoLoopBrainConfig:
     client: str = DEFAULT_AUTO_LOOP_BRAIN_CLIENT
     endpoint: str | None = None
     model_id: str = DEFAULT_CRITIC_MODEL
+    codex_reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT
     max_history_tokens: int = DEFAULT_MAX_HISTORY_TOKENS
     temperature: float = 0.0
     min_continue_confidence: float = MIN_CONTINUE_CONFIDENCE
@@ -309,6 +371,12 @@ class AutoLoopBrainConfig:
         endpoint = os.environ.get("KAI_AUTO_LOOP_BRAIN_ENDPOINT", brain_config.get("endpoint"))
         endpoint = str(endpoint).strip() if endpoint is not None and str(endpoint).strip() else None
         model_id = os.environ.get("KAI_AUTO_LOOP_BRAIN_MODEL_ID", str(brain_config.get("model_id") or DEFAULT_CRITIC_MODEL))
+        codex_reasoning_effort = _validate_codex_reasoning_effort(
+            os.environ.get(
+                "KAI_AUTO_LOOP_BRAIN_CODEX_REASONING_EFFORT",
+                str(brain_config.get("codex_reasoning_effort") or DEFAULT_CODEX_REASONING_EFFORT),
+            )
+        )
         if _env_bool("KAI_AUTO_LOOP_BRAIN_KILL_SWITCH", False):
             enabled = False
         elif client in {"claude-cli", "anthropic"} and not _model_meets_minimum_tier(model_id):
@@ -318,6 +386,7 @@ class AutoLoopBrainConfig:
             client=client,
             endpoint=endpoint,
             model_id=model_id,
+            codex_reasoning_effort=codex_reasoning_effort,
             max_history_tokens=_env_int("KAI_AUTO_LOOP_BRAIN_MAX_HISTORY_TOKENS", _config_int(brain_config, "max_history_tokens", DEFAULT_MAX_HISTORY_TOKENS)),
             temperature=_env_float("KAI_AUTO_LOOP_BRAIN_TEMPERATURE", _config_float(brain_config, "temperature", 0.0)),
             min_continue_confidence=_env_float("KAI_AUTO_LOOP_BRAIN_MIN_CONTINUE_CONFIDENCE", _config_float(brain_config, "min_continue_confidence", MIN_CONTINUE_CONFIDENCE)),
@@ -540,6 +609,8 @@ def build_toolless_llm_client(config: AutoLoopBrainConfig, *, raw_config: dict[s
     client = _validate_auto_loop_brain_client_choice(config)
     if client == "claude-cli":
         return ClaudeCLIToollessLLMClient()
+    if client == "codex-cli":
+        return CodexCLIToollessLLMClient(reasoning_effort=config.codex_reasoning_effort)
     if client == "anthropic":
         return AnthropicToollessLLMClient()
     if not config.endpoint:
@@ -751,6 +822,14 @@ def _optional_int(value: Any) -> int | None:
 def _is_placeholder_api_key(value: str) -> bool:
     normalized = value.strip().lower()
     return normalized in {"missing-kai-api-key", "missing-api-key", "not-configured", "changeme", "change-me", "placeholder", "not-set"}
+
+
+def _validate_codex_reasoning_effort(value: str) -> str:
+    normalized = str(value or DEFAULT_CODEX_REASONING_EFFORT).strip().lower()
+    if normalized not in VALID_CODEX_REASONING_EFFORTS:
+        valid = ", ".join(VALID_CODEX_REASONING_EFFORTS)
+        raise ValueError(f"invalid codex reasoning effort '{value}'; valid choices: {valid}")
+    return normalized
 
 
 def _config_bool(config: dict[str, Any], key: str, default: bool) -> bool:
