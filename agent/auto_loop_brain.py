@@ -309,7 +309,9 @@ class AutoLoopBrainConfig:
         endpoint = os.environ.get("KAI_AUTO_LOOP_BRAIN_ENDPOINT", brain_config.get("endpoint"))
         endpoint = str(endpoint).strip() if endpoint is not None and str(endpoint).strip() else None
         model_id = os.environ.get("KAI_AUTO_LOOP_BRAIN_MODEL_ID", str(brain_config.get("model_id") or DEFAULT_CRITIC_MODEL))
-        if _env_bool("KAI_AUTO_LOOP_BRAIN_KILL_SWITCH", False) or not _model_meets_minimum_tier(model_id):
+        if _env_bool("KAI_AUTO_LOOP_BRAIN_KILL_SWITCH", False):
+            enabled = False
+        elif client in {"claude-cli", "anthropic"} and not _model_meets_minimum_tier(model_id):
             enabled = False
         return cls(
             enabled=enabled,
