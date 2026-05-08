@@ -24,7 +24,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agent_logger import get_logger, log_slash_command
 from agent.agent_runs_client import AgentRunsClient
-from agent.auto_loop_brain import AutoLoopBrainConfig, build_toolless_llm_client
+from agent.auto_loop_brain import (
+    AutoLoopBrainConfig,
+    build_auto_response_evaluator,
+    redact_prompt_secrets,
+)
 from agent.taskboard_dispatcher import (
     DaemonTaskboardSpawner,
     TaskboardDispatcher,
@@ -111,6 +115,7 @@ from daemon.heartbeat import (
     HeartbeatTick,
     load_heartbeat_config,
 )
+from daemon.runtime_config_store import RuntimeConfigStore
 from daemon.scheduler import DaemonEventBus, Scheduler
 from daemon.protocol import (
     AttachEnvelope,
@@ -179,8 +184,32 @@ def _taskboard_dispatcher_enabled(value: bool | None) -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, *, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _sanitize_auto_loop_brain_error(exc: Exception) -> str:
+    text = str(exc) or exc.__class__.__name__
+    redacted = redact_prompt_secrets(text)
+    safe = str(redacted).replace("\n", " ").replace("\r", " ").strip()
+    return safe[:300] or exc.__class__.__name__
 
 
 def _parse_schedule_at_value(raw: str, *, now: datetime | None = None) -> str:
@@ -528,6 +557,14 @@ class WatchlistUpdateRequest(BaseModel):
     remove: str | None = None
 
 
+class AutoLoopBrainToggleRequest(BaseModel):
+    """Payload for the runtime auto-loop-brain enabled override."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+
 class DaemonServer:
     """FastAPI-facing daemon runtime that owns sessions and a shared bus."""
 
@@ -546,6 +583,7 @@ class DaemonServer:
         taskboard_client: Any | None = None,
         taskboard_dispatcher_enabled: bool | None = None,
         heartbeat_config: HeartbeatConfig | None = None,
+        runtime_config_store: RuntimeConfigStore | None = None,
     ) -> None:
         self.agent_name = agent_name
         self.nats_url = nats_url
@@ -559,6 +597,7 @@ class DaemonServer:
         self.webhook_secret_provider = webhook_secret_provider
         self.forgejo_webhook_secret_provider = forgejo_webhook_secret_provider
         self.taskboard_client = taskboard_client
+        self.runtime_config_store = runtime_config_store or RuntimeConfigStore()
         self.taskboard_dispatcher_enabled = _taskboard_dispatcher_enabled(
             taskboard_dispatcher_enabled
         )
@@ -585,35 +624,103 @@ class DaemonServer:
         self.heartbeat_service: HeartbeatService | None = None
         self.daemon_token = ""
         self.started_at_monotonic: float | None = None
+        self.auto_loop_brain_boot_probe_last_at: str | None = None
+        self.auto_loop_brain_boot_probe_last_ok: bool | None = None
         self.log = get_logger("daemon.server")
 
     @staticmethod
     def _default_bus_factory(url: str, agent_name: str) -> NatsBus:
         return NatsBus(url=url, agent_name=agent_name)
 
+    def _effective_agent_config(self) -> dict[str, Any]:
+        return self.runtime_config_store.effective_config()
+
+    def _auto_loop_brain_config(self) -> AutoLoopBrainConfig:
+        return AutoLoopBrainConfig.from_sources(self._effective_agent_config())
+
+    def _auto_loop_brain_payload(self) -> dict[str, Any]:
+        config = self._auto_loop_brain_config()
+        payload = {
+            "enabled": bool(config.enabled),
+            "client": config.client,
+            "endpoint": config.endpoint,
+            "model_id": config.model_id,
+            "codex_reasoning_effort": config.codex_reasoning_effort,
+            "max_history_tokens": config.max_history_tokens,
+            "temperature": config.temperature,
+            "min_continue_confidence": config.min_continue_confidence,
+            "timeout_seconds": config.timeout_seconds,
+            "max_output_tokens": config.max_output_tokens,
+            "max_llm_critic_calls_per_session": config.max_llm_critic_calls_per_session,
+            "max_consecutive_llm_critic_calls": config.max_consecutive_llm_critic_calls,
+            "kill_switch_active": _env_flag("KAI_AUTO_LOOP_BRAIN_KILL_SWITCH"),
+        }
+        return payload
+
+    def _auto_loop_brain_health(self) -> dict[str, Any]:
+        config = self._auto_loop_brain_config()
+        calls_total = 0
+        for managed in self.sessions.values():
+            evaluator = getattr(managed.session, "auto_response_evaluator", None)
+            calls_total += int(getattr(evaluator, "_llm_calls_this_session", 0) or 0)
+        return {
+            "enabled": bool(config.enabled),
+            "effective_client": config.client,
+            "effective_model": config.model_id,
+            "kill_switch_active": _env_flag("KAI_AUTO_LOOP_BRAIN_KILL_SWITCH"),
+            "boot_probe_last_at": self.auto_loop_brain_boot_probe_last_at,
+            "boot_probe_last_ok": self.auto_loop_brain_boot_probe_last_ok,
+            "calls_total": calls_total,
+            "escalations_total": calls_total,
+        }
+
+    def _refresh_session_auto_loop_brain_evaluator(
+        self,
+        managed: "ManagedSession",
+    ) -> None:
+        session = managed.session
+        config = self._auto_loop_brain_config()
+        session.auto_response_evaluator = build_auto_response_evaluator(
+            chat_history_provider=lambda session=session: tuple(session.chat_history),
+            telemetry=session,
+            config=config,
+        )
+
+    def _record_auto_loop_brain_boot_probe(self, ok: bool) -> None:
+        self.auto_loop_brain_boot_probe_last_at = _utc_now().isoformat()
+        self.auto_loop_brain_boot_probe_last_ok = bool(ok)
+
+    def _probe_auto_loop_brain(self, config: AutoLoopBrainConfig) -> None:
+        evaluator = build_auto_response_evaluator(
+            chat_history_provider=tuple,
+            config=config,
+        )
+        evaluator.llm_client.complete_json(
+            model=config.model_id,
+            system="ping",
+            user="reply 'pong'",
+            timeout=min(float(config.timeout_seconds), 10.0),
+            temperature=0.0,
+            max_output_tokens=4,
+        )
+
     def _validate_auto_loop_brain_startup(self) -> None:
         """Fail fast when enabled auto-loop-brain client routing is unusable."""
 
-        config = AutoLoopBrainConfig.from_sources()
+        config = self._auto_loop_brain_config()
         if not config.enabled:
             return
         try:
-            client = build_toolless_llm_client(config)
-            client.complete_json(
-                model=config.model_id,
-                system="ping",
-                user="reply with the literal string 'pong'",
-                timeout=config.timeout_seconds,
-                temperature=0.0,
-                max_output_tokens=4,
-            )
+            self._probe_auto_loop_brain(config)
         except Exception as exc:  # noqa: BLE001
+            self._record_auto_loop_brain_boot_probe(False)
             self.log.warning(
                 "auto-loop-brain startup validation failed: %s: %s",
                 exc.__class__.__name__,
                 exc,
             )
             raise
+        self._record_auto_loop_brain_boot_probe(True)
 
     async def startup(self) -> None:
         """Connect shared resources used by daemon-backed sessions."""
@@ -925,6 +1032,7 @@ class DaemonServer:
                 ),
                 "last_tick": heartbeat_last_tick,
             },
+            "auto_loop_brain": self._auto_loop_brain_health(),
             "process": {
                 "pid": os.getpid(),
                 "memory_rss_bytes": _process_memory_bytes(),
@@ -960,6 +1068,7 @@ class DaemonServer:
             "agent_queue_depth": metrics["sessions"]["queue_depth"]["total"],
             "scheduler_job_count": metrics["scheduler"]["job_count"],
             "heartbeat": metrics["heartbeat"],
+            "auto_loop_brain": metrics["auto_loop_brain"],
         }
 
     def _is_authorized(self, *, token: str | None, client_host: str | None) -> bool:
@@ -1041,6 +1150,7 @@ class DaemonServer:
 
         managed = ManagedSession(session=session)
         self.sessions[session.name] = managed
+        self._refresh_session_auto_loop_brain_evaluator(managed)
         return managed
 
     async def run_input(
@@ -1057,6 +1167,7 @@ class DaemonServer:
         """Run one input turn through the target session."""
         result = InputRunResult()
         async with managed.input_lock:
+            self._refresh_session_auto_loop_brain_evaluator(managed)
             managed.current_input_task = asyncio.current_task()
             managed.session.set_activity_status("thinking...")
             try:
@@ -1104,6 +1215,71 @@ class DaemonServer:
                 with suppress(Exception):
                     managed.session.save()
         return result
+
+    async def get_auto_loop_brain_config(self) -> dict[str, Any]:
+        """Return the effective auto-loop-brain runtime config block."""
+
+        return self._auto_loop_brain_payload()
+
+    async def patch_auto_loop_brain_config(self, *, enabled: bool) -> dict[str, Any]:
+        """Persist and hot-apply an auto-loop-brain enabled runtime override."""
+
+        target_enabled = bool(enabled)
+        current = self._auto_loop_brain_config()
+        configured_enabled = bool(
+            self.runtime_config_store.get_auto_loop_brain().get("enabled", False)
+        )
+        if target_enabled == bool(current.enabled) and target_enabled == configured_enabled:
+            return self._auto_loop_brain_payload()
+
+        if target_enabled and _env_flag("KAI_AUTO_LOOP_BRAIN_KILL_SWITCH"):
+            raise ValueError("auto-loop-brain kill switch is active")
+
+        if target_enabled:
+            raw_config = self._effective_agent_config()
+            daemon_config = raw_config.setdefault("daemon", {})
+            if not isinstance(daemon_config, dict):
+                daemon_config = {}
+                raw_config["daemon"] = daemon_config
+            brain_config = daemon_config.setdefault("auto_loop_brain", {})
+            if not isinstance(brain_config, dict):
+                brain_config = {}
+                daemon_config["auto_loop_brain"] = brain_config
+            brain_config["enabled"] = True
+            probe_config = AutoLoopBrainConfig.from_sources(raw_config)
+            try:
+                await asyncio.to_thread(self._probe_auto_loop_brain, probe_config)
+            except Exception as exc:  # noqa: BLE001
+                self._record_auto_loop_brain_boot_probe(False)
+                raise RuntimeError(_sanitize_auto_loop_brain_error(exc)) from exc
+            self._record_auto_loop_brain_boot_probe(True)
+        else:
+            await self._drain_auto_loop_brain_calls()
+
+        self.runtime_config_store.update_auto_loop_brain_enabled(target_enabled)
+        for managed in list(self.sessions.values()):
+            self._refresh_session_auto_loop_brain_evaluator(managed)
+        await self.publish_daemon_event(
+            "auto.loop_brain_toggle",
+            {
+                "from": bool(current.enabled),
+                "to": target_enabled,
+                "actor": "api",
+                "endpoint": "PATCH /api/daemon/config/auto_loop_brain",
+                "ts": _utc_now().isoformat(),
+            },
+        )
+        return self._auto_loop_brain_payload()
+
+    async def _drain_auto_loop_brain_calls(self) -> None:
+        """Best-effort wait for active session turns before disabling critic calls."""
+
+        timeout = _env_float("KAI_AUTO_LOOP_BRAIN_DRAIN_TIMEOUT_SECONDS", default=2.0)
+        deadline = time.monotonic() + max(0.0, timeout)
+        while time.monotonic() < deadline:
+            if not any(managed.input_lock.locked() for managed in self.sessions.values()):
+                return
+            await asyncio.sleep(0.05)
 
     async def stop_session_run(self, session_name: str) -> dict[str, Any]:
         """Cancel the current LLM stream for a live session.
@@ -2518,6 +2694,7 @@ def create_app(
     taskboard_client: Any | None = None,
     taskboard_dispatcher_enabled: bool | None = None,
     heartbeat_config: HeartbeatConfig | None = None,
+    runtime_config_store: RuntimeConfigStore | None = None,
 ) -> FastAPI:
     """Build the FastAPI app that exposes the daemon WebSocket server.
 
@@ -2542,6 +2719,7 @@ def create_app(
         taskboard_client: Optional taskboard fetch client for dispatcher tests.
         taskboard_dispatcher_enabled: Optional dispatcher lifecycle override.
         heartbeat_config: Optional heartbeat override for tests.
+        runtime_config_store: Optional runtime override store for tests.
 
     Returns:
         Configured FastAPI application.
@@ -2559,6 +2737,7 @@ def create_app(
         taskboard_client=taskboard_client,
         taskboard_dispatcher_enabled=taskboard_dispatcher_enabled,
         heartbeat_config=heartbeat_config,
+        runtime_config_store=runtime_config_store,
     )
 
     @asynccontextmanager
@@ -2581,6 +2760,37 @@ def create_app(
     async def health_endpoint(request: Request) -> dict[str, Any]:
         daemon_server.require_http_auth(request)
         return daemon_server.health_snapshot()
+
+    @app.get("/api/health.auto_loop_brain")
+    async def auto_loop_brain_health_endpoint(request: Request) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
+        return daemon_server._auto_loop_brain_health()
+
+    @app.get("/api/daemon/config/auto_loop_brain")
+    async def get_auto_loop_brain_config_endpoint(request: Request) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
+        return await daemon_server.get_auto_loop_brain_config()
+
+    @app.patch("/api/daemon/config/auto_loop_brain")
+    async def patch_auto_loop_brain_config_endpoint(
+        request: Request,
+        payload: AutoLoopBrainToggleRequest,
+    ) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
+        try:
+            return await daemon_server.patch_auto_loop_brain_config(
+                enabled=payload.enabled,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
 
     @app.post("/api/webhooks/taskboard")
     async def taskboard_webhook_endpoint(request: Request) -> dict[str, Any]:
