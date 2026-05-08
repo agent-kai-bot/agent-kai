@@ -8,6 +8,7 @@ from typing import Any
 
 from agent_logger import get_logger
 
+from .agent_pack import load_and_register_pack_role
 from .actions import EXECUTORS, ActionResult, ExecutionContext
 from .actions.base import ACTION_STATUS_FAILED
 from .dedup_table import RouterDedupTable
@@ -189,6 +190,7 @@ class SignalRouter:
                 for raw_action in raw_actions
                 if isinstance(raw_action, dict)
             ]
+            self._register_spawn_agent_packs(actions)
             routes[name] = Route(
                 name=name,
                 channel=str(raw_route.get("channel", "")),
@@ -219,6 +221,24 @@ class SignalRouter:
                 },
             )
         return routes
+
+    def _register_spawn_agent_packs(self, actions: list[ActionDescriptor]) -> None:
+        packs_dir = self.config.get("agent_packs_dir")
+        for action in actions:
+            if action.kind != "spawn_agent":
+                continue
+            pack_name = action.params.get("pack") or action.target
+            if not pack_name:
+                continue
+            outcome = load_and_register_pack_role(
+                str(pack_name),
+                packs_dir=packs_dir,
+                logger=self.log,
+            )
+            self.log_info(
+                "signal_router agent-pack role "
+                f"pack={outcome.pack_name} role={outcome.role_name} status={outcome.status}"
+            )
 
 
 def _action_from_config(raw_action: dict[str, Any]) -> ActionDescriptor:
