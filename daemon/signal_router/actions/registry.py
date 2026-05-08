@@ -10,6 +10,7 @@ from .ignore import IgnoreExecutor
 from .inject_session import InjectSessionExecutor
 from .log import LogExecutor
 from .notify import NotifyExecutor
+from .spawn_agent import SpawnAgentExecutor
 from .trade import TradeExecutor
 from .ui_panel import UIPanelExecutor
 
@@ -19,6 +20,7 @@ EXECUTORS: dict[str, ActionExecutor] = {
     "inject_session": InjectSessionExecutor(),
     "log": LogExecutor(),
     "notify": NotifyExecutor(),
+    "spawn_agent": SpawnAgentExecutor(),
     "trade": TradeExecutor(),
     "ui_panel": UIPanelExecutor(),
 }

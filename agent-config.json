@@ -384,6 +384,7 @@
       "mode": "legacy",
       "channels": {},
       "routes": [],
+      "agent_packs_dir": "${AGENTKAI_HOME}/agent-packs",
       "dedup_table_path": "${AGENTKAI_HOME}/router_dedup.sqlite3"
     },
     "heartbeat": {
