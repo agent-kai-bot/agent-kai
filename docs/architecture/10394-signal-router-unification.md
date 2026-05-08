@@ -2,7 +2,7 @@
 
 Author: Architect
 Date: 2026-05-08
-Status: Final architecture artifact, read-only assessment
+Status: Final architecture artifact, revised 2026-05-08
 
 ## 1. Executive recommendation
 
@@ -10,11 +10,11 @@ Unify KAI's NATS event ingestion behind a daemon-owned `signal_router` framework
 
 1. **Channel** — a named NATS subject group with a payload schema/normalizer and minimal validation.
 2. **Route** — a channel plus a match expression and an ordered action list.
-3. **Action** — a typed terminal effect (`ui_panel`, `inject_session`, `notify`, `trade`, `alert`, `log`, `ignore`).
+3. **Action** — a typed terminal effect (`ui_panel`, `inject_session`, `notify`, `trade`, `alert`, `log`, `ignore`, `spawn_agent`).
 
-The router should become the single subscription manager for scanner signals, AI analyses, and alert-style event streams such as polymarket alarms. The existing `EventInjector` from #10389 should survive as the primitive behind `inject_session`; `AlertSubscriber` should be refactored into a compatibility/config adapter that constructs router channels/routes from its current `subscriptions[]` block.
+The router should become the single subscription manager for scanner signals, AI analyses, and alert-style event streams such as polymarket alarms. The existing `EventInjector` from #10389 should survive as the primitive behind `inject_session`. `AlertSubscriber` should be deprecated cleanly: its config block migrates through a read-time compatibility shim into router channels/routes, and its independent NATS subscription wrapper is deleted after shadow/new-mode validation.
 
-Live trading must be protected by a strict backward-compatibility shim for existing top-level `signal_handlers[]`. The shim must translate every legacy handler into router routes at config-load time, preserve matching, cooldown, autotrade gating, and action semantics, and fail daemon startup if translation cannot be proven. Cutover should use `daemon.signal_router.mode: legacy | shadow | new`, defaulting to `shadow` only after Phase A lands, plus `KAI_SIGNAL_ROUTER_KILL_SWITCH=1` to force legacy behavior.
+Live trading must be protected by a strict backward-compatibility shim for existing top-level `signal_handlers[]`. The shim must translate every legacy handler into router routes at config-load time, preserve matching, cooldown, autotrade gating, and action semantics, and fail daemon startup if translation cannot be proven. Cutover should use `daemon.signal_router.mode: legacy | shadow | new`, defaulting to `shadow` only after Phase A lands, plus `KAI_SIGNAL_ROUTER_KILL_SWITCH=1` to force legacy behavior. The new `spawn_agent` action has no legacy equivalent; in shadow it must only emit would-have-fired metrics and must not create a process.
 
 Recommended UI decision: keep one Svelte signal/alert stream initially, using the existing `SignalPanel.svelte` with category badges and filters (`signals`, `alerts`, `ai_analyses`) rather than creating multiple panels now. Separate panels can be deferred until operator clutter is proven.
 
@@ -28,6 +28,14 @@ Recommended UI decision: keep one Svelte signal/alert stream initially, using th
 - `web/src/lib/components/SignalPanel.svelte`
 - `agent-config.json`
 - `docs/architecture/10387-alert-subscriber.md`
+- `/home/atc/git/OPS/kai-alert-response/README.md`
+- `/home/atc/git/OPS/kai-alert-response/system_prompt.md`
+- `/home/atc/git/OPS/kai-alert-response/decision_logic.md`
+- `/home/atc/git/OPS/kai-alert-response/tools_reference.md`
+- `/home/atc/git/OPS/kai-alert-response/nats_payload_schema.json`
+- `/home/atc/git/OPS/kai-alert-response/alert_format_examples.md`
+- `/home/atc/git/OPS/kai-alert-response/integration_checklist.md`
+- `/home/atc/git/OPS/kai-alert-response/example_alarms/01_cross_above_0_65_sentinel_match.json`
 
 ## 3. Current-state summary
 
@@ -58,7 +66,7 @@ Recommended UI decision: keep one Svelte signal/alert stream initially, using th
   - `webhook`
 - Enforces `/autotrade` gating if `requires_autotrade: true` or dispatching to the `trader` agent.
 
-The prompt says the production domain verbs are `notify / trade / alert / log / ignore`; implementation currently names some older terminal effects differently. The router should expose the new seven-kind action taxonomy while preserving legacy verb mappings via shim.
+The prompt says the production domain verbs are `notify / trade / alert / log / ignore`; implementation currently names some older terminal effects differently. The router should expose the new eight-kind action taxonomy while preserving legacy verb mappings via shim.
 
 ### 3.2 Alert path: new and default-disabled
 
@@ -83,6 +91,18 @@ The prompt says the production domain verbs are `notify / trade / alert / log / 
 
 This 1-day work is not wasted. It is the foundation for the router's `inject_session` action.
 
+### 3.3 Polymarket alert-response contract
+
+The polymarket-alpha-alarms team has supplied a concrete agent bundle at `/home/atc/git/OPS/kai-alert-response/`. It defines the canonical agent-pack shape for alarm-response agents:
+
+- `system_prompt.md` is the required spawned-agent role/goal.
+- `decision_logic.md` is optional additional guidance and includes the seven-step alarm decision tree.
+- `tools_reference.md` describes local host tools and env vars.
+- `nats_payload_schema.json` is the optional schema for the user-message payload.
+- `example_alarms/` contains captured fixtures for route and pack tests.
+
+Operator-confirmed deployment assumption: all relevant trading-platform infra is on the same host as the KAI daemon (`atc-home`). The router and spawned agents can directly access `/home/atc/git/OPS/vpn-stack/scripts/lib/local_first.py`, `/home/atc/git/OPS/vpn-stack/scripts/cache/sweep_state/edge_sentinel_<DATE>.json`, `/home/atc/git/OPS/vpn-stack/scripts/cache/sweep_state/codex_audit/audit_<DATE>.jsonl`, `nats://localhost:4222`, and `docker exec timescaledb psql ...` without cross-host RPC.
+
 ## 4. Target architecture
 
 ### 4.1 High-level flow
@@ -97,6 +117,7 @@ flowchart LR
   ACT[Action executor]
   UI[Web UI SignalPanel]
   INJ[EventInjector]
+  SPAWN[Fresh agent process]
   AUTO[Autotrade / order path]
   NOTIFY[Notify / alert / log]
 
@@ -107,6 +128,7 @@ flowchart LR
   MATCH --> ACT
   ACT -->|ui_panel| UI
   ACT -->|inject_session| INJ
+  ACT -->|spawn_agent| SPAWN
   ACT -->|trade| AUTO
   ACT -->|notify/alert/log| NOTIFY
 ```
@@ -117,7 +139,7 @@ One router subscribes to all configured channels. For each inbound message it:
 2. Normalizes payload into a `RoutedEvent`.
 3. Stores event in the relevant bounded buffer if configured.
 4. Evaluates routes for that channel in declaration order.
-5. Applies cooldown/rate-limit/autotrade gates.
+5. Applies pre-action filters, cooldown/rate-limit/cap gates, and autotrade gates.
 6. Executes each matched route's ordered actions.
 7. Emits metrics and shadow-diff telemetry.
 
@@ -203,7 +225,7 @@ Route evaluation rules:
 
 An **Action** is a typed terminal effect with `kind`, `target`, and per-kind parameters.
 
-The router should expose exactly these seven action kinds in the public config API:
+The router should expose exactly these eight action kinds in the public config API:
 
 1. `ui_panel`
    - Target taxonomy: `signals | alerts | ai_analyses | <future>`.
@@ -236,6 +258,56 @@ The router should expose exactly these seven action kinds in the public config A
 7. `ignore`
    - Target optional.
    - No-op action that records a decision reason in metrics/audit.
+
+8. `spawn_agent`
+   - Target: an agent-pack name, represented explicitly as `pack`.
+   - Resolves to `$AGENTKAI_HOME/agent-packs/<name>/`.
+   - Starts a fresh autonomous agent process per matched alarm/event rather than injecting into an existing session.
+   - Uses full shell/tool access by design; tool-less or approval-gated guarantees do not apply to this action kind.
+   - Primary params: `pack`, `executor`, `model`, `reasoning_effort`, `bypass_approvals`, `timeout_seconds`, `cooldown_key_template`, `cooldown_seconds`, `daily_cap`, `hourly_cap`, `audit_path_template`, `env_passthrough`.
+
+Canonical agent-pack structure:
+
+```text
+$AGENTKAI_HOME/agent-packs/<name>/
+├── system_prompt.md          # required - LLM role/goal
+├── decision_logic.md         # optional - appended to system prompt
+├── tools_reference.md        # optional - appended as tool guidance
+├── nats_payload_schema.json  # optional - schema for user-message payload
+├── README.md                 # human docs, not loaded into prompt
+└── example_alarms/           # optional test fixtures, not loaded
+```
+
+Other future packs for other trading platforms or event sources should follow the same shape.
+
+### 4.3 RouterDedupTable
+
+Cooldown, dedup, and route-level caps should be a first-class router subsystem, not a private detail of `inject_session`.
+
+`RouterDedupTable`:
+
+- Backing store: SQLite at `$AGENTKAI_HOME/router_dedup.sqlite3`.
+- Rows: `namespace`, `key`, `expires_at`, `created_at`, `metadata_json`.
+- Cooldown keys are rendered from action templates, e.g. `{rule_id}:{token_id}`.
+- Daily/hourly cap rows use separate namespaces such as `cap:day:<route>:<YYYY-MM-DD>` and `cap:hour:<route>:<hour-bucket>`.
+- Check-and-set must be atomic: the router consults the table before invoking an action and suppresses the action on hit.
+- Recovery is durable across daemon restart. This goes beyond the polymarket bundle's in-memory-acceptable recommendation and is appropriate for a daemon-owned router.
+
+Health surface in `/api/health.signal_router`:
+
+```json
+{
+  "dedup_db": "ok",
+  "spawns_today": 12,
+  "spawns_this_hour": 3,
+  "spawns_this_minute": 1,
+  "top_suppressed": [
+    {"rule_id": "cross_above_0_65", "token_id": "824171...", "count": 4}
+  ]
+}
+```
+
+Per-action telemetry should distinguish suppression reason: cooldown, daily cap, hourly cap, shadow dry-run, validation failure, and execution failure.
 
 ## 5. Configuration shape
 
@@ -290,20 +362,19 @@ daemon:
           - kind: ui_panel
             target: ai_analyses
 
-      - name: polymarket-alerts-to-kai
+      - name: polymarket-alarm-response
         enabled: false
         channel: polymarket_alarms
         match: {}
         actions:
-          - kind: ui_panel
-            target: alerts
-          - kind: inject_session
-            target: kai
-            template: prompts/alerts/polymarket.md.tmpl
-            rate_limit:
-              max_per_hour: 10
-            dedup:
-              ttl_seconds: 900
+          - kind: spawn_agent
+            pack: kai-alert-response
+            executor: codex-cli
+            timeout_seconds: 300
+            cooldown_key_template: "{rule_id}:{token_id}"
+            cooldown_seconds: 600
+            daily_cap: 50
+            hourly_cap: 10
 ```
 
 ### 5.3 Example: existing `signal_handlers[]` translated
@@ -378,11 +449,45 @@ Shim output:
 
 If channel inference is ambiguous, default legacy handlers to `trade_signals` unless the match explicitly identifies `source: ai-token-analyzer` or `signal_type: ANALYSIS`. Emit a warning in `legacy` mode, but fail fast in `shadow`/`new` if the route would not be behaviorally comparable.
 
+### 5.4 Example: polymarket alarm-response route
+
+The operator-confirmed polymarket route is not `inject_session`. It spawns a fresh autonomous process per unsuppressed alarm and hands that process the alarm payload plus the `kai-alert-response` agent pack.
+
+```yaml
+daemon:
+  signal_router:
+    routes:
+      - name: polymarket-alarm-response
+        channel: polymarket_alarms
+        match: {}                        # all alarms; per-rule filtering inside the agent pack
+        actions:
+          - kind: spawn_agent
+            pack: kai-alert-response
+            executor: codex-cli
+            model: gpt-5.5
+            reasoning_effort: high
+            bypass_approvals: true
+            timeout_seconds: 300
+            cooldown_key_template: "{rule_id}:{token_id}"
+            cooldown_seconds: 600
+            daily_cap: 50
+            hourly_cap: 10
+            audit_path_template: "/home/atc/git/OPS/vpn-stack/scripts/cache/sweep_state/codex_audit/audit_{date}.jsonl"
+            env_passthrough: [KAI_PUSHOVER_USER, KAI_PUSHOVER_TOKEN, KAI_NTFY_TOPIC]
+    channels:
+      polymarket_alarms:
+        subjects: ["polymarket.alpha.alarm.>"]
+        schema: polymarket_alarm   # references kai-alert-response/nats_payload_schema.json
+```
+
+The pack should be staged under `$AGENTKAI_HOME/agent-packs/kai-alert-response/`. In the current operator host layout the source bundle lives at `/home/atc/git/OPS/kai-alert-response/`; deployment may symlink or copy it, but config should reference the stable pack name, not the source path.
+
 ## 6. Backward-compatibility shim — critical design
 
 ### 6.1 Requirements
 
 - Top-level `signal_handlers[]` stays valid byte-for-byte.
+- Existing `daemon.alert_subscriber` stays valid and is translated on read into router channels/routes.
 - No operator config rewrite is required during Phase A/B.
 - Every enabled legacy handler must translate to one or more router routes.
 - Shim failures must fail daemon startup in `shadow` or `new`; do not silently skip trade rules.
@@ -403,6 +508,8 @@ If channel inference is ambiguous, default legacy handlers to `trade_signals` un
 | `action: publish` | `kind: notify`, `target: nats`, `subject: subject`, `template_inline: template` or raw event |
 | `action: webhook` | `kind: notify`, `target: webhook`, `url: url`, `template_inline: template` |
 | implicit trader gate | if `agent.lower() == "trader"`, force autotrade gate even if `requires_autotrade` is false |
+
+`daemon.alert_subscriber.subscriptions[]` uses the Section 12 mapping and produces `source_compat: alert_subscriber` routes. For polymarket, the target action is now `spawn_agent` when the route is migrated to the operator-confirmed `kai-alert-response` pack; old `inject_session` alert configs can still be represented for compatibility until the operator migrates them.
 
 ### 6.3 Shim validation
 
@@ -455,7 +562,33 @@ match:
   score: {op: ">=", value: 0.8}
 ```
 
-But this is out of scope for Phase A-C.
+But this is out of scope for Phase A-C, except for the explicit pre-action gate below.
+
+### 7.1 Pre-action filter gate
+
+Architect recommendation: use a `pre_action` filter instead of expanding `match` with file-backed operators.
+
+Reasoning:
+
+- The core `match` language must stay identical to `signal_handlers.py` for legacy parity and live-trading safety.
+- Sentinel lookup is a side-effect-adjacent file read with date templating and JSON parsing; it should not be hidden inside the legacy matcher.
+- Some routes, including the canonical polymarket route in Section 5.4, intentionally let the agent pack perform per-rule filtering. A pre-action gate is available when the operator wants declarative short-circuiting, without forcing it into every pack.
+
+Shape:
+
+```yaml
+pre_action:
+  kind: filter
+  expr:
+    sentinel_match:
+      file: "/home/atc/git/OPS/vpn-stack/scripts/cache/sweep_state/edge_sentinel_{date}.json"
+      token_field: "token_id"
+      tokens_path: "$.tokens"
+      whitelist_rules_path: "$.whitelist_rules"
+      on_missing: "allow_high_leverage_only"
+```
+
+`sentinel_match` returns `allow`, `suppress`, or `error`. `suppress` writes an audit row and emits route telemetry but does not invoke the action. `error` follows route policy: for polymarket, malformed sentinel should produce escalation/audit rather than silently dropping high-leverage rules.
 
 ## 8. Code reorganization
 
@@ -465,7 +598,7 @@ Use `daemon/signal_router.py` as the primary module because:
 
 - `EventInjector` is daemon-owned.
 - UI session event publishing is daemon-owned.
-- AlertSubscriber and Heartbeat-style injection are daemon services.
+- AlertSubscriber compatibility and Heartbeat-style injection are daemon services.
 - Feature flags live under `daemon` config.
 
 Keep lightweight compatibility types or imports in `agent/` only if tools depend on them.
@@ -481,6 +614,10 @@ Keep lightweight compatibility types or imports in `agent/` only if tools depend
 - `RouteDecision`
 - `ActionDecision`
 - `SignalRouterConfig`
+- `RouterDedupTable`
+- `RouterAuditWriter`
+- `SpawnAgentExecutor`
+- `AgentPackLoader`
 - `SignalRouter`
 - `load_signal_router_config(config)`
 - `translate_legacy_signal_handlers(config)`
@@ -503,9 +640,10 @@ Keep lightweight compatibility types or imports in `agent/` only if tools depend
 
 `daemon/alert_subscriber.py`:
 
-- Refactor into a thin adapter that loads current `daemon.alert_subscriber` config and returns channels/routes.
-- Keep `AlertEvent` normalization helpers if useful as the `polymarket_alarm` schema normalizer.
-- Do not keep a separate NATS subscription manager after router cutover.
+- Keep only as a transitional config adapter during shim phases.
+- Translate current `daemon.alert_subscriber` config into channels/routes at config-load time.
+- Keep `AlertEvent` normalization helpers only if useful as the `polymarket_alarm` schema normalizer.
+- Delete the independent NATS subscription manager after router cutover validation.
 
 `daemon/server.py`:
 
@@ -523,7 +661,8 @@ SignalRouter
   - event_injector
   - action_executor
   - buffers: channel -> deque
-  - cooldown_tracker
+  - dedup_table
+  - audit_writer
   - stats
   - start(): subscribe once per unique subject pattern/channel binding
   - handle_message(channel, subject, payload): normalize, buffer, route, execute
@@ -548,6 +687,7 @@ The callback must stay hot-path safe:
 - Normalize and decision computation should be synchronous and cheap.
 - Slow action effects should be scheduled/backgrounded.
 - Do not await webhooks, injected turns, or agent runs inside the NATS callback except through bounded async scheduling consistent with current `SignalHandlerRunner.run_async` behavior.
+- `spawn_agent` is always scheduled outside the hot callback and bounded by `timeout_seconds`.
 
 ## 9. Action execution details
 
@@ -588,7 +728,7 @@ Whether `inject_session` also publishes `signal.received`:
 
 - **No, not implicitly.** UI surfacing must be explicit via `ui_panel` action.
 - Rationale: session injection and UI display are separate effects. Some injected events may be noisy or sensitive; some UI events should not wake agents.
-- Routes that need both should declare both actions, as the polymarket example does.
+- Routes that need both should declare both actions explicitly.
 
 ### 9.2 `inject_session`
 
@@ -631,9 +771,133 @@ Implement these as small action adapters, not as separate subscription systems.
 - `notify target=chat` maps legacy `chat_message`.
 - `notify target=nats` maps legacy `publish`.
 - `notify target=webhook` maps legacy `webhook`.
+- `notify target=push` supports `pushover`, `ntfy`, and `log_only` backends.
 - `alert` emits high-salience operator alert telemetry/UI events.
 - `log` writes structured log/audit records.
 - `ignore` records route decision and reason; optional `stop_processing` can be introduced later.
+
+`notify target=push` shape:
+
+```yaml
+- kind: notify
+  target: push
+  backends: [pushover, ntfy, log_only]
+  pushover:
+    user_env: KAI_PUSHOVER_USER
+    token_env: KAI_PUSHOVER_TOKEN
+    priority: 1
+    url: "{polymarket_url}"
+    url_title: "Open Polymarket"
+  ntfy:
+    topic_env: KAI_NTFY_TOPIC
+    priority: 3
+```
+
+Rules:
+
+- Env vars only; never inline Pushover user keys, tokens, or ntfy topics.
+- Fallback chain is route-configured, normally `pushover -> ntfy -> log_only`.
+- Pushover priority accepts `0 | 1 | 2`; ntfy priority accepts `1-5`.
+- If all configured push backends fail, write audit, emit `auto.notify.push.failed`, and do not block the rest of the route.
+
+### 9.5 `spawn_agent`
+
+`spawn_agent` starts a fresh process for each unsuppressed route action. This is intentionally different from `inject_session`: no existing KAI session receives a human message, and no prior conversational state is reused.
+
+Action params:
+
+```yaml
+- kind: spawn_agent
+  pack: kai-alert-response
+  executor: codex-cli
+  model: gpt-5.5
+  reasoning_effort: high
+  bypass_approvals: true
+  timeout_seconds: 300
+  cooldown_key_template: "{rule_id}:{token_id}"
+  cooldown_seconds: 600
+  daily_cap: 50
+  hourly_cap: 10
+  audit_path_template: "/home/atc/git/OPS/vpn-stack/scripts/cache/sweep_state/codex_audit/audit_{date}.jsonl"
+  env_passthrough: [KAI_PUSHOVER_USER, KAI_PUSHOVER_TOKEN, KAI_NTFY_TOPIC]
+```
+
+Parameter contract:
+
+- `pack: string` resolves to `$AGENTKAI_HOME/agent-packs/<name>/`.
+- `executor: string` is `codex-cli | claude-cli | openai | anthropic`; default `codex-cli`.
+- `model: string` defaults to the executor's default model.
+- `reasoning_effort: string` is `medium | high | xhigh` and applies to `codex-cli` only.
+- `bypass_approvals: bool` defaults to `true`. This follows Dan's autonomy-by-design rule for this product path.
+- `timeout_seconds: int` hard-kills the spawned process; default `300`.
+- `cooldown_key_template: string` is a Jinja-style field template that renders the action dedup key, e.g. `{rule_id}:{token_id}`.
+- `cooldown_seconds: int` defaults to `0`; polymarket uses `600`.
+- `daily_cap: int` defaults to `0` unlimited; polymarket uses `50`.
+- `hourly_cap: int` defaults to `0` unlimited; polymarket uses `10`.
+- `audit_path_template: string` controls where decisions are written.
+- `env_passthrough: list[string]` forwards only named environment variables into the child.
+
+Pack loading:
+
+- Load `system_prompt.md` first.
+- Append `decision_logic.md` and `tools_reference.md` if present.
+- Validate the inbound payload against `nats_payload_schema.json` if present before spawning.
+- Do not load `README.md` or `example_alarms/` into the prompt.
+- The user message to the spawned process contains subject, route name, rendered event payload, and router metadata.
+
+Process semantics:
+
+- Spawn outside the NATS callback.
+- Enforce `RouterDedupTable` cooldown and cap checks before process creation.
+- Shadow mode must not spawn. It records would-have-fired `spawn_agent` decisions only.
+- Tool-less guarantees do not apply. `spawn_agent` is a full-tools, full-shell autonomous agent by design, with per-step approvals bypassed when configured.
+- The spawned process inherits the daemon host filesystem and can import `/home/atc/git/OPS/vpn-stack/scripts/lib/local_first.py`, read sentinel/audit files, reach `nats://localhost:4222`, and run local shell commands subject to daemon process permissions.
+
+Telemetry:
+
+- `auto.spawn_agent.fired`
+- `auto.spawn_agent.suppressed_cooldown`
+- `auto.spawn_agent.suppressed_daily_cap`
+- `auto.spawn_agent.suppressed_hourly_cap`
+- `auto.spawn_agent.exit_ok`
+- `auto.spawn_agent.exit_failed`
+- `auto.spawn_agent.timed_out`
+
+### 9.6 Audit log writes
+
+Every route decision writes one JSONL row: fired, suppressed, failed, timed out, or shadow would-have-fired. This is a router side effect, not merely an action-specific log.
+
+Default path:
+
+```text
+$AGENTKAI_HOME/audit/router_{date}.jsonl
+```
+
+Routes may override with `audit_path_template`. The polymarket route uses:
+
+```text
+/home/atc/git/OPS/vpn-stack/scripts/cache/sweep_state/codex_audit/audit_{date}.jsonl
+```
+
+Minimum row fields:
+
+```json
+{
+  "ts": "2026-05-08T19:42:11.337Z",
+  "route": "polymarket-alarm-response",
+  "channel": "polymarket_alarms",
+  "subject": "polymarket.alpha.alarm.cross_above_0_65",
+  "action_kind": "spawn_agent",
+  "decision": "fired",
+  "reason": null,
+  "rule_id": "cross_above_0_65",
+  "token_id": "824171...",
+  "cooldown_key": "cross_above_0_65:824171...",
+  "shadow": false
+}
+```
+
+Audit write failure emits telemetry and structured daemon logs. It should not block a notification fallback chain, but repeated audit failures should mark `/api/health.signal_router.audit` unhealthy.
 
 ## 10. UI surface decision
 
@@ -665,7 +929,7 @@ Wire decision:
 - Add payload `category` instead of adding a new websocket subscription channel in Phase A-C.
 - Do not publish `signal.received` for `inject_session` unless the route includes `ui_panel`.
 
-Optional Phase 6:
+Optional Phase 8:
 
 - Rename UI subscription channel from `signals` to `events` while keeping `signals` as alias.
 - Split visual sections within the same component if clutter appears.
@@ -690,7 +954,8 @@ Kill-switch behavior:
 
 - Forces `mode=legacy` unconditionally.
 - Starts only legacy `SignalConsumer`/`SignalHandlerRunner` path for signals.
-- Keeps `AlertSubscriber` behavior at its current default-disabled setting.
+- During transitional releases, keeps legacy `AlertSubscriber` behavior at its current default-disabled setting if that service still exists.
+- Prevents all router-only effects, including `spawn_agent`.
 - Emits a clear health/metrics field: `signal_router.kill_switch_active=true`.
 
 ### Phase A: Land router code path + shim, no behavior change
@@ -700,6 +965,7 @@ Behavior:
 - Legacy path remains authoritative.
 - Router subscribes in shadow only if duplicate subscriptions will not produce duplicate side effects. Prefer feeding router from the legacy callback during early shadow to avoid NATS duplicate side effects; if it subscribes to NATS directly, all actions must be dry-run except metrics.
 - Router computes route decisions but does not execute side effects.
+- `spawn_agent` is wired and config-validatable, including agent-pack validation, but is not invoked in `legacy` or `shadow`.
 - Router emits shadow metrics comparing legacy decisions and router decisions.
 
 Deliverables:
@@ -724,7 +990,8 @@ Behavior:
 - `mode=shadow` remains default after Phase A confidence.
 - Legacy side effects remain authoritative.
 - Router either receives mirrored events from legacy path or direct NATS events with dry-run effects.
-- Metrics expose divergence.
+- Router shadow-evaluates routes including `spawn_agent`, but must not actually spawn; it only counts would-have-fired, suppressed-cooldown, and cap decisions.
+- Metrics expose divergence and spawn dry-run counts.
 
 Minimum validation period:
 
@@ -741,6 +1008,7 @@ signal_router_legacy_diff_total{kind}
 signal_router_legacy_diff_rate
 signal_router_decision_latency_ms_bucket
 signal_router_action_dry_run_total{kind,target}
+signal_router_spawn_agent_would_fire_total{route,pack}
 signal_router_shim_translation_errors_total
 signal_router_subject_overlap_warnings_total
 ```
@@ -773,6 +1041,8 @@ Behavior:
 - Operator sets `daemon.signal_router.mode: new` or `legacy_path: false` if that legacy boolean exists.
 - Legacy signal side effects stop.
 - Router executes actions authoritatively.
+- `spawn_agent` actions actually fire, subject to `RouterDedupTable`, caps, timeout, and audit writes.
+- The polymarket `kai-alert-response` route can be enabled at this point.
 - Legacy `SignalConsumer` becomes query facade or is disabled except for compatibility methods.
 
 Immediate rollback:
@@ -793,11 +1063,12 @@ Only after at least one stable release/week in `new` mode:
 
 - Remove old independent signal handler runner if unused.
 - Keep config shim for `signal_handlers[]` for at least one additional release unless operator explicitly migrates config.
-- Remove `AlertSubscriber` as a subscription service; keep alert config adapter if legacy `daemon.alert_subscriber` still supported.
+- Delete `daemon/alert_subscriber.py` as a subscription service after the read-time shim has run cleanly for N days in shadow plus `mode: new`.
+- Delete `daemon/event_injector.py` alert-only glue, but preserve `EventInjector` itself for heartbeat and router `inject_session`.
 
 ## 12. AlertSubscriber's fate
 
-Recommendation: refactor `daemon/alert_subscriber.py` into a thin adapter, not a second subscriber.
+Operator decision: deprecate `AlertSubscriber` cleanly, not refactor it as a long-lived thin wrapper.
 
 Current `daemon.alert_subscriber.subscriptions[]` maps to:
 
@@ -811,15 +1082,18 @@ routes:
   - name: alert-subscription:polymarket-default
     enabled: false
     channel: polymarket_alarms
+    source_compat: alert_subscriber
     match: {}
     actions:
-      - kind: ui_panel
-        target: alerts
-      - kind: inject_session
-        target: kai
-        template: prompts/alerts/polymarket.md.tmpl
-        rate_limit:
-          max_per_hour: 10
+      - kind: spawn_agent
+        pack: kai-alert-response
+        executor: codex-cli
+        bypass_approvals: true
+        timeout_seconds: 300
+        cooldown_key_template: "{rule_id}:{token_id}"
+        cooldown_seconds: 600
+        daily_cap: 50
+        hourly_cap: 10
 ```
 
 Mapping details:
@@ -829,13 +1103,26 @@ Mapping details:
 | `enabled` global | controls whether adapter routes are enabled/loaded, unless kill switch |
 | `kill_switch` | disables generated alert routes |
 | `subject_pattern` | channel subject |
-| `prompt_template_path` | `inject_session.template` |
-| `target_session` | `inject_session.target` |
+| `prompt_template_path` | legacy `inject_session.template`; superseded by `spawn_agent.pack` for polymarket |
+| `target_session` | legacy `inject_session.target`; superseded by fresh process semantics for polymarket |
 | `target_agent` | optional metadata or future role override; do not invent new routing now |
-| `max_injected_turns_per_hour` | `inject_session.rate_limit.max_per_hour` |
+| `max_injected_turns_per_hour` | legacy `inject_session.rate_limit.max_per_hour`; maps to `hourly_cap` for spawn-agent routes |
 | alert normalizer | channel schema `polymarket_alarm` |
 
-The adapter should preserve env overrides (`KAI_ALERT_SUBSCRIBER_*`) until config migration is complete.
+Migration behavior:
+
+- The shim translates the legacy block on read, so existing `agent-config.json` does not require a flag day.
+- Old configs keep working through the shim while operators move to `daemon.signal_router.routes`.
+- The polymarket subscription becomes a route under the unified `signal_router` framework.
+- The operator-confirmed route is the Section 5.4 `spawn_agent` route, not an `inject_session` route.
+- Env overrides (`KAI_ALERT_SUBSCRIBER_*`) are preserved only through the compatibility window.
+
+Deletion criteria:
+
+- Run the read-time shim cleanly for N operator-approved days in shadow.
+- Run `mode: new` with router-owned polymarket subscriptions and zero alert-router critical diffs.
+- Delete `daemon/alert_subscriber.py` and the alert-only path in `daemon/event_injector.py`.
+- Preserve `EventInjector` itself. Heartbeat still uses it, and the router's `inject_session` action still uses it.
 
 ## 13. Subject-pattern collision handling
 
@@ -858,10 +1145,12 @@ Targets:
 - p95 decision latency under 5 ms, excluding side-effect execution.
 - p99 decision latency under 20 ms.
 - NATS callback does not block on webhooks, agent turns, or network notifications.
+- NATS callback does not block on spawned agent processes; enqueue spawn work and return.
 - Route matching remains O(routes for channel), not O(all routes).
 - Pre-index routes by channel.
 - Pre-parse match keys and action configs at load time.
 - Template files should be loaded/cached at config load; inline templates are precompiled if practical.
+- SQLite dedup check-and-set must stay under the same p95/p99 decision budget.
 
 ## 15. Failure modes and handling
 
@@ -871,11 +1160,16 @@ Targets:
 | Legacy shim translation failure | Fail startup in `shadow/new`; never silently drop enabled handler |
 | Unknown action kind | Fail config validation |
 | Unknown `inject_session` target | Fail config validation for enabled route |
+| Unknown `spawn_agent` pack | Fail config validation for enabled route |
 | Missing template file | Fail config validation for enabled route |
 | Malformed payload | Drop event, increment malformed metric, do not inject |
 | Subject overlap | Fail if enabled and ambiguous in `shadow/new`; warn in `legacy` |
 | Action execution exception | Log, increment action error, continue next route unless policy says stop |
 | `EventInjector` target busy/rate-limited | Publish/drop telemetry, no retry queue in v1 |
+| `spawn_agent` timeout | Kill process, emit `auto.spawn_agent.timed_out`, write audit |
+| `spawn_agent` cap/cooldown hit | Suppress before process creation, emit specific telemetry, write audit |
+| Push backend failure | Fall through configured chain; if all fail, emit `auto.notify.push.failed` and audit |
+| Audit write failure | Emit telemetry/log; mark health unhealthy if repeated |
 | Autotrade disabled | Gate action, emit metric/log; do not execute |
 | Router unavailable | Kill switch or `mode=legacy` falls back to old path |
 | In-flight alert at cutover | At-most-once semantics; accept possible drop during restart, no durable replay in v1 |
@@ -901,6 +1195,19 @@ Targets:
   - disabled handlers preserved as disabled routes
 - Action validation:
   - unknown target/action/template fails.
+- `spawn_agent` action:
+  - mock subprocess and verify executor args, model, reasoning effort, approval bypass flag, hard timeout, and exit code handling.
+  - verify `env_passthrough` forwards only named env vars.
+  - verify cooldown/cap checks run before process creation.
+  - verify telemetry events for fired, suppressed cooldown, suppressed daily/hourly cap, exit ok, exit failed, and timed out.
+- `RouterDedupTable`:
+  - atomic concurrent check-and-set permits one winner.
+  - cooldown rows survive daemon restart.
+  - daily/hourly cap namespaces do not collide with cooldown keys.
+- `notify target=push`:
+  - pushover failure falls through to ntfy success.
+  - pushover and ntfy failure falls through to `log_only`.
+  - `auto.notify.push.failed` emits only when the push chain fails.
 
 ### 16.2 Golden fixture tests
 
@@ -912,6 +1219,7 @@ Build a fixture matrix from current `agent-config.json`:
 - clucmay BUY BTC/ETH/SOL matching trader handler and autotrade gate.
 - AI analyzer completion matching chat handler.
 - Negative fixtures for wrong symbol, wrong signal type, missing confidence.
+- Polymarket alarm-response fixture from `/home/atc/git/OPS/kai-alert-response/example_alarms/01_cross_above_0_65_sentinel_match.json`.
 
 For each fixture compare:
 
@@ -932,35 +1240,42 @@ For each fixture compare:
 
 - NATS fake bus publishes `signals.clucmay02.BTC`; UI receives one `signal.received`.
 - `get_signals` returns the same newest-first results as before.
-- Alert subscription config generates polymarket route and `inject_session` request.
+- Alert subscription config generates a polymarket router route through the compatibility shim.
+- Polymarket route end-to-end: captured fixture matches `polymarket-alarm-response`, passes pack schema validation, renders cooldown key `cross_above_0_65:<token_id>`, writes audit, and would spawn in `new` mode.
+- Shadow-mode polymarket route records would-have-spawned metrics but creates no subprocess.
+- Legacy `inject_session` alert configs remain representable until migration.
 - Busy session/rate-limit drops are emitted through existing `auto.alert_*`-style telemetry or router equivalent.
 
 ## 17. Phased ticket plan, decision criteria, and ETA
 
 Do not file these automatically; this is the recommended implementation sequence.
 
-### Phase 1 — Router skeleton + data model + shim harness
+### Phase 1 — Router skeleton + RouteDecision model + RouterDedupTable + shim harness
 
 Scope:
 
 - Add router config/data classes.
 - Add channel/route/action model.
+- Add `RouteDecision`/`ActionDecision` dry-run model.
+- Add `RouterDedupTable` with SQLite durability, atomic check-and-set, and cap namespaces.
 - Add config validation framework.
 - Add legacy shim harness, dry-run only.
 
 Decision criteria:
 
 - Unit tests pass for parsing/validation.
+- Dedup concurrent-write and restart-durability tests pass.
 - No runtime path change.
 - Kill switch recognized.
 
-ETA with serial CR/SA/QA: 2-3 developer days + 1 day review/QA.
+ETA with serial dev/CR/SA/QA: 4-5 developer days.
 
-### Phase 2 — Backward-compat shim parity
+### Phase 2 — Backward-compat shims
 
 Scope:
 
 - Implement full `signal_handlers[] -> routes[]` translation.
+- Implement `daemon.alert_subscriber -> routes[]` migration shim.
 - Extract/reuse matcher.
 - Build golden parity fixture suite.
 
@@ -969,59 +1284,98 @@ Decision criteria:
 - 100% parity on golden fixtures.
 - Enabled malformed legacy trade handler fails startup in shadow/new.
 - Trader autotrade gate parity proven.
+- Existing alert subscriber config translates without requiring an `agent-config.json` flag day.
 
-ETA: 2-3 developer days + 1-2 days review/QA.
+ETA: 4-5 developer days.
 
-### Phase 3 — New action kinds + AlertSubscriber refactor
+### Phase 3 — Core action kinds
 
 Scope:
 
 - Implement `ui_panel` and `inject_session` action executors.
-- Map `notify`, `alert`, `log`, `ignore` minimally.
-- Refactor `daemon.alert_subscriber` config into generated router channels/routes.
+- Implement `notify` including `push` subtypes and fallback chain.
+- Implement `log`, `ignore`, `alert`, and `trade` validators/executors.
 - Reuse `EventInjector`.
 
 Decision criteria:
 
 - Existing `signal.received` UI unchanged for signals.
-- Polymarket default remains disabled.
-- Enabled polymarket fixture injects through `EventInjector` with same template values.
+- Push fallback tests pass: Pushover -> ntfy -> log-only.
+- `trade` and trader-targeted injection remain autotrade-gated.
 
-ETA: 3-5 developer days + 2 days review/QA/security.
+ETA: 5-7 developer days.
 
-### Phase 4 — Shadow mode + diff metrics + telemetry
+### Phase 4 — `spawn_agent` + agent-pack format + bundle staging
+
+Scope:
+
+- Implement `spawn_agent` executor for `codex-cli` first, with executor interface for `claude-cli`, `openai`, and `anthropic`.
+- Implement agent-pack loader and validation.
+- Stage or symlink `kai-alert-response` into `$AGENTKAI_HOME/agent-packs/kai-alert-response/`.
+- Enforce cooldown, daily cap, hourly cap, timeout, audit, and env passthrough.
+- Add polymarket fixture tests from the bundle.
+
+Decision criteria:
+
+- Mock subprocess tests prove args/env/timeout/exit telemetry.
+- Shadow mode never spawns.
+- Polymarket fixture would spawn exactly once, then suppresses on cooldown.
+
+ETA: 5-7 developer days.
+
+### Phase 5 — Shadow mode + diff metrics + telemetry
 
 Scope:
 
 - Run legacy side effects and router dry-run decisions in parallel.
 - Emit diff metrics and health.
 - Prevent duplicate side effects.
+- Include `spawn_agent` would-have-fired metrics and suppression counters.
 
 Decision criteria:
 
 - Shadow mode can run continuously.
 - Diff metrics visible.
 - No duplicate UI/session/action side effects.
+- No subprocesses are created in shadow.
 - Decision latency target met.
 
-ETA: 3-4 developer days + 2-3 days review/QA.
+ETA: 4-6 developer days.
 
-### Phase 5 — Cutover to new path
+### Phase 6 — Cutover to new path
 
 Scope:
 
 - Operator flips `daemon.signal_router.mode: new` after validation.
 - Router becomes authoritative.
 - Legacy path retained behind kill switch.
+- Polymarket `spawn_agent` route enabled.
 
 Decision criteria:
 
-- Phase 4 thresholds met: zero critical diffs, zero shim errors, zero overlap errors, non-critical diff rate <0.1% and explained, p95 decision latency <5 ms.
+- Phase 5 thresholds met: zero critical diffs, zero shim errors, zero overlap errors, non-critical diff rate <0.1% and explained, p95 decision latency <5 ms.
 - Rollback documented and tested.
 
-ETA: 1-2 developer days + 1-2 days QA, after N-day operator shadow validation.
+ETA: 2-4 developer days, after N-day operator shadow validation.
 
-### Phase 6 — Optional UI panel reshape
+### Phase 7 — AlertSubscriber deprecation + delete
+
+Scope:
+
+- Keep read-time shim for legacy config.
+- Delete `daemon/alert_subscriber.py` after stable `new` mode and operator-approved N-day window.
+- Delete alert-only `EventInjector` glue while preserving `EventInjector` itself.
+- Remove any remaining independent alert NATS subscription wiring.
+
+Decision criteria:
+
+- Router owns polymarket subscription.
+- Legacy `daemon.alert_subscriber` block still translates if present.
+- Heartbeat and router `inject_session` still use `EventInjector`.
+
+ETA: 2-3 developer days.
+
+### Optional Phase 8 — UI panel reshape
 
 Scope:
 
@@ -1039,12 +1393,12 @@ ETA: 2-4 developer days + 1-2 days frontend QA.
 
 Assuming serial code review, security audit, QA, and no major fix loops:
 
-- Implementation through shadow mode: **2.5-3.5 calendar weeks**.
+- Implementation through shadow mode: **4.5-6 calendar weeks**.
 - Operator validation window: **3-7 days**, depending on signal volume.
-- Cutover and stabilization: **3-5 additional days**.
+- Cutover, deprecation, and stabilization: **1-1.5 additional weeks**.
 - Optional UI reshape: **up to 1 additional week**.
 
-Total to safe cutover: **approximately 4-5 calendar weeks**. With fix loops or low signal volume, plan for **5-6 weeks**.
+Total to safe cutover/deprecation readiness: **approximately 6-8 calendar weeks**. With fix loops or low signal volume, plan for **8-9 weeks**.
 
 ## 18. Risks and mitigations
 
@@ -1078,6 +1432,7 @@ Risk: adding regex/JSONPath/ranges creates security/performance/correctness regr
 Mitigation:
 
 - Phase A-C match language exactly equals legacy matcher.
+- Keep sentinel lookup as `pre_action` filter, not core `match`.
 - Defer richer operators until after cutover.
 
 ### 18.4 Performance latency
@@ -1101,6 +1456,7 @@ Mitigation:
 - Perform cutover on daemon restart/quiet period.
 - Keep default disabled until operator opts in.
 - No durable retry queue in v1.
+- Router-owned dedup state is durable, so cooldown resets are not an added cutover risk.
 
 ### 18.6 Duplicate UI/session effects in shadow
 
@@ -1111,6 +1467,18 @@ Mitigation:
 - Shadow actions are dry-run only.
 - If router subscribes directly to NATS in shadow, enforce executor-level `dry_run=true`.
 - Prefer feeding router from legacy ingested event during early shadow.
+- `spawn_agent` has an explicit no-spawn invariant in shadow tests.
+
+### 18.7 Spawn storm or runaway agent
+
+Risk: a noisy alarm rule creates too many autonomous agent processes.
+
+Mitigation:
+
+- `RouterDedupTable` cooldown check happens before process creation.
+- Per-route `daily_cap` and `hourly_cap` suppress before spawn.
+- `timeout_seconds` hard-kills each process.
+- Health exposes current spawn counts and top suppressed `(rule_id, token_id)` pairs.
 
 ## 19. Decisions and rejected alternatives
 
@@ -1132,23 +1500,43 @@ Chosen to maximize behavior parity.
 
 Rejected: richer expression language in first implementation. Useful long term but dangerous during live-trading cutover.
 
-### Decision: AlertSubscriber becomes adapter
+### Decision: sentinel lookup is a pre-action gate
 
-Chosen because it avoids a second subscription framework while preserving #10389 value.
+Chosen to preserve legacy matcher parity while allowing declarative file-backed filtering for non-legacy routes.
 
-Rejected: keep AlertSubscriber as independent long-term service. This recreates the duplication the task is meant to remove.
+Rejected: `sentinel_match` inside `match`. It hides file IO/date templating inside the same surface that must remain behaviorally identical to `signal_handlers.py`.
+
+### Decision: spawn fresh per alarm
+
+Chosen because the polymarket alert-response use case requires a fresh autonomous process with full-shell access and no per-step approvals.
+
+Rejected: inject alarms into the existing `kai` session. It reuses conversational state and does not match the operator-confirmed latency/autonomy contract.
+
+### Decision: AlertSubscriber is deprecated
+
+Chosen because it avoids a second subscription framework while preserving #10389 `EventInjector` value for the paths that still need injection.
+
+Rejected: keep AlertSubscriber as independent long-term service or refactor it as a permanent thin wrapper. Both preserve the duplication the task is meant to remove.
 
 ## 20. Final acceptance criteria for the architecture implementation
 
 A future implementation should be considered complete only when:
 
 1. Existing `signal_handlers[]` works unchanged.
-2. Router config supports channels/routes/actions with the seven public action kinds.
+2. Router config supports channels/routes/actions with the eight public action kinds.
 3. `trade_signals`, `ai_analyses`, and polymarket alert channels are representable.
 4. `ui_panel` preserves current `signal.received` UI behavior.
 5. `inject_session` uses `EventInjector`.
-6. `AlertSubscriber` no longer owns independent NATS subscriptions after router cutover.
-7. Shadow mode reports decision diffs without side effects.
-8. Kill switch forces legacy path.
-9. Cutover requires zero critical diffs and zero shim errors.
-10. Live trading cannot be enabled by translation accident; trader/direct trade paths remain autotrade-gated.
+6. `spawn_agent` can launch a fresh agent process from a validated agent pack in `new` mode only.
+7. `spawn_agent` never spawns in `shadow`; it emits would-have-fired metrics only.
+8. `RouterDedupTable` enforces cooldown, hourly cap, and daily cap before side effects.
+9. Every route decision writes an audit row or marks audit health unhealthy on repeated write failure.
+10. `AlertSubscriber` no longer owns independent NATS subscriptions after router cutover.
+11. Shadow mode reports decision diffs without side effects.
+12. Kill switch forces legacy path and prevents router-only effects.
+13. Cutover requires zero critical diffs and zero shim errors.
+14. Live trading cannot be enabled by translation accident; trader/direct trade paths remain autotrade-gated.
+
+## Spec revision history
+
+- 2026-05-08 — codex xhigh — added `spawn_agent` action kind, deprecated AlertSubscriber, cooldown subsystem details, polymarket route migration; per operator-confirmed details from kai-alert-response bundle.
