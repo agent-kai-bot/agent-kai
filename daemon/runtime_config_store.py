@@ -14,6 +14,7 @@ from typing import Any
 from config import CONFIG_PATH, WORKSPACES_DIR
 
 DEFAULT_RUNTIME_OVERRIDES_PATH = Path(WORKSPACES_DIR) / "runtime_overrides.json"
+SIGNAL_ROUTER_PATH = ("daemon", "signal_router")
 
 
 class _ReadWriteLock:
@@ -124,6 +125,54 @@ class RuntimeConfigStore:
         self.update_section(("daemon", "auto_loop_brain"), {"enabled": bool(enabled)})
         return self.get_auto_loop_brain()
 
+    def get_signal_router(self) -> dict[str, Any]:
+        """Return the effective daemon.signal_router block."""
+
+        return self.get_section(SIGNAL_ROUTER_PATH)
+
+    def get_signal_router_live_trades_enabled(self) -> bool:
+        """Return whether direct trade actions are allowed to execute live."""
+
+        return bool(self.get_signal_router().get("live_trades_enabled", False))
+
+    def update_signal_router_live_trades_enabled(self, enabled: bool) -> dict[str, Any]:
+        """Persist the global signal-router live-trades override."""
+
+        self.update_section(SIGNAL_ROUTER_PATH, {"live_trades_enabled": bool(enabled)})
+        return self.get_signal_router()
+
+    def get_signal_router_route_enabled(
+        self,
+        route_name: str,
+        *,
+        default: bool = True,
+    ) -> bool:
+        """Return a per-route enabled override, falling back to route config."""
+
+        overrides = self.load_overrides()
+        router = _nested_mapping(overrides, SIGNAL_ROUTER_PATH)
+        routes = router.get("routes") if isinstance(router, Mapping) else None
+        if not isinstance(routes, Mapping):
+            return bool(default)
+        route_overlay = routes.get(route_name)
+        if not isinstance(route_overlay, Mapping):
+            return bool(default)
+        enabled = route_overlay.get("enabled")
+        return bool(enabled) if isinstance(enabled, bool) else bool(default)
+
+    def update_signal_router_route_enabled(
+        self,
+        route_name: str,
+        enabled: bool,
+    ) -> dict[str, Any]:
+        """Persist one per-route enabled override."""
+
+        self.update_section(
+            SIGNAL_ROUTER_PATH,
+            {"routes": {str(route_name): {"enabled": bool(enabled)}}},
+        )
+        return self.get_signal_router()
+
     def update_section(self, path: Sequence[str], patch: Mapping[str, Any]) -> None:
         """Merge a patch into one override section and atomically persist it."""
 
@@ -192,6 +241,46 @@ def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str
         current = merged.get(key)
         if isinstance(current, Mapping) and isinstance(value, Mapping):
             merged[key] = _deep_merge(current, value)
+        elif isinstance(current, list) and isinstance(value, Mapping):
+            merged[key] = _merge_named_list(current, value)
         else:
             merged[key] = value
+    return merged
+
+
+def _nested_mapping(payload: Mapping[str, Any], path: Sequence[str]) -> Mapping[str, Any]:
+    cursor: Any = payload
+    for key in path:
+        if not isinstance(cursor, Mapping):
+            return {}
+        cursor = cursor.get(key, {})
+    return cursor if isinstance(cursor, Mapping) else {}
+
+
+def _merge_named_list(
+    base: Sequence[Any],
+    overlay_by_name: Mapping[str, Any],
+) -> list[Any]:
+    """Merge a {"name": patch} overlay into a list of named config objects."""
+
+    merged: list[Any] = []
+    seen: set[str] = set()
+    for item in base:
+        if not isinstance(item, Mapping):
+            merged.append(item)
+            continue
+        name = item.get("name")
+        if not isinstance(name, str):
+            merged.append(dict(item))
+            continue
+        seen.add(name)
+        patch = overlay_by_name.get(name)
+        if isinstance(patch, Mapping):
+            merged.append(_deep_merge(item, patch))
+        else:
+            merged.append(dict(item))
+    for name, patch in overlay_by_name.items():
+        if name in seen or not isinstance(patch, Mapping):
+            continue
+        merged.append({"name": name, **dict(patch)})
     return merged
