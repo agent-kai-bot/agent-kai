@@ -195,13 +195,15 @@ class CodexCLIToollessLLMClient:
             completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
         except subprocess.TimeoutExpired as exc:
             raise TimeoutError(f"codex CLI timed out after {timeout} seconds") from exc
-        if completed.stderr.strip():
-            raise RuntimeError(completed.stderr.strip())
         if completed.returncode != 0:
-            raise RuntimeError(f"codex CLI exited with status {completed.returncode}")
+            stderr = completed.stderr.strip() or "<no stderr>"
+            raise RuntimeError(f"codex CLI exited with status {completed.returncode}: {stderr}")
         text = completed.stdout.strip()
         if not text:
-            raise RuntimeError("codex CLI returned empty stdout")
+            raise RuntimeError(
+                "codex CLI returned empty stdout"
+                + (f"; stderr: {completed.stderr.strip()[:200]}" if completed.stderr.strip() else "")
+            )
         return LLMResult(text=text, model_id=model, usage=TokenUsage())
 
 
