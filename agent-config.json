@@ -401,11 +401,14 @@
             {
               "kind": "inject_session",
               "target": "polymarket",
+              "require_auto_mode": false,
+              "single_auto_iteration": true,
+              "max_per_hour": 60,
               "cooldown_key_template": "{rule_id}:{token_id}",
               "cooldown_seconds": 600,
               "daily_cap": 50,
               "hourly_cap": 10,
-              "template_inline": "POLYMARKET ALARM rule={rule_id} type={rule_type} token={token_id} observed={observed_value} threshold={threshold} ts={ts}\n\nMarket: {extra.market_title}\nDirection: {extra.direction}\n\nDecide and act per the kai-alert-response decision logic: priority gate (sentinel-listed? leverage? noisy?), then send a Pushover or ntfy notification at the right priority, or suppress with a reason. Audit the decision."
+              "template_inline": "POLYMARKET ALARM rule={rule_id} type={rule_type} token={token_id} observed={observed_value} threshold={threshold} ts={ts}\n\nMarket: {extra.market_title}\nDirection: {extra.direction}\n\nDecide and act per the kai-alert-response decision logic at /home/atc/.agentkai/agent-packs/kai-alert-response/decision_logic.md: priority gate (sentinel-listed? leverage? noisy?), then send a Pushover or ntfy notification at the right priority, or suppress with a reason. Audit the decision."
             }
           ]
         }
