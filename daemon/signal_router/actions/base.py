@@ -80,11 +80,62 @@ class ActionExecutor(Protocol):
         """Execute or dry-run one action."""
 
 
-class SafeFormatDict(dict):
-    """Format mapping that keeps unknown placeholders visible."""
+class _MissingChain:
+    """Sentinel returned for missing keys. Renders as empty string and
+    safely supports arbitrary further `[key]` lookups so nested template
+    expressions like `{extra[market_title]}` don't raise on missing data."""
 
-    def __missing__(self, key: str) -> str:
-        return "{" + key + "}"
+    __slots__ = ()
+
+    def __getitem__(self, _key: Any) -> "_MissingChain":
+        return self
+
+    def __str__(self) -> str:
+        return ""
+
+    def __format__(self, _spec: str) -> str:
+        return ""
+
+
+_MISSING_CHAIN = _MissingChain()
+
+
+class SafeFormatDict(dict):
+    """Format mapping that survives missing keys at any depth.
+
+    - Top-level missing key  -> renders as ""
+    - Nested missing key via `{extra[market_title]}` -> renders as ""
+    - Nested dict values are wrapped on access so dict-index `{a[b]}`
+      works even if `b` is missing.
+    """
+
+    def __missing__(self, key: str) -> Any:
+        return _MISSING_CHAIN
+
+    def __getitem__(self, key: str) -> Any:  # type: ignore[override]
+        try:
+            value = super().__getitem__(key)
+        except KeyError:
+            return _MISSING_CHAIN
+        if isinstance(value, dict) and not isinstance(value, _SafeNestedMapping):
+            return _SafeNestedMapping(value)
+        return value
+
+
+class _SafeNestedMapping(dict):
+    """Internal: lets nested `{a[b][c]}` lookups survive missing keys."""
+
+    def __missing__(self, key: str) -> Any:
+        return _MISSING_CHAIN
+
+    def __getitem__(self, key: str) -> Any:  # type: ignore[override]
+        try:
+            value = super().__getitem__(key)
+        except KeyError:
+            return _MISSING_CHAIN
+        if isinstance(value, dict) and not isinstance(value, _SafeNestedMapping):
+            return _SafeNestedMapping(value)
+        return value
 
 
 def stable_json(value: Any) -> str:

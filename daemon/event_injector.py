@@ -73,6 +73,7 @@ class EventInjectionPolicy:
     busy_reason: str = "busy"
     active_reason: str = "event_turn_active"
     single_auto_iteration: bool = True
+    prefetch_polymarket_bbo: bool = False
 
 
 @dataclass(frozen=True)
@@ -170,6 +171,20 @@ class EventInjector:
             ):
                 self.publish_drop(managed, request, policy.busy_reason)
                 return
+            from datetime import datetime, timezone
+            request.render_values.setdefault(
+                "inject_ts", datetime.now(timezone.utc).isoformat()
+            )
+            if policy.prefetch_polymarket_bbo:
+                bbo = await _fetch_polymarket_bbo_safe(
+                    request.render_values.get("token_id")
+                )
+                request.render_values["live_bbo_ts"] = bbo["ts"]
+                request.render_values["live_bbo_bid"] = bbo["bid"]
+                request.render_values["live_bbo_ask"] = bbo["ask"]
+                request.render_values["live_bbo_source"] = bbo["source"]
+                request.render_values["live_bbo_stale"] = bbo["stale"]
+                request.render_values["live_bbo_error"] = bbo["error"]
             try:
                 prompt = request.template.render_map(request.render_values)
             except Exception as exc:  # noqa: BLE001
@@ -218,3 +233,48 @@ def stable_json(value: Any) -> str:
     """Return deterministic JSON for template payload fields."""
 
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+_LOCAL_FIRST_PATH = "/home/atc/git/OPS/vpn-stack/scripts/lib"
+
+
+async def _fetch_polymarket_bbo_safe(token_id: Any) -> dict[str, str]:
+    """Pre-fetch live polymarket BBO for inject-time enrichment.
+
+    Always returns string values for template rendering. Errors are
+    caught and reported in the `error` field; render still proceeds.
+    """
+    from datetime import datetime, timezone
+    out = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "bid": "",
+        "ask": "",
+        "source": "",
+        "stale": "",
+        "error": "",
+    }
+    if not token_id:
+        out["error"] = "no_token_id"
+        return out
+    try:
+        import sys
+        if _LOCAL_FIRST_PATH not in sys.path:
+            sys.path.insert(0, _LOCAL_FIRST_PATH)
+        from local_first import polymarket  # type: ignore
+        result = await polymarket.best_bid_ask_async(
+            str(token_id), allow_rest_fallback=True
+        )
+        if isinstance(result, dict):
+            if result.get("ok"):
+                out["bid"] = str(result.get("bid", ""))
+                out["ask"] = str(result.get("ask", ""))
+                out["source"] = str(result.get("source", ""))
+                out["stale"] = str(bool(result.get("stale", False)))
+                if result.get("ts_event"):
+                    out["ts"] = str(result["ts_event"])
+            else:
+                out["error"] = str(result.get("error") or result.get("detail") or "unknown")
+                out["source"] = str(result.get("source", ""))
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out

@@ -1165,6 +1165,8 @@ def create_tools(
     tools.extend(create_taskboard_tools(getattr(session, "taskboard_context", None)))
     tools.extend(create_forgejo_tools())
     tools.extend(create_sdlc_result_tools())
+    from agent.polymarket_tools import create_polymarket_tools
+    tools.extend(create_polymarket_tools())
     return tools
 
 

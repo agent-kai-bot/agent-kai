@@ -404,11 +404,12 @@
               "require_auto_mode": false,
               "single_auto_iteration": true,
               "max_per_hour": 60,
+              "prefetch_polymarket_bbo": true,
               "cooldown_key_template": "{rule_id}:{token_id}",
               "cooldown_seconds": 600,
               "daily_cap": 50,
               "hourly_cap": 10,
-              "template_inline": "POLYMARKET ALARM rule={rule_id} type={rule_type} token={token_id} observed={observed_value} threshold={threshold} ts={ts}\n\nMarket: {extra[market_title]}\nDirection: {extra[direction]}\n\nDecide and act per the kai-alert-response decision logic at /home/atc/.agentkai/agent-packs/kai-alert-response/decision_logic.md: priority gate (sentinel-listed? leverage? noisy?), then deliver via Discord webhook at $KAI_DISCORD_WEBHOOK_URL with the appropriate embed color (green=priority0, yellow=priority1, red=priority2), or suppress with a reason. Audit the decision."
+              "template_inline": "POLYMARKET ALARM\n  rule={rule_id} type={rule_type}\n  token={token_id}\n  observed={observed_value} threshold={threshold}\n  alarm_ts={ts}\n  inject_ts={inject_ts}\n  market={extra[market_title]}\n  direction={extra[direction]}\n\nLIVE BBO at inject (already fetched for you):\n  bid={live_bbo_bid}\n  ask={live_bbo_ask}\n  source={live_bbo_source}\n  stale={live_bbo_stale}\n  bbo_ts={live_bbo_ts}\n  bbo_error={live_bbo_error}\n\nDecide per /home/atc/.agentkai/agent-packs/kai-alert-response/decision_logic.md (7-step tree). The LIVE BBO above is real and was fetched from local_first.polymarket.best_bid_ask_async at inject time — use it for step 3 (signal-reversal check). If you need to re-verify or get fresher data, call the polymarket_bbo tool. NEVER guess prices.\n\nIf NOT suppressed, deliver via Discord webhook at $KAI_DISCORD_WEBHOOK_URL — POST a JSON embed (use shell_exec or python_exec) with color green=priority0, yellow=priority1 sentinel-match, red=priority2 emergency. Audit the decision."
             }
           ]
         }
