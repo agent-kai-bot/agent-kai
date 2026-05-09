@@ -1195,6 +1195,7 @@
         </section>
 
         <div class="dashboard-actions">
+          <a class="nav-pill" href="/router">Router</a>
           <AutoLoopBrainToggle {client} {token} />
           <div class="model-picker">
             <select
