@@ -381,9 +381,41 @@
       "max_consecutive_llm_critic_calls": 5
     },
     "signal_router": {
-      "mode": "legacy",
-      "channels": {},
-      "routes": [],
+      "mode": "shadow",
+      "live_trades_enabled": false,
+      "channels": {
+        "polymarket_alarms": {
+          "subjects": [
+            "alerts.>"
+          ],
+          "schema": "polymarket_alarm"
+        }
+      },
+      "routes": [
+        {
+          "name": "polymarket-alarm-response",
+          "enabled": true,
+          "channel": "polymarket_alarms",
+          "match": {},
+          "actions": [
+            {
+              "kind": "spawn_agent",
+              "pack": "kai-alert-response",
+              "timeout_seconds": 300,
+              "cooldown_key_template": "{rule_id}:{token_id}",
+              "cooldown_seconds": 600,
+              "daily_cap": 50,
+              "hourly_cap": 10,
+              "audit_path_template": "/home/atc/git/OPS/vpn-stack/scripts/cache/sweep_state/codex_audit/audit_{date}.jsonl",
+              "env_passthrough": [
+                "KAI_PUSHOVER_USER",
+                "KAI_PUSHOVER_TOKEN",
+                "KAI_NTFY_TOPIC"
+              ]
+            }
+          ]
+        }
+      ],
       "agent_packs_dir": "${AGENTKAI_HOME}/agent-packs",
       "dedup_table_path": "${AGENTKAI_HOME}/router_dedup.sqlite3"
     },
