@@ -102,7 +102,6 @@ from daemon.core import (
     remove_indexed_session,
     serialize_messages,
 )
-from daemon.alert_subscriber import AlertSubscriberConfig, load_alert_subscriber_config
 from daemon.event_injector import (
     EventInjectionPolicy,
     EventInjectionRequest,
@@ -628,9 +627,6 @@ class DaemonServer:
         self.signal_consumer = SignalConsumer()
         self.scheduler: Scheduler | None = None
         agent_config = get_agent_config(agent_name)
-        self.alert_subscriber_config: AlertSubscriberConfig = load_alert_subscriber_config(
-            agent_config
-        )
         self.signal_router_config = dict(
             (agent_config.get("daemon") or {}).get("signal_router") or {}
         )
@@ -643,7 +639,7 @@ class DaemonServer:
         alert_errors = []
         if isinstance((agent_config.get("daemon") or {}).get("alert_subscriber"), dict):
             alert_routes, alert_errors = translate_alert_subscriber_config(
-                self.alert_subscriber_config,
+                agent_config,
                 mode=signal_router_mode,
             )
         shim_errors = [*signal_errors, *alert_errors]
