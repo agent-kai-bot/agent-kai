@@ -381,7 +381,7 @@
       "max_consecutive_llm_critic_calls": 5
     },
     "signal_router": {
-      "mode": "shadow",
+      "mode": "new",
       "live_trades_enabled": false,
       "channels": {
         "polymarket_alarms": {
