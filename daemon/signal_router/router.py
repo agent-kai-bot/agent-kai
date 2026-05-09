@@ -220,16 +220,20 @@ class SignalRouter:
         }
 
     def is_route_enabled(self, route: Route) -> bool:
-        """Return the effective enabled state for a route."""
+        """Return the effective enabled state for a route.
 
-        if not route.enabled:
-            return False
+        Overlay wins. The runtime overlay can toggle either direction:
+        a config-disabled route can be enabled via the operator UI, and
+        a config-enabled route can be disabled. When no overlay value is
+        set, the route's config-default is used.
+        """
+
         store = self.runtime_config_store
         if store is None:
-            return True
+            return route.enabled
         getter = getattr(store, "get_signal_router_route_enabled", None)
         if getter is None:
-            return True
+            return route.enabled
         return bool(getter(route.name, default=route.enabled))
 
     def recent_decisions(

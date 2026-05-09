@@ -50,6 +50,44 @@ def test_channel_lookup_by_subject_pattern(tmp_path) -> None:
     assert router.find_channel_for_subject("orders.BTC") is None
 
 
+def test_overlay_can_enable_a_config_disabled_route(tmp_path) -> None:
+    """Operator UI must be able to flip a route ON whose config default is False."""
+
+    class _FakeStore:
+        def __init__(self) -> None:
+            self._values: dict[str, bool] = {}
+
+        def get_signal_router_route_enabled(self, name: str, *, default: bool) -> bool:
+            return self._values.get(name, default)
+
+        def set(self, name: str, value: bool) -> None:
+            self._values[name] = value
+
+    store = _FakeStore()
+    router = SignalRouter(
+        {
+            "routes": [
+                {"name": "off-by-default", "enabled": False, "channel": "x", "actions": []},
+                {"name": "on-by-default", "enabled": True, "channel": "x", "actions": []},
+            ],
+        },
+        dedup_table=RouterDedupTable(tmp_path / "dedup.sqlite3"),
+        runtime_config_store=store,
+    )
+
+    off_route = router.routes["off-by-default"]
+    on_route = router.routes["on-by-default"]
+
+    assert router.is_route_enabled(off_route) is False
+    assert router.is_route_enabled(on_route) is True
+
+    store.set("off-by-default", True)
+    store.set("on-by-default", False)
+
+    assert router.is_route_enabled(off_route) is True
+    assert router.is_route_enabled(on_route) is False
+
+
 def test_daemon_signal_router_health_shape(tmp_path) -> None:
     config = {
         "daemon": {
