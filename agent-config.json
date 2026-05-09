@@ -386,7 +386,7 @@
       "channels": {
         "polymarket_alarms": {
           "subjects": [
-            "alerts.>"
+            "polymarket.alpha.alarm.>"
           ],
           "schema": "polymarket_alarm"
         }
@@ -399,19 +399,13 @@
           "match": {},
           "actions": [
             {
-              "kind": "spawn_agent",
-              "pack": "kai-alert-response",
-              "timeout_seconds": 300,
+              "kind": "inject_session",
+              "target": "polymarket",
               "cooldown_key_template": "{rule_id}:{token_id}",
               "cooldown_seconds": 600,
               "daily_cap": 50,
               "hourly_cap": 10,
-              "audit_path_template": "/home/atc/git/OPS/vpn-stack/scripts/cache/sweep_state/codex_audit/audit_{date}.jsonl",
-              "env_passthrough": [
-                "KAI_PUSHOVER_USER",
-                "KAI_PUSHOVER_TOKEN",
-                "KAI_NTFY_TOPIC"
-              ]
+              "template_inline": "POLYMARKET ALARM rule={rule_id} type={rule_type} token={token_id} observed={observed_value} threshold={threshold} ts={ts}\n\nMarket: {extra.market_title}\nDirection: {extra.direction}\n\nDecide and act per the kai-alert-response decision logic: priority gate (sentinel-listed? leverage? noisy?), then send a Pushover or ntfy notification at the right priority, or suppress with a reason. Audit the decision."
             }
           ]
         }
