@@ -121,8 +121,10 @@ from daemon.signal_router import (
     ExecutionContext,
     SignalRouter,
     SignalRouterMode,
+    kill_switch_active,
     resolve_mode,
 )
+from daemon.signal_router.actions.trade import TradeExecutor
 from daemon.signal_router.shadow import ShadowRunner
 from daemon.signal_router.shim_alert_subscriber import translate_alert_subscriber_config
 from daemon.signal_router.shim_signal_handlers import (
@@ -578,6 +580,10 @@ class AutoLoopBrainToggleRequest(BaseModel):
     enabled: bool
 
 
+class SignalRouterConfigPatchError(ValueError):
+    """Raised when a signal-router runtime config patch is invalid."""
+
+
 class DaemonServer:
     """FastAPI-facing daemon runtime that owns sessions and a shared bus."""
 
@@ -646,6 +652,10 @@ class DaemonServer:
         self.signal_router = SignalRouter(
             self.signal_router_config,
             routes=[*signal_routes, *alert_routes],
+            runtime_config_store=self.runtime_config_store,
+        )
+        self.signal_router.action_executors["trade"] = TradeExecutor(
+            self.runtime_config_store
         )
         self.shadow_runner: ShadowRunner | None = None
         if self.signal_router.mode == SignalRouterMode.SHADOW:
@@ -658,6 +668,8 @@ class DaemonServer:
                 context_factory=self._signal_router_execution_context,
             )
         self.services: list[Any] = [self.signal_router]
+        self.signal_router_subscriptions: list[Any] = []
+        self.signal_router_sub_agent_manager: Any | None = None
         self.heartbeat_config = heartbeat_config or load_heartbeat_config(agent_config)
         self.heartbeat_prompt_template = HeartbeatPromptTemplate.load(
             self.heartbeat_config.prompt_template_path
@@ -677,6 +689,68 @@ class DaemonServer:
     @staticmethod
     def _default_bus_factory(url: str, agent_name: str) -> NatsBus:
         return NatsBus(url=url, agent_name=agent_name)
+
+    def _bind_signal_router_sub_agent_manager(self, bus: Any) -> None:
+        try:
+            from agent.sub_agents import SubAgentManager
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("signal_router sub-agent manager unavailable: %s", exc)
+            self.signal_router_sub_agent_manager = None
+            return
+        self.signal_router_sub_agent_manager = SubAgentManager(bus)
+
+    async def _subscribe_signal_router_channels(self, bus: Any) -> None:
+        if self.signal_router.mode == SignalRouterMode.LEGACY:
+            return
+        subscribe = getattr(bus, "subscribe", None)
+        if subscribe is None:
+            self.log.warning("signal_router channel subscribe skipped: bus has no subscribe")
+            return
+        subscribed_subjects: set[str] = set()
+        for channel in self.signal_router.channels.values():
+            for subject in channel.subjects:
+                if not subject or subject in subscribed_subjects:
+                    continue
+                subscribed_subjects.add(subject)
+                subscription = await subscribe(
+                    subject,
+                    self._handle_signal_router_nats,
+                )
+                self.signal_router_subscriptions.append(subscription)
+
+    async def _handle_signal_router_nats(
+        self,
+        subject: str,
+        payload: dict[str, Any],
+    ) -> None:
+        envelope = {
+            "subject": subject,
+            "payload": payload,
+            "received_at": _utc_now().isoformat(),
+        }
+        channel = self.signal_router.find_channel_for_subject(subject)
+        if channel is not None:
+            envelope["channel"] = channel.name
+        context = self._signal_router_execution_context(envelope)
+        for decision in self.signal_router.decide(envelope):
+            self.signal_router.execute_actions(decision, envelope, context)
+
+    async def _signal_router_nats_request(
+        self,
+        role_name: str,
+        task: str,
+        *,
+        timeout_seconds: int = 300,
+        timeout: int | float | None = None,
+    ) -> Any:
+        if self.bus is None:
+            return {"error": "not connected"}
+        request_timeout = timeout if timeout is not None else timeout_seconds
+        return await self.bus.request(
+            f"agent.{role_name}.request",
+            {"message": task},
+            timeout=request_timeout,
+        )
 
     def _effective_agent_config(self) -> dict[str, Any]:
         return self.runtime_config_store.effective_config()
@@ -722,6 +796,16 @@ class DaemonServer:
 
     def _signal_router_health(self) -> dict[str, Any]:
         payload = self.signal_router.health_payload()
+        enabled_count = sum(
+            1
+            for route in self.signal_router.routes.values()
+            if self.signal_router.is_route_enabled(route)
+        )
+        payload["live_trades_enabled"] = (
+            self.runtime_config_store.get_signal_router_live_trades_enabled()
+        )
+        payload["routes_enabled_count"] = enabled_count
+        payload["routes_disabled_count"] = len(self.signal_router.routes) - enabled_count
         payload["shadow_running"] = bool(
             self.shadow_runner is not None and self.shadow_runner.running
         )
@@ -731,6 +815,46 @@ class DaemonServer:
             else {}
         )
         return payload
+
+    def _signal_router_config_payload(self) -> dict[str, Any]:
+        routes = []
+        for route in self.signal_router.routes.values():
+            counts = self.signal_router.route_counts_24h(route.name)
+            routes.append(
+                {
+                    "name": route.name,
+                    "channel": route.channel,
+                    "actions": [
+                        {
+                            "kind": action.kind,
+                            **({"target": action.target} if action.target else {}),
+                            **dict(action.params),
+                        }
+                        for action in route.actions
+                    ],
+                    "enabled": self.signal_router.is_route_enabled(route),
+                    "fire_count_24h": counts["fire_count_24h"],
+                    "suppress_count_24h": counts["suppress_count_24h"],
+                    "last_decisions": self.signal_router.recent_decisions(
+                        route_name=route.name,
+                        limit=5,
+                    ),
+                }
+            )
+        return {
+            "mode": (
+                SignalRouterMode.LEGACY.value
+                if kill_switch_active()
+                else self.signal_router.mode.value
+            ),
+            "live_trades_enabled": (
+                self.runtime_config_store.get_signal_router_live_trades_enabled()
+            ),
+            "kill_switch_active": kill_switch_active(),
+            "routes": routes,
+            "last_decisions": self.signal_router.recent_decisions(limit=10),
+            "dedup_stats": self.signal_router.dedup_stats_24h(),
+        }
 
     def _signal_router_execution_context(
         self,
@@ -743,6 +867,13 @@ class DaemonServer:
             sessions=self.sessions,
             dedup_table=self.signal_router.dedup_table,
             event_injector=self.event_injector,
+            daemon_event_publisher=lambda topic, payload: self.publish_daemon_event(
+                topic,
+                payload,
+            ),
+            runtime_config_store=self.runtime_config_store,
+            sub_agent_manager=self.signal_router_sub_agent_manager,
+            nats_request=self._signal_router_nats_request if self.bus is not None else None,
             autotrade_enabled=lambda: False,
         )
 
@@ -838,10 +969,12 @@ class DaemonServer:
                 self.bus = None
             else:
                 self.bus = bus
+                self._bind_signal_router_sub_agent_manager(bus)
                 with suppress(Exception):
                     self.bus.on_message(self._handle_nats_message)
                 with suppress(Exception):
                     await self.signal_consumer.subscribe(bus)
+                await self._subscribe_signal_router_channels(bus)
 
         self.scheduler = self.scheduler_factory(
             dispatch_callback=self._handle_scheduled_job_trigger,
@@ -867,6 +1000,10 @@ class DaemonServer:
         for managed in self.sessions.values():
             with suppress(Exception):
                 await managed.session.sub_agent_registry.stop_all()
+        if self.signal_router_sub_agent_manager is not None:
+            with suppress(Exception):
+                await self.signal_router_sub_agent_manager.stop_all()
+            self.signal_router_sub_agent_manager = None
 
         if self.scheduler is not None:
             with suppress(Exception):
@@ -1298,6 +1435,116 @@ class DaemonServer:
         """Return the effective auto-loop-brain runtime config block."""
 
         return self._auto_loop_brain_payload()
+
+    async def get_signal_router_config(self) -> dict[str, Any]:
+        """Return the effective signal-router runtime config block."""
+
+        return self._signal_router_config_payload()
+
+    async def patch_signal_router_config(
+        self,
+        payload: dict[str, Any],
+        *,
+        actor: str = "api",
+    ) -> dict[str, Any]:
+        """Persist signal-router runtime toggles and return effective config."""
+
+        live_target, route_targets = self._validate_signal_router_patch(payload)
+        if kill_switch_active():
+            raise PermissionError("signal-router kill switch is active")
+
+        if live_target is not None:
+            current = (
+                self.runtime_config_store.get_signal_router_live_trades_enabled()
+            )
+            self.runtime_config_store.update_signal_router_live_trades_enabled(
+                live_target
+            )
+            if current != live_target:
+                await self.publish_daemon_event(
+                    "auto.signal_router.live_trades_toggle",
+                    {
+                        "from": current,
+                        "to": live_target,
+                        "by": actor if actor in {"operator-ui", "api"} else "api",
+                    },
+                )
+
+        for route_name, enabled in route_targets.items():
+            route = self.signal_router.routes[route_name]
+            current = self.signal_router.is_route_enabled(route)
+            self.runtime_config_store.update_signal_router_route_enabled(
+                route_name,
+                enabled,
+            )
+            if current != enabled:
+                await self.publish_daemon_event(
+                    "auto.signal_router.route_toggle",
+                    {
+                        "route": route_name,
+                        "from": current,
+                        "to": enabled,
+                    },
+                )
+
+        return self._signal_router_config_payload()
+
+    def _validate_signal_router_patch(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[bool | None, dict[str, bool]]:
+        if not isinstance(payload, dict):
+            raise SignalRouterConfigPatchError("request body must be a JSON object")
+        allowed = {"live_trades_enabled", "routes"}
+        unknown = sorted(set(payload) - allowed)
+        if unknown:
+            raise SignalRouterConfigPatchError(
+                f"unsupported signal_router config keys: {', '.join(unknown)}"
+            )
+        if not payload:
+            raise SignalRouterConfigPatchError("at least one setting is required")
+
+        live_target: bool | None = None
+        if "live_trades_enabled" in payload:
+            value = payload["live_trades_enabled"]
+            if not isinstance(value, bool):
+                raise SignalRouterConfigPatchError(
+                    "live_trades_enabled must be a boolean"
+                )
+            live_target = value
+
+        route_targets: dict[str, bool] = {}
+        if "routes" in payload:
+            routes = payload["routes"]
+            if not isinstance(routes, dict):
+                raise SignalRouterConfigPatchError("routes must be an object")
+            for route_name, route_patch in routes.items():
+                if route_name not in self.signal_router.routes:
+                    raise SignalRouterConfigPatchError(
+                        f"unknown signal_router route: {route_name}"
+                    )
+                if not isinstance(route_patch, dict):
+                    raise SignalRouterConfigPatchError(
+                        f"routes.{route_name} must be an object"
+                    )
+                unknown_route_keys = sorted(set(route_patch) - {"enabled"})
+                if unknown_route_keys:
+                    raise SignalRouterConfigPatchError(
+                        f"unsupported keys for route {route_name}: "
+                        f"{', '.join(unknown_route_keys)}"
+                    )
+                if "enabled" not in route_patch:
+                    raise SignalRouterConfigPatchError(
+                        f"routes.{route_name}.enabled is required"
+                    )
+                enabled = route_patch["enabled"]
+                if not isinstance(enabled, bool):
+                    raise SignalRouterConfigPatchError(
+                        f"routes.{route_name}.enabled must be a boolean"
+                    )
+                route_targets[route_name] = enabled
+
+        return live_target, route_targets
 
     async def patch_auto_loop_brain_config(self, *, enabled: bool) -> dict[str, Any]:
         """Persist and hot-apply an auto-loop-brain enabled runtime override."""
@@ -2882,6 +3129,38 @@ def create_app(
                 detail=str(exc),
             ) from exc
         except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    @app.get("/api/daemon/config/signal_router")
+    async def get_signal_router_config_endpoint(request: Request) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
+        return await daemon_server.get_signal_router_config()
+
+    @app.patch("/api/daemon/config/signal_router")
+    async def patch_signal_router_config_endpoint(request: Request) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
+        try:
+            payload = await request.json()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="request body must be valid JSON",
+            ) from exc
+        actor = request.headers.get("x-operator-source", "api")
+        try:
+            return await daemon_server.patch_signal_router_config(
+                payload,
+                actor=actor,
+            )
+        except PermissionError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(exc),
+            ) from exc
+        except SignalRouterConfigPatchError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=str(exc),
