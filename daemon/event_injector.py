@@ -74,6 +74,7 @@ class EventInjectionPolicy:
     active_reason: str = "event_turn_active"
     single_auto_iteration: bool = True
     prefetch_polymarket_bbo: bool = False
+    prefetch_polymarket_token_info: bool = False
 
 
 @dataclass(frozen=True)
@@ -185,6 +186,16 @@ class EventInjector:
                 request.render_values["live_bbo_source"] = bbo["source"]
                 request.render_values["live_bbo_stale"] = bbo["stale"]
                 request.render_values["live_bbo_error"] = bbo["error"]
+            if policy.prefetch_polymarket_token_info:
+                tok_info = _resolve_polymarket_token_safe(
+                    request.render_values.get("token_id")
+                )
+                request.render_values["token_market_slug"] = tok_info["slug"]
+                request.render_values["token_market_title"] = tok_info["title"]
+                request.render_values["token_outcome"] = tok_info["outcome"]
+                request.render_values["token_category"] = tok_info["category"]
+                request.render_values["token_summary"] = tok_info["summary"]
+                request.render_values["token_resolve_error"] = tok_info["error"]
             try:
                 prompt = request.template.render_map(request.render_values)
             except Exception as exc:  # noqa: BLE001
@@ -236,6 +247,43 @@ def stable_json(value: Any) -> str:
 
 
 _LOCAL_FIRST_PATH = "/home/atc/git/OPS/vpn-stack/scripts/lib"
+_AGENT_KAI_SHARED_PATH = "/home/atc/git/OPS/agent-kai-shared"
+
+
+def _resolve_polymarket_token_safe(token_id: Any) -> dict[str, str]:
+    """Pre-resolve polymarket token_id -> {slug, title, outcome, category}.
+
+    Two-tier cached (in-process LRU + on-disk 24h TTL via token_resolver).
+    Always returns string values for template rendering. Errors caught.
+    """
+    out = {
+        "slug": "",
+        "title": "",
+        "outcome": "",
+        "category": "",
+        "summary": "",
+        "error": "",
+    }
+    if not token_id:
+        out["error"] = "no_token_id"
+        return out
+    try:
+        import sys
+        if _AGENT_KAI_SHARED_PATH not in sys.path:
+            sys.path.insert(0, _AGENT_KAI_SHARED_PATH)
+        from token_resolver import resolve_token  # type: ignore
+        info = resolve_token(str(token_id))
+        if isinstance(info, dict):
+            out["slug"] = str(info.get("slug", ""))
+            out["title"] = str(info.get("title", ""))
+            out["outcome"] = str(info.get("outcome", ""))
+            out["category"] = str(info.get("category", ""))
+            out["summary"] = (
+                f"[{out['category']}] {out['title']} :: {out['outcome']}"
+            )
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
 
 
 async def _fetch_polymarket_bbo_safe(token_id: Any) -> dict[str, str]:

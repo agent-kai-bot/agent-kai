@@ -16,6 +16,7 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
 _LOCAL_FIRST_PATH = "/home/atc/git/OPS/vpn-stack/scripts/lib"
+_AGENT_KAI_SHARED_PATH = "/home/atc/git/OPS/agent-kai-shared"
 
 
 class PolymarketBboInput(BaseModel):
@@ -83,6 +84,54 @@ def _polymarket_bbo(token_id: str, allow_rest_fallback: bool = True) -> dict[str
     return out
 
 
+class TokenResolveInput(BaseModel):
+    token_id: str = Field(
+        ...,
+        description=(
+            "Polymarket CLOB token id (long numeric string). NOT the market "
+            "address or slug. Required."
+        ),
+    )
+
+
+def _polymarket_token_resolve(token_id: str) -> dict[str, Any]:
+    """Resolve a Polymarket token_id to {slug, title, outcome, category}.
+
+    Two-tier cache: in-process LRU + on-disk 24h TTL (zero-network for
+    repeats). Falls back: today's sentinel JSON -> Polymarket gamma API ->
+    safe placeholder. Always returns a dict; never raises.
+    """
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    if not token_id:
+        return {"ok": False, "error": "token_id required", "fetched_at": fetched_at}
+    try:
+        if _AGENT_KAI_SHARED_PATH not in sys.path:
+            sys.path.insert(0, _AGENT_KAI_SHARED_PATH)
+        from token_resolver import resolve_token  # type: ignore
+
+        info = resolve_token(str(token_id))
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "fetched_at": fetched_at,
+        }
+    if not isinstance(info, dict):
+        return {"ok": False, "error": f"unexpected:{type(info).__name__}", "fetched_at": fetched_at}
+    return {
+        "ok": True,
+        "slug": str(info.get("slug", "")),
+        "title": str(info.get("title", "")),
+        "outcome": str(info.get("outcome", "")),
+        "category": str(info.get("category", "")),
+        "summary": (
+            f"[{info.get('category','?')}] {info.get('title','?')} "
+            f":: {info.get('outcome','?')}"
+        ),
+        "fetched_at": fetched_at,
+    }
+
+
 def create_polymarket_tools() -> list[StructuredTool]:
     """Tools the kai agent uses for Polymarket-specific lookups."""
     return [
@@ -99,5 +148,20 @@ def create_polymarket_tools() -> list[StructuredTool]:
                 "DO NOT guess prices; always call this tool."
             ),
             args_schema=PolymarketBboInput,
+        ),
+        StructuredTool.from_function(
+            func=_polymarket_token_resolve,
+            name="polymarket_token_resolve",
+            description=(
+                "Resolve a Polymarket CLOB token_id to a human-readable "
+                "{slug, title, outcome, category, summary}. Two-tier cached "
+                "(in-process LRU + on-disk 24h TTL), so repeat calls are free. "
+                "Falls back: today's sentinel JSON -> Polymarket gamma API -> "
+                "safe placeholder. Use to label alarms, embed titles, or audit "
+                "rows with the actual market name (e.g. 'MLB: HOU vs CIN :: "
+                "Houston Astros') instead of the raw token id. Returns "
+                "{ok, slug, title, outcome, category, summary, fetched_at}."
+            ),
+            args_schema=TokenResolveInput,
         ),
     ]

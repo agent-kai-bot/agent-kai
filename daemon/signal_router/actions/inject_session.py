@@ -167,6 +167,7 @@ class InjectSessionExecutor:
                 active_reason="signal_router_turn_active",
                 single_auto_iteration=bool(action.params.get("single_auto_iteration", True)),
                 prefetch_polymarket_bbo=bool(action.params.get("prefetch_polymarket_bbo", False)),
+                prefetch_polymarket_token_info=bool(action.params.get("prefetch_polymarket_token_info", False)),
             ),
             render_values={**payload, "channel": channel, "subject": context.subject or envelope.get("subject", "")},
             seq=payload.get("id") or payload.get("seq") or context.route_name or "signal-router",
