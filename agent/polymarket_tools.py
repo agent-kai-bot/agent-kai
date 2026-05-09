@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 _LOCAL_FIRST_PATH = "/home/atc/git/OPS/vpn-stack/scripts/lib"
 _AGENT_KAI_SHARED_PATH = "/home/atc/git/OPS/agent-kai-shared"
+_DISCORD_USER_AGENT = "Kai-Alert-Response (https://agent-k.ai, 1.0)"
 
 
 class PolymarketBboInput(BaseModel):
@@ -82,6 +83,86 @@ def _polymarket_bbo(token_id: str, allow_rest_fallback: bool = True) -> dict[str
         out["error"] = str(result.get("error") or result.get("detail") or "unknown")
         out["fallback_reason"] = str(result.get("fallback_reason", ""))
     return out
+
+
+class DiscordAlertInput(BaseModel):
+    title: str = Field(..., description="Embed title — should be a short human-readable summary (e.g. '🟡 strategy_b_burst — HOU vs CIN — Astros').")
+    description: str = Field(default="", description="Embed body. Markdown-supported. Keep ~4 lines.")
+    color: int = Field(default=3066993, description="Embed color (decimal RGB). 3066993=green/p0, 16776960=yellow/p1 sentinel, 15158332=red/p2 emergency.")
+    url: str = Field(default="", description="Optional click-through URL (e.g. https://polymarket.com/event/<slug>).")
+    rule_id: str = Field(default="", description="Alarm rule_id, surfaced in the embed footer.")
+    sentinel_match: bool = Field(default=False, description="Whether this token is in today's edge sentinel.")
+    timestamp: str = Field(default="", description="ISO 8601 timestamp of the alarm/event (used as Discord embed timestamp).")
+    webhook_url: str = Field(default="", description="Optional override; if empty, reads $KAI_DISCORD_WEBHOOK_URL.")
+
+
+def _discord_alert_send(
+    title: str,
+    description: str = "",
+    color: int = 3066993,
+    url: str = "",
+    rule_id: str = "",
+    sentinel_match: bool = False,
+    timestamp: str = "",
+    webhook_url: str = "",
+) -> dict[str, Any]:
+    """POST a single alert as a Discord embed via the operator-configured webhook.
+
+    Handles Discord's Cloudflare WAF correctly: sends a non-default User-Agent
+    so we don't get blocked with HTTP 403 'error code: 1010'. Returns
+    {ok, http_status, response_body, fetched_at, webhook_id_redacted}.
+    Always returns a dict; never raises.
+    """
+    import os
+    import re
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    hook = webhook_url or os.environ.get("KAI_DISCORD_WEBHOOK_URL", "").strip()
+    if not hook:
+        return {"ok": False, "error": "KAI_DISCORD_WEBHOOK_URL not set", "fetched_at": fetched_at}
+    redacted_id = "?"
+    m = re.match(r"https://discord\.com/api/webhooks/(\d+)/", hook)
+    if m:
+        redacted_id = m.group(1)
+    embed = {"title": title, "description": description, "color": int(color)}
+    if url:
+        embed["url"] = url
+    if timestamp:
+        embed["timestamp"] = timestamp
+    footer_bits = []
+    if rule_id:
+        footer_bits.append(f"rule {rule_id}")
+    footer_bits.append(f"sentinel={'yes' if sentinel_match else 'no'}")
+    embed["footer"] = {"text": " · ".join(footer_bits)}
+    payload = {"username": "Kai", "embeds": [embed]}
+    try:
+        import requests  # type: ignore
+        resp = requests.post(
+            hook,
+            json=payload,
+            timeout=8,
+            headers={"User-Agent": _DISCORD_USER_AGENT},
+        )
+        ok = 200 <= resp.status_code < 300
+        body = ""
+        if not ok:
+            try:
+                body = resp.text[:300]
+            except Exception:
+                body = "<unreadable>"
+        return {
+            "ok": ok,
+            "http_status": resp.status_code,
+            "response_body": body,
+            "webhook_id": redacted_id,
+            "fetched_at": fetched_at,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "webhook_id": redacted_id,
+            "fetched_at": fetched_at,
+        }
 
 
 class TokenResolveInput(BaseModel):
@@ -163,5 +244,21 @@ def create_polymarket_tools() -> list[StructuredTool]:
                 "{ok, slug, title, outcome, category, summary, fetched_at}."
             ),
             args_schema=TokenResolveInput,
+        ),
+        StructuredTool.from_function(
+            func=_discord_alert_send,
+            name="discord_alert_send",
+            description=(
+                "POST one alert as a Discord embed via the operator-configured "
+                "webhook (KAI_DISCORD_WEBHOOK_URL env var). Use this for ALL "
+                "alert delivery — DO NOT call requests/curl/urllib yourself for "
+                "Discord; this tool handles the User-Agent header that Discord's "
+                "Cloudflare WAF requires (default Python urllib gets HTTP 403 "
+                "with 'error code 1010'). Color: 3066993=green standard, "
+                "16776960=yellow sentinel-match, 15158332=red emergency. "
+                "Returns {ok, http_status, response_body, webhook_id, fetched_at}. "
+                "On HTTP 204 success, http_status=204 and response_body is empty."
+            ),
+            args_schema=DiscordAlertInput,
         ),
     ]
