@@ -134,6 +134,59 @@ export type AutoLoopBrainHealth = {
   escalations_total: number;
 };
 
+export type SignalRouterDecision = {
+  route: string;
+  channel?: string | null;
+  kind: string;
+  timestamp: string;
+  status: string;
+  detail?: string | null;
+};
+
+export type SignalRouterAction = {
+  kind: string;
+  target?: string | null;
+  [key: string]: unknown;
+};
+
+export type SignalRouterRoute = {
+  name: string;
+  channel: string;
+  actions: SignalRouterAction[];
+  enabled: boolean;
+  fire_count_24h: number;
+  suppress_count_24h: number;
+  last_decisions: SignalRouterDecision[];
+};
+
+export type SignalRouterDedupStats = {
+  keys_count: number;
+  cooldown_hits_24h: number;
+  cap_hits_24h: number;
+};
+
+export type SignalRouterConfig = {
+  mode: "legacy" | "shadow" | "new";
+  live_trades_enabled: boolean;
+  kill_switch_active: boolean;
+  routes: SignalRouterRoute[];
+  last_decisions?: SignalRouterDecision[];
+  dedup_stats: SignalRouterDedupStats;
+};
+
+export type SignalRouterHealth = {
+  mode: "legacy" | "shadow" | "new";
+  routes_loaded: number;
+  channels_loaded: number;
+  dedup_keys_count: number;
+  kill_switch_active: boolean;
+  live_trades_enabled: boolean;
+  routes_enabled_count: number;
+  routes_disabled_count: number;
+  shadow_running?: boolean;
+  diff_metrics?: Record<string, unknown>;
+};
+
 export type ChartViewState = {
   chart_symbol: string;
   chart_timeframe: string;

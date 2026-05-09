@@ -71,6 +71,9 @@ def test_daemon_signal_router_health_shape(tmp_path) -> None:
         "channels_loaded": 0,
         "dedup_keys_count": 0,
         "kill_switch_active": False,
+        "live_trades_enabled": False,
+        "routes_enabled_count": 0,
+        "routes_disabled_count": 0,
         "shadow_running": False,
         "diff_metrics": {},
     }

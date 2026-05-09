@@ -12,6 +12,8 @@ import type {
   ServerEnvelope,
   SessionAttachedEnvelope,
   SessionSummary,
+  SignalRouterConfig,
+  SignalRouterHealth,
   StatusEnvelope,
   WatchlistQuote,
 } from "$lib/daemon/types";
@@ -135,6 +137,36 @@ function normalizeAutoLoopBrainConfig(payload: Partial<AutoLoopBrainConfig>): Au
     max_llm_critic_calls_per_session: asNumber(payload.max_llm_critic_calls_per_session),
     max_consecutive_llm_critic_calls: asNumber(payload.max_consecutive_llm_critic_calls),
     kill_switch_active: asBoolean(payload.kill_switch_active),
+  };
+}
+
+function normalizeSignalRouterConfig(payload: Partial<SignalRouterConfig>): SignalRouterConfig {
+  return {
+    mode: payload.mode ?? "legacy",
+    live_trades_enabled: asBoolean(payload.live_trades_enabled),
+    kill_switch_active: asBoolean(payload.kill_switch_active),
+    routes: Array.isArray(payload.routes) ? payload.routes : [],
+    last_decisions: Array.isArray(payload.last_decisions) ? payload.last_decisions : [],
+    dedup_stats: payload.dedup_stats ?? {
+      keys_count: 0,
+      cooldown_hits_24h: 0,
+      cap_hits_24h: 0,
+    },
+  };
+}
+
+function normalizeSignalRouterHealth(payload: Partial<SignalRouterHealth>): SignalRouterHealth {
+  return {
+    mode: payload.mode ?? "legacy",
+    routes_loaded: asNumber(payload.routes_loaded),
+    channels_loaded: asNumber(payload.channels_loaded),
+    dedup_keys_count: asNumber(payload.dedup_keys_count),
+    kill_switch_active: asBoolean(payload.kill_switch_active),
+    live_trades_enabled: asBoolean(payload.live_trades_enabled),
+    routes_enabled_count: asNumber(payload.routes_enabled_count),
+    routes_disabled_count: asNumber(payload.routes_disabled_count),
+    shadow_running: asBoolean(payload.shadow_running),
+    diff_metrics: payload.diff_metrics ?? {},
   };
 }
 
@@ -328,6 +360,61 @@ export class DaemonClient {
       token,
     )) as Partial<AutoLoopBrainConfig>;
     return normalizeAutoLoopBrainConfig(payload);
+  }
+
+  async fetchSignalRouterHealth(token = ""): Promise<SignalRouterHealth> {
+    const payload = (await this.requestJson(
+      "/api/health.signal_router",
+      token,
+    )) as Partial<SignalRouterHealth>;
+    return normalizeSignalRouterHealth(payload);
+  }
+
+  async fetchSignalRouterConfig(token = ""): Promise<SignalRouterConfig> {
+    const payload = (await this.requestJson(
+      "/api/daemon/config/signal_router",
+      token,
+    )) as Partial<SignalRouterConfig>;
+    return normalizeSignalRouterConfig(payload);
+  }
+
+  async updateSignalRouterLiveTrades(
+    liveTradesEnabled: boolean,
+    token = "",
+  ): Promise<SignalRouterConfig> {
+    const payload = (await this.requestJson(
+      "/api/daemon/config/signal_router",
+      token,
+      {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Operator-Source": "operator-ui",
+        },
+        body: JSON.stringify({ live_trades_enabled: liveTradesEnabled }),
+      },
+    )) as Partial<SignalRouterConfig>;
+    return normalizeSignalRouterConfig(payload);
+  }
+
+  async updateSignalRouterRoute(
+    routeName: string,
+    enabled: boolean,
+    token = "",
+  ): Promise<SignalRouterConfig> {
+    const payload = (await this.requestJson(
+      "/api/daemon/config/signal_router",
+      token,
+      {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Operator-Source": "operator-ui",
+        },
+        body: JSON.stringify({ routes: { [routeName]: { enabled } } }),
+      },
+    )) as Partial<SignalRouterConfig>;
+    return normalizeSignalRouterConfig(payload);
   }
 
   async switchAgentModel(

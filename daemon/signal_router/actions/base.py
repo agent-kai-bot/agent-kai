@@ -56,6 +56,7 @@ class ExecutionContext:
     chat_logger: Callable[[str], Any] | None = None
     audit_writer: Callable[[dict[str, Any]], Any] | None = None
     telemetry_emitter: Callable[[str, dict[str, Any]], Any] | None = None
+    runtime_config_store: Any | None = None
     sub_agent_manager: Any | None = None
     nats_request: Callable[..., Any] | None = None
     autotrade_enabled: Callable[[], bool] = lambda: False
