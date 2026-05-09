@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from agent_logger import get_logger
@@ -38,11 +39,13 @@ class SignalRouter:
         routes: list[Route] | None = None,
         channels: list[Channel] | None = None,
         dedup_table: RouterDedupTable | None = None,
+        runtime_config_store: Any | None = None,
         log_info: Callable[[str], None] | None = None,
         log_debug: Callable[[str], None] | None = None,
     ) -> None:
         self.config = config or {}
         self.mode: SignalRouterMode = resolve_mode(self.config)
+        self.runtime_config_store = runtime_config_store
         self.dedup_table = dedup_table or RouterDedupTable(
             self.config.get("dedup_table_path")
         )
@@ -61,6 +64,7 @@ class SignalRouter:
             f"channels={len(self.channels)}"
         )
         self.action_executors = dict(EXECUTORS)
+        self._decision_history: deque[dict[str, Any]] = deque(maxlen=500)
 
     def route(self, envelope: dict[str, Any]) -> RouteDecision | None:
         """Return the first matched route decision for compatibility callers."""
@@ -71,6 +75,8 @@ class SignalRouter:
     def decide(self, envelope: dict[str, Any]) -> list[RouteDecision]:
         """Evaluate configured routes for one normalized envelope."""
 
+        if kill_switch_active():
+            return []
         payload = envelope.get("payload")
         if payload is None:
             payload = envelope
@@ -84,7 +90,7 @@ class SignalRouter:
         )
         decisions: list[RouteDecision] = []
         for route in self.routes.values():
-            if not route.enabled:
+            if not self.is_route_enabled(route):
                 continue
             if not self._route_accepts_envelope(route, subject, inferred_channel):
                 continue
@@ -133,7 +139,17 @@ class SignalRouter:
     ) -> list[ActionResult]:
         """Execute route actions according to router cutover mode."""
 
-        if self.mode == SignalRouterMode.LEGACY:
+        if self.mode == SignalRouterMode.LEGACY or kill_switch_active():
+            return []
+        route = self.routes.get(decision.route_name)
+        if route is not None and not self.is_route_enabled(route):
+            self._record_action_decision(
+                route_name=decision.route_name,
+                channel=decision.channel,
+                action_kind="route",
+                status="suppressed_route_disabled",
+                detail="route_disabled",
+            )
             return []
 
         execution_context = context or ExecutionContext()
@@ -144,6 +160,9 @@ class SignalRouter:
             route_name=execution_context.route_name or decision.route_name,
             subject=execution_context.subject or envelope.get("subject"),
             dedup_table=execution_context.dedup_table or self.dedup_table,
+            runtime_config_store=(
+                execution_context.runtime_config_store or self.runtime_config_store
+            ),
         )
         results: list[ActionResult] = []
         for action in decision.actions:
@@ -176,18 +195,121 @@ class SignalRouter:
                     metrics={},
                 )
             results.append(result)
+            self._record_action_decision(
+                route_name=decision.route_name,
+                channel=decision.channel,
+                action_kind=action.kind,
+                status=result.status,
+                detail=result.detail,
+            )
         return results
 
     def health_payload(self) -> dict[str, Any]:
         """Return the Phase 1 health shape."""
 
         return {
-            "mode": self.mode.value,
+            "mode": (
+                SignalRouterMode.LEGACY.value
+                if kill_switch_active()
+                else self.mode.value
+            ),
             "routes_loaded": len(self.routes),
             "channels_loaded": len(self.channels),
             "dedup_keys_count": self.dedup_table.count_keys(),
             "kill_switch_active": kill_switch_active(),
         }
+
+    def is_route_enabled(self, route: Route) -> bool:
+        """Return the effective enabled state for a route."""
+
+        if not route.enabled:
+            return False
+        store = self.runtime_config_store
+        if store is None:
+            return True
+        getter = getattr(store, "get_signal_router_route_enabled", None)
+        if getter is None:
+            return True
+        return bool(getter(route.name, default=route.enabled))
+
+    def recent_decisions(
+        self,
+        *,
+        route_name: str | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Return recent action outcomes, newest first."""
+
+        rows = []
+        for row in reversed(self._decision_history):
+            if route_name is not None and row.get("route") != route_name:
+                continue
+            public = dict(row)
+            public.pop("_ts", None)
+            rows.append(public)
+        return rows[: max(0, limit)]
+
+    def route_counts_24h(self, route_name: str) -> dict[str, int]:
+        """Return fire/suppress counters for one route over the last 24h."""
+
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        fire_count = 0
+        suppress_count = 0
+        for row in self._decision_history:
+            if row.get("route") != route_name:
+                continue
+            ts = row.get("_ts")
+            if not isinstance(ts, datetime) or ts < since:
+                continue
+            status = str(row.get("status") or "")
+            if status == "fired":
+                fire_count += 1
+            elif status.startswith("suppressed") or status in {"skipped", "failed"}:
+                suppress_count += 1
+        return {"fire_count_24h": fire_count, "suppress_count_24h": suppress_count}
+
+    def dedup_stats_24h(self) -> dict[str, int]:
+        """Return a compact dedup/cap hit summary for management surfaces."""
+
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        cooldown_hits = 0
+        cap_hits = 0
+        for row in self._decision_history:
+            ts = row.get("_ts")
+            if not isinstance(ts, datetime) or ts < since:
+                continue
+            status = str(row.get("status") or "")
+            if "cooldown" in status:
+                cooldown_hits += 1
+            if "cap" in status:
+                cap_hits += 1
+        return {
+            "keys_count": self.dedup_table.count_keys(),
+            "cooldown_hits_24h": cooldown_hits,
+            "cap_hits_24h": cap_hits,
+        }
+
+    def _record_action_decision(
+        self,
+        *,
+        route_name: str,
+        channel: str | None,
+        action_kind: str,
+        status: str,
+        detail: str | None,
+    ) -> None:
+        ts = datetime.now(timezone.utc)
+        self._decision_history.append(
+            {
+                "_ts": ts,
+                "route": route_name,
+                "channel": channel,
+                "kind": action_kind,
+                "timestamp": ts.isoformat().replace("+00:00", "Z"),
+                "status": status,
+                "detail": detail,
+            }
+        )
 
     @staticmethod
     def _route_accepts_envelope(
@@ -280,11 +402,20 @@ class SignalRouter:
             pack_name = action.params.get("pack") or action.target
             if not pack_name:
                 continue
-            outcome = load_and_register_pack_role(
-                str(pack_name),
-                packs_dir=packs_dir,
-                logger=self.log,
-            )
+            try:
+                outcome = load_and_register_pack_role(
+                    str(pack_name),
+                    packs_dir=packs_dir,
+                    logger=self.log,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning(
+                    "signal_router agent-pack role registration deferred "
+                    "pack=%s error=%s",
+                    pack_name,
+                    exc,
+                )
+                continue
             self.log_info(
                 "signal_router agent-pack role "
                 f"pack={outcome.pack_name} role={outcome.role_name} status={outcome.status}"
