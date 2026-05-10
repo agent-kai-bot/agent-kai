@@ -36,7 +36,7 @@ class _FakeRunner:
     def __init__(self) -> None:
         self.chat_history = []
 
-    async def run(self, user_input: str):
+    async def run(self, user_input: str, **_kwargs):
         yield {"type": "token", "data": f"live:{user_input}"}
         yield {
             "type": "tool_start",

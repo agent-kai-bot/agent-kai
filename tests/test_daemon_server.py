@@ -39,7 +39,7 @@ class _FakeRunner:
         self.chat_history = []
         self.auto_mode_calls: list[tuple[bool, int]] = []
 
-    async def run(self, user_input: str):
+    async def run(self, user_input: str, **_kwargs):
         yield {"type": "token", "data": f"echo:{user_input}"}
         yield {
             "type": "tool_start",
@@ -68,7 +68,7 @@ class _FakeRunner:
 class _SlowRunner(_FakeRunner):
     """Runner stub that stays inside a stream until cancelled."""
 
-    async def run(self, user_input: str):
+    async def run(self, user_input: str, **_kwargs):
         yield {"type": "token", "data": f"started:{user_input}"}
         await asyncio.sleep(60)
         yield {"type": "final", "data": "should-not-finish"}

@@ -78,6 +78,7 @@ class CodexCredentials:
     # from the JWT's ``exp`` claim — the auth.json file itself does
     # NOT store an expiry, only the access_token JWT does.
     expires_at: int = 0
+    id_token: str = ""
 
     def is_expired(self, grace_seconds: int = REFRESH_GRACE_SECONDS) -> bool:
         if self.expires_at <= 0:
@@ -91,7 +92,7 @@ class CodexCredentials:
         return {
             "OPENAI_API_KEY": None,
             "tokens": {
-                "id_token": "",
+                "id_token": self.id_token,
                 "access_token": self.access_token,
                 "refresh_token": self.refresh_token,
                 "account_id": self.account_id,
@@ -158,6 +159,7 @@ def load_credentials(path: Path = DEFAULT_AUTH_PATH) -> Optional[CodexCredential
     access = tokens.get("access_token")
     refresh = tokens.get("refresh_token")
     account_id = tokens.get("account_id")
+    id_token = tokens.get("id_token") or ""
     if not (access and refresh):
         return None
 
@@ -172,6 +174,7 @@ def load_credentials(path: Path = DEFAULT_AUTH_PATH) -> Optional[CodexCredential
         access_token=access,
         refresh_token=refresh,
         account_id=account_id,
+        id_token=id_token if isinstance(id_token, str) else "",
         expires_at=_extract_expiry(access),
     )
 
@@ -213,6 +216,7 @@ def refresh_credentials(creds: CodexCredentials) -> CodexCredentials:
 
     new_access = payload.get("access_token")
     new_refresh = payload.get("refresh_token") or creds.refresh_token
+    new_id_token = payload.get("id_token") or creds.id_token
     if not new_access:
         raise RuntimeError(f"Refresh response missing access_token: {payload}")
 
@@ -221,11 +225,16 @@ def refresh_credentials(creds: CodexCredentials) -> CodexCredentials:
         access_token=new_access,
         refresh_token=new_refresh,
         account_id=new_account_id,
+        id_token=new_id_token if isinstance(new_id_token, str) else creds.id_token,
         expires_at=_extract_expiry(new_access),
     )
 
 
-def get_valid_credentials(path: Path = DEFAULT_AUTH_PATH) -> Optional[CodexCredentials]:
+def get_valid_credentials(
+    path: Path = DEFAULT_AUTH_PATH,
+    *,
+    force_refresh: bool = False,
+) -> Optional[CodexCredentials]:
     """Load credentials and refresh them if expired. Persists the refresh.
 
     Returns None if no credentials exist on disk. Raises if a refresh
@@ -235,10 +244,13 @@ def get_valid_credentials(path: Path = DEFAULT_AUTH_PATH) -> Optional[CodexCrede
     creds = load_credentials(path)
     if creds is None:
         return None
-    if not creds.is_expired():
+    if not force_refresh and not creds.is_expired():
         return creds
 
-    logger.info("Codex access token expired or near expiry — refreshing")
+    if force_refresh:
+        logger.info("Codex access token rejected — refreshing")
+    else:
+        logger.info("Codex access token expired or near expiry — refreshing")
     refreshed = refresh_credentials(creds)
     try:
         save_credentials(refreshed, path)
@@ -399,6 +411,7 @@ def login(
 
     access = token_response.get("access_token")
     refresh = token_response.get("refresh_token")
+    id_token = token_response.get("id_token") or ""
     if not access or not refresh:
         raise RuntimeError(f"Token exchange returned no tokens: {token_response}")
 
@@ -410,6 +423,7 @@ def login(
         access_token=access,
         refresh_token=refresh,
         account_id=account_id,
+        id_token=id_token if isinstance(id_token, str) else "",
         expires_at=_extract_expiry(access),
     )
     save_credentials(creds, path)
