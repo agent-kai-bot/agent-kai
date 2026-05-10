@@ -164,7 +164,7 @@ class SessionEventBusTests(unittest.IsolatedAsyncioTestCase):
         session = Session("alpha")
         token_events = session.subscribe_events("agent.token")
 
-        async def fake_run(_user_input):
+        async def fake_run(_user_input, **_kwargs):
             yield {"type": "token", "data": "hello"}
             yield {"type": "final", "data": "done"}
 
@@ -186,7 +186,7 @@ class SessionEventBusTests(unittest.IsolatedAsyncioTestCase):
             overrides.append(limit)
             yield
 
-        async def fake_run(_user_input):
+        async def fake_run(_user_input, **_kwargs):
             yield {"type": "final", "data": "done"}
 
         session.agent_runner = mock.Mock()

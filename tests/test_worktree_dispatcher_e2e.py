@@ -23,8 +23,14 @@ class _FakeSession:
     def attach_runtime(self, **kwargs):
         return object()
 
-    def start_auto_mode(self, *, max_iterations: int, readonly: bool):
-        self.started.append((max_iterations, readonly))
+    def start_auto_mode(
+        self,
+        *,
+        max_iterations: int,
+        readonly: bool,
+        heartbeat_subscribed: bool | None = None,
+    ):
+        self.started.append((max_iterations, readonly, heartbeat_subscribed))
 
 
 class _FakeManaged:

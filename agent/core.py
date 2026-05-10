@@ -1,5 +1,6 @@
 """LangChain agent core — AgentRunner wrapping AgentExecutor with fallback."""
 
+import asyncio
 from contextlib import contextmanager
 import os
 from pathlib import Path
@@ -10,6 +11,8 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
+from openai import APIStatusError
+from pydantic import SecretStr
 
 from agent.auto_prompt import build_auto_suffix, parse_auto_state
 from agent.memory_store import MemoryStore
@@ -42,6 +45,9 @@ from config import (
 
 DEFAULT_LLM_HISTORY_MAX_MESSAGES = 80
 DEFAULT_LLM_HISTORY_MAX_CHARS = 80_000
+CODEX_OPERATOR_REAUTH_MESSAGE = (
+    "Codex OAuth refresh failed — operator must run `codex login --device-auth`"
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -293,6 +299,72 @@ class ChatCodex(ChatOpenAI):
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
         return _move_system_to_instructions(payload)
 
+    def _refresh_codex_credentials_for_retry(self) -> None:
+        from agent.codex_auth import get_valid_credentials
+
+        try:
+            creds = get_valid_credentials(force_refresh=True)
+        except RuntimeError as exc:
+            raise RuntimeError(CODEX_OPERATOR_REAUTH_MESSAGE) from exc
+        if creds is None:
+            raise RuntimeError(CODEX_OPERATOR_REAUTH_MESSAGE)
+        _apply_codex_credentials(self, creds)
+
+    def _invoke_with_codex_auth_retry(self, call):
+        try:
+            return call()
+        except APIStatusError as exc:
+            if not _is_codex_unauthorized_error(exc):
+                raise
+            self._refresh_codex_credentials_for_retry()
+
+        try:
+            return call()
+        except APIStatusError as exc:
+            if _is_codex_unauthorized_error(exc):
+                raise RuntimeError(CODEX_OPERATOR_REAUTH_MESSAGE) from exc
+            raise
+
+    def _stream_with_codex_auth_retry(self, stream_factory):
+        emitted_chunk = False
+        try:
+            for chunk in stream_factory():
+                emitted_chunk = True
+                yield chunk
+            return
+        except APIStatusError as exc:
+            if emitted_chunk or not _is_codex_unauthorized_error(exc):
+                raise
+            self._refresh_codex_credentials_for_retry()
+
+        try:
+            for chunk in stream_factory():
+                yield chunk
+        except APIStatusError as exc:
+            if _is_codex_unauthorized_error(exc):
+                raise RuntimeError(CODEX_OPERATOR_REAUTH_MESSAGE) from exc
+            raise
+
+    async def _astream_with_codex_auth_retry(self, stream_factory):
+        emitted_chunk = False
+        try:
+            async for chunk in stream_factory():
+                emitted_chunk = True
+                yield chunk
+            return
+        except APIStatusError as exc:
+            if emitted_chunk or not _is_codex_unauthorized_error(exc):
+                raise
+            await asyncio.to_thread(self._refresh_codex_credentials_for_retry)
+
+        try:
+            async for chunk in stream_factory():
+                yield chunk
+        except APIStatusError as exc:
+            if _is_codex_unauthorized_error(exc):
+                raise RuntimeError(CODEX_OPERATOR_REAUTH_MESSAGE) from exc
+            raise
+
     # ── Content-flattening overrides ────────────────────────────
     # All four model code paths (sync/async × streaming/non-streaming)
     # need the same fix because the agent executor reaches them via
@@ -301,24 +373,83 @@ class ChatCodex(ChatOpenAI):
     # to the parent and post-processes the result.
 
     async def _astream(self, *args, **kwargs):
-        async for chunk in super()._astream(*args, **kwargs):
-            yield _flatten_chat_chunk(chunk)
+        async def stream_once():
+            async for chunk in super(ChatCodex, self)._astream(*args, **kwargs):
+                yield _flatten_chat_chunk(chunk)
+
+        async for chunk in self._astream_with_codex_auth_retry(stream_once):
+            yield chunk
 
     def _stream(self, *args, **kwargs):
-        for chunk in super()._stream(*args, **kwargs):
-            yield _flatten_chat_chunk(chunk)
+        def stream_once():
+            for chunk in super(ChatCodex, self)._stream(*args, **kwargs):
+                yield _flatten_chat_chunk(chunk)
+
+        yield from self._stream_with_codex_auth_retry(stream_once)
 
     def _generate(self, *args, **kwargs):
-        result = super()._generate(*args, **kwargs)
+        def generate_once():
+            return super(ChatCodex, self)._generate(*args, **kwargs)
+
+        result = (
+            generate_once()
+            if self.streaming
+            else self._invoke_with_codex_auth_retry(generate_once)
+        )
         for gen in result.generations:
             _flatten_chat_message(gen.message)
         return result
 
     async def _agenerate(self, *args, **kwargs):
-        result = await super()._agenerate(*args, **kwargs)
+        async def generate_once():
+            return await super(ChatCodex, self)._agenerate(*args, **kwargs)
+
+        if self.streaming:
+            result = await generate_once()
+        else:
+            try:
+                result = await generate_once()
+            except APIStatusError as exc:
+                if not _is_codex_unauthorized_error(exc):
+                    raise
+                await asyncio.to_thread(self._refresh_codex_credentials_for_retry)
+                try:
+                    result = await generate_once()
+                except APIStatusError as retry_exc:
+                    if _is_codex_unauthorized_error(retry_exc):
+                        raise RuntimeError(CODEX_OPERATOR_REAUTH_MESSAGE) from retry_exc
+                    raise
         for gen in result.generations:
             _flatten_chat_message(gen.message)
         return result
+
+
+def _apply_codex_credentials(model: ChatCodex, creds) -> None:
+    """Update a live ChatCodex instance with freshly refreshed OAuth credentials."""
+    model.openai_api_key = SecretStr(creds.access_token)
+    headers = dict(model.default_headers or {})
+    headers["chatgpt-account-id"] = creds.account_id
+    model.default_headers = headers
+
+    for client in (
+        getattr(model, "root_client", None),
+        getattr(model, "root_async_client", None),
+    ):
+        if client is None:
+            continue
+        client.api_key = creds.access_token
+        custom_headers = getattr(client, "_custom_headers", None)
+        if isinstance(custom_headers, dict):
+            custom_headers["chatgpt-account-id"] = creds.account_id
+
+
+def _is_codex_unauthorized_error(exc: APIStatusError) -> bool:
+    """Return True for the Codex 401s that should trigger one OAuth refresh."""
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 401:
+        return True
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) == 401
 
 
 def _flatten_chat_chunk(chunk):
