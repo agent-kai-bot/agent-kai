@@ -15,6 +15,7 @@
 
   import type { ChartMode } from "$lib/chart-mode";
   import type { CandleBar } from "$lib/daemon/types";
+  import { shouldRefitPriceScale } from "$lib/market-ui";
 
   import Panel from "$lib/components/Panel.svelte";
 
@@ -155,6 +156,9 @@
   $effect(() => {
     const marketKey = `${symbol}:${timeframe}:${source}`;
     if (marketKey !== lastMarketKey) {
+      if (shouldRefitPriceScale(lastMarketKey, marketKey)) {
+        candleSeries?.priceScale().setAutoScale(true);
+      }
       lastMarketKey = marketKey;
       hasFitted = false;
     }

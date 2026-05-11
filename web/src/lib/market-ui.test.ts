@@ -5,6 +5,7 @@ import {
   formatRelativeTime,
   isActionableSignal,
   normalizeSignalAlert,
+  shouldRefitPriceScale,
   signalChartPatch,
   signalCountsBySymbol,
   sortWatchlistQuotes,
@@ -78,6 +79,13 @@ describe("market UI helpers", () => {
         Date.parse("2026-04-23T21:00:44Z"),
       ),
     ).toBe("44s ago");
+  });
+
+  it("refits the chart price scale only when the symbol changes", () => {
+    expect(shouldRefitPriceScale("", "BTC:1h:live")).toBe(true);
+    expect(shouldRefitPriceScale("BTC:1h:live", "DOGE:1h:live")).toBe(true);
+    expect(shouldRefitPriceScale("BTC:1h:live", "BTC:4h:live")).toBe(false);
+    expect(shouldRefitPriceScale("BTC:1h:live", "BTC:1h:paper")).toBe(false);
   });
 
   it("filters actionable directional signals", () => {
