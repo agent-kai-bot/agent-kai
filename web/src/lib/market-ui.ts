@@ -172,7 +172,7 @@ export function normalizeSignalAlert(
   const timestamp = normalizeTimestamp(payload);
   const symbol = normalizeSymbol(payload.symbol ?? payload.market ?? payload.pair) || "?";
   const side =
-    firstString(payload, ["side", "direction", "signal", "type"]) ?? "signal";
+    firstString(payload, ["side", "direction", "signal", "type", "signal_type"]) ?? "signal";
   const source = firstString(payload, ["source", "strategy", "strategy_name"]);
   const reason = firstString(payload, ["reason", "message", "summary", "description"]);
   const timeframe = firstString(payload, ["timeframe", "tf", "interval"]);
