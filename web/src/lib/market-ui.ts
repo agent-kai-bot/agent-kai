@@ -67,6 +67,10 @@ export function normalizeMarketSymbol(value: string): string {
   return normalizeSymbol(value);
 }
 
+export function shouldRefitPriceScale(prevMarketKey: string, nextMarketKey: string): boolean {
+  return prevMarketKey.split(":")[0] !== nextMarketKey.split(":")[0];
+}
+
 function numberFrom(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
