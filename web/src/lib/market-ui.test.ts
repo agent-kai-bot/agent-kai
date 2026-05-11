@@ -39,6 +39,26 @@ describe("market UI helpers", () => {
     expect(signalChartPatch(alert)).toEqual({ symbol: "BTC", timeframe: "15m" });
   });
 
+  it("uses signal_type as the final side fallback for signal alerts", () => {
+    const alert = normalizeSignalAlert(
+      { symbol: "FLORKETH", signal_type: "BUY", price: 0.000002207 },
+      0,
+    );
+
+    expect(alert.side).toBe("BUY");
+    expect(isActionableSignal(alert)).toBe(true);
+  });
+
+  it("prefers canonical type over signal_type when both are present", () => {
+    const alert = normalizeSignalAlert({
+      symbol: "FLORKETH",
+      type: "SELL",
+      signal_type: "BUY",
+    });
+
+    expect(alert.side).toBe("SELL");
+  });
+
   it("builds local symbol suggestions from chart, watchlist, signals, and known symbols", () => {
     const suggestions = buildSymbolSuggestions({
       activeSymbol: "BTC",
