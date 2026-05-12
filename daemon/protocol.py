@@ -29,6 +29,7 @@ class ChatHistoryEntry(ProtocolModel):
 
     role: NonEmptyString
     content: str
+    ts: str | None = None
 
 
 class SessionStateSnapshot(ProtocolModel):

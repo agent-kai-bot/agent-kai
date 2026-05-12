@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import unittest
+from typing import get_args
 
 from daemon.protocol import (
     AutoProgressEnvelope,
     AutoStartedEnvelope,
     AutoStoppedEnvelope,
     ChartBarEnvelope,
+    ChatHistoryEntry,
     NatsEventEnvelope,
     OptimizerCompletedEnvelope,
     ScheduledJobCreatedEnvelope,
@@ -79,6 +81,49 @@ class ServerEnvelopeTests(unittest.TestCase):
         self.assertTrue(decoded.state.auto_mode)
         self.assertEqual(decoded.state.auto_iterations_total, 20)
         self.assertEqual(decoded.state.chat_history[0].role, "human")
+
+    def test_session_snapshot_accepts_timestamped_chat_history(self):
+        snapshot = SessionStateSnapshot(
+            chat_history=[
+                {
+                    "role": "human",
+                    "content": "hello",
+                    "ts": "2026-05-12T09:25:00-04:00",
+                },
+                {
+                    "role": "ai",
+                    "content": "hi",
+                    "ts": "2026-05-12T09:25:04-04:00",
+                },
+            ],
+        )
+
+        encoded = encode_envelope(
+            SessionAttachedEnvelope(
+                type="session_attached",
+                session="terminal",
+                state=snapshot,
+            )
+        )
+
+        self.assertEqual(
+            encoded["state"]["chat_history"][0]["ts"],
+            "2026-05-12T09:25:00-04:00",
+        )
+        decoded = decode_server_envelope(encoded)
+        self.assertEqual(
+            decoded.state.chat_history[1].ts,
+            "2026-05-12T09:25:04-04:00",
+        )
+
+    def test_chat_history_entry_ts_is_optional_string(self):
+        entry = ChatHistoryEntry(role="human", content="hello")
+
+        self.assertIsNone(entry.ts)
+        self.assertEqual(
+            set(get_args(ChatHistoryEntry.model_fields["ts"].annotation)),
+            {str, type(None)},
+        )
 
     def test_tool_end_omits_null_elapsed_on_encode(self):
         payload = encode_envelope(
