@@ -263,6 +263,34 @@ export type ToolEndEnvelope = {
   ok: boolean;
 };
 
+export type AutoStartedEnvelope = {
+  type: "auto_started";
+  readonly: boolean;
+  iterations_total: number;
+  iterations_remaining: number;
+  iterations_used: number;
+  elapsed_seconds: number;
+};
+
+export type AutoProgressEnvelope = {
+  type: "auto_progress";
+  readonly: boolean;
+  iterations_total: number;
+  iterations_remaining: number;
+  iterations_used: number;
+  elapsed_seconds: number;
+};
+
+export type AutoStoppedEnvelope = {
+  type: "auto_stopped";
+  readonly: boolean;
+  iterations_total: number;
+  iterations_remaining: number;
+  iterations_used: number;
+  elapsed_seconds: number;
+  reason: string;
+};
+
 export type SignalEnvelope = {
   type: "signal";
   signal: Record<string, unknown>;
@@ -307,6 +335,9 @@ export type ServerEnvelope =
   | ErrorEnvelope
   | ToolStartEnvelope
   | ToolEndEnvelope
+  | AutoStartedEnvelope
+  | AutoProgressEnvelope
+  | AutoStoppedEnvelope
   | SignalEnvelope
   | ChartBarEnvelope
   | ChartViewEnvelope

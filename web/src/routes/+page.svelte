@@ -17,6 +17,12 @@
     type ChartStreamKey,
   } from "$lib/chart-stream";
   import {
+    applyChatActivityEnvelope,
+    clearChatActivityState,
+    startChatActivityTurn,
+    type ChatActivityState,
+  } from "$lib/chat-activity";
+  import {
     filterPaletteItems,
     resolvePaletteQuery,
     splitSlashInput,
@@ -90,6 +96,7 @@
   let activeSuggestionIndex = $state(0);
   let chatMessages = $state<ChatHistoryEntry[]>([]);
   let streamingReply = $state("");
+  let chatActivity = $state<ChatActivityState>(clearChatActivityState());
   let chartQuote = $state<WatchlistQuote | null>(null);
   let watchlistQuotes = $state<WatchlistQuote[]>([]);
   let portfolio = $state<PortfolioSnapshot>({ positions: [], pnl: {} });
@@ -699,6 +706,7 @@
       await client.stopSession(activeSession, token);
       daemonConnection?.interrupt();
       streamingReply = "";
+      chatActivity = clearChatActivityState();
       currentStatus = "idle";
     } catch (error) {
       attachError = error instanceof Error ? error.message : String(error);
@@ -818,10 +826,12 @@
     if (envelope.type === "status") {
       currentStatus = envelope.activity;
       queueDepth = envelope.queue;
+      chatActivity = applyChatActivityEnvelope(chatActivity, envelope);
       return;
     }
 
     if (envelope.type === "token") {
+      chatActivity = applyChatActivityEnvelope(chatActivity, envelope);
       recordStreamToken(envelope.text);
       streamingReply += envelope.text;
       return;
@@ -830,6 +840,18 @@
     if (envelope.type === "final") {
       chatMessages = [...chatMessages, { role: "ai", content: envelope.text }];
       streamingReply = "";
+      chatActivity = applyChatActivityEnvelope(chatActivity, envelope);
+      return;
+    }
+
+    if (
+      envelope.type === "tool_start" ||
+      envelope.type === "tool_end" ||
+      envelope.type === "auto_started" ||
+      envelope.type === "auto_progress" ||
+      envelope.type === "auto_stopped"
+    ) {
+      chatActivity = applyChatActivityEnvelope(chatActivity, envelope);
       return;
     }
 
@@ -895,6 +917,7 @@
       chartQuote = null;
       watchlist = [];
       chatMessages = [];
+      chatActivity = clearChatActivityState();
       return;
     }
     const snapshot = daemonConnection.snapshot;
@@ -911,6 +934,8 @@
         : `${totalMessages} chat messages`;
     snapshotSummary = `${chartSymbol} ${chartTimeframe} · ${chartSource} · chart ${chartMode} · ${recentLabel}`;
     chatMessages = [...snapshot.chat_history];
+    streamingReply = "";
+    chatActivity = clearChatActivityState();
   }
 
   async function refreshSessions(): Promise<void> {
@@ -953,6 +978,7 @@
         chartHistoryRequestSeq += 1;
         chartBars = [];
         chartStatus = "waiting for a session";
+        chatActivity = clearChatActivityState();
         stopPolling();
       };
       daemonConnection.subscribe("signals");
@@ -1004,6 +1030,7 @@
     schedulerEvents = [];
     chatMessages = [];
     streamingReply = "";
+    chatActivity = clearChatActivityState();
     streamStartedAt = null;
     firstTokenAt = null;
     streamChunkCount = 0;
@@ -1028,6 +1055,7 @@
     }
     chatMessages = [...chatMessages, { role: "human", content: text }];
     streamingReply = "";
+    chatActivity = startChatActivityTurn();
     resetStreamMetrics();
     if (text.startsWith("/")) {
       const firstSpace = text.indexOf(" ");
@@ -1046,6 +1074,7 @@
     const text = prompt.trim();
     chatMessages = [...chatMessages, { role: "human", content: text }];
     streamingReply = "";
+    chatActivity = startChatActivityTurn();
     resetStreamMetrics();
     daemonConnection.sendInput(text);
   }
@@ -1084,6 +1113,7 @@
       },
     ];
     streamingReply = "";
+    chatActivity = startChatActivityTurn();
     resetStreamMetrics();
     daemonConnection.sendSlash(split.command, split.args);
     closePalette();
@@ -1416,6 +1446,7 @@
           ></button>
 
           <ChatPanel
+            activity={chatActivity}
             initiallyOpen={false}
             messages={chatMessages}
             mobileCollapsible={true}
