@@ -150,6 +150,11 @@ def _role_for_message(message: Any) -> str:
     return "ai"
 
 
+def message_timestamp_now() -> str:
+    """ISO-8601 UTC timestamp stamped onto chat-history entries at append time."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 def _tool_name_from_auto_pause_reason(reason: str | None) -> str:
     text = str(reason or "").strip()
     if text.startswith("requires approval for "):
@@ -208,12 +213,14 @@ def serialize_messages(messages: list[Any]) -> list[dict[str, str]]:
         content = _flatten_message_content(getattr(message, "content", ""))
         if not content:
             continue
-        serialized.append(
-            {
-                "role": _role_for_message(message),
-                "content": content,
-            }
-        )
+        entry: dict[str, str] = {
+            "role": _role_for_message(message),
+            "content": content,
+        }
+        ts = getattr(message, "additional_kwargs", {}).get("timestamp") if hasattr(message, "additional_kwargs") else None
+        if isinstance(ts, str) and ts:
+            entry["ts"] = ts
+        serialized.append(entry)
     return serialized
 
 
@@ -227,12 +234,14 @@ def deserialize_messages(entries: list[dict[str, Any]]) -> list[Any]:
         if not isinstance(content, str) or not content:
             continue
         role = entry.get("role", "")
+        ts = entry.get("ts")
+        extra: dict[str, Any] = {"timestamp": ts} if isinstance(ts, str) and ts else {}
         if role == "human":
-            restored.append(HumanMessage(content=content))
+            restored.append(HumanMessage(content=content, additional_kwargs=extra))
         elif role == "system":
-            restored.append(SystemMessage(content=content))
+            restored.append(SystemMessage(content=content, additional_kwargs=extra))
         else:
-            restored.append(AIMessage(content=content))
+            restored.append(AIMessage(content=content, additional_kwargs=extra))
     return restored
 
 
@@ -1117,7 +1126,10 @@ class Session:
             raise RuntimeError("session runtime is not attached")
 
         if source == "scheduler" and job_id:
-            self.chat_history.append(SystemMessage(content=f"[scheduled job: {job_id}]"))
+            self.chat_history.append(SystemMessage(
+                content=f"[scheduled job: {job_id}]",
+                additional_kwargs={"timestamp": message_timestamp_now()},
+            ))
             self.agent_runner.chat_history = self.chat_history
 
         self.publish_event(

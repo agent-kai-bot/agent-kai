@@ -2,6 +2,7 @@
   import { tick } from "svelte";
   import type { ChatHistoryEntry } from "$lib/daemon/types";
   import { renderMarkdown } from "$lib/markdown";
+  import { formatChatTimestamp } from "$lib/market-ui";
 
   import Panel from "$lib/components/Panel.svelte";
 
@@ -16,6 +17,8 @@
     mobileCollapsible?: boolean;
     initiallyOpen?: boolean;
   } = $props();
+
+  const streamingStartedAt = new Date().toISOString();
 
   let scrollAnchor: HTMLDivElement | undefined = $state();
 
@@ -53,7 +56,12 @@
     {#if messages.length || streamingReply}
       {#each messages as message, index (message.role + message.content + index)}
         <article class={`message ${message.role}`}>
-          <span>{label(message.role)}</span>
+          <header class="message-header">
+            <span class="role">{label(message.role)}</span>
+            {#if formatChatTimestamp(message.ts)}
+              <span class="timestamp">{formatChatTimestamp(message.ts)}</span>
+            {/if}
+          </header>
           <div class="markdown-body">
             {@html renderMarkdown(message.content)}
           </div>
@@ -61,7 +69,10 @@
       {/each}
       {#if streamingReply}
         <article class="message ai streaming">
-          <span>Agent</span>
+          <header class="message-header">
+            <span class="role">Agent</span>
+            <span class="timestamp">{formatChatTimestamp(streamingStartedAt)}</span>
+          </header>
           <pre>{streamingReply}</pre>
         </article>
       {/if}
@@ -103,12 +114,25 @@
     border-style: dashed;
   }
 
-  .message span {
+  .message-header {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+  }
+
+  .message-header .role {
     color: var(--accent-strong);
     font-size: 0.76rem;
     font-weight: 700;
     letter-spacing: 0.12em;
     text-transform: uppercase;
+  }
+
+  .message-header .timestamp {
+    color: var(--muted);
+    font-size: 0.7rem;
+    font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+    letter-spacing: 0.02em;
   }
 
   .message pre {

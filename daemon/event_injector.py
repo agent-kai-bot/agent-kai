@@ -12,6 +12,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 
 from agent_logger import get_logger
+from daemon.core import message_timestamp_now
 
 
 class SafeFormatDict(dict):
@@ -203,7 +204,10 @@ class EventInjector:
                 self.publish_drop(managed, request, "template_render_failed")
                 return
 
-            session.chat_history.append(HumanMessage(content=prompt))
+            session.chat_history.append(HumanMessage(
+                content=prompt,
+                additional_kwargs={"timestamp": message_timestamp_now()},
+            ))
             session.agent_runner.chat_history = session.chat_history
             self._record_injection(session, policy.timestamp_attr, request.monotonic_seconds)
             injected_payload = {**request.injected_payload}

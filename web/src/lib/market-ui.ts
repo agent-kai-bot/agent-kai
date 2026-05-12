@@ -133,6 +133,27 @@ export function formatLocalTime(timestamp: string): string {
   });
 }
 
+export function formatChatTimestamp(
+  timestamp: string | undefined,
+  timeZone = "America/New_York",
+): string | null {
+  if (!timestamp) {
+    return null;
+  }
+  const parsed = new Date(timestamp);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+  return parsed.toLocaleTimeString("en-US", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    timeZoneName: "short",
+  });
+}
+
 export function formatRelativeTime(timestamp: string, now = Date.now()): string {
   const parsed = new Date(timestamp).getTime();
   if (Number.isNaN(parsed)) {

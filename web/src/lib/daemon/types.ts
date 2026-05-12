@@ -1,6 +1,7 @@
 export type ChatHistoryEntry = {
   role: string;
   content: string;
+  ts?: string;
 };
 
 export type SessionStateSnapshot = {

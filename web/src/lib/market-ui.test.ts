@@ -2,6 +2,7 @@ import {
   buildSymbolSuggestions,
   filterSignalAlerts,
   filterWatchlistQuotes,
+  formatChatTimestamp,
   formatRelativeTime,
   isActionableSignal,
   normalizeSignalAlert,
@@ -123,5 +124,23 @@ describe("market UI helpers", () => {
     ]);
     expect(sortWatchlistQuotes(quotes, "signals", signalCounts)[0].symbol).toBe("SOL");
     expect(sortWatchlistQuotes(quotes, "change")[0].symbol).toBe("ETH");
+  });
+
+  it("formats chat timestamps in the requested timezone with zone suffix", () => {
+    // 17:32:05 UTC on a date that's EST (winter) — 12:32:05 EST.
+    const formatted = formatChatTimestamp("2026-01-15T17:32:05Z");
+    expect(formatted).toBe("12:32:05 EST");
+  });
+
+  it("formats chat timestamps as EDT during summer DST", () => {
+    // 17:32:05 UTC mid-summer — 13:32:05 EDT.
+    const formatted = formatChatTimestamp("2026-07-15T17:32:05Z");
+    expect(formatted).toBe("13:32:05 EDT");
+  });
+
+  it("returns null for missing or invalid chat timestamps", () => {
+    expect(formatChatTimestamp(undefined)).toBeNull();
+    expect(formatChatTimestamp("")).toBeNull();
+    expect(formatChatTimestamp("not-a-date")).toBeNull();
   });
 });

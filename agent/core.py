@@ -2,9 +2,14 @@
 
 import asyncio
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 from typing import Any, AsyncIterator
+
+
+def _now_ts() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.messages import AIMessage, HumanMessage
@@ -1050,7 +1055,10 @@ class AgentRunner:
         visible_input = not getattr(self, "_is_auto_continuation", False)
         log_input = user_input if visible_input else "[AUTO_CONTINUATION]"
         if visible_input and not pre_injected_input:
-            self.chat_history.append(HumanMessage(content=user_input))
+            self.chat_history.append(HumanMessage(
+                content=user_input,
+                additional_kwargs={"timestamp": _now_ts()},
+            ))
         elif not visible_input:
             self.log.info("AUTO_HIDDEN_TURN")
         self.log.info("USER_INPUT agent=%s input=%s", self.agent_name, log_input[:200])
@@ -1200,7 +1208,10 @@ class AgentRunner:
             self.log.warning("EMPTY_RESPONSE agent=%s endpoint=final", self.agent_name)
         if not emitted_final or not (final_text or accumulated).strip():
             yield {"type": "final", "data": response_text}
-        self.chat_history.append(AIMessage(content=response_text))
+        self.chat_history.append(AIMessage(
+            content=response_text,
+            additional_kwargs={"timestamp": _now_ts()},
+        ))
         if getattr(self, "_auto_mode", False):
             self._last_auto_state = parse_auto_state(response_text)
 
