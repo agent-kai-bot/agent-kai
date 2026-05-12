@@ -9,6 +9,14 @@
     type ChartMode,
   } from "$lib/chart-mode";
   import {
+    applyChartBar,
+    chartBarMatchesSubscription,
+    chartStreamKeyLabel,
+    chartSubscriptionActions,
+    makeChartStreamKey,
+    type ChartStreamKey,
+  } from "$lib/chart-stream";
+  import {
     filterPaletteItems,
     resolvePaletteQuery,
     splitSlashInput,
@@ -58,6 +66,7 @@
     half: 50,
     mini: 34,
   };
+  type DaemonConnectionHandle = Awaited<ReturnType<DaemonClient["attach"]>>;
 
   let token = $state("");
   let sessionName = $state(DEFAULT_SESSION_NAME);
@@ -95,7 +104,7 @@
   let paletteQuery = $state("");
   let paletteItems = $state<CommandPaletteItem[]>(filterPaletteItems(""));
   let pollingHandle: number | null = null;
-  let daemonConnection = $state<Awaited<ReturnType<DaemonClient["attach"]>> | null>(null);
+  let daemonConnection = $state<DaemonConnectionHandle | null>(null);
   let modelAgents = $state<ModelAgentSummary[]>([]);
   let modelEndpoints = $state<EndpointModelSummary[]>([]);
   let selectedModelAgent = $state("kai");
@@ -115,6 +124,10 @@
   let leftPanePct = $state(20);
   let rightPanePct = $state(20);
   let chartPanePct = $state(56);
+  let activeChartConnection: DaemonConnectionHandle | null = null;
+  let activeChartSubscription: ChartStreamKey | null = null;
+  let activeChartMarketKey = "";
+  let chartHistoryRequestSeq = 0;
 
   function isScheduledJobEnvelope(envelope: ServerEnvelope): envelope is ScheduledJobEnvelope {
     return envelope.type.startsWith("scheduled_job_");
@@ -190,6 +203,7 @@
       previousTimeframe !== chartTimeframe ||
       previousSource !== chartSource;
     if (changedMarket) {
+      resetChartBarsForMarket();
       void Promise.all([refreshSidebarData(), refreshChartData()]);
     }
   }
@@ -253,6 +267,50 @@
 
   function chartPrice(): number | undefined {
     return chartQuote?.price ?? chartBars.at(-1)?.close;
+  }
+
+  function currentChartMarketKey(): string {
+    return `${chartSymbol}:${chartTimeframe}:${chartSource}`;
+  }
+
+  function resetChartBarsForMarket(marketKey = currentChartMarketKey()): void {
+    chartHistoryRequestSeq += 1;
+    activeChartMarketKey = daemonConnection ? marketKey : "";
+    chartBars = [];
+    chartStatus = daemonConnection
+      ? `loading ${chartSymbol} ${chartTimeframe} from ${chartSource}`
+      : "waiting for a session";
+  }
+
+  function syncChartStreamSubscription(): void {
+    const connection = daemonConnection;
+    const connectionChanged = activeChartConnection !== connection;
+    const nextSubscription = connection
+      ? makeChartStreamKey(chartSymbol, chartTimeframe)
+      : null;
+    const previousSubscription =
+      connectionChanged ? null : activeChartSubscription;
+    const nextMarketKey = connection ? currentChartMarketKey() : "";
+
+    if (connectionChanged || nextMarketKey !== activeChartMarketKey) {
+      resetChartBarsForMarket(nextMarketKey);
+    }
+
+    if (connection) {
+      for (const action of chartSubscriptionActions(
+        previousSubscription,
+        nextSubscription,
+      )) {
+        if (action.type === "unsubscribe") {
+          connection.unsubscribe("chart", action.key.symbol, action.key.timeframe);
+        } else {
+          connection.subscribe("chart", action.key.symbol, action.key.timeframe);
+        }
+      }
+    }
+
+    activeChartConnection = connection;
+    activeChartSubscription = nextSubscription;
   }
 
   function symbolSuggestions() {
@@ -667,20 +725,39 @@
   }
 
   async function refreshChartData(): Promise<void> {
-    if (!daemonConnection) {
+    const requestConnection = daemonConnection;
+    if (!requestConnection) {
+      chartHistoryRequestSeq += 1;
       chartBars = [];
       chartStatus = "waiting for a session";
       return;
     }
+    const requestSeq = ++chartHistoryRequestSeq;
+    const requestSymbol = chartSymbol;
+    const requestTimeframe = chartTimeframe;
+    const requestSource = chartSource;
     try {
-      chartBars = await client.fetchChartHistory({
-        symbol: chartSymbol,
-        interval: chartTimeframe,
-        source: chartSource,
+      const bars = await client.fetchChartHistory({
+        symbol: requestSymbol,
+        interval: requestTimeframe,
+        source: requestSource,
         token,
       });
-      chartStatus = `${chartBars.length} bars refreshed from ${chartSource}`;
+      if (
+        requestSeq !== chartHistoryRequestSeq ||
+        requestConnection !== daemonConnection ||
+        requestSymbol !== chartSymbol ||
+        requestTimeframe !== chartTimeframe ||
+        requestSource !== chartSource
+      ) {
+        return;
+      }
+      chartBars = bars;
+      chartStatus = `${bars.length} bars refreshed from ${requestSource}`;
     } catch (error) {
+      if (requestSeq !== chartHistoryRequestSeq || requestConnection !== daemonConnection) {
+        return;
+      }
       chartStatus = error instanceof Error ? error.message : String(error);
     }
   }
@@ -758,6 +835,20 @@
 
     if (envelope.type === "chart_view") {
       applyChartViewState(envelope);
+      return;
+    }
+
+    if (envelope.type === "chart_bar") {
+      const currentSubscription = makeChartStreamKey(chartSymbol, chartTimeframe);
+      if (!chartBarMatchesSubscription(envelope, currentSubscription)) {
+        return;
+      }
+      const nextBars = applyChartBar(chartBars, envelope.bar);
+      if (!nextBars) {
+        return;
+      }
+      chartBars = nextBars;
+      chartStatus = `${nextBars.length} bars live for ${chartStreamKeyLabel(currentSubscription)}`;
       return;
     }
 
@@ -856,6 +947,12 @@
         activeSession = "";
         daemonConnection = null;
         chartQuote = null;
+        activeChartConnection = null;
+        activeChartSubscription = null;
+        activeChartMarketKey = "";
+        chartHistoryRequestSeq += 1;
+        chartBars = [];
+        chartStatus = "waiting for a session";
         stopPolling();
       };
       daemonConnection.subscribe("signals");
@@ -865,6 +962,7 @@
       queueDepth = daemonConnection.queueDepth;
       connectionStatus = `attached to session ${activeSession}`;
       applySnapshot();
+      resetChartBarsForMarket();
       await refreshModelInfo();
       await refreshSessions();
       await Promise.all([refreshSidebarData(), refreshChartData()]);
@@ -896,6 +994,10 @@
     portfolio = { positions: [], pnl: {} };
     chartBars = [];
     chartStatus = "waiting for a session";
+    activeChartConnection = null;
+    activeChartSubscription = null;
+    activeChartMarketKey = "";
+    chartHistoryRequestSeq += 1;
     signalAlerts = [];
     selectedSignalId = "";
     natsEvents = [];
@@ -1013,6 +1115,10 @@
   onDestroy(() => {
     stopPolling();
     daemonConnection?.close(1000, "page teardown");
+  });
+
+  $effect(() => {
+    syncChartStreamSubscription();
   });
 
   $effect(() => {

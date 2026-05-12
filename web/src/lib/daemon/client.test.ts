@@ -397,5 +397,12 @@ describe("daemon attach handshake", () => {
     expect(connection.session).toBe("terminal");
     expect(connection.snapshot.chart_symbol).toBe("BTC");
     expect(connection.snapshot.watchlist_symbols).toContain("BIO");
+
+    connection.subscribe("chart", "BTC", "1m");
+    connection.unsubscribe("chart", "BTC", "1m");
+    expect(attachedSocket.sent.slice(1).map((message) => JSON.parse(message))).toEqual([
+      { type: "subscribe", channel: "chart", symbol: "BTC", tf: "1m" },
+      { type: "unsubscribe", channel: "chart", symbol: "BTC", tf: "1m" },
+    ]);
   });
 });

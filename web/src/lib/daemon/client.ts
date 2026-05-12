@@ -225,6 +225,17 @@ export class DaemonConnection {
     );
   }
 
+  unsubscribe(channel: "chart" | "signals" | "nats", symbol?: string, tf?: string): void {
+    this.socket.send(
+      JSON.stringify({
+        type: "unsubscribe",
+        channel,
+        symbol,
+        tf,
+      }),
+    );
+  }
+
   close(code?: number, reason?: string): void {
     this.socket.close(code, reason);
   }
