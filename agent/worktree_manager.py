@@ -28,10 +28,14 @@ class WorktreeManager:
         self,
         repo_root: Path,
         *,
+        auth_env: dict[str, str] | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> None:
         self.repo_root = Path(repo_root)
-        self.extra_env = dict(extra_env or {})
+        self.auth_env = self._merged_auth_env(auth_env, extra_env)
+        # Backwards-compat alias for older tests/callers while phase 2 moves
+        # git auth plumbing to the explicit auth_env name.
+        self.extra_env = self.auth_env
 
     def create(
         self,
@@ -39,6 +43,7 @@ class WorktreeManager:
         branch_name: str,
         base_branch: str = "main",
         *,
+        auth_env: dict[str, str] | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> Path:
         """Create an isolated worktree for ``session_id``.
@@ -61,13 +66,14 @@ class WorktreeManager:
             base_branch,
         ]
         try:
-            self._run(cmd, extra_env=extra_env)
+            self._run(cmd, auth_env=auth_env, extra_env=extra_env)
         except subprocess.CalledProcessError:
             self._run(
                 ["git", "-C", str(self.repo_root), "worktree", "prune"],
+                auth_env=auth_env,
                 extra_env=extra_env,
             )
-            self._run(cmd, extra_env=extra_env)
+            self._run(cmd, auth_env=auth_env, extra_env=extra_env)
         return path
 
     def cleanup(self, session_id: str) -> None:
@@ -97,10 +103,12 @@ class WorktreeManager:
         *,
         repo_key: str | None = None,
         default_branch: str = "main",
+        auth_env: dict[str, str] | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> Path:
         """Ensure a dispatcher-managed primary clone exists for ``repo_url``."""
 
+        overlay = cls._merged_auth_env(auth_env, extra_env)
         sanitized_key = cls.repo_key_for_url(repo_url, fallback=repo_key or "repo")
         repo_path = REPO_CACHE_ROOT / sanitized_key
         repo_path.parent.mkdir(parents=True, exist_ok=True)
@@ -110,12 +118,12 @@ class WorktreeManager:
                     shutil.rmtree(repo_path, ignore_errors=True)
                 cls._run_static(
                     ["git", "clone", repo_url, str(repo_path)],
-                    extra_env=extra_env,
+                    auth_env=overlay,
                 )
             else:
                 cls._run_static(
                     ["git", "-C", str(repo_path), "fetch", "--prune", "origin"],
-                    extra_env=extra_env,
+                    auth_env=overlay,
                 )
 
             base_branch = (default_branch or "main").strip() or "main"
@@ -128,7 +136,7 @@ class WorktreeManager:
                     "origin",
                     base_branch,
                 ],
-                extra_env=extra_env,
+                auth_env=overlay,
             )
         return repo_path
 
@@ -213,16 +221,18 @@ class WorktreeManager:
         self,
         cmd: list[str],
         *,
+        auth_env: dict[str, str] | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> None:
-        overlay = dict(self.extra_env)
-        overlay.update(extra_env or {})
-        self._run_static(cmd, extra_env=overlay)
+        overlay = dict(self.auth_env)
+        overlay.update(self._merged_auth_env(auth_env, extra_env))
+        self._run_static(cmd, auth_env=overlay)
 
     @staticmethod
     def _run_static(
         cmd: list[str],
         *,
+        auth_env: dict[str, str] | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> None:
         kwargs: dict[str, Any] = {
@@ -230,12 +240,22 @@ class WorktreeManager:
             "capture_output": True,
             "text": True,
         }
-        overlay = {str(key): str(value) for key, value in dict(extra_env or {}).items()}
+        overlay = WorktreeManager._merged_auth_env(auth_env, extra_env)
         if overlay:
-            env = os.environ.copy()
-            env.update(overlay)
-            kwargs["env"] = env
+            kwargs["env"] = {**os.environ, **overlay}
         subprocess.run(cmd, **kwargs)
+
+    @staticmethod
+    def _merged_auth_env(
+        auth_env: dict[str, str] | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        overlay: dict[str, str] = {}
+        for source in (auth_env, extra_env):
+            for key, value in dict(source or {}).items():
+                if key and value is not None:
+                    overlay[str(key)] = str(value)
+        return overlay
 
     def _best_effort_run(self, cmd: list[str]) -> None:
         try:
@@ -251,8 +271,8 @@ class WorktreeManager:
                 capture_output=True,
                 text=True,
                 **(
-                    {"env": {**os.environ, **self.extra_env}}
-                    if self.extra_env
+                    {"env": {**os.environ, **self.auth_env}}
+                    if self.auth_env
                     else {}
                 ),
             )
@@ -286,8 +306,8 @@ class WorktreeManager:
                 capture_output=True,
                 text=True,
                 **(
-                    {"env": {**os.environ, **self.extra_env}}
-                    if self.extra_env
+                    {"env": {**os.environ, **self.auth_env}}
+                    if self.auth_env
                     else {}
                 ),
             )

@@ -175,7 +175,7 @@ class WorktreeManagerTests(unittest.TestCase):
         self.assertEqual(sum(1 for cmd in calls if cmd[:2] == ["git", "clone"]), 1)
         self.assertEqual(len(results), 2)
 
-    def test_extra_env_applies_to_subprocess_without_argv_leak(self) -> None:
+    def test_auth_env_applies_to_clone_fetch_without_argv_leak(self) -> None:
         calls: list[tuple[list[str], dict]] = []
         repo_url = "https://forgejo.example/openclawdev/taskboard.git"
 
@@ -192,10 +192,61 @@ class WorktreeManagerTests(unittest.TestCase):
             WorktreeManager.ensure_repo_clone(
                 repo_url,
                 default_branch="main",
-                extra_env={"FORGEJO_TOKEN": "secret-token"},
+                auth_env={"FORGEJO_TOKEN": "secret-token"},
             )
 
         self.assertTrue(calls)
         for cmd, kwargs in calls:
-            self.assertNotIn("secret-token", cmd)
+            self.assertNotIn("secret-token", " ".join(cmd))
             self.assertEqual(kwargs["env"]["FORGEJO_TOKEN"], "secret-token")
+        self.assertTrue(any(cmd[:2] == ["git", "clone"] for cmd, _ in calls))
+        self.assertTrue(any(cmd[-3:] == ["fetch", "origin", "main"] for cmd, _ in calls))
+
+    def test_ensure_repo_clone_without_auth_env_uses_process_env_fallback(self) -> None:
+        calls: list[tuple[list[str], dict]] = []
+        repo_url = "https://forgejo.example/openclawdev/taskboard.git"
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            if cmd[:2] == ["git", "clone"]:
+                Path(cmd[-1], ".git").mkdir(parents=True, exist_ok=True)
+            return mock.Mock(stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch("agent.worktree_manager.REPO_CACHE_ROOT", Path(temp_dir) / "repos"), \
+             mock.patch("agent.worktree_manager.REPO_CACHE_LOCK_ROOT", Path(temp_dir) / "repos" / ".locks"), \
+             mock.patch("agent.worktree_manager.subprocess.run", side_effect=fake_run), \
+             mock.patch.dict("os.environ", {"FORGEJO_TOKEN": "process-token"}, clear=True):
+            WorktreeManager.ensure_repo_clone(
+                repo_url,
+                default_branch="main",
+            )
+
+        self.assertTrue(calls)
+        for _cmd, kwargs in calls:
+            self.assertNotIn("env", kwargs)
+
+    def test_extra_env_alias_preserves_existing_callers(self) -> None:
+        calls: list[tuple[list[str], dict]] = []
+        repo_url = "https://forgejo.example/openclawdev/taskboard.git"
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            if cmd[:2] == ["git", "clone"]:
+                Path(cmd[-1], ".git").mkdir(parents=True, exist_ok=True)
+            return mock.Mock(stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch("agent.worktree_manager.REPO_CACHE_ROOT", Path(temp_dir) / "repos"), \
+             mock.patch("agent.worktree_manager.REPO_CACHE_LOCK_ROOT", Path(temp_dir) / "repos" / ".locks"), \
+             mock.patch("agent.worktree_manager.subprocess.run", side_effect=fake_run):
+            WorktreeManager.ensure_repo_clone(
+                repo_url,
+                default_branch="main",
+                extra_env={"FORGEJO_TOKEN": "legacy-secret"},
+            )
+
+        self.assertTrue(calls)
+        for cmd, kwargs in calls:
+            self.assertNotIn("legacy-secret", " ".join(cmd))
+            self.assertEqual(kwargs["env"]["FORGEJO_TOKEN"], "legacy-secret")

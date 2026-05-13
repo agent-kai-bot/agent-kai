@@ -809,6 +809,94 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(forgejo_context.token, "role-pat")
         self.assertEqual(runtime_env["FORGEJO_TOKEN_DEVELOPER"], "role-pat")
 
+    async def test_daemon_spawner_resolves_role_config_before_clone_with_auth_env(self) -> None:
+        """Worktree clone receives the resolver auth env after role resolution."""
+
+        events: list[str] = []
+
+        class _OrderedResolver:
+            def resolve_for_role(self, role: str, **_kwargs) -> RoleRuntimeConfig:
+                events.append(f"resolve:{role}")
+                return RoleRuntimeConfig(
+                    role=role,
+                    forgejo_pat="resolved-pat",
+                    forgejo_user="agent-developer",
+                    forgejo_base_url="http://forgejo.local",
+                    taskboard_base_url="http://taskboard.local",
+                    taskboard_bearer_token="resolved-bearer",
+                    source="test",
+                )
+
+        session = _AttachOrderSession()
+        daemon = _FakeDaemonServer(session)
+        spawner = DaemonTaskboardSpawner(
+            daemon,
+            runtime_config_resolver=_OrderedResolver(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            primary_repo = temp_root / "primary"
+            worktree = temp_root / "worktree"
+
+            def ensure_repo_clone(_repo_url, **kwargs):
+                events.append("clone")
+                self.assertEqual(kwargs["auth_env"]["FORGEJO_TOKEN"], "resolved-pat")
+                self.assertEqual(
+                    kwargs["auth_env"]["FORGEJO_TOKEN_DEVELOPER"],
+                    "resolved-pat",
+                )
+                self.assertEqual(
+                    kwargs["auth_env"]["TASKBOARD_BEARER_TOKEN"],
+                    "resolved-bearer",
+                )
+                self.assertNotIn("extra_env", kwargs)
+                primary_repo.mkdir(parents=True, exist_ok=True)
+                return primary_repo
+
+            with mock.patch(
+                "agent.taskboard_dispatcher._worktree_isolation_enabled",
+                return_value=True,
+            ), mock.patch(
+                "agent.taskboard_dispatcher._multi_repo_routing_enabled",
+                return_value=True,
+            ), mock.patch(
+                "agent.taskboard_dispatcher.WorktreeManager.ensure_repo_clone",
+                side_effect=ensure_repo_clone,
+            ), mock.patch(
+                "agent.taskboard_dispatcher.WorktreeManager.create",
+                return_value=worktree,
+            ), mock.patch(
+                "agent.taskboard_dispatcher._resolve_max_iterations_for_role",
+                return_value=5,
+            ):
+                session_id = await spawner.spawn(
+                    session_id="session-2",
+                    task_id=2,
+                    fire_generation=12,
+                    role="Developer",
+                    agent_id="developer",
+                    model="codex",
+                    profile="xhigh",
+                    prompt="prompt",
+                    task={
+                        "id": 2,
+                        "agent": "Developer",
+                        "fire_generation": 12,
+                        "default_branch": "main",
+                        "project": {
+                            "repoUrl": "https://forgejo.example/openclawdev/taskboard.git"
+                        },
+                    },
+                    session_token="session-token",
+                    session_generation=12,
+                )
+                await daemon.managed.current_input_task
+
+        self.assertEqual(session_id, "session-2")
+        self.assertEqual(events[:2], ["resolve:developer", "clone"])
+        self.assertEqual(session.runtime_env["FORGEJO_TOKEN"], "resolved-pat")
+
     async def test_tier_mapping_table(self) -> None:
         """Every supported taskboard role maps to the required model tier."""
 

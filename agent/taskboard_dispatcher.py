@@ -519,7 +519,14 @@ class DaemonTaskboardSpawner:
             session_generation=_coerce_positive_int(kwargs.get("session_generation")),
             agent_name=agent_id,
         )
-        runtime_env = dict(kwargs.get("runtime_env") or runtime_config.env_overlay())
+        runtime_env = runtime_config.env_overlay()
+        runtime_env.update(
+            {
+                str(key): str(value)
+                for key, value in dict(kwargs.get("runtime_env") or {}).items()
+                if key and value is not None
+            }
+        )
         task_payload = kwargs.get("task") if isinstance(kwargs.get("task"), dict) else {}
         worktree_path = ""
         primary_repo_path = ""
@@ -542,7 +549,7 @@ class DaemonTaskboardSpawner:
                     repo_target.repo_url,
                     repo_key=repo_target.repo_key,
                     default_branch=repo_target.default_branch,
-                    extra_env=runtime_env,
+                    auth_env=runtime_env,
                 )
             elif repo_target.routing_mode == "explicit" and not multi_repo_enabled:
                 if normalized_role == "developer":
@@ -562,7 +569,7 @@ class DaemonTaskboardSpawner:
                     routing_mode="fallback_local_flag_disabled",
                     display_name=self.repo_root.name,
                 )
-            manager = WorktreeManager(repo_root, extra_env=runtime_env)
+            manager = WorktreeManager(repo_root, auth_env=runtime_env)
             worktree = manager.create(
                 session_id=session_id,
                 branch_name=branch_name,
