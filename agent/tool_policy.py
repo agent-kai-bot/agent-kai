@@ -184,6 +184,13 @@ _POLICY_OVERRIDES: dict[str, ToolPolicy] = {
         external_side_effects=True,
         requires_approval_in_auto=True,
     ),
+    "taskboard_submit_review_verdict": _policy(
+        "taskboard_submit_review_verdict",
+        read_only=False,
+        persistent=True,
+        external_side_effects=True,
+        requires_approval_in_auto=True,
+    ),
     "taskboard_stop_work": _policy(
         "taskboard_stop_work",
         read_only=False,

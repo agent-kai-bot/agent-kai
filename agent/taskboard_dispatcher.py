@@ -572,6 +572,7 @@ class DaemonTaskboardSpawner:
             session_token=str(kwargs.get("session_token") or "").strip(),
             session_generation=_coerce_positive_int(kwargs.get("session_generation")),
             agent_name=agent_id,
+            task_id=_coerce_positive_int(kwargs.get("task_id")),
         )
         if hasattr(managed.session, "start_auto_mode"):
             # Phase 0 (#10247): per-role iteration budget instead of a

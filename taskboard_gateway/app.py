@@ -182,6 +182,7 @@ async def execute_run_with_local_session(run: TaskboardRun, store: RunStore) -> 
         session_token=session_token,
         session_generation=session_generation,
         agent_name=run.requested_agent_id,
+        task_id=run.task_id,
     )
     session.attach_runtime(agent_name=run.local_agent_name)
     session.start_auto_mode(

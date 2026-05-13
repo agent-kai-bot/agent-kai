@@ -120,6 +120,24 @@ class PromptRendererTests(unittest.TestCase):
                 self.assertIn("STOP: TASKBOARD_FIRE_PROMPT_END", rendered)
                 self.assertIn("Task ID: 10153", rendered)
 
+    def test_review_role_prompts_require_terminal_verdict_submit(self) -> None:
+        """CR, SA, and QA prompts require the structured verdict tool."""
+
+        role_to_review_type = {
+            "code-reviewer": "code",
+            "security-auditor": "security",
+            "qa-agent": "qa",
+        }
+
+        for role, review_type in role_to_review_type.items():
+            with self.subTest(role=role):
+                rendered = render_taskboard_fire_prompt(role, self._sample_task())
+                self.assertIn("taskboard_submit_review_verdict", rendered)
+                self.assertIn(f'review_type="{review_type}"', rendered)
+                self.assertIn("mandatory terminal action", rendered)
+                self.assertIn("A comment is not a verdict", rendered)
+                self.assertIn("[AUTO_STATE: done]", rendered)
+
     def test_task_id_is_populated_for_non_empty_task(self) -> None:
         """Any non-empty task payload receives a task_id substitution."""
 

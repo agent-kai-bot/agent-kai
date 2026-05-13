@@ -50,6 +50,8 @@ forbids this role from authoring code or rotating production state:
   cycle.
 
 ## Submit
-Write the security audit to `{output_target}`. Lead with high-impact findings, then note tests or checks performed and any required remediation. End with a concise verdict (`APPROVED` or `REQUEST_CHANGES`).
+Write the security audit to `{output_target}`. Lead with high-impact findings, then note tests or checks performed and any required remediation. End with a concise verdict (`APPROVE` or `REQUEST_CHANGES`).
+
+After verification, your mandatory terminal action is to call `taskboard_submit_review_verdict(review_type="security", verdict="APPROVE" or "REQUEST_CHANGES", summary_md="<your verdict summary>")` before printing `[AUTO_STATE: done]`. A comment is not a verdict; only `taskboard_submit_review_verdict` advances the staged review.
 
 STOP: TASKBOARD_FIRE_PROMPT_END

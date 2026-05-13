@@ -79,7 +79,7 @@ operator to repeat.
 
 ### 4. Decide the verdict
 
-- `APPROVED` — every ticket requirement is `Met`, no regressions
+- `APPROVE` — every ticket requirement is `Met`, no regressions
   observed, no out-of-scope creep that materially expands risk.
 - `REQUEST_CHANGES` — at least one requirement is `Partial` / `Missed`,
   OR a regression appears, OR scope creep changes risk. Spell out which
@@ -108,6 +108,8 @@ forbids this role from authoring code:
   with reproduction steps. The developer fixes it on the next cycle.
 
 ## Submit
-Write the QA report to `{output_target}`. Include pass/fail status, executed checks, defects found, logs or artifacts produced, and remaining risk. End with a concise verdict (`APPROVED` or `REQUEST_CHANGES`).
+Write the QA report to `{output_target}`. Include pass/fail status, executed checks, defects found, logs or artifacts produced, and remaining risk. End with a concise verdict (`APPROVE` or `REQUEST_CHANGES`).
+
+After verification, your mandatory terminal action is to call `taskboard_submit_review_verdict(review_type="qa", verdict="APPROVE" or "REQUEST_CHANGES", summary_md="<your verdict summary>")` before printing `[AUTO_STATE: done]`. A comment is not a verdict; only `taskboard_submit_review_verdict` advances the staged review.
 
 STOP: TASKBOARD_FIRE_PROMPT_END

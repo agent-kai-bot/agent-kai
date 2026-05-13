@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
 from unittest import mock
 
 import requests
@@ -61,6 +63,7 @@ class TaskboardToolsTests(unittest.TestCase):
             session_token="session-secret",
             session_generation=7,
             agent_name="Developer",
+            task_id=123,
         )
         self.client = TaskboardClient(self.context)
 
@@ -147,6 +150,98 @@ class TaskboardToolsTests(unittest.TestCase):
         self.assertNotIn("bearer-secret", result)
 
     @mock.patch("agent.taskboard_tools.requests.request")
+    def test_submit_review_verdict_posts_approve_payload(self, request_mock) -> None:
+        """Structured verdict tool posts the canonical task-scoped payload."""
+
+        request_mock.return_value = _FakeResponse(payload={"status": "submitted"})
+
+        result = self.client.submit_review_verdict(
+            "code",
+            "APPROVE",
+            "No blocking findings.",
+        )
+
+        request_mock.assert_called_once()
+        _, kwargs = request_mock.call_args
+        self.assertEqual(kwargs["method"], "POST")
+        self.assertEqual(
+            kwargs["url"],
+            "http://taskboard.local/api/tasks/123/reviews/verdict",
+        )
+        self.assertEqual(kwargs["params"], {"token": "session-secret", "generation": 7})
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer bearer-secret")
+        self.assertEqual(
+            kwargs["json"],
+            {
+                "review_type": "code",
+                "verdict": "APPROVE",
+                "summary_md": "No blocking findings.",
+            },
+        )
+        self.assertTrue(json.loads(result)["ok"])
+
+    @mock.patch("agent.taskboard_tools.requests.request")
+    def test_submit_review_verdict_posts_request_changes_payload(self, request_mock) -> None:
+        """Structured verdict tool forwards REQUEST_CHANGES unchanged."""
+
+        request_mock.return_value = _FakeResponse(payload={"status": "submitted"})
+
+        result = self.client.submit_review_verdict(
+            "qa",
+            "REQUEST_CHANGES",
+            "Regression observed in the focused test path.",
+        )
+
+        _, kwargs = request_mock.call_args
+        self.assertEqual(
+            kwargs["json"],
+            {
+                "review_type": "qa",
+                "verdict": "REQUEST_CHANGES",
+                "summary_md": "Regression observed in the focused test path.",
+            },
+        )
+        self.assertTrue(json.loads(result)["ok"])
+
+    @mock.patch("agent.taskboard_tools.requests.request")
+    def test_submit_review_verdict_redacts_request_errors(self, request_mock) -> None:
+        """Verdict transport errors redact bearer and session tokens."""
+
+        request_mock.side_effect = requests.Timeout(
+            "bearer-secret session-secret timed out"
+        )
+
+        result = self.client.submit_review_verdict(
+            "security",
+            "APPROVE",
+            "No security findings.",
+        )
+
+        payload = json.loads(result)
+        self.assertFalse(payload["ok"])
+        self.assertIn("[REDACTED]", payload["error"])
+        self.assertNotIn("bearer-secret", result)
+        self.assertNotIn("session-secret", result)
+
+    @mock.patch("agent.taskboard_tools.requests.request")
+    def test_submit_review_verdict_rejects_invalid_args(self, request_mock) -> None:
+        """Invalid review types, verdicts, summaries, and task binding raise."""
+
+        with self.assertRaises(ValueError):
+            self.client.submit_review_verdict("architecture", "APPROVE", "summary")
+        with self.assertRaises(ValueError):
+            self.client.submit_review_verdict("code", "APPROVED", "summary")
+        with self.assertRaises(ValueError):
+            self.client.submit_review_verdict("code", "APPROVE", " ")
+        with self.assertRaises(ValueError):
+            TaskboardClient(replace(self.context, task_id=None)).submit_review_verdict(
+                "code",
+                "APPROVE",
+                "summary",
+            )
+        request_mock.assert_not_called()
+
+    @mock.patch("agent.taskboard_tools.requests.request")
     def test_get_task_still_truncates_envelope_for_large_response(self, request_mock) -> None:
         """LLM tool responses keep the 20K preview envelope for large bodies."""
 
@@ -177,6 +272,45 @@ class TaskboardToolsTests(unittest.TestCase):
         self.assertIn("taskboard_move", names)
         self.assertIn("taskboard_stop_work", names)
         self.assertIn("taskboard_create_action_item", names)
+
+    def test_create_taskboard_tools_role_gates_submit_review_verdict(self) -> None:
+        """Only review roles receive the structured verdict tool."""
+
+        developer_names = {
+            tool.name
+            for tool in create_taskboard_tools(
+                replace(self.context, agent_name="developer")
+            )
+        }
+        self.assertNotIn("taskboard_submit_review_verdict", developer_names)
+
+        for agent_name in ("code-reviewer", "security-auditor", "qa-agent"):
+            with self.subTest(agent_name=agent_name):
+                review_names = {
+                    tool.name
+                    for tool in create_taskboard_tools(
+                        replace(self.context, agent_name=agent_name)
+                    )
+                }
+                self.assertIn("taskboard_submit_review_verdict", review_names)
+
+    def test_standard_toolset_role_gates_submit_review_verdict(self) -> None:
+        """A normal session toolset exposes verdict submit only to review roles."""
+
+        from agent.tools import create_tools
+
+        cr_session = SimpleNamespace(
+            taskboard_context=replace(self.context, agent_name="code-reviewer")
+        )
+        developer_session = SimpleNamespace(
+            taskboard_context=replace(self.context, agent_name="developer")
+        )
+
+        cr_names = {tool.name for tool in create_tools(session=cr_session)}
+        developer_names = {tool.name for tool in create_tools(session=developer_session)}
+
+        self.assertIn("taskboard_submit_review_verdict", cr_names)
+        self.assertNotIn("taskboard_submit_review_verdict", developer_names)
 
 
 if __name__ == "__main__":

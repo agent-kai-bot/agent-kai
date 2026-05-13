@@ -37,6 +37,14 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertTrue(spawn_agent.external_side_effects)
         self.assertTrue(spawn_agent.requires_approval_in_auto)
 
+    def test_taskboard_submit_review_verdict_is_persistent_write(self):
+        policy = get_tool_policy("taskboard_submit_review_verdict")
+
+        self.assertFalse(policy.read_only)
+        self.assertTrue(policy.persistent)
+        self.assertTrue(policy.external_side_effects)
+        self.assertTrue(policy.requires_approval_in_auto)
+
     def test_read_only_tools_are_safe(self):
         self.assertTrue(is_readonly("query_ohlcv"))
         self.assertTrue(is_readonly("get_signals"))

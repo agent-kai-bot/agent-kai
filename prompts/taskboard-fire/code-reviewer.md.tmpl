@@ -85,6 +85,8 @@ this role from authoring code:
   the fix yourself is a SPEC v23 violation.
 
 ## Submit
-Write the review summary to `{output_target}`. Lead with findings by severity, then list open questions, tests checked, and a concise verdict (`APPROVED` or `REQUEST_CHANGES`).
+Write the review summary to `{output_target}`. Lead with findings by severity, then list open questions, tests checked, and a concise verdict (`APPROVE` or `REQUEST_CHANGES`).
+
+After verification, your mandatory terminal action is to call `taskboard_submit_review_verdict(review_type="code", verdict="APPROVE" or "REQUEST_CHANGES", summary_md="<your verdict summary>")` before printing `[AUTO_STATE: done]`. A comment is not a verdict; only `taskboard_submit_review_verdict` advances the staged review.
 
 STOP: TASKBOARD_FIRE_PROMPT_END

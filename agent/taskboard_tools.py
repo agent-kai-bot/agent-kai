@@ -27,6 +27,7 @@ class TaskboardContext:
         session_token: Optional active task session token.
         session_generation: Optional active task session generation.
         agent_name: Optional display name to use for lifecycle calls.
+        task_id: Optional active task id bound to the current taskboard session.
     """
 
     base_url: str
@@ -34,6 +35,7 @@ class TaskboardContext:
     session_token: str = ""
     session_generation: int | None = None
     agent_name: str = ""
+    task_id: int | None = None
 
 
 def _context_from_environment() -> TaskboardContext:
@@ -55,6 +57,7 @@ def _context_from_environment() -> TaskboardContext:
             os.getenv("TASKBOARD_SESSION_GENERATION", "").strip()
         ),
         agent_name=os.getenv("TASKBOARD_AGENT_NAME", "").strip(),
+        task_id=_parse_optional_int(os.getenv("TASKBOARD_TASK_ID", "").strip()),
     )
 
 
@@ -92,6 +95,78 @@ def _redact(text: str, context: TaskboardContext) -> str:
         if secret:
             redacted = redacted.replace(secret, REDACTED)
     return redacted
+
+
+_REVIEW_TYPES = {"code", "security", "qa"}
+_REVIEW_VERDICTS = {"APPROVE", "REQUEST_CHANGES"}
+_REVIEW_VERDICT_ROLE_BY_AGENT = {
+    "code reviewer": "code",
+    "code-reviewer": "code",
+    "agent-code-reviewer": "code",
+    "security auditor": "security",
+    "security-auditor": "security",
+    "agent-security-auditor": "security",
+    "qa agent": "qa",
+    "qa-agent": "qa",
+    "agent-qa": "qa",
+    "qa": "qa",
+}
+
+
+def _normalize_review_type(review_type: str) -> str:
+    """Return a canonical taskboard review type.
+
+    Args:
+        review_type: Candidate review type.
+
+    Returns:
+        Canonical review type.
+
+    Raises:
+        ValueError: If the review type is unsupported.
+    """
+
+    normalized = str(review_type or "").strip().lower().replace("_", "-")
+    aliases = {
+        "code": "code",
+        "code-review": "code",
+        "code-reviewer": "code",
+        "security": "security",
+        "security-audit": "security",
+        "security-auditor": "security",
+        "qa": "qa",
+        "qa-agent": "qa",
+    }
+    canonical = aliases.get(normalized)
+    if canonical not in _REVIEW_TYPES:
+        raise ValueError("review_type must be one of: code, security, qa")
+    return canonical
+
+
+def _normalize_review_verdict(verdict: str) -> str:
+    """Return a canonical taskboard review verdict.
+
+    Args:
+        verdict: Candidate verdict.
+
+    Returns:
+        Canonical verdict.
+
+    Raises:
+        ValueError: If the verdict is unsupported.
+    """
+
+    normalized = str(verdict or "").strip().upper().replace("-", "_").replace(" ", "_")
+    if normalized not in _REVIEW_VERDICTS:
+        raise ValueError("verdict must be one of: APPROVE, REQUEST_CHANGES")
+    return normalized
+
+
+def _agent_can_submit_review_verdict(context: TaskboardContext) -> bool:
+    """Return whether the active taskboard role may submit review verdicts."""
+
+    normalized = str(context.agent_name or "").strip().lower().replace("_", "-")
+    return normalized in _REVIEW_VERDICT_ROLE_BY_AGENT
 
 
 def _format_response(response: requests.Response, context: TaskboardContext) -> str:
@@ -350,6 +425,44 @@ class TaskboardClient:
             json_body=body,
         )
 
+    def submit_review_verdict(
+        self,
+        review_type: str,
+        verdict: str,
+        summary_md: str,
+    ) -> str:
+        """Submit the structured review verdict for this taskboard session.
+
+        Args:
+            review_type: Review gate type: code, security, or qa.
+            verdict: Review verdict: APPROVE or REQUEST_CHANGES.
+            summary_md: Markdown summary for the verdict.
+
+        Returns:
+            Formatted taskboard response.
+
+        Raises:
+            ValueError: If task id or verdict arguments are invalid.
+        """
+
+        if self.context.task_id is None:
+            raise ValueError("taskboard task_id is required to submit a review verdict")
+        canonical_review_type = _normalize_review_type(review_type)
+        canonical_verdict = _normalize_review_verdict(verdict)
+        summary = str(summary_md or "")
+        if not summary.strip():
+            raise ValueError("summary_md is required")
+        return self._request(
+            "POST",
+            f"/api/tasks/{int(self.context.task_id)}/reviews/verdict",
+            params=self._session_params(),
+            json_body={
+                "review_type": canonical_review_type,
+                "verdict": canonical_verdict,
+                "summary_md": summary,
+            },
+        )
+
     def _session_params(
         self,
         *,
@@ -442,7 +555,8 @@ def create_taskboard_tools(
         List of LangChain structured tools for taskboard lifecycle calls.
     """
 
-    client = TaskboardClient(context or _context_from_environment())
+    resolved_context = context or _context_from_environment()
+    client = TaskboardClient(resolved_context)
 
     async def _async_call(method_name: str, *args: Any, **kwargs: Any) -> str:
         """Run a synchronous client method without blocking the event loop.
@@ -488,7 +602,7 @@ def create_taskboard_tools(
             comment_id=comment_id,
         )
 
-    return [
+    tools = [
         StructuredTool.from_function(
             func=client.get_task,
             coroutine=lambda task_id: _async_call("get_task", task_id),
@@ -606,3 +720,27 @@ def create_taskboard_tools(
             ),
         ),
     ]
+    if _agent_can_submit_review_verdict(resolved_context):
+        tools.append(
+            StructuredTool.from_function(
+                func=client.submit_review_verdict,
+                coroutine=(
+                    lambda review_type,
+                    verdict,
+                    summary_md: _async_call(
+                        "submit_review_verdict",
+                        review_type,
+                        verdict,
+                        summary_md,
+                    )
+                ),
+                name="taskboard_submit_review_verdict",
+                description=(
+                    "Submit the structured staged-review verdict for the current "
+                    "taskboard session. Inputs: review_type, verdict, summary_md. "
+                    "review_type must be code, security, or qa; verdict must be "
+                    "APPROVE or REQUEST_CHANGES."
+                ),
+            )
+        )
+    return tools
