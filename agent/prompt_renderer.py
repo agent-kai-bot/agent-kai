@@ -18,6 +18,7 @@ DEFAULT_TEMPLATE = "default.md.tmpl"
 MAX_RENDERED_PROMPT_CHARS = 60_000
 
 _ROLE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_ROLE_SEPARATOR_RE = re.compile(r"[\s_]+")
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _SECRET_KEY_PARTS = (
     "authorization",
@@ -476,7 +477,8 @@ def _resolve_template_path(prompt_root: Path | str, role: str | None = None) -> 
 def _normalize_role(role: str) -> str:
     """Normalize a role to a template filename stem."""
 
-    return str(role or "").strip().lower()
+    cleaned = str(role or "").strip().lower()
+    return _ROLE_SEPARATOR_RE.sub("-", cleaned)
 
 
 def _mapping_value(mapping: Mapping[str, Any], key: str) -> Mapping[str, Any]:

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import unittest
 
-from agent.prompt_renderer import _extract_substitutions, render_taskboard_fire_prompt
+from agent.prompt_renderer import (
+    _extract_substitutions,
+    _normalize_role,
+    render_taskboard_fire_prompt,
+)
 
 
 class PromptRendererTests(unittest.TestCase):
@@ -35,6 +39,43 @@ class PromptRendererTests(unittest.TestCase):
             "sessionGeneration": 9,
             "outputTarget": "developer/claude/artifacts/10153-final.txt",
         }
+
+    def test_normalize_role_handles_proper_case_with_space(self) -> None:
+        """Proper-case role names with spaces normalize to template stems."""
+
+        cases = {
+            "Code Reviewer": "code-reviewer",
+            "qa agent": "qa-agent",
+            "security auditor": "security-auditor",
+            "QA Agent": "qa-agent",
+            "Security Auditor": "security-auditor",
+        }
+
+        for role, expected in cases.items():
+            with self.subTest(role=role):
+                self.assertEqual(_normalize_role(role), expected)
+
+    def test_normalize_role_handles_underscores(self) -> None:
+        """Underscored role names normalize to hyphenated template stems."""
+
+        cases = {
+            "code_reviewer": "code-reviewer",
+            "security_auditor": "security-auditor",
+        }
+
+        for role, expected in cases.items():
+            with self.subTest(role=role):
+                self.assertEqual(_normalize_role(role), expected)
+
+    def test_normalize_role_idempotent_on_already_kebab(self) -> None:
+        """Already-normalized role names are unchanged."""
+
+        self.assertEqual(_normalize_role("code-reviewer"), "code-reviewer")
+
+    def test_normalize_role_handles_mixed_separators(self) -> None:
+        """Mixed separators are collapsed to a single hyphen."""
+
+        self.assertEqual(_normalize_role("Code_Reviewer "), "code-reviewer")
 
     def test_render_developer_template_substitutes_task_fields(self) -> None:
         """Developer template renders expected task substitutions."""
@@ -137,6 +178,36 @@ class PromptRendererTests(unittest.TestCase):
                 self.assertIn("mandatory terminal action", rendered)
                 self.assertIn("A comment is not a verdict", rendered)
                 self.assertIn("[AUTO_STATE: done]", rendered)
+
+    def test_render_taskboard_fire_prompt_proper_case_lands_role_template(self) -> None:
+        """Proper-case Code Reviewer renders the role-specific prompt."""
+
+        rendered = render_taskboard_fire_prompt("Code Reviewer", self._sample_task())
+        expected = render_taskboard_fire_prompt("code-reviewer", self._sample_task())
+
+        self.assertEqual(len(rendered), len(expected))
+        self.assertIn("taskboard_submit_review_verdict", rendered)
+        self.assertIn('review_type="code"', rendered)
+
+    def test_render_taskboard_fire_prompt_proper_case_review_roles(self) -> None:
+        """Proper-case SA and QA roles render their role-specific prompts."""
+
+        role_to_review_type = {
+            "Security Auditor": ("security-auditor", "security"),
+            "QA Agent": ("qa-agent", "qa"),
+        }
+
+        for role, (normalized_role, review_type) in role_to_review_type.items():
+            with self.subTest(role=role):
+                rendered = render_taskboard_fire_prompt(role, self._sample_task())
+                expected = render_taskboard_fire_prompt(
+                    normalized_role,
+                    self._sample_task(),
+                )
+
+                self.assertEqual(len(rendered), len(expected))
+                self.assertIn("taskboard_submit_review_verdict", rendered)
+                self.assertIn(f'review_type="{review_type}"', rendered)
 
     def test_task_id_is_populated_for_non_empty_task(self) -> None:
         """Any non-empty task payload receives a task_id substitution."""
