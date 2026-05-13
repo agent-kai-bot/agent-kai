@@ -56,6 +56,16 @@ LOGGER = logging.getLogger("agent.run_outcome_reaper")
 
 DEFAULT_RUN_DIR = Path("workspaces/taskboard-runs").resolve()
 DEFAULT_STATE_DB = Path("workspaces/run_outcome_reaper.sqlite3").resolve()
+_REAPED_RUNS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS reaped_runs (
+    run_id TEXT PRIMARY KEY,
+    ended_at TEXT,
+    ledger_run_id INTEGER,
+    terminal_status TEXT,
+    failure_class TEXT,
+    reaped_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+)
+"""
 
 # Roles eligible for the agent_runs ledger. The main `kai` chat agent
 # also writes run JSON files but is not part of the autonomous SDLC
@@ -211,26 +221,19 @@ class ReaperStateStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS reaped_runs (
-                    run_id TEXT PRIMARY KEY,
-                    ended_at TEXT,
-                    ledger_run_id INTEGER,
-                    terminal_status TEXT,
-                    failure_class TEXT,
-                    reaped_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-                )
-                """
-            )
+            self._ensure_schema(conn)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _ensure_schema(self, conn: sqlite3.Connection) -> None:
+        conn.execute(_REAPED_RUNS_SCHEMA)
+
     def has_seen(self, run_id: str) -> bool:
         with self._connect() as conn:
+            self._ensure_schema(conn)
             row = conn.execute(
                 "SELECT 1 FROM reaped_runs WHERE run_id = ?", (run_id,)
             ).fetchone()
@@ -246,6 +249,7 @@ class ReaperStateStore:
         failure_class: Optional[str],
     ) -> None:
         with self._connect() as conn:
+            self._ensure_schema(conn)
             conn.execute(
                 """
                 INSERT OR REPLACE INTO reaped_runs (
@@ -449,7 +453,13 @@ def iter_run_files(
     """Yield ``run_*.json`` paths sorted by mtime ascending (oldest first)."""
     if not directory.exists():
         return iter(())
-    paths = sorted(directory.glob(pattern), key=lambda p: p.stat().st_mtime)
+    paths_with_mtime: list[tuple[float, Path]] = []
+    for path in directory.glob(pattern):
+        try:
+            paths_with_mtime.append((path.stat().st_mtime, path))
+        except OSError as exc:
+            LOGGER.warning("reaper.iter_run_files skipped path=%s error=%s", path, exc)
+    paths = [path for _, path in sorted(paths_with_mtime, key=lambda item: item[0])]
     return iter(paths)
 
 

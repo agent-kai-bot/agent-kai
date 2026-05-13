@@ -446,7 +446,13 @@ class TaskboardToolsTests(unittest.TestCase):
         }
         self.assertNotIn("taskboard_submit_review_verdict", developer_names)
 
-        for agent_name in ("code-reviewer", "security-auditor", "qa-agent"):
+        for agent_name in (
+            "code-reviewer",
+            "security-auditor",
+            "qa-agent",
+            "QA Agent",
+            "agent-qa",
+        ):
             with self.subTest(agent_name=agent_name):
                 review_names = {
                     tool.name

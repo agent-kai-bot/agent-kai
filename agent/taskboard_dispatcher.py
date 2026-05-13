@@ -2505,6 +2505,93 @@ def _cleanup_dispatcher_worktree(daemon_server: Any, session_id: str) -> None:
         LOGGER.warning("worktree cleanup failed session_id=%s error=%s", session_id, exc)
 
 
+def _derive_dispatcher_inprocess_outcome(
+    task: asyncio.Task[Any],
+    session_id: str,
+):
+    from agent.run_outcome import (
+        RunOutcome,
+        derive_outcome_from_agent_events,
+        derive_outcome_from_exception,
+        derive_outcome_from_manual_cancel,
+    )
+
+    if task.cancelled():
+        return derive_outcome_from_manual_cancel(
+            f"in-process run cancelled session_id={session_id}"
+        )
+
+    exc = task.exception()
+    if exc is not None:
+        return derive_outcome_from_exception(exc)
+
+    # task.result() is an InputRunResult (final_text + error +
+    # auto_stopped_reason). The session itself doesn't retain a full event log
+    # on this path, so synthesize the minimum events derive_outcome needs to
+    # classify; fall back to 'succeeded' + WARNING when none of the three
+    # fields are populated.
+    result = task.result()
+    final_text = getattr(result, "final_text", None)
+    error_text = getattr(result, "error", None)
+    auto_stopped_reason = getattr(result, "auto_stopped_reason", None)
+    auto_stopped_data = getattr(result, "auto_stopped_data", None)
+    events: list[dict[str, Any]] = []
+    if isinstance(auto_stopped_data, dict):
+        events.append({"type": "auto_stopped", "data": auto_stopped_data})
+    elif auto_stopped_reason is not None:
+        # auto_stopped beats error/final in derive_outcome precedence
+        # (iteration_budget, requires_approval, malformed AUTO_STATE all
+        # surface here). The empty string is a valid 'auto_stopped (no reason)'
+        # signal.
+        events.append(
+            {
+                "type": "auto_stopped",
+                "data": {"reason": auto_stopped_reason},
+            }
+        )
+    if error_text:
+        events.append({"type": "error", "data": error_text})
+    if final_text:
+        events.append({"type": "final", "data": final_text})
+    if not events:
+        LOGGER.warning(
+            "finalize: shallow-inferred succeeded for session_id=%s "
+            "(no final/error captured by run_input)",
+            session_id,
+        )
+        return RunOutcome(
+            status="succeeded",
+            failure_class=None,
+            failure_detail=None,
+        )
+    return derive_outcome_from_agent_events(
+        events,
+        final_text=final_text,
+    )
+
+
+def _mark_dispatcher_session_terminal(
+    daemon_server: Any,
+    *,
+    session_id: str,
+    outcome_status: str,
+) -> None:
+    try:
+        dispatcher = getattr(daemon_server, "taskboard_dispatcher", None)
+        store = getattr(dispatcher, "_store", None) if dispatcher else None
+        if store is not None and hasattr(store, "mark_session_terminal"):
+            store.mark_session_terminal(
+                session_id=session_id,
+                outcome_status=outcome_status,
+            )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning(
+            "mark_session_terminal failed session_id=%s error=%s",
+            session_id,
+            exc,
+        )
+
+
 def _finalize_dispatcher_inprocess_run(
     task: asyncio.Task[Any],
     daemon_server: Any,
@@ -2538,129 +2625,60 @@ def _finalize_dispatcher_inprocess_run(
     Best-effort: this callback cannot be allowed to raise into the
     asyncio loop or wedge the dispatcher's poll loop.
     """
+    outcome_status = "failed"
     try:
         from agent.agent_runs_client import AgentRunsClient
-        from agent.run_outcome import (
-            derive_outcome_from_agent_events,
-            derive_outcome_from_exception,
-            derive_outcome_from_manual_cancel,
-        )
+
+        outcome = _derive_dispatcher_inprocess_outcome(task, session_id)
+        outcome_status = outcome.status
 
         client = AgentRunsClient.from_env()
-        if not client.enabled or task_id is None or role is None:
-            return
-        # Locate the ledger row by session_id.
-        rows = client.list_for_task(int(task_id), limit=200) or []
-        ledger_run_id = None
-        row_status = None
-        for row in rows:
-            if str(row.get("session_id") or "") == session_id and row.get(
-                "status"
-            ) in ("spawning", "running"):
-                ledger_run_id = int(row["id"])
-                row_status = str(row.get("status") or "")
-                break
-        if ledger_run_id is None:
-            return
+        if client.enabled and task_id is not None and role is not None:
+            # Locate the ledger row by session_id.
+            rows = client.list_for_task(int(task_id), limit=200) or []
+            ledger_run_id = None
+            row_status = None
+            for row in rows:
+                if str(row.get("session_id") or "") == session_id and row.get(
+                    "status"
+                ) in ("spawning", "running"):
+                    ledger_run_id = int(row["id"])
+                    row_status = str(row.get("status") or "")
+                    break
 
-        # spawning → running → terminal. Newer dispatcher paths already patch
-        # running when the session task is scheduled, so avoid a no-op PATCH
-        # here when possible.
-        if row_status == "spawning":
-            client.patch(ledger_run_id, {"status": "running"})
+            if ledger_run_id is not None:
+                # spawning → running → terminal. Newer dispatcher paths already
+                # patch running when the session task is scheduled, so avoid a
+                # no-op PATCH here when possible.
+                if row_status == "spawning":
+                    client.patch(ledger_run_id, {"status": "running"})
 
-        # ---- derive the real terminal outcome --------------------------------
-        if task.cancelled():
-            outcome = derive_outcome_from_manual_cancel(
-                f"in-process run cancelled session_id={session_id}"
-            )
-        else:
-            exc = task.exception()
-            if exc is not None:
-                outcome = derive_outcome_from_exception(exc)
-            else:
-                # task.result() is an InputRunResult (final_text + error +
-                # auto_stopped_reason). The session itself doesn't retain a
-                # full event log on this path, so synthesize the minimum
-                # events derive_outcome needs to classify; fall back to
-                # 'succeeded' + WARNING when none of the three fields are
-                # populated.
-                result = task.result()
-                final_text = getattr(result, "final_text", None)
-                error_text = getattr(result, "error", None)
-                auto_stopped_reason = getattr(result, "auto_stopped_reason", None)
-                auto_stopped_data = getattr(result, "auto_stopped_data", None)
-                events: list[dict[str, Any]] = []
-                if isinstance(auto_stopped_data, dict):
-                    events.append({"type": "auto_stopped", "data": auto_stopped_data})
-                elif auto_stopped_reason is not None:
-                    # auto_stopped beats error/final in derive_outcome
-                    # precedence (iteration_budget, requires_approval,
-                    # malformed AUTO_STATE all surface here). The empty
-                    # string is a valid 'auto_stopped (no reason)' signal.
-                    events.append(
-                        {
-                            "type": "auto_stopped",
-                            "data": {"reason": auto_stopped_reason},
-                        }
-                    )
-                if error_text:
-                    events.append({"type": "error", "data": error_text})
-                if final_text:
-                    events.append({"type": "final", "data": final_text})
-                if not events:
-                    LOGGER.warning(
-                        "finalize: shallow-inferred succeeded for session_id=%s "
-                        "(no final/error captured by run_input)",
-                        session_id,
-                    )
-                    from agent.run_outcome import RunOutcome
-
-                    outcome = RunOutcome(
-                        status="succeeded",
-                        failure_class=None,
-                        failure_detail=None,
-                    )
-                else:
-                    outcome = derive_outcome_from_agent_events(
-                        events,
-                        final_text=final_text,
-                    )
-
-        body: dict[str, Any] = {"status": outcome.status}
-        if outcome.failure_class is not None:
-            body["failure_class"] = outcome.failure_class
-        if outcome.failure_detail is not None:
-            body["failure_detail"] = outcome.failure_detail
-        client.patch(ledger_run_id, body)
-
-        # Phase 0 follow-up (#10247) — close the dual-ledger lifecycle.
-        # Without this, the remote agent_runs row goes terminal but the
-        # local sessions.status stays 'running' until the stuck-session
-        # sweeper aborts it ~60min later and posts a misleading
-        # [System] sweeper-aborted comment to the parent task. See
-        # 2026-05-01T23-25_rca_orphan_sessions_local_sessions_table_never_marked_terminal.md
-        try:
-            dispatcher = getattr(daemon_server, "taskboard_dispatcher", None)
-            store = getattr(dispatcher, "_store", None) if dispatcher else None
-            if store is not None and hasattr(store, "mark_session_terminal"):
-                store.mark_session_terminal(
-                    session_id=session_id,
-                    outcome_status=outcome.status,
-                )
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning(
-                "mark_session_terminal failed session_id=%s error=%s",
-                session_id,
-                exc,
-            )
-        _cleanup_dispatcher_worktree(daemon_server, session_id)
+                body: dict[str, Any] = {"status": outcome.status}
+                if outcome.failure_class is not None:
+                    body["failure_class"] = outcome.failure_class
+                if outcome.failure_detail is not None:
+                    body["failure_detail"] = outcome.failure_detail
+                client.patch(ledger_run_id, body)
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning(
             "_finalize_dispatcher_inprocess_run failed session_id=%s error=%s",
             session_id,
             exc,
         )
+    finally:
+        # Phase 0 follow-up (#10247) — close the dual-ledger lifecycle.
+        # Without this, the local sessions.status stays 'running' until the
+        # stuck-session sweeper aborts it ~60min later and posts a misleading
+        # [System] sweeper-aborted comment to the parent task. Keep this local
+        # terminal write independent from the remote agent_runs ledger: a
+        # missing/disabled ledger row is not evidence that a finished local
+        # session is still active.
+        _mark_dispatcher_session_terminal(
+            daemon_server,
+            session_id=session_id,
+            outcome_status=outcome_status,
+        )
+        _cleanup_dispatcher_worktree(daemon_server, session_id)
 
 
 def _consume_task_exception(task: asyncio.Task[Any]) -> None:

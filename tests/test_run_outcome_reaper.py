@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -132,6 +133,23 @@ class ReaperStateStoreTests(unittest.TestCase):
                 failure_class="endpoint_unreachable",
             )
             self.assertTrue(store.has_seen("run_a"))
+
+    def test_has_seen_and_record_recreate_missing_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "state.sqlite"
+            store = ReaperStateStore(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute("DROP TABLE reaped_runs")
+
+            self.assertFalse(store.has_seen("run_missing"))
+            store.record(
+                run_id="run_missing",
+                ended_at="2026-05-13T19:15:20Z",
+                ledger_run_id=10413,
+                terminal_status="succeeded",
+                failure_class=None,
+            )
+            self.assertTrue(store.has_seen("run_missing"))
 
 
 class ReapOneTests(unittest.TestCase):

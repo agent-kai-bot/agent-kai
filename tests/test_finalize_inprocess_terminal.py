@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -42,6 +43,22 @@ class _StubAgentRunsClient:
 
     def patch(self, run_id: int, body: dict[str, Any]) -> None:
         self.patches.append((run_id, dict(body)))
+
+
+@dataclass
+class _StubSessionStore:
+    terminal_marks: list[tuple[str, str]] = field(default_factory=list)
+
+    def mark_session_terminal(self, *, session_id: str, outcome_status: str) -> None:
+        self.terminal_marks.append((session_id, outcome_status))
+
+
+def _daemon_with_store(store: _StubSessionStore) -> SimpleNamespace:
+    return SimpleNamespace(
+        taskboard_dispatcher=SimpleNamespace(
+            _store=store,
+        )
+    )
 
 
 def _make_task(
@@ -298,6 +315,20 @@ class FinalizeInprocessRunTests(unittest.TestCase):
         )
         self.assertEqual(self.client.patches, [])
 
+    def test_marks_local_terminal_when_client_disabled(self) -> None:
+        self.client.enabled = False
+        store = _StubSessionStore()
+        task = _make_task(result=_StubInputRunResult(final_text="ok"))
+        td._finalize_dispatcher_inprocess_run(
+            task,
+            daemon_server=_daemon_with_store(store),
+            session_id="sess-x",
+            task_id=10247,
+            role="qa-agent",
+        )
+        self.assertEqual(self.client.patches, [])
+        self.assertEqual(store.terminal_marks, [("sess-x", "succeeded")])
+
     def test_noop_when_no_matching_spawning_row(self) -> None:
         self.client.rows = [
             {"id": 7, "session_id": "other-session", "status": "spawning"},
@@ -309,18 +340,41 @@ class FinalizeInprocessRunTests(unittest.TestCase):
         )
         self.assertEqual(self.client.patches, [])
 
+    def test_marks_local_terminal_when_no_matching_ledger_row(self) -> None:
+        self.client.rows = [
+            {"id": 7, "session_id": "other-session", "status": "spawning"},
+        ]
+        store = _StubSessionStore()
+        task = _make_task(result=_StubInputRunResult(final_text="ok"))
+        td._finalize_dispatcher_inprocess_run(
+            task,
+            daemon_server=_daemon_with_store(store),
+            session_id="sess-x",
+            task_id=10247,
+            role="qa-agent",
+        )
+        self.assertEqual(self.client.patches, [])
+        self.assertEqual(store.terminal_marks, [("sess-x", "succeeded")])
+
     def test_callback_swallows_internal_exceptions(self) -> None:
         # Force list_for_task to blow up — callback must not raise.
         def _boom(*_a: Any, **_k: Any) -> Any:
             raise RuntimeError("ledger 5xx")
 
         self.client.list_for_task = _boom  # type: ignore[assignment]
+        store = _StubSessionStore()
         task = _make_task(result=_StubInputRunResult(final_text="ok"))
         td._finalize_dispatcher_inprocess_run(
-            task, daemon_server=None, session_id="sess-x", task_id=10247, role="cr"
+            task,
+            daemon_server=_daemon_with_store(store),
+            session_id="sess-x",
+            task_id=10247,
+            role="cr",
         )
-        # No PATCH performed — but no exception escaped the callback either.
+        # No PATCH performed — but no exception escaped the callback either,
+        # and the local session still leaves the active set.
         self.assertEqual(self.client.patches, [])
+        self.assertEqual(store.terminal_marks, [("sess-x", "succeeded")])
 
     def test_terminal_from_already_running_row_does_not_rewrite_started_at(self) -> None:
         self.client.rows = [

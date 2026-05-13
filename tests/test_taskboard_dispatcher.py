@@ -613,6 +613,55 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._pending_row(row_id)["dispatch_status"], "stuck_aborted")
         self.assertEqual(self._session_row()["status"], "aborted")
 
+    async def test_completed_qa_fire_is_not_marked_stuck_aborted(self) -> None:
+        """A finished QA fire must leave the sweeper's active-session set."""
+
+        row_id = self._insert_pending(10413, 11, "QA Agent")
+        task = {
+            "id": 10413,
+            "title": "Cycle 11 QA",
+            "agent": "QA Agent",
+            "fire_generation": 11,
+        }
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={10413: task},
+            session_manager=session_manager,
+        )
+
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="rendered qa prompt with verdict tool",
+        ):
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawned": 1})
+        session_id = "taskboard-10413-11-qa-agent"
+        dispatcher._store.mark_session_terminal(  # type: ignore[attr-defined]
+            session_id=session_id,
+            outcome_status="succeeded",
+        )
+        stale_created_at = self._iso(NOW - timedelta(minutes=61))
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET created_at = ?, updated_at = ?
+                WHERE session_id = ?
+                """,
+                (stale_created_at, stale_created_at, session_id),
+            )
+
+        count = await dispatcher.sweep_stuck_sessions()
+
+        self.assertEqual(count, 0)
+        self.assertEqual(session_manager.abort_calls, [])
+        self.assertEqual(self._pending_row(row_id)["dispatch_status"], "spawned")
+        session = self._session_row()
+        self.assertEqual(session["session_id"], session_id)
+        self.assertEqual(session["agent_id"], "qa-agent")
+        self.assertEqual(session["status"], "completed")
+
     async def test_stuck_session_sweep_posts_abort_audit_comment(self) -> None:
         """The stuck-session sweeper comments on the source task."""
 
