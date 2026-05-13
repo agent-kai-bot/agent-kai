@@ -20,6 +20,7 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from agent.prompt_renderer import render_taskboard_fire_prompt
+from agent.taskboard_service_client import TaskboardServiceClient, TaskboardServiceError
 from agent.taskboard_status_router import route_event
 from agent.worktree_manager import WorktreeManager
 
@@ -368,23 +369,16 @@ class DefaultTaskboardTaskClient:
             ValueError: If the response cannot be interpreted as a task.
         """
 
-        from agent.taskboard_tools import TaskboardClient, TaskboardContext
-
-        client = TaskboardClient(
-            TaskboardContext(
-                base_url=self.base_url,
-                bearer_token=self.bearer_token,
-            ),
+        client = TaskboardServiceClient(
+            self.base_url,
+            bearer_token=self.bearer_token,
             timeout_seconds=self.timeout_seconds,
         )
-        raw = client.get_task(task_id)
         try:
-            envelope = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError("taskboard response was not JSON") from exc
-        if not envelope.get("ok"):
-            raise RuntimeError(str(envelope.get("error") or envelope.get("body")))
-        return _extract_task(envelope.get("body"))
+            payload = client.fetch_task(task_id)
+        except TaskboardServiceError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return _extract_task(payload)
 
     def post_audit_comment(self, task_id: int, content: str) -> dict[str, Any]:
         """Post one dispatcher audit comment to the taskboard.
@@ -401,27 +395,15 @@ class DefaultTaskboardTaskClient:
             ValueError: If the response cannot be interpreted as JSON.
         """
 
-        from agent.taskboard_tools import TaskboardClient, TaskboardContext
-
-        client = TaskboardClient(
-            TaskboardContext(
-                base_url=self.base_url,
-                bearer_token=self.bearer_token,
-            ),
+        client = TaskboardServiceClient(
+            self.base_url,
+            bearer_token=self.bearer_token,
             timeout_seconds=self.timeout_seconds,
         )
-        raw = client.comment(
-            task_id,
-            _audit_actor_for_content(content),
-            content,
-        )
         try:
-            envelope = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError("taskboard response was not JSON") from exc
-        if not envelope.get("ok"):
-            raise RuntimeError(str(envelope.get("error") or envelope.get("body")))
-        return envelope
+            return client.post_audit_comment(task_id, content)
+        except TaskboardServiceError as exc:
+            raise RuntimeError(str(exc)) from exc
 
 
 @dataclass(frozen=True)

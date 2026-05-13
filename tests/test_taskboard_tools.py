@@ -146,6 +146,26 @@ class TaskboardToolsTests(unittest.TestCase):
         self.assertIn("[REDACTED]", payload["error"])
         self.assertNotIn("bearer-secret", result)
 
+    @mock.patch("agent.taskboard_tools.requests.request")
+    def test_get_task_still_truncates_envelope_for_large_response(self, request_mock) -> None:
+        """LLM tool responses keep the 20K preview envelope for large bodies."""
+
+        request_mock.return_value = _FakeResponse(
+            payload={
+                "id": 10413,
+                "comments": [{"content": "x" * 40_000}],
+            }
+        )
+
+        result = self.client.get_task(10413)
+
+        envelope = json.loads(result)
+        self.assertTrue(envelope["ok"])
+        self.assertEqual(envelope["status_code"], 200)
+        self.assertTrue(envelope["truncated"])
+        self.assertIn("body_preview", envelope)
+        self.assertNotIn("body", envelope)
+
     def test_create_taskboard_tools_includes_lifecycle_tool_names(self) -> None:
         """Factory returns all expected taskboard tools."""
 
