@@ -12,6 +12,8 @@ from urllib.parse import urljoin
 import requests
 from langchain_core.tools import StructuredTool
 
+from agent.taskboard_service_client import TaskboardServiceClient, TaskboardServiceError
+
 
 DEFAULT_TIMEOUT_SECONDS = 20
 REDACTED = "[REDACTED]"
@@ -99,6 +101,11 @@ def _redact(text: str, context: TaskboardContext) -> str:
 
 _REVIEW_TYPES = {"code", "security", "qa"}
 _REVIEW_VERDICTS = {"APPROVE", "REQUEST_CHANGES"}
+REVIEWER_USER_BY_TYPE = {
+    "code": "agent-code-reviewer",
+    "security": "agent-security-auditor",
+    "qa": "agent-qa",
+}
 _REVIEW_VERDICT_ROLE_BY_AGENT = {
     "code reviewer": "code",
     "code-reviewer": "code",
@@ -126,18 +133,7 @@ def _normalize_review_type(review_type: str) -> str:
         ValueError: If the review type is unsupported.
     """
 
-    normalized = str(review_type or "").strip().lower().replace("_", "-")
-    aliases = {
-        "code": "code",
-        "code-review": "code",
-        "code-reviewer": "code",
-        "security": "security",
-        "security-audit": "security",
-        "security-auditor": "security",
-        "qa": "qa",
-        "qa-agent": "qa",
-    }
-    canonical = aliases.get(normalized)
+    canonical = str(review_type or "").strip().lower()
     if canonical not in _REVIEW_TYPES:
         raise ValueError("review_type must be one of: code, security, qa")
     return canonical
@@ -160,6 +156,48 @@ def _normalize_review_verdict(verdict: str) -> str:
     if normalized not in _REVIEW_VERDICTS:
         raise ValueError("verdict must be one of: APPROVE, REQUEST_CHANGES")
     return normalized
+
+
+def _review_row_int(row: dict[str, Any], key: str, default: int) -> int:
+    """Return an integer field from a review row with a stable default."""
+
+    try:
+        return int(row.get(key) if row.get(key) is not None else default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_pending_review_id(task: dict[str, Any], review_type: str) -> int:
+    """Resolve the current pending review row id for a gate type."""
+
+    reviews = task.get("reviews")
+    if not isinstance(reviews, list):
+        raise ValueError("task response did not include a reviews list")
+
+    matching_reviews = [
+        row
+        for row in reviews
+        if isinstance(row, dict)
+        and str(row.get("review_type") or "").strip().lower() == review_type
+        and str(row.get("status") or "").strip().lower() == "pending"
+    ]
+    if not matching_reviews:
+        raise ValueError(f"no pending {review_type} review exists for this task")
+
+    selected_review = min(
+        matching_reviews,
+        key=lambda row: (
+            -_review_row_int(row, "cycle", 0),
+            _review_row_int(row, "sequence", 1),
+            _review_row_int(row, "id", 0),
+        ),
+    )
+    try:
+        return int(selected_review["id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"pending {review_type} review row is missing a numeric id"
+        ) from exc
 
 
 def _agent_can_submit_review_verdict(context: TaskboardContext) -> bool:
@@ -430,6 +468,7 @@ class TaskboardClient:
         review_type: str,
         verdict: str,
         summary_md: str,
+        evidence_url: str | None = None,
     ) -> str:
         """Submit the structured review verdict for this taskboard session.
 
@@ -437,6 +476,7 @@ class TaskboardClient:
             review_type: Review gate type: code, security, or qa.
             verdict: Review verdict: APPROVE or REQUEST_CHANGES.
             summary_md: Markdown summary for the verdict.
+            evidence_url: Optional evidence URL for the verdict record.
 
         Returns:
             Formatted taskboard response.
@@ -452,14 +492,31 @@ class TaskboardClient:
         summary = str(summary_md or "")
         if not summary.strip():
             raise ValueError("summary_md is required")
+
+        service_client = TaskboardServiceClient(
+            self.context.base_url,
+            bearer_token=self.context.bearer_token,
+            timeout_seconds=self.timeout_seconds,
+        )
+        try:
+            task = service_client.fetch_task(int(self.context.task_id))
+        except TaskboardServiceError as exc:
+            raise RuntimeError(_redact(str(exc), self.context)) from exc
+
+        review_id = _resolve_pending_review_id(task, canonical_review_type)
         return self._request(
             "POST",
-            f"/api/tasks/{int(self.context.task_id)}/reviews/verdict",
+            (
+                f"/api/tasks/{int(self.context.task_id)}/reviews/"
+                f"{review_id}/verdict"
+            ),
             params=self._session_params(),
             json_body={
-                "review_type": canonical_review_type,
+                "gate_type": canonical_review_type,
                 "verdict": canonical_verdict,
-                "summary_md": summary,
+                "reviewer_user": REVIEWER_USER_BY_TYPE[canonical_review_type],
+                "evidence_url": evidence_url,
+                "findings_summary_path": None,
             },
         )
 
@@ -727,19 +784,21 @@ def create_taskboard_tools(
                 coroutine=(
                     lambda review_type,
                     verdict,
-                    summary_md: _async_call(
+                    summary_md,
+                    evidence_url=None: _async_call(
                         "submit_review_verdict",
                         review_type,
                         verdict,
                         summary_md,
+                        evidence_url=evidence_url,
                     )
                 ),
                 name="taskboard_submit_review_verdict",
                 description=(
                     "Submit the structured staged-review verdict for the current "
-                    "taskboard session. Inputs: review_type, verdict, summary_md. "
-                    "review_type must be code, security, or qa; verdict must be "
-                    "APPROVE or REQUEST_CHANGES."
+                    "taskboard session. Inputs: review_type, verdict, summary_md, "
+                    "evidence_url. review_type must be code, security, or qa; "
+                    "verdict must be APPROVE or REQUEST_CHANGES."
                 ),
             )
         )

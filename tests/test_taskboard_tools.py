@@ -11,6 +11,7 @@ from unittest import mock
 import requests
 
 from agent.taskboard_tools import (
+    REVIEWER_USER_BY_TYPE,
     TaskboardClient,
     TaskboardContext,
     create_taskboard_tools,
@@ -66,6 +67,11 @@ class TaskboardToolsTests(unittest.TestCase):
             task_id=123,
         )
         self.client = TaskboardClient(self.context)
+
+    def _task_with_reviews(self, reviews: list[dict]) -> dict:
+        """Build a minimal task payload with review rows."""
+
+        return {"id": self.context.task_id, "reviews": reviews}
 
     @mock.patch("agent.taskboard_tools.requests.request")
     def test_comment_posts_with_auth_and_session_params(self, request_mock) -> None:
@@ -151,9 +157,24 @@ class TaskboardToolsTests(unittest.TestCase):
 
     @mock.patch("agent.taskboard_tools.requests.request")
     def test_submit_review_verdict_posts_approve_payload(self, request_mock) -> None:
-        """Structured verdict tool posts the canonical task-scoped payload."""
+        """Structured verdict tool posts to the resolved review verdict URL."""
 
-        request_mock.return_value = _FakeResponse(payload={"status": "submitted"})
+        request_mock.side_effect = [
+            _FakeResponse(
+                payload=self._task_with_reviews(
+                    [
+                        {
+                            "id": 451,
+                            "review_type": "code",
+                            "status": "pending",
+                            "cycle": 2,
+                            "sequence": 1,
+                        }
+                    ]
+                )
+            ),
+            _FakeResponse(payload={"status": "submitted"}),
+        ]
 
         result = self.client.submit_review_verdict(
             "code",
@@ -161,55 +182,196 @@ class TaskboardToolsTests(unittest.TestCase):
             "No blocking findings.",
         )
 
-        request_mock.assert_called_once()
-        _, kwargs = request_mock.call_args
+        self.assertEqual(request_mock.call_count, 2)
+        _, kwargs = request_mock.call_args_list[1]
         self.assertEqual(kwargs["method"], "POST")
         self.assertEqual(
             kwargs["url"],
-            "http://taskboard.local/api/tasks/123/reviews/verdict",
+            "http://taskboard.local/api/tasks/123/reviews/451/verdict",
         )
         self.assertEqual(kwargs["params"], {"token": "session-secret", "generation": 7})
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer bearer-secret")
         self.assertEqual(
             kwargs["json"],
             {
-                "review_type": "code",
+                "gate_type": "code",
                 "verdict": "APPROVE",
-                "summary_md": "No blocking findings.",
+                "reviewer_user": REVIEWER_USER_BY_TYPE["code"],
+                "evidence_url": None,
+                "findings_summary_path": None,
             },
         )
         self.assertTrue(json.loads(result)["ok"])
 
     @mock.patch("agent.taskboard_tools.requests.request")
     def test_submit_review_verdict_posts_request_changes_payload(self, request_mock) -> None:
-        """Structured verdict tool forwards REQUEST_CHANGES unchanged."""
+        """Structured verdict tool sends gate_type and reviewer_user body shape."""
 
-        request_mock.return_value = _FakeResponse(payload={"status": "submitted"})
+        request_mock.side_effect = [
+            _FakeResponse(
+                payload=self._task_with_reviews(
+                    [
+                        {
+                            "id": 452,
+                            "review_type": "qa",
+                            "status": "pending",
+                            "cycle": 1,
+                            "sequence": 1,
+                        }
+                    ]
+                )
+            ),
+            _FakeResponse(payload={"status": "submitted"}),
+        ]
 
         result = self.client.submit_review_verdict(
             "qa",
             "REQUEST_CHANGES",
             "Regression observed in the focused test path.",
+            evidence_url="https://example.test/evidence",
         )
 
-        _, kwargs = request_mock.call_args
-        self.assertEqual(
-            kwargs["json"],
-            {
-                "review_type": "qa",
-                "verdict": "REQUEST_CHANGES",
-                "summary_md": "Regression observed in the focused test path.",
-            },
-        )
+        _, kwargs = request_mock.call_args_list[1]
+        body = kwargs["json"]
+        self.assertEqual(body["gate_type"], "qa")
+        self.assertEqual(body["verdict"], "REQUEST_CHANGES")
+        self.assertEqual(body["reviewer_user"], REVIEWER_USER_BY_TYPE["qa"])
+        self.assertEqual(body["evidence_url"], "https://example.test/evidence")
+        self.assertIsNone(body["findings_summary_path"])
+        self.assertNotIn("review_type", body)
+        self.assertNotIn("summary_md", body)
         self.assertTrue(json.loads(result)["ok"])
+
+    @mock.patch("agent.taskboard_tools.requests.request")
+    def test_submit_review_verdict_resolves_highest_cycle_lowest_sequence(
+        self,
+        request_mock,
+    ) -> None:
+        """Review id resolution prefers highest cycle, then smallest sequence."""
+
+        request_mock.side_effect = [
+            _FakeResponse(
+                payload=self._task_with_reviews(
+                    [
+                        {
+                            "id": 520,
+                            "review_type": "code",
+                            "status": "pending",
+                            "cycle": 2,
+                            "sequence": 1,
+                        },
+                        {
+                            "id": 521,
+                            "review_type": "code",
+                            "status": "pending",
+                            "cycle": 2,
+                            "sequence": 2,
+                        },
+                        {
+                            "id": 522,
+                            "review_type": "security",
+                            "status": "pending",
+                            "cycle": 2,
+                            "sequence": 1,
+                        },
+                        {
+                            "id": 620,
+                            "review_type": "code",
+                            "status": "pending",
+                            "cycle": 3,
+                            "sequence": 3,
+                        },
+                        {
+                            "id": 621,
+                            "review_type": "code",
+                            "status": "pending",
+                            "cycle": 3,
+                            "sequence": 1,
+                        },
+                        {
+                            "id": 622,
+                            "review_type": "security",
+                            "status": "pending",
+                            "cycle": 3,
+                            "sequence": 1,
+                        },
+                    ]
+                )
+            ),
+            _FakeResponse(payload={"status": "submitted"}),
+        ]
+
+        self.client.submit_review_verdict(
+            "code",
+            "APPROVE",
+            "Cycle three code review passes.",
+        )
+
+        _, kwargs = request_mock.call_args_list[1]
+        self.assertEqual(
+            kwargs["url"],
+            "http://taskboard.local/api/tasks/123/reviews/621/verdict",
+        )
+
+    @mock.patch("agent.taskboard_tools.requests.request")
+    def test_submit_review_verdict_raises_when_no_pending_review(
+        self,
+        request_mock,
+    ) -> None:
+        """Submitted review rows are not eligible for verdict submission."""
+
+        request_mock.return_value = _FakeResponse(
+            payload=self._task_with_reviews(
+                [
+                    {
+                        "id": 701,
+                        "review_type": "security",
+                        "status": "approved",
+                        "cycle": 3,
+                        "sequence": 1,
+                    },
+                    {
+                        "id": 702,
+                        "review_type": "security",
+                        "status": "changes_requested",
+                        "cycle": 2,
+                        "sequence": 1,
+                    },
+                ]
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "no pending security review"):
+            self.client.submit_review_verdict(
+                "security",
+                "APPROVE",
+                "No pending review remains.",
+            )
+
+        request_mock.assert_called_once()
+        _, kwargs = request_mock.call_args
+        self.assertEqual(kwargs["method"], "GET")
 
     @mock.patch("agent.taskboard_tools.requests.request")
     def test_submit_review_verdict_redacts_request_errors(self, request_mock) -> None:
         """Verdict transport errors redact bearer and session tokens."""
 
-        request_mock.side_effect = requests.Timeout(
-            "bearer-secret session-secret timed out"
-        )
+        request_mock.side_effect = [
+            _FakeResponse(
+                payload=self._task_with_reviews(
+                    [
+                        {
+                            "id": 453,
+                            "review_type": "security",
+                            "status": "pending",
+                            "cycle": 1,
+                            "sequence": 1,
+                        }
+                    ]
+                )
+            ),
+            requests.Timeout("bearer-secret session-secret timed out"),
+        ]
 
         result = self.client.submit_review_verdict(
             "security",
