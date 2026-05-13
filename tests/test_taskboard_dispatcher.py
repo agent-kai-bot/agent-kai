@@ -453,6 +453,59 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(review_context["review_status"], "pending")
         self.assertEqual(review_context["review_types"], ["code"])
 
+    async def test_review_verdict_approved_spawns_next_gate_and_records_queued_run(self) -> None:
+        """A code approval verdict routes to Security Auditor without status churn."""
+
+        row_id = self._insert_pending(
+            402,
+            9,
+            "Developer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Review",
+            extra_payload={
+                "review_id": 265,
+                "gate_type": "code",
+                "verdict": "APPROVED",
+                "reviewer_user": "agent-code-reviewer",
+                "cycle": 8,
+            },
+        )
+        task = {
+            "id": 402,
+            "agent": "Developer",
+            "implementation_agent": "Developer",
+            "status": "Review",
+            "fire_generation": 9,
+        }
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={402: task},
+            session_manager=session_manager,
+        )
+
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="rendered prompt",
+        ), mock.patch.object(
+            dispatcher,
+            "_record_agent_run_queued",
+            return_value=321,
+        ) as record_queued:
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawned": 1})
+        self.assertEqual(len(session_manager.spawn_calls), 1)
+        spawn = session_manager.spawn_calls[0]
+        self.assertEqual(spawn["role"], "Security Auditor")
+        self.assertEqual(spawn["agent_id"], "security-auditor")
+        self.assertEqual(spawn["task_id"], 402)
+        self.assertEqual(spawn["fire_generation"], 9)
+        record_queued.assert_called_once()
+        self.assertEqual(record_queued.call_args.kwargs["role"], "security-auditor")
+        self.assertEqual(record_queued.call_args.kwargs["trigger_event_id"], str(row_id))
+
     async def test_backpressure_leaves_overflow_rows_pending(self) -> None:
         """The dispatcher respects the active spawn cap and drains later."""
 
@@ -856,22 +909,29 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         *,
         received_at: str | None = None,
         from_status: str | None = "Backlog",
-        to_status: str = "In Progress",
+        to_status: str | None = "In Progress",
+        event_type: str = "task.status_changed",
+        task_status: str | None = None,
+        extra_payload: dict | None = None,
     ) -> int:
         payload = {
             "event_id": f"event-{task_id}-{fire_generation}-{agent}",
-            "event_type": "task.status_changed",
+            "event_type": event_type,
             "task_id": task_id,
             "fire_generation": fire_generation,
-            "from_status": from_status,
-            "to_status": to_status,
             "task": {
                 "id": task_id,
                 "agent": agent,
                 "fire_generation": fire_generation,
-                "status": to_status,
+                "status": task_status or to_status or "Review",
             },
         }
+        if from_status is not None:
+            payload["from_status"] = from_status
+        if to_status is not None:
+            payload["to_status"] = to_status
+        if extra_payload:
+            payload.update(extra_payload)
         with self._connect() as conn:
             cursor = conn.execute(
                 """

@@ -144,6 +144,88 @@ def test_review_to_done_is_noop() -> None:
     assert _route({"from_status": "Review", "to_status": "Done"}) == ()
 
 
+def test_code_approve_verdict_fires_security_auditor() -> None:
+    assert _route(
+        {
+            "event_type": "review.verdict_submitted",
+            "gate_type": "code",
+            "verdict": "APPROVED",
+        }
+    ) == (
+        RouteDecision(
+            role="Security Auditor",
+            reason="review_verdict_code_approved",
+            concurrency_group="review",
+            allow_parallel=False,
+        ),
+    )
+
+
+def test_security_approve_verdict_fires_qa_agent() -> None:
+    assert _route(
+        {
+            "event_type": "review.verdict_submitted",
+            "gate_type": "security",
+            "verdict": "APPROVE",
+        }
+    ) == (
+        RouteDecision(
+            role="QA Agent",
+            reason="review_verdict_security_approved",
+            concurrency_group="review",
+            allow_parallel=False,
+        ),
+    )
+
+
+def test_qa_approve_verdict_is_noop() -> None:
+    assert _route(
+        {
+            "event_type": "review.verdict_submitted",
+            "gate_type": "qa",
+            "verdict": "APPROVED",
+        }
+    ) == ()
+
+
+def test_late_approve_verdict_after_done_is_noop() -> None:
+    assert _route(
+        {
+            "event_type": "review.verdict_submitted",
+            "gate_type": "code",
+            "verdict": "APPROVED",
+        },
+        task={"id": 16, "agent": "Developer", "status": "Done"},
+    ) == ()
+
+
+def test_request_changes_verdict_routes_to_implementation_agent() -> None:
+    assert _route(
+        {
+            "event_type": "review.verdict_submitted",
+            "gate_type": "code",
+            "verdict": "REQUEST_CHANGES",
+        },
+        task={"id": 15, "agent": "Code Reviewer", "implementation_agent": "Architect"},
+    ) == (
+        RouteDecision(
+            role="Architect",
+            reason="review_verdict_request_changes",
+            concurrency_group="implementation",
+            allow_parallel=False,
+        ),
+    )
+
+
+def test_task_prefixed_review_verdict_event_alias_is_accepted() -> None:
+    assert _route(
+        {
+            "event_type": "task.review_verdict_submitted",
+            "payload": {"gate_type": "code", "verdict": "APPROVED"},
+        }
+    )[0].role == "Security Auditor"
+
+
 def test_code_review_to_done_is_noop() -> None:
     """Done is a terminal status with no auto-fire."""
 

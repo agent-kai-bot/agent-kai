@@ -1,7 +1,7 @@
 """Map task events to structured auto-fire routing decisions.
 
 Used by the taskboard dispatcher to decide which role(s) to spawn for a given
-``task.status_changed`` event. Routing produces auditable
+taskboard webhook event. Routing produces auditable
 :class:`agent.route_decision.RouteDecision` values consumed by the dispatcher.
 
 Routing model
@@ -117,6 +117,10 @@ _REVIEW_DECISIONS: dict[str, RouteDecision] = {
     ),
 }
 
+_VERDICT_EVENT_TYPES = {"review.verdict_submitted", "task.review_verdict_submitted"}
+_IMPLEMENTATION_ROLES = {"Architect", "Developer"}
+_ACTIVE_REVIEW_STATUSES = {"review", "code_review", "security_audit", "qa"}
+
 
 def resolve_role_for_task(latest_task: dict[str, Any] | None) -> str | None:
     """Return the canonical role for a task, or ``None`` if unresolved.
@@ -142,6 +146,88 @@ def resolve_role_for_task(latest_task: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _normalize_token(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _review_verdict_body(payload: dict[str, Any]) -> dict[str, Any]:
+    body = payload.get("payload")
+    return body if isinstance(body, dict) else payload
+
+
+def _resolve_implementation_role_for_task(latest_task: dict[str, Any] | None) -> str | None:
+    if not latest_task:
+        return None
+    for key in ("implementation_agent", "agent"):
+        value = latest_task.get(key)
+        if isinstance(value, str) and value.strip():
+            role = _AGENT_TO_ROLE.get(value.strip().lower())
+            if role in _IMPLEMENTATION_ROLES:
+                return role
+    task_type = latest_task.get("task_type")
+    if isinstance(task_type, str) and task_type.strip():
+        role = _TASK_TYPE_TO_ROLE.get(task_type.strip().lower())
+        if role in _IMPLEMENTATION_ROLES:
+            return role
+    return "Developer"
+
+
+def _latest_task_status(latest_task: dict[str, Any] | None) -> str:
+    if not latest_task:
+        return ""
+    status = latest_task.get("status")
+    return _normalize_token(status) if isinstance(status, str) and status.strip() else ""
+
+
+def _review_verdict_route(
+    payload: dict[str, Any],
+    latest_task: dict[str, Any] | None,
+) -> tuple[RouteDecision, ...]:
+    body = _review_verdict_body(payload)
+    gate_type = _normalize_token(body.get("gate_type") or body.get("review_type"))
+    verdict = _normalize_token(body.get("verdict"))
+    latest_status = _latest_task_status(latest_task)
+
+    if latest_status and latest_status not in _ACTIVE_REVIEW_STATUSES:
+        return ()
+
+    if verdict in {"approve", "approved"}:
+        if gate_type in {"code", "code_review"}:
+            return (
+                RouteDecision(
+                    role="Security Auditor",
+                    reason="review_verdict_code_approved",
+                    concurrency_group="review",
+                    allow_parallel=False,
+                ),
+            )
+        if gate_type in {"security", "security_audit", "security_review"}:
+            return (
+                RouteDecision(
+                    role="QA Agent",
+                    reason="review_verdict_security_approved",
+                    concurrency_group="review",
+                    allow_parallel=False,
+                ),
+            )
+        return ()
+
+    if verdict in {"request_changes", "changes_requested", "requested_changes"}:
+        role = _resolve_implementation_role_for_task(latest_task)
+        if role is None:
+            return ()
+        return (
+            RouteDecision(
+                role=role,
+                reason="review_verdict_request_changes",
+                concurrency_group=_CONCURRENCY_GROUP_FOR_ROLE.get(role, "implementation"),
+                allow_parallel=False,
+            ),
+        )
+
+    return ()
+
+
 def route_event(
     payload: dict[str, Any],
     latest_task: dict[str, Any] | None,
@@ -150,8 +236,7 @@ def route_event(
     """Return structured routing decisions for one taskboard event.
 
     Args:
-        payload: Raw webhook/event payload containing ``from_status`` and
-            ``to_status``.
+        payload: Raw webhook/event payload.
         latest_task: Most recent taskboard task document. Inspected for
             ``agent`` and ``task_type`` when routing implementation stages.
         review_context: Review metadata bundle accepted for future policy.
@@ -162,7 +247,13 @@ def route_event(
         unknown-role on an actionable status).
     """
 
-    del review_context  # accepted for future verdict-driven gating
+    del review_context  # accepted for future policy
+
+    event_type = str(payload.get("event_type") or "").strip()
+    if event_type in _VERDICT_EVENT_TYPES:
+        return _review_verdict_route(payload, latest_task)
+    if event_type and event_type != "task.status_changed":
+        return ()
 
     to_status = payload.get("to_status")
     if to_status is None:
