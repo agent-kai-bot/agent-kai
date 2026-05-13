@@ -1261,15 +1261,16 @@ class Session:
                         ],
                     )
 
-                    if self.auto_iterations_remaining <= 0:
-                        stopped = self.stop_auto_mode("iteration budget exhausted")
-                        yield {"type": "auto_stopped", "data": stopped}
-                        break
+                    if auto_state not in {"done", "pause"}:
+                        if self.auto_iterations_remaining <= 0:
+                            stopped = self.stop_auto_mode("iteration budget exhausted")
+                            yield {"type": "auto_stopped", "data": stopped}
+                            break
 
-                    if self.auto_elapsed_seconds() > self.auto_max_duration:
-                        stopped = self.stop_auto_mode("wall-clock budget exceeded")
-                        yield {"type": "auto_stopped", "data": stopped}
-                        break
+                        if self.auto_elapsed_seconds() > self.auto_max_duration:
+                            stopped = self.stop_auto_mode("wall-clock budget exceeded")
+                            yield {"type": "auto_stopped", "data": stopped}
+                            break
 
                     normalized_final = turn_final_text.strip()
                     repeated_final_detected = bool(

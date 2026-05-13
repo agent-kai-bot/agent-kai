@@ -953,8 +953,10 @@ class TaskboardDispatcher:
                     self._record_agent_run_terminal(
                         run_id=ledger_run_id,
                         status="failed",
-                        failure_class="tool_unknown_failure",
-                        failure_detail=f"spawn raised: {error_message}",
+                        failure_class="tool_runtime_exception",
+                        failure_detail=(
+                            f"spawn raised: {type(exc).__name__}: {error_message}"
+                        ),
                     )
                     await self._post_spawn_failure_audit(
                         row=row,
@@ -975,13 +977,13 @@ class TaskboardDispatcher:
                     agent_id=route.agent_id,
                     session_id=session_id,
                 )
-                # Phase 1 (#10223): PATCH the ledger row to `spawning` and
-                # capture the resolved session_id. Terminal status is written
-                # later by the run-outcome reaper (#10229 follow-up) once the
-                # run JSON is observable.
+                # Phase 1 (#10223): PATCH the ledger row through `spawning`
+                # into `running` once the in-process session task is scheduled.
+                # Terminal status is written by the task done-callback.
                 self._record_agent_run_spawning(
                     run_id=ledger_run_id, session_id=session_id
                 )
+                self._record_agent_run_running(run_id=ledger_run_id)
                 session_results.append((route, session_id))
                 reserved_key = None
 
@@ -1285,6 +1287,25 @@ class TaskboardDispatcher:
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning(
                 "agent_runs_spawning_failed run_id=%s error=%s",
+                run_id,
+                _redact_known_secrets(str(exc)),
+            )
+
+    def _record_agent_run_running(self, *, run_id: int | None) -> None:
+        """PATCH the ledger row to ``running`` once the session task is scheduled.
+
+        The taskboard API sets ``started_at`` on the first running transition.
+        This must happen when the in-process session starts, not in the
+        done-callback, otherwise terminal rows show millisecond runtimes.
+        """
+        client = self._agent_runs_client
+        if client is None or run_id is None or not getattr(client, "enabled", False):
+            return
+        try:
+            client.patch(run_id, {"status": "running"})
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "agent_runs_running_failed run_id=%s error=%s",
                 run_id,
                 _redact_known_secrets(str(exc)),
             )
@@ -2354,8 +2375,8 @@ def _finalize_dispatcher_inprocess_run(
     inference with a real outcome derivation:
 
     1. ``task.cancelled()`` → ``cancelled`` / ``manual_cancellation``.
-    2. ``task.exception()`` is set → ``failed`` / ``tool_unknown_failure``
-       with the exception's repr in the detail.
+    2. ``task.exception()`` is set → ``failed`` / ``tool_runtime_exception``
+       with the raw exception class in the detail.
     3. Otherwise the task's :class:`InputRunResult` (final_text + error) is
        projected into a synthetic event stream and routed through
        :func:`agent.run_outcome.derive_outcome_from_agent_events`, so
@@ -2374,6 +2395,7 @@ def _finalize_dispatcher_inprocess_run(
         from agent.agent_runs_client import AgentRunsClient
         from agent.run_outcome import (
             derive_outcome_from_agent_events,
+            derive_outcome_from_exception,
             derive_outcome_from_manual_cancel,
         )
 
@@ -2383,15 +2405,22 @@ def _finalize_dispatcher_inprocess_run(
         # Locate the ledger row by session_id.
         rows = client.list_for_task(int(task_id), limit=200) or []
         ledger_run_id = None
+        row_status = None
         for row in rows:
-            if str(row.get("session_id") or "") == session_id and row.get("status") == "spawning":
+            if str(row.get("session_id") or "") == session_id and row.get(
+                "status"
+            ) in ("spawning", "running"):
                 ledger_run_id = int(row["id"])
+                row_status = str(row.get("status") or "")
                 break
         if ledger_run_id is None:
             return
 
-        # spawning → running → terminal
-        client.patch(ledger_run_id, {"status": "running"})
+        # spawning → running → terminal. Newer dispatcher paths already patch
+        # running when the session task is scheduled, so avoid a no-op PATCH
+        # here when possible.
+        if row_status == "spawning":
+            client.patch(ledger_run_id, {"status": "running"})
 
         # ---- derive the real terminal outcome --------------------------------
         if task.cancelled():
@@ -2401,13 +2430,7 @@ def _finalize_dispatcher_inprocess_run(
         else:
             exc = task.exception()
             if exc is not None:
-                from agent.run_outcome import RunOutcome
-
-                outcome = RunOutcome(
-                    status="failed",
-                    failure_class="tool_unknown_failure",
-                    failure_detail=f"{type(exc).__name__}: {exc}",
-                )
+                outcome = derive_outcome_from_exception(exc)
             else:
                 # task.result() is an InputRunResult (final_text + error +
                 # auto_stopped_reason). The session itself doesn't retain a
@@ -2419,8 +2442,11 @@ def _finalize_dispatcher_inprocess_run(
                 final_text = getattr(result, "final_text", None)
                 error_text = getattr(result, "error", None)
                 auto_stopped_reason = getattr(result, "auto_stopped_reason", None)
+                auto_stopped_data = getattr(result, "auto_stopped_data", None)
                 events: list[dict[str, Any]] = []
-                if auto_stopped_reason is not None:
+                if isinstance(auto_stopped_data, dict):
+                    events.append({"type": "auto_stopped", "data": auto_stopped_data})
+                elif auto_stopped_reason is not None:
                     # auto_stopped beats error/final in derive_outcome
                     # precedence (iteration_budget, requires_approval,
                     # malformed AUTO_STATE all surface here). The empty

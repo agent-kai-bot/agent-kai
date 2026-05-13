@@ -26,6 +26,7 @@ class _StubInputRunResult:
     final_text: str = ""
     error: str | None = None
     auto_stopped_reason: str | None = None
+    auto_stopped_data: dict[str, Any] | None = None
 
 
 @dataclass
@@ -154,7 +155,7 @@ class FinalizeInprocessRunTests(unittest.TestCase):
         )
         body = self._terminal()
         self.assertEqual(body["status"], "failed")
-        self.assertEqual(body["failure_class"], "tool_unknown_failure")
+        self.assertEqual(body["failure_class"], "tool_runtime_exception")
         self.assertIn("RuntimeError", body["failure_detail"])
         self.assertIn("kaboom", body["failure_detail"])
 
@@ -213,6 +214,40 @@ class FinalizeInprocessRunTests(unittest.TestCase):
         )
         body = self._terminal()
         self.assertEqual(body, {"status": "succeeded"})
+
+    def test_done_final_text_wins_over_late_wall_clock_auto_stop(self) -> None:
+        task = _make_task(
+            result=_StubInputRunResult(
+                final_text="Wrote final artifact.\n[AUTO_STATE: done]",
+                auto_stopped_data={
+                    "reason": "wall-clock budget exceeded",
+                    "elapsed_seconds": 241.7,
+                },
+            )
+        )
+        td._finalize_dispatcher_inprocess_run(
+            task, daemon_server=None, session_id="sess-x", task_id=10247, role="cr"
+        )
+        body = self._terminal()
+        self.assertEqual(body, {"status": "succeeded"})
+
+    def test_wall_clock_auto_stop_maps_specific_failure_class(self) -> None:
+        task = _make_task(
+            result=_StubInputRunResult(
+                final_text="Still working.\n[AUTO_STATE: continue]",
+                auto_stopped_data={
+                    "reason": "wall-clock budget exceeded",
+                    "elapsed_seconds": 181.2,
+                },
+            )
+        )
+        td._finalize_dispatcher_inprocess_run(
+            task, daemon_server=None, session_id="sess-x", task_id=10247, role="cr"
+        )
+        body = self._terminal()
+        self.assertEqual(body["status"], "failed")
+        self.assertEqual(body["failure_class"], "wall_clock_budget_exceeded")
+        self.assertIn("elapsed=181.2s", body["failure_detail"])
 
     def test_both_final_and_error_picks_error(self) -> None:
         """run_outcome precedence: error beats final when both present.
@@ -286,6 +321,16 @@ class FinalizeInprocessRunTests(unittest.TestCase):
         )
         # No PATCH performed — but no exception escaped the callback either.
         self.assertEqual(self.client.patches, [])
+
+    def test_terminal_from_already_running_row_does_not_rewrite_started_at(self) -> None:
+        self.client.rows = [
+            {"id": 7, "session_id": "sess-x", "status": "running"},
+        ]
+        task = _make_task(result=_StubInputRunResult(final_text="ok"))
+        td._finalize_dispatcher_inprocess_run(
+            task, daemon_server=None, session_id="sess-x", task_id=10247, role="cr"
+        )
+        self.assertEqual(self.client.patches, [(7, {"status": "succeeded"})])
 
 
 if __name__ == "__main__":

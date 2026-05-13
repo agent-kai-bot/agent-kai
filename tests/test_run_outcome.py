@@ -17,6 +17,7 @@ from agent.run_outcome import (
     AGENT_RUN_TERMINAL_STATUSES,
     RunOutcome,
     derive_outcome_from_agent_events,
+    derive_outcome_from_exception,
     derive_outcome_from_duplicate,
     derive_outcome_from_manual_cancel,
     derive_outcome_from_outage_backfill,
@@ -154,6 +155,39 @@ class DeriveFromAgentEventsTests(unittest.TestCase):
         self.assertEqual(out.status, "timeout")
         self.assertEqual(out.failure_class, "session_exceeded_iterations")
 
+    def test_auto_stopped_wall_clock_budget(self) -> None:
+        events = [
+            {
+                "type": "auto_stopped",
+                "data": {
+                    "reason": "wall-clock budget exceeded",
+                    "elapsed_seconds": 181.234,
+                },
+            },
+        ]
+        out = derive_outcome_from_agent_events(events)
+        self.assertEqual(out.status, "failed")
+        self.assertEqual(out.failure_class, "wall_clock_budget_exceeded")
+        self.assertIn("elapsed=181.2s", out.failure_detail)
+
+    def test_final_auto_state_done_beats_late_wall_clock_sentinel(self) -> None:
+        events = [
+            {
+                "type": "final",
+                "data": "Wrote artifact.\n[AUTO_STATE: done]",
+            },
+            {
+                "type": "auto_stopped",
+                "data": {
+                    "reason": "wall-clock budget exceeded",
+                    "elapsed_seconds": 181.234,
+                },
+            },
+        ]
+        out = derive_outcome_from_agent_events(events)
+        self.assertEqual(out.status, "succeeded")
+        self.assertIsNone(out.failure_class)
+
     def test_auto_stopped_missing_auto_state_footer(self) -> None:
         events = [
             {
@@ -215,6 +249,22 @@ class DeriveFromAgentEventsTests(unittest.TestCase):
         ]
         out = derive_outcome_from_agent_events(events)
         self.assertEqual(out.failure_class, "endpoint_unreachable")
+
+    def test_subprocess_crash_surfaces_runtime_exception_class(self) -> None:
+        out = derive_outcome_from_exception(RuntimeError("codex CLI exited with status 1"))
+        self.assertEqual(out.status, "failed")
+        self.assertEqual(out.failure_class, "tool_runtime_exception")
+        self.assertIn("RuntimeError", out.failure_detail)
+        self.assertIn("codex CLI exited with status 1", out.failure_detail)
+
+    def test_error_event_with_raw_exception_class_is_runtime_exception(self) -> None:
+        events = [
+            {"type": "error", "data": "RuntimeError: codex CLI exited with status 1: boom"},
+        ]
+        out = derive_outcome_from_agent_events(events)
+        self.assertEqual(out.status, "failed")
+        self.assertEqual(out.failure_class, "tool_runtime_exception")
+        self.assertIn("RuntimeError", out.failure_detail)
 
 
 class DeriveFromOtherSourcesTests(unittest.TestCase):
@@ -332,7 +382,7 @@ class TaskboardEnumLockstepTests(unittest.TestCase):
         self.assertEqual(len(AGENT_RUN_STATUSES), 16)
 
     def test_failure_class_count(self) -> None:
-        self.assertEqual(len(AGENT_RUN_FAILURE_CLASSES), 23)
+        self.assertEqual(len(AGENT_RUN_FAILURE_CLASSES), 25)
 
     def test_terminal_statuses_documented(self) -> None:
         # Specifically the cases that bit us today must be terminal.

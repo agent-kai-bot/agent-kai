@@ -258,6 +258,96 @@ class ReapOneTests(unittest.TestCase):
         _, comment = client.audit_comments[0]
         self.assertTrue(comment.startswith("[KAI] COMPLETED qa-agent: ok"))
 
+    def test_done_session_with_late_wall_clock_sentinel_marks_succeeded(self) -> None:
+        artifact_path = self.dir / "code-reviewer" / "claude" / "artifacts" / "10413-final.txt"
+        artifact_path.parent.mkdir(parents=True)
+        artifact_path.write_text("review complete\n", encoding="utf-8")
+        final_text = (
+            "Task #10413 is complete.\n"
+            f"Wrote final artifact to `{artifact_path}`.\n\n"
+            "[AUTO_STATE: done]"
+        )
+        path = _write_run_file(
+            self.dir,
+            "run_10413_300",
+            {
+                "session_key": "agent:code-reviewer:task-10413-code-review:run_10413_300",
+                "status": "completed",
+                "started_at": "2026-05-13T14:58:35.756Z",
+                "ended_at": "2026-05-13T14:58:35.765Z",
+                "events": [
+                    {"type": "final", "data": final_text},
+                    {
+                        "type": "auto_stopped",
+                        "data": {
+                            "reason": "wall-clock budget exceeded",
+                            "elapsed_seconds": 241.7,
+                        },
+                    },
+                ],
+                "final_text": final_text,
+            },
+        )
+        artifact = parse_run_artifact(path)
+        client = _StubClient(
+            ledger_rows={
+                10413: [
+                    {
+                        "id": 300,
+                        "session_id": artifact.session_key,
+                        "task_id": 10413,
+                        "role": "code-reviewer",
+                        "status": "running",
+                    }
+                ]
+            }
+        )
+
+        result = reap_one(artifact, client=client, state=self.state)
+
+        self.assertEqual(result.outcome.status, "succeeded")
+        self.assertIsNone(result.outcome.failure_class)
+        self.assertEqual(client.patches[0][0], 300)
+        self.assertEqual(client.patches[0][1]["status"], "succeeded")
+        self.assertNotIn("failure_class", client.patches[0][1])
+        self.assertAlmostEqual(artifact.elapsed_seconds, 0.009, places=3)
+
+    def test_real_wall_clock_budget_marks_specific_failure_class(self) -> None:
+        path = _write_run_file(
+            self.dir,
+            "run_wall_clock",
+            {
+                "session_key": "agent:developer:task-10413:run_wall_clock",
+                "status": "completed",
+                "started_at": "2026-05-13T14:00:00Z",
+                "ended_at": "2026-05-13T14:03:02Z",
+                "events": [
+                    {
+                        "type": "auto_stopped",
+                        "data": {
+                            "reason": "wall-clock budget exceeded",
+                            "elapsed_seconds": 182.0,
+                        },
+                    }
+                ],
+            },
+        )
+        artifact = parse_run_artifact(path)
+        client = _StubClient(
+            ledger_rows={
+                10413: [
+                    {"id": 301, "session_id": artifact.session_key, "task_id": 10413}
+                ]
+            }
+        )
+
+        result = reap_one(artifact, client=client, state=self.state)
+
+        self.assertEqual(result.outcome.status, "failed")
+        self.assertEqual(result.outcome.failure_class, "wall_clock_budget_exceeded")
+        self.assertIn("elapsed=182.0s", result.outcome.failure_detail)
+        self.assertEqual(client.patches[0][1]["failure_class"], "wall_clock_budget_exceeded")
+
 
 class ReapDirectoryTests(unittest.TestCase):
     def test_processes_all_terminal_files_oldest_first(self) -> None:

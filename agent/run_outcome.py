@@ -33,6 +33,7 @@ taskboard side (``app.py:AGENT_RUN_STATUSES`` /
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Mapping, Optional
 
@@ -100,11 +101,13 @@ AGENT_RUN_FAILURE_CLASSES: frozenset[str] = frozenset({
     "auth_agent_identity_missing",
     "tool_approval_blocked",
     "tool_filesystem_denied",
+    "tool_runtime_exception",
     "tool_unknown_failure",
     "forgejo_pr_not_found",
     "forgejo_branch_diverged",
     "taskboard_status_conflict",
     "session_exceeded_iterations",
+    "wall_clock_budget_exceeded",
     "session_stuck_no_progress",
     "manual_cancellation",
     "outage_period_silent_failure",
@@ -230,10 +233,23 @@ def derive_outcome_from_agent_events(
             last_final = ev
 
     # Order of precedence:
-    #   1. auto_stopped beats everything (we want the gate reason)
-    #   2. error beats final (a final after error is the "agent returned
+    #   1. A final [AUTO_STATE: done] beats a later wall-clock sentinel. The
+    #      runtime can emit both when a long last turn finishes successfully.
+    #   2. auto_stopped beats other cases (we want the gate reason)
+    #   3. error beats final (a final after error is the "agent returned
     #      an empty response" sentinel)
-    #   3. final implies success unless empty sentinel
+    #   4. final implies success unless empty sentinel
+    if (
+        last_auto_stopped is not None
+        and _is_wall_clock_budget_stop(last_auto_stopped)
+        and last_error is None
+        and _final_text_declares_done(last_final, final_text)
+    ):
+        return RunOutcome(
+            status="succeeded",
+            failure_class=None,
+            failure_detail=None,
+        )
     if last_auto_stopped is not None:
         return _outcome_from_auto_stopped(last_auto_stopped)
     if last_error is not None:
@@ -328,6 +344,67 @@ def derive_outcome_from_outage_backfill(detail: str) -> RunOutcome:
 # ---------------------------------------------------------------------------
 
 _EMPTY_RESPONSE_SENTINEL = "error: agent returned an empty response."
+_AUTO_STATE_DONE_RE = re.compile(
+    r"^\[AUTO_STATE:\s*done(?:\s*\|[^\]]*)?\]\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PYTHON_EXCEPTION_RE = re.compile(
+    r"(?:^|[\s(])(?P<class>[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))\s*:",
+    re.MULTILINE,
+)
+
+
+def _final_text_declares_done(
+    event: Optional[Mapping[str, Any]],
+    explicit_final_text: Optional[str],
+) -> bool:
+    data = event.get("data") if isinstance(event, Mapping) else None
+    final_text = (
+        explicit_final_text
+        if explicit_final_text not in (None, "")
+        else (data if isinstance(data, str) else "")
+    )
+    return bool(final_text and _AUTO_STATE_DONE_RE.search(str(final_text).strip()))
+
+
+def _auto_stopped_reason(event: Mapping[str, Any]) -> str:
+    data = event.get("data")
+    if isinstance(data, Mapping):
+        return str(data.get("reason") or "").strip().lower()
+    return _normalize_data_for_match(data).strip()
+
+
+def _is_wall_clock_budget_stop(event: Mapping[str, Any]) -> bool:
+    reason = _auto_stopped_reason(event)
+    return (
+        "wall-clock budget exceeded" in reason
+        or "wall clock budget exceeded" in reason
+    )
+
+
+def _auto_stop_detail(data: Any, *, fallback: str = "auto_stopped") -> str:
+    if not isinstance(data, Mapping):
+        return str(data or fallback).strip() or fallback
+
+    reason = str(data.get("reason") or fallback).strip() or fallback
+    elapsed = data.get("elapsed_seconds")
+    if isinstance(elapsed, (int, float)):
+        return f"{reason}; elapsed={float(elapsed):.1f}s"
+    return reason
+
+
+def derive_outcome_from_exception(exc: BaseException) -> RunOutcome:
+    """Build a failed outcome for an uncaught runtime exception.
+
+    The taskboard failure class stays a closed, queryable enum while the detail
+    preserves the raw Python exception class that identifies the crash.
+    """
+
+    return RunOutcome(
+        status="failed",
+        failure_class="tool_runtime_exception",
+        failure_detail=_truncate(f"{type(exc).__name__}: {exc}"),
+    )
 
 
 def _outcome_from_error(event: Mapping[str, Any]) -> RunOutcome:
@@ -405,6 +482,27 @@ def _outcome_from_error(event: Mapping[str, Any]) -> RunOutcome:
             failure_detail=_truncate(detail),
         )
 
+    if "wall-clock budget exceeded" in raw or "wall clock budget exceeded" in raw:
+        return RunOutcome(
+            status="failed",
+            failure_class="wall_clock_budget_exceeded",
+            failure_detail=_truncate(detail),
+        )
+
+    if "timed out after" in raw and ("codex cli" in raw or "claude cli" in raw):
+        return RunOutcome(
+            status="failed",
+            failure_class="wall_clock_budget_exceeded",
+            failure_detail=_truncate(detail),
+        )
+
+    if _PYTHON_EXCEPTION_RE.search(detail):
+        return RunOutcome(
+            status="failed",
+            failure_class="tool_runtime_exception",
+            failure_detail=_truncate(detail),
+        )
+
     return RunOutcome(
         status="failed",
         failure_class="tool_unknown_failure",
@@ -426,7 +524,7 @@ def _outcome_from_auto_stopped(event: Mapping[str, Any]) -> RunOutcome:
     data = event.get("data")
     if isinstance(data, Mapping):
         reason = str(data.get("reason") or "").strip().lower()
-        detail = str(data.get("reason") or "auto_stopped (no reason)")
+        detail = _auto_stop_detail(data, fallback="auto_stopped (no reason)")
     else:
         reason = _normalize_data_for_match(data)
         detail = str(data or "auto_stopped").strip() or "auto_stopped"
@@ -460,6 +558,15 @@ def _outcome_from_auto_stopped(event: Mapping[str, Any]) -> RunOutcome:
         return RunOutcome(
             status="timeout",
             failure_class="session_exceeded_iterations",
+            failure_detail=_truncate(detail),
+        )
+    if (
+        "wall-clock budget exceeded" in reason
+        or "wall clock budget exceeded" in reason
+    ):
+        return RunOutcome(
+            status="failed",
+            failure_class="wall_clock_budget_exceeded",
             failure_detail=_truncate(detail),
         )
     if "missing or malformed auto_state" in reason:

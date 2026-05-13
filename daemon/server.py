@@ -520,16 +520,17 @@ class ManagedSession:
 class InputRunResult:
     """Outcome of running one input turn through a session.
 
-    ``auto_stopped_reason`` carries the *last* ``auto_stopped`` event's
-    reason payload (from auto-mode policy halts: iteration budget,
+    ``auto_stopped_reason`` and ``auto_stopped_data`` carry the *last*
+    ``auto_stopped`` event (from auto-mode policy halts: iteration budget,
     requires-approval, malformed AUTO_STATE, etc.) when present. The
-    dispatcher uses this to derive the correct terminal RunOutcome
-    instead of misrecording auto_stopped runs as ``succeeded``.
+    dispatcher uses this to derive the correct terminal RunOutcome instead of
+    misrecording auto_stopped runs as ``succeeded``.
     """
 
     final_text: str = ""
     error: str | None = None
     auto_stopped_reason: str | None = None
+    auto_stopped_data: dict[str, Any] | None = None
 
 
 class SessionCreateRequest(BaseModel):
@@ -1403,6 +1404,7 @@ class DaemonServer:
                         # last_auto_stopped precedence).
                         data = event.get("data")
                         if isinstance(data, dict):
+                            result.auto_stopped_data = dict(data)
                             reason = data.get("reason")
                             result.auto_stopped_reason = (
                                 str(reason) if reason is not None else ""
