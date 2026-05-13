@@ -1000,13 +1000,16 @@ class TaskboardDispatcher:
                     "task_id": task_id,
                     "role": route.role,
                 }
-                runtime_bearer = (
-                    runtime_config.taskboard_bearer_token
+                # Gate agents may run with a tenant-scoped taskboard bearer;
+                # the session mint endpoint still requires the daemon/admin bearer.
+                mint_bearer = (
+                    runtime_config.taskboard_mint_bearer_token
                     or self._taskboard_bearer_token()
+                    or runtime_config.taskboard_bearer_token
                 )
-                if runtime_bearer:
+                if mint_bearer:
                     mint_kwargs["base_url"] = runtime_config.taskboard_base_url
-                    mint_kwargs["bearer_token"] = runtime_bearer
+                    mint_kwargs["bearer_token"] = mint_bearer
                 session_token, session_generation_value = (
                     self._mint_taskboard_session_token(**mint_kwargs)
                 )

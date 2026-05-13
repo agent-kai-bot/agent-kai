@@ -21,6 +21,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from agent.runtime_config_resolver import RoleRuntimeConfig
 from agent.taskboard_dispatcher import TaskboardDispatcher, resolve_taskboard_role
 
 
@@ -53,6 +54,18 @@ class _FakeTaskClient:
 
     async def post_audit_comment(self, task_id: int, content: str) -> None:
         self.comments.append((task_id, content))
+
+
+class _GateRuntimeConfigResolver:
+    def resolve_for_role(self, role: str, **_kwargs) -> RoleRuntimeConfig:
+        return RoleRuntimeConfig(
+            role=role,
+            forgejo_pat=f"forgejo-pat-for-{role}",
+            taskboard_base_url="http://taskboard.local",
+            taskboard_bearer_token=f"gate-taskboard-token-for-{role}",
+            taskboard_mint_bearer_token="admin-taskboard-token",
+            source="test",
+        )
 
 
 def _create_pending_table(db: Path) -> None:
@@ -149,6 +162,75 @@ class SessionTokenRoleCasingTests(unittest.IsolatedAsyncioTestCase):
         )
         for _, role in mint_calls:
             self.assertNotIn("-", role, f"kebab-case leaked into mint: {role}")
+
+    async def test_gate_reviewer_runtime_uses_gate_bearer_but_mint_uses_admin_bearer(self) -> None:
+        _seed_review_row(self.db, task_id=903, fire_generation=4)
+        task = {"id": 903, "agent": "Developer", "fire_generation": 4}
+        spawner = _CaptureSpawner()
+        dispatcher = TaskboardDispatcher(
+            db_path=self.db,
+            task_client=_FakeTaskClient({903: task}),
+            session_manager=spawner,
+            nats_bus=None,
+            agent_runs_client=_DisabledAgentRunsClient(),
+            runtime_config_resolver=_GateRuntimeConfigResolver(),
+        )
+
+        mint_calls: list[dict] = []
+
+        def _capture_mint(
+            self_,
+            *,
+            task_id: int,
+            role: str,
+            base_url: str | None = None,
+            bearer_token: str | None = None,
+        ) -> tuple[str, int]:
+            mint_calls.append(
+                {
+                    "task_id": task_id,
+                    "role": role,
+                    "base_url": base_url,
+                    "bearer_token": bearer_token,
+                }
+            )
+            return "session-token", 4
+
+        with mock.patch.object(
+            TaskboardDispatcher,
+            "_mint_taskboard_session_token",
+            new=_capture_mint,
+        ), mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="rendered prompt",
+        ):
+            await dispatcher.run_once()
+
+        self.assertEqual(
+            mint_calls,
+            [
+                {
+                    "task_id": 903,
+                    "role": "Code Reviewer",
+                    "base_url": "http://taskboard.local",
+                    "bearer_token": "admin-taskboard-token",
+                }
+            ],
+        )
+        self.assertEqual(len(spawner.spawn_calls), 1)
+        spawn = spawner.spawn_calls[0]
+        self.assertEqual(
+            spawn["taskboard_bearer_token"],
+            "gate-taskboard-token-for-code-reviewer",
+        )
+        self.assertEqual(
+            spawn["runtime_env"]["TASKBOARD_BEARER_TOKEN"],
+            "gate-taskboard-token-for-code-reviewer",
+        )
+        self.assertEqual(
+            spawn["runtime_config"].taskboard_mint_bearer_token,
+            "admin-taskboard-token",
+        )
 
     async def test_developer_spawn_mints_proper_case_developer(self) -> None:
         # Insert a Backlog→In Progress webhook row for a Developer task.

@@ -49,6 +49,39 @@ class RuntimeConfigResolverTests(unittest.TestCase):
         self.assertEqual(second.forgejo_pat, "vault-pat")
         self.assertEqual(vault.reads, ["forgejo/agent-developer"])
 
+    def test_gate_taskboard_vault_token_is_runtime_bearer_not_mint_bearer(self) -> None:
+        vault = _FakeVaultClient(
+            {
+                "forgejo/agent-code-reviewer": {
+                    "username": "agent-code-reviewer",
+                    "password": "forgejo-pat",
+                },
+                "taskboard/agent-code-reviewer": {
+                    "token": "gate-taskboard-token",
+                },
+            }
+        )
+        resolver = RuntimeConfigResolver(
+            vault_client=vault,
+            env={
+                "TASKBOARD_URL": "http://taskboard.local",
+                "TASKBOARD_BEARER_TOKEN": "admin-taskboard-token",
+            },
+        )
+
+        config = resolver.resolve_for_role("Code Reviewer")
+        overlay = config.env_overlay()
+
+        self.assertEqual(config.forgejo_pat, "forgejo-pat")
+        self.assertEqual(config.taskboard_bearer_token, "gate-taskboard-token")
+        self.assertEqual(config.taskboard_mint_bearer_token, "admin-taskboard-token")
+        self.assertEqual(overlay["TASKBOARD_BEARER_TOKEN"], "gate-taskboard-token")
+        self.assertNotIn("TASKBOARD_MINT_BEARER_TOKEN", overlay)
+        self.assertEqual(
+            vault.reads,
+            ["forgejo/agent-code-reviewer", "taskboard/agent-code-reviewer"],
+        )
+
     def test_vault_miss_falls_back_to_role_env_then_global_then_raises(self) -> None:
         vault = _FakeVaultClient(error=RuntimeError("vault unavailable"))
 

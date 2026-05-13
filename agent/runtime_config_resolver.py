@@ -28,6 +28,11 @@ DEFAULT_ROLE_VAULT_PATHS = {
     "qa-agent": "forgejo/agent-qa",
     "orchestrator": "forgejo/agent-orchestrator",
 }
+DEFAULT_TASKBOARD_ROLE_VAULT_PATHS = {
+    "code-reviewer": "taskboard/agent-code-reviewer",
+    "security-auditor": "taskboard/agent-security-auditor",
+    "qa-agent": "taskboard/agent-qa",
+}
 
 
 class RuntimeConfigError(RuntimeError):
@@ -53,11 +58,13 @@ class RoleRuntimeConfig:
     forgejo_base_url: str = ""
     taskboard_base_url: str = ""
     taskboard_bearer_token: str = field(default="", repr=False)
+    taskboard_mint_bearer_token: str = field(default="", repr=False)
     taskboard_session_token: str = field(default="", repr=False)
     taskboard_session_generation: int | None = None
     taskboard_agent_name: str = ""
     source: str = ""
     vault_path: str | None = None
+    taskboard_vault_path: str | None = None
 
     def __repr__(self) -> str:
         return (
@@ -66,10 +73,13 @@ class RoleRuntimeConfig:
             f"forgejo_pat={'set' if self.forgejo_pat else 'missing'}, "
             "taskboard_bearer_token="
             f"{'set' if self.taskboard_bearer_token else 'missing'}, "
+            "taskboard_mint_bearer_token="
+            f"{'set' if self.taskboard_mint_bearer_token else 'missing'}, "
             "taskboard_session_token="
             f"{'set' if self.taskboard_session_token else 'missing'}, "
             f"taskboard_session_generation={self.taskboard_session_generation!r}, "
-            f"source={self.source!r}, vault_path={self.vault_path!r})"
+            f"source={self.source!r}, vault_path={self.vault_path!r}, "
+            f"taskboard_vault_path={self.taskboard_vault_path!r})"
         )
 
     def with_taskboard_session(
@@ -191,6 +201,7 @@ class RuntimeConfigResolver:
         *,
         vault_client: VaultClient | None = None,
         role_vault_paths: Mapping[str, str] | None = None,
+        taskboard_role_vault_paths: Mapping[str, str] | None = None,
         ttl_seconds: float = DEFAULT_TTL_SECONDS,
         env: Mapping[str, str] | None = None,
         clock: Callable[[], float] | None = None,
@@ -200,6 +211,12 @@ class RuntimeConfigResolver:
         self.role_vault_paths = {
             normalize_role_key(role): str(path)
             for role, path in dict(role_vault_paths or DEFAULT_ROLE_VAULT_PATHS).items()
+        }
+        self.taskboard_role_vault_paths = {
+            normalize_role_key(role): str(path)
+            for role, path in dict(
+                taskboard_role_vault_paths or DEFAULT_TASKBOARD_ROLE_VAULT_PATHS
+            ).items()
         }
         self.ttl_seconds = max(0.0, float(ttl_seconds))
         self.env = env if env is not None else os.environ
@@ -211,6 +228,9 @@ class RuntimeConfigResolver:
         return {
             "cache_ttl_seconds": int(self.ttl_seconds),
             "vault_paths": dict(sorted(self.role_vault_paths.items())),
+            "taskboard_vault_paths": dict(
+                sorted(self.taskboard_role_vault_paths.items())
+            ),
             "vault_client": self.vault_client.__class__.__name__,
             "env_fallbacks_present": _env_fallback_presence(self.env),
         }
@@ -265,6 +285,7 @@ class RuntimeConfigResolver:
 
     def _resolve_uncached(self, role_key: str) -> RoleRuntimeConfig:
         vault_path = self.role_vault_paths.get(role_key)
+        taskboard_vault_path = self.taskboard_role_vault_paths.get(role_key)
         if vault_path:
             secret = self._read_vault(role_key, vault_path)
             pat = _first_nonempty(secret, "password", "token", "pat")
@@ -284,8 +305,13 @@ class RuntimeConfigResolver:
                         "login",
                         "name",
                     ),
+                    taskboard_bearer_token=self._resolve_taskboard_bearer_token(
+                        role_key,
+                        taskboard_vault_path,
+                    ),
                     source="vault",
                     vault_path=vault_path,
+                    taskboard_vault_path=taskboard_vault_path,
                 )
             self.log.info(
                 "runtime_config_resolver role=%s source=vault hit=false "
@@ -294,7 +320,15 @@ class RuntimeConfigResolver:
                 vault_path,
             )
 
-        config = self._config_from_env(role_key, vault_path=vault_path)
+        config = self._config_from_env(
+            role_key,
+            vault_path=vault_path,
+            taskboard_vault_path=taskboard_vault_path,
+            taskboard_bearer_token=self._resolve_taskboard_bearer_token(
+                role_key,
+                taskboard_vault_path,
+            ),
+        )
         if config.forgejo_pat:
             self.log.info(
                 "runtime_config_resolver role=%s source=%s hit=true",
@@ -319,11 +353,40 @@ class RuntimeConfigResolver:
             )
             return {}
 
+    def _resolve_taskboard_bearer_token(
+        self,
+        role_key: str,
+        vault_path: str | None,
+    ) -> str:
+        if not vault_path:
+            return ""
+        secret = self._read_vault(role_key, vault_path)
+        token = _first_nonempty(
+            secret,
+            "taskboard_bearer_token",
+            "taskboard_token",
+            "TASKBOARD_BEARER_TOKEN",
+            "bearer_token",
+            "bearer",
+            "token",
+            "password",
+            "pat",
+        )
+        if token:
+            self.log.info(
+                "runtime_config_resolver role=%s source=taskboard_vault hit=true path=%s",
+                role_key,
+                vault_path,
+            )
+        return token
+
     def _config_from_env(
         self,
         role_key: str,
         *,
         vault_path: str | None,
+        taskboard_vault_path: str | None,
+        taskboard_bearer_token: str = "",
     ) -> RoleRuntimeConfig:
         suffix = role_env_suffix(role_key)
         role_token = str(self.env.get(f"FORGEJO_TOKEN_{suffix}", "")).strip()
@@ -331,6 +394,15 @@ class RuntimeConfigResolver:
             str(self.env.get("FORGEJO_TOKEN", "")).strip()
             or str(self.env.get("GITEA_TOKEN", "")).strip()
         )
+        role_taskboard_token = (
+            str(self.env.get(f"TASKBOARD_BEARER_TOKEN_{suffix}", "")).strip()
+            or str(self.env.get(f"TASKBOARD_TOKEN_{suffix}", "")).strip()
+        )
+        if not role_taskboard_token and role_key == "qa-agent":
+            role_taskboard_token = (
+                str(self.env.get("TASKBOARD_BEARER_TOKEN_QA", "")).strip()
+                or str(self.env.get("TASKBOARD_TOKEN_QA", "")).strip()
+            )
         source = (
             "env_role" if role_token else ("env_global" if global_token else "missing")
         )
@@ -342,8 +414,10 @@ class RuntimeConfigResolver:
                 or str(self.env.get("FORGEJO_USER", "")).strip()
                 or str(self.env.get("GITEA_USER", "")).strip()
             ),
+            taskboard_bearer_token=taskboard_bearer_token or role_taskboard_token,
             source=source,
             vault_path=vault_path,
+            taskboard_vault_path=taskboard_vault_path,
         )
 
     def _config_from_parts(
@@ -352,9 +426,12 @@ class RuntimeConfigResolver:
         *,
         forgejo_pat: str,
         forgejo_user: str = "",
+        taskboard_bearer_token: str = "",
         source: str,
         vault_path: str | None,
+        taskboard_vault_path: str | None,
     ) -> RoleRuntimeConfig:
+        taskboard_mint_bearer_token = self._global_taskboard_bearer_token()
         return RoleRuntimeConfig(
             role=role_key,
             forgejo_pat=str(forgejo_pat or "").strip(),
@@ -367,13 +444,21 @@ class RuntimeConfigResolver:
                 self.env.get("TASKBOARD_URL", "http://localhost:8080")
             ).strip(),
             taskboard_bearer_token=(
-                str(self.env.get("TASKBOARD_BEARER_TOKEN", "")).strip()
-                or str(self.env.get("OPENCLAW_GATEWAY_TOKEN", "")).strip()
-                or str(self.env.get("OPENCLAW_TOKEN", "")).strip()
+                str(taskboard_bearer_token or "").strip()
+                or taskboard_mint_bearer_token
             ),
+            taskboard_mint_bearer_token=taskboard_mint_bearer_token,
             taskboard_agent_name=str(self.env.get("TASKBOARD_AGENT_NAME", "")).strip(),
             source=source,
             vault_path=vault_path,
+            taskboard_vault_path=taskboard_vault_path,
+        )
+
+    def _global_taskboard_bearer_token(self) -> str:
+        return (
+            str(self.env.get("TASKBOARD_BEARER_TOKEN", "")).strip()
+            or str(self.env.get("OPENCLAW_GATEWAY_TOKEN", "")).strip()
+            or str(self.env.get("OPENCLAW_TOKEN", "")).strip()
         )
 
 
@@ -410,6 +495,8 @@ def redact_known_runtime_secrets(
             key_text in {"FORGEJO_TOKEN", "GITEA_TOKEN"}
             or key_text.startswith("FORGEJO_TOKEN_")
             or key_text in {"TASKBOARD_BEARER_TOKEN", "TASKBOARD_SESSION_TOKEN"}
+            or key_text.startswith("TASKBOARD_BEARER_TOKEN_")
+            or key_text.startswith("TASKBOARD_TOKEN_")
         ) and value:
             secrets.append(str(value))
     for config in configs or []:
@@ -417,6 +504,7 @@ def redact_known_runtime_secrets(
             [
                 config.forgejo_pat,
                 config.taskboard_bearer_token,
+                config.taskboard_mint_bearer_token,
                 config.taskboard_session_token,
             ]
         )
@@ -521,6 +609,14 @@ def _env_fallback_presence(env: Mapping[str, str]) -> dict[str, bool]:
         "GITEA_TOKEN": bool(str(env.get("GITEA_TOKEN", "")).strip()),
         "TASKBOARD_BEARER_TOKEN": bool(
             str(env.get("TASKBOARD_BEARER_TOKEN", "")).strip()
+        ),
+        "role_taskboard_tokens": any(
+            (
+                str(key).startswith("TASKBOARD_BEARER_TOKEN_")
+                or str(key).startswith("TASKBOARD_TOKEN_")
+            )
+            and bool(str(value).strip())
+            for key, value in env.items()
         ),
         "role_forgejo_tokens": any(
             str(key).startswith("FORGEJO_TOKEN_") and bool(str(value).strip())
