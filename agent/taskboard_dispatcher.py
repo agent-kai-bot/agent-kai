@@ -12,16 +12,22 @@ import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from collections.abc import Mapping
-from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections.abc import Iterable
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
+from agent.forgejo_tools import ForgejoContext
 from agent.prompt_renderer import render_taskboard_fire_prompt
+from agent.runtime_config_resolver import (
+    RoleRuntimeConfig,
+    RuntimeConfigResolver,
+    redact_known_runtime_secrets,
+)
 from agent.taskboard_service_client import TaskboardServiceClient, TaskboardServiceError
 from agent.taskboard_status_router import route_event
+from agent.taskboard_tools import TaskboardContext
 from agent.worktree_manager import WorktreeManager
 
 LOGGER = logging.getLogger(__name__)
@@ -433,11 +439,18 @@ class DaemonTaskboardSpawner:
         :class:`TaskboardDispatcher`.
     """
 
-    def __init__(self, daemon_server: Any, repo_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        daemon_server: Any,
+        repo_root: Path | None = None,
+        *,
+        runtime_config_resolver: RuntimeConfigResolver | None = None,
+    ) -> None:
         self.daemon_server = daemon_server
         self.repo_root = Path(repo_root or Path(__file__).resolve().parents[1])
         self.worktree_manager = WorktreeManager(self.repo_root)
         self._session_repo_roots: dict[str, Path] = {}
+        self.runtime_config_resolver = runtime_config_resolver
 
     async def spawn(self, **kwargs: Any) -> str:
         """Create a live daemon session and submit the rendered prompt.
@@ -452,6 +465,61 @@ class DaemonTaskboardSpawner:
         session_id = str(kwargs["session_id"])
         agent_id = str(kwargs["agent_id"])
         prompt = str(kwargs["prompt"])
+        runtime_config = kwargs.get("runtime_config")
+        if not isinstance(runtime_config, RoleRuntimeConfig):
+            forgejo_context = kwargs.get("forgejo_context")
+            if isinstance(forgejo_context, ForgejoContext):
+                runtime_config = RoleRuntimeConfig(
+                    role=forgejo_context.role or agent_id,
+                    forgejo_pat=forgejo_context.token,
+                    forgejo_user=forgejo_context.user,
+                    forgejo_base_url=forgejo_context.base_url,
+                    taskboard_base_url=str(
+                        kwargs.get("taskboard_base_url")
+                        or os.getenv("TASKBOARD_URL", "http://localhost:8080")
+                    ),
+                    taskboard_bearer_token=str(
+                        kwargs.get("taskboard_bearer_token") or ""
+                    ).strip(),
+                    taskboard_session_token=str(
+                        kwargs.get("session_token") or ""
+                    ).strip(),
+                    taskboard_session_generation=_coerce_positive_int(
+                        kwargs.get("session_generation")
+                    ),
+                    taskboard_agent_name=agent_id,
+                    source="spawn_context",
+                )
+            elif self.runtime_config_resolver is not None:
+                runtime_config = self.runtime_config_resolver.resolve_for_role(
+                    agent_id,
+                    allow_missing_forgejo_pat=True,
+                )
+            else:
+                runtime_config = RoleRuntimeConfig(
+                    role=agent_id,
+                    taskboard_base_url=str(
+                        kwargs.get("taskboard_base_url")
+                        or os.getenv("TASKBOARD_URL", "http://localhost:8080")
+                    ),
+                    taskboard_bearer_token=str(
+                        kwargs.get("taskboard_bearer_token") or ""
+                    ).strip(),
+                    taskboard_session_token=str(
+                        kwargs.get("session_token") or ""
+                    ).strip(),
+                    taskboard_session_generation=_coerce_positive_int(
+                        kwargs.get("session_generation")
+                    ),
+                    taskboard_agent_name=agent_id,
+                    source="spawn_legacy",
+                )
+        runtime_config = runtime_config.with_taskboard_session(
+            session_token=str(kwargs.get("session_token") or "").strip(),
+            session_generation=_coerce_positive_int(kwargs.get("session_generation")),
+            agent_name=agent_id,
+        )
+        runtime_env = dict(kwargs.get("runtime_env") or runtime_config.env_overlay())
         task_payload = kwargs.get("task") if isinstance(kwargs.get("task"), dict) else {}
         worktree_path = ""
         primary_repo_path = ""
@@ -474,6 +542,7 @@ class DaemonTaskboardSpawner:
                     repo_target.repo_url,
                     repo_key=repo_target.repo_key,
                     default_branch=repo_target.default_branch,
+                    extra_env=runtime_env,
                 )
             elif repo_target.routing_mode == "explicit" and not multi_repo_enabled:
                 if normalized_role == "developer":
@@ -493,7 +562,7 @@ class DaemonTaskboardSpawner:
                     routing_mode="fallback_local_flag_disabled",
                     display_name=self.repo_root.name,
                 )
-            manager = WorktreeManager(repo_root)
+            manager = WorktreeManager(repo_root, extra_env=runtime_env)
             worktree = manager.create(
                 session_id=session_id,
                 branch_name=branch_name,
@@ -544,6 +613,31 @@ class DaemonTaskboardSpawner:
             session_id,
             create_if_missing=True,
         )
+        managed.session.runtime_env = runtime_env
+        managed.session.taskboard_context = TaskboardContext(
+            base_url=str(
+                runtime_config.taskboard_base_url
+                or kwargs.get("taskboard_base_url")
+                or os.getenv("TASKBOARD_URL", "http://localhost:8080")
+            ),
+            bearer_token=(
+                str(runtime_config.taskboard_bearer_token or "").strip()
+                or str(kwargs.get("taskboard_bearer_token") or "").strip()
+                or os.getenv("TASKBOARD_BEARER_TOKEN", "").strip()
+                or os.getenv("OPENCLAW_GATEWAY_TOKEN", "").strip()
+                or os.getenv("OPENCLAW_TOKEN", "").strip()
+            ),
+            session_token=str(runtime_config.taskboard_session_token or "").strip(),
+            session_generation=runtime_config.taskboard_session_generation,
+            agent_name=agent_id,
+            task_id=_coerce_positive_int(kwargs.get("task_id")),
+        )
+        managed.session.forgejo_context = ForgejoContext(
+            role=runtime_config.role or agent_id,
+            token=runtime_config.forgejo_pat,
+            user=runtime_config.forgejo_user,
+            base_url=runtime_config.forgejo_base_url,
+        )
         managed.session.attach_runtime(
             bus=self.daemon_server.bus,
             agent_name=agent_id,
@@ -561,19 +655,6 @@ class DaemonTaskboardSpawner:
             "workspace_manifest_path": workspace_manifest_path,
             "repo_routing_mode": repo_routing_mode,
         }
-        managed.session.taskboard_context = SimpleNamespace(
-            base_url=str(kwargs.get("taskboard_base_url") or os.getenv("TASKBOARD_URL", "http://localhost:8080")),
-            bearer_token=(
-                str(kwargs.get("taskboard_bearer_token") or "").strip()
-                or os.getenv("TASKBOARD_BEARER_TOKEN", "").strip()
-                or os.getenv("OPENCLAW_GATEWAY_TOKEN", "").strip()
-                or os.getenv("OPENCLAW_TOKEN", "").strip()
-            ),
-            session_token=str(kwargs.get("session_token") or "").strip(),
-            session_generation=_coerce_positive_int(kwargs.get("session_generation")),
-            agent_name=agent_id,
-            task_id=_coerce_positive_int(kwargs.get("task_id")),
-        )
         if hasattr(managed.session, "start_auto_mode"):
             # Phase 0 (#10247): per-role iteration budget instead of a
             # hardcoded 20. CR/SA finish in 8-15; QA/Dev/Architect need
@@ -658,6 +739,7 @@ class TaskboardDispatcher:
         stuck_after_seconds: int = DEFAULT_STUCK_AFTER_SECONDS,
         clock: Callable[[], datetime] | None = None,
         agent_runs_client: Any | None = None,
+        runtime_config_resolver: RuntimeConfigResolver | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.task_client = task_client or DefaultTaskboardTaskClient()
@@ -670,6 +752,7 @@ class TaskboardDispatcher:
         self.sweep_interval_seconds = sweep_interval_seconds
         self.stuck_after_seconds = stuck_after_seconds
         self.clock = clock or _utc_now
+        self.runtime_config_resolver = runtime_config_resolver or RuntimeConfigResolver()
         self._store = _TaskboardQueueStore(self.db_path, clock=self.clock)
         self._stop_event = asyncio.Event()
         self._last_sweep_at = datetime.min.replace(tzinfo=timezone.utc)
@@ -880,6 +963,25 @@ class TaskboardDispatcher:
                     continue
                 reserved_key = (task_id, fire_generation, route.agent_id)
 
+                try:
+                    runtime_config = self.runtime_config_resolver.resolve_for_role(
+                        route.agent_id,
+                        allow_missing_forgejo_pat=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._store.mark_session_failed(*reserved_key)
+                    error_message = _redact_known_secrets(str(exc))
+                    self._store.mark_processed(row, "spawn_failed", error=error_message)
+                    await self._post_spawn_failure_audit(
+                        row=row,
+                        task_id=task_id,
+                        fire_generation=fire_generation,
+                        role=route.agent_id,
+                        error=exc,
+                    )
+                    reserved_key = None
+                    return "spawn_failed"
+
                 # Phase 0 follow-up (#10247): mint a taskboard agent_session
                 # token + generation so the spawned agent can authenticate
                 # its taskboard writes (start-work, comment, move-status,
@@ -894,9 +996,24 @@ class TaskboardDispatcher:
                 # The taskboard's validate_task_status checks the session row's
                 # `agent` column against REVIEWER_AGENT_TO_TYPE keys, which use
                 # proper-case names. Kebab-case mismatches → 409.
-                session_token, session_generation_value = self._mint_taskboard_session_token(
-                    task_id=task_id,
-                    role=route.role,
+                mint_kwargs: dict[str, Any] = {
+                    "task_id": task_id,
+                    "role": route.role,
+                }
+                runtime_bearer = (
+                    runtime_config.taskboard_bearer_token
+                    or self._taskboard_bearer_token()
+                )
+                if runtime_bearer:
+                    mint_kwargs["base_url"] = runtime_config.taskboard_base_url
+                    mint_kwargs["bearer_token"] = runtime_bearer
+                session_token, session_generation_value = (
+                    self._mint_taskboard_session_token(**mint_kwargs)
+                )
+                runtime_config = runtime_config.with_taskboard_session(
+                    session_token=session_token,
+                    session_generation=session_generation_value,
+                    agent_name=route.agent_id,
                 )
 
                 prompt = render_taskboard_fire_prompt(
@@ -938,8 +1055,22 @@ class TaskboardDispatcher:
                         task=latest_task,
                         session_token=session_token,
                         session_generation=session_generation_value,
-                        taskboard_base_url=self._taskboard_base_url(),
-                        taskboard_bearer_token=self._taskboard_bearer_token(),
+                        taskboard_base_url=(
+                            runtime_config.taskboard_base_url
+                            or self._taskboard_base_url()
+                        ),
+                        taskboard_bearer_token=(
+                            runtime_config.taskboard_bearer_token
+                            or self._taskboard_bearer_token()
+                        ),
+                        runtime_config=runtime_config,
+                        runtime_env=runtime_config.env_overlay(),
+                        forgejo_context=ForgejoContext(
+                            role=runtime_config.role,
+                            token=runtime_config.forgejo_pat,
+                            user=runtime_config.forgejo_user,
+                            base_url=runtime_config.forgejo_base_url,
+                        ),
                     )
                     if inspect.isawaitable(spawn_result):
                         spawn_result = await spawn_result
@@ -1156,6 +1287,8 @@ class TaskboardDispatcher:
         *,
         task_id: int,
         role: str,
+        base_url: str | None = None,
+        bearer_token: str | None = None,
     ) -> tuple[str, int | None]:
         """Mint a taskboard agent_session token for a fresh spawn.
 
@@ -1171,8 +1304,12 @@ class TaskboardDispatcher:
             renderer; an empty token degrades gracefully (agent can't write
             back to the taskboard but the spawn itself still happens).
         """
-        base = self._taskboard_base_url()
-        bearer = self._taskboard_bearer_token()
+        base = str(base_url or self._taskboard_base_url()).rstrip("/")
+        bearer = str(
+            bearer_token
+            if bearer_token is not None
+            else self._taskboard_bearer_token()
+        ).strip()
         if not base or not bearer:
             return "", None
 
@@ -2139,7 +2276,7 @@ def _redact_known_secrets(message: str) -> str:
         secret = os.getenv(env_name, "").strip()
         if secret:
             redacted = redacted.replace(secret, "[REDACTED]")
-    return redacted
+    return redact_known_runtime_secrets(redacted)
 
 
 def _resolve_max_concurrent(value: int | None) -> int:

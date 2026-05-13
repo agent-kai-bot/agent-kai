@@ -38,7 +38,8 @@ from agent.core import AgentRunner
 from agent.signal_consumer import SignalConsumer
 from agent.strategy_agent_tools import InProcessStrategyRuntime
 from agent.sub_agents import SubAgentManager
-from agent.tools import create_tools, session_worktree_context
+from agent.runtime_utils import session_env_context, session_worktree_context
+from agent.tools import create_tools
 from agent_logger import log_auto_event
 from config import AGENTS, WORKSPACES_DIR
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -656,6 +657,8 @@ class Session:
         self.event_bus = SessionEventBus(self.name)
         self.agent_name: str | None = None
         self.taskboard_context: Any = None
+        self.forgejo_context: Any = None
+        self.runtime_env: dict[str, str] = {}
         self.taskboard_dispatcher: dict[str, Any] = {}
         self.current_source: str = "user"
         self.current_job_id: str | None = None
@@ -1180,26 +1183,30 @@ class Session:
                     try:
                         worktree_path = ""
                         if isinstance(getattr(self, "taskboard_dispatcher", None), dict):
-                            worktree_path = str(self.taskboard_dispatcher.get("worktree_path") or "")
+                            worktree_path = str(
+                                self.taskboard_dispatcher.get("worktree_path") or ""
+                            )
                         with session_worktree_context(worktree_path or None):
-                            async for event in self.agent_runner.run(
-                                current_input,
-                                pre_injected_input=pre_injected_input and not is_auto_continuation,
-                            ):
-                                etype = event.get("type", "unknown")
-                                data = event.get("data")
-                                if etype == "final":
-                                    turn_final_text = str(data or "")
-                                elif etype == "tool_start" and isinstance(data, dict):
-                                    turn_tool_calls.append(
-                                        (
-                                            str(data.get("tool") or ""),
-                                            self._tool_input_key(data.get("input")),
+                            with session_env_context(getattr(self, "runtime_env", {})):
+                                async for event in self.agent_runner.run(
+                                    current_input,
+                                    pre_injected_input=pre_injected_input
+                                    and not is_auto_continuation,
+                                ):
+                                    etype = event.get("type", "unknown")
+                                    data = event.get("data")
+                                    if etype == "final":
+                                        turn_final_text = str(data or "")
+                                    elif etype == "tool_start" and isinstance(data, dict):
+                                        turn_tool_calls.append(
+                                            (
+                                                str(data.get("tool") or ""),
+                                                self._tool_input_key(data.get("input")),
+                                            )
                                         )
-                                    )
-                                payload = data if isinstance(data, dict) else {"value": data}
-                                self.publish_event(f"agent.{etype}", payload)
-                                yield event
+                                    payload = data if isinstance(data, dict) else {"value": data}
+                                    self.publish_event(f"agent.{etype}", payload)
+                                    yield event
                     finally:
                         self.agent_runner._is_auto_continuation = False
 

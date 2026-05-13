@@ -11,6 +11,7 @@ from unittest import mock
 import requests
 
 from agent.forgejo_tools import (
+    ForgejoContext,
     create_forgejo_tools,
     forgejo_create_pr,
     forgejo_find_pr_for_branch,
@@ -128,6 +129,59 @@ class ForgejoToolsTests(unittest.TestCase):
         self.assertEqual(kwargs["headers"]["Authorization"], "token forgejo-secret")
         self.assertEqual(kwargs["json"]["head"], "feat/task")
         self.assertTrue(json.loads(result)["ok"])
+
+    @mock.patch("agent.forgejo_tools.requests.request")
+    def test_context_token_wins_for_create_pr_and_review(self, request_mock) -> None:
+        """Session ForgejoContext token beats role and global env fallbacks."""
+
+        request_mock.return_value = _FakeResponse(status_code=201, payload={"ok": True})
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "FORGEJO_TOKEN_DEVELOPER": "role-env-secret",
+                "FORGEJO_TOKEN": "global-secret",
+            },
+            clear=False,
+        ):
+            tools = create_forgejo_tools(
+                ForgejoContext(
+                    role="developer",
+                    token="context-secret",
+                    base_url="http://forgejo.local",
+                )
+            )
+            create_pr_tool = next(tool for tool in tools if tool.name == "forgejo_create_pr")
+            submit_review_tool = next(
+                tool for tool in tools if tool.name == "forgejo_submit_review"
+            )
+
+            create_pr_tool.func("owner", "repo", "Task PR", "feat/task")
+            submit_review_tool.func("owner", "repo", 1, "APPROVED", "ok")
+
+        headers = [call.kwargs["headers"]["Authorization"] for call in request_mock.call_args_list]
+        self.assertEqual(headers, ["token context-secret", "token context-secret"])
+
+    @mock.patch("agent.forgejo_tools.requests.request")
+    def test_role_env_token_wins_over_global_when_context_has_role(self, request_mock) -> None:
+        """Role-scoped env token is preferred over legacy global env token."""
+
+        request_mock.return_value = _FakeResponse(status_code=201, payload={"ok": True})
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "FORGEJO_TOKEN_DEVELOPER": "role-env-secret",
+                "FORGEJO_TOKEN": "global-secret",
+            },
+            clear=False,
+        ):
+            tools = create_forgejo_tools(
+                ForgejoContext(role="developer", base_url="http://forgejo.local")
+            )
+            create_pr_tool = next(tool for tool in tools if tool.name == "forgejo_create_pr")
+            create_pr_tool.func("owner", "repo", "Task PR", "feat/task")
+
+        _, kwargs = request_mock.call_args
+        self.assertEqual(kwargs["headers"]["Authorization"], "token role-env-secret")
 
     @mock.patch("agent.forgejo_tools.requests.request")
     def test_forgejo_errors_are_redacted(self, request_mock) -> None:

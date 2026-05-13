@@ -7,8 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
-from contextlib import contextmanager, redirect_stdout
-from contextvars import ContextVar
+from contextlib import redirect_stdout
 from html.parser import HTMLParser
 
 import requests
@@ -32,19 +31,11 @@ from config import (
     MAX_OUTPUT_CHARS,
     SHELL_TIMEOUT_SECONDS,
 )
-
-
-_SESSION_WORKTREE: ContextVar[str | None] = ContextVar("kai_session_worktree", default=None)
-
-
-@contextmanager
-def session_worktree_context(path: str | None):
-    """Temporarily bind a session worktree for tool execution."""
-    token = _SESSION_WORKTREE.set(path if path else None)
-    try:
-        yield
-    finally:
-        _SESSION_WORKTREE.reset(token)
+from agent.runtime_utils import (
+    current_session_worktree,
+    session_subprocess_env,
+    session_worktree_context,
+)
 
 
 # ── File Read ────────────────────────────────────────────────
@@ -133,10 +124,8 @@ file_edit = StructuredTool.from_function(
 def _shell_exec(command: str) -> str:
     """Execute a shell command and return stdout + stderr."""
     try:
-        cwd = _SESSION_WORKTREE.get() or None
-        env = os.environ.copy()
-        if cwd:
-            env["KAI_SESSION_WORKTREE"] = cwd
+        cwd = current_session_worktree() or None
+        env = session_subprocess_env(worktree=cwd)
         result = subprocess.run(
             command,
             shell=True,
@@ -251,7 +240,7 @@ def _codex_exec(prompt: str, working_directory: str = "") -> str:
         return f"Error: codex CLI not found at {CODEX_PATH}"
 
     cmd = [CODEX_PATH, "exec", prompt, "--full-auto", "--skip-git-repo-check"]
-    cwd = working_directory or None
+    cwd = working_directory or current_session_worktree() or None
     if cwd and not os.path.isdir(cwd):
         return f"Error: directory '{cwd}' does not exist."
 
@@ -262,6 +251,7 @@ def _codex_exec(prompt: str, working_directory: str = "") -> str:
             text=True,
             timeout=CODEX_TIMEOUT,
             cwd=cwd,
+            env=session_subprocess_env(worktree=current_session_worktree()),
         )
         output = ""
         if result.stdout:
@@ -308,7 +298,7 @@ def _claude_exec(prompt: str, working_directory: str = "", model: str = "") -> s
     cmd = [CLAUDE_PATH, "-p", "--dangerously-skip-permissions", prompt]
     if model:
         cmd.extend(["--model", model])
-    cwd = working_directory or None
+    cwd = working_directory or current_session_worktree() or None
     if cwd and not os.path.isdir(cwd):
         return f"Error: directory '{cwd}' does not exist."
 
@@ -319,6 +309,7 @@ def _claude_exec(prompt: str, working_directory: str = "", model: str = "") -> s
             text=True,
             timeout=CLAUDE_TIMEOUT,
             cwd=cwd,
+            env=session_subprocess_env(worktree=current_session_worktree()),
         )
         output = ""
         if result.stdout:
@@ -1163,7 +1154,7 @@ def create_tools(
     if scheduler is not None and session is not None:
         tools.extend(create_scheduler_tools(scheduler, session))
     tools.extend(create_taskboard_tools(getattr(session, "taskboard_context", None)))
-    tools.extend(create_forgejo_tools())
+    tools.extend(create_forgejo_tools(getattr(session, "forgejo_context", None)))
     tools.extend(create_sdlc_result_tools())
     from agent.polymarket_tools import create_polymarket_tools
     tools.extend(create_polymarket_tools())

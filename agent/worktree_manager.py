@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -23,14 +24,22 @@ REPO_CACHE_LOCK_ROOT = REPO_CACHE_ROOT / ".locks"
 class WorktreeManager:
     """Create and clean up isolated git worktrees for agent sessions."""
 
-    def __init__(self, repo_root: Path) -> None:
+    def __init__(
+        self,
+        repo_root: Path,
+        *,
+        extra_env: dict[str, str] | None = None,
+    ) -> None:
         self.repo_root = Path(repo_root)
+        self.extra_env = dict(extra_env or {})
 
     def create(
         self,
         session_id: str,
         branch_name: str,
         base_branch: str = "main",
+        *,
+        extra_env: dict[str, str] | None = None,
     ) -> Path:
         """Create an isolated worktree for ``session_id``.
 
@@ -52,10 +61,13 @@ class WorktreeManager:
             base_branch,
         ]
         try:
-            self._run(cmd)
+            self._run(cmd, extra_env=extra_env)
         except subprocess.CalledProcessError:
-            self._run(["git", "-C", str(self.repo_root), "worktree", "prune"])
-            self._run(cmd)
+            self._run(
+                ["git", "-C", str(self.repo_root), "worktree", "prune"],
+                extra_env=extra_env,
+            )
+            self._run(cmd, extra_env=extra_env)
         return path
 
     def cleanup(self, session_id: str) -> None:
@@ -85,6 +97,7 @@ class WorktreeManager:
         *,
         repo_key: str | None = None,
         default_branch: str = "main",
+        extra_env: dict[str, str] | None = None,
     ) -> Path:
         """Ensure a dispatcher-managed primary clone exists for ``repo_url``."""
 
@@ -95,19 +108,28 @@ class WorktreeManager:
             if not (repo_path / ".git").exists():
                 if repo_path.exists():
                     shutil.rmtree(repo_path, ignore_errors=True)
-                cls._run_static(["git", "clone", repo_url, str(repo_path)])
+                cls._run_static(
+                    ["git", "clone", repo_url, str(repo_path)],
+                    extra_env=extra_env,
+                )
             else:
-                cls._run_static(["git", "-C", str(repo_path), "fetch", "--prune", "origin"])
+                cls._run_static(
+                    ["git", "-C", str(repo_path), "fetch", "--prune", "origin"],
+                    extra_env=extra_env,
+                )
 
             base_branch = (default_branch or "main").strip() or "main"
-            cls._run_static([
-                "git",
-                "-C",
-                str(repo_path),
-                "fetch",
-                "origin",
-                base_branch,
-            ])
+            cls._run_static(
+                [
+                    "git",
+                    "-C",
+                    str(repo_path),
+                    "fetch",
+                    "origin",
+                    base_branch,
+                ],
+                extra_env=extra_env,
+            )
         return repo_path
 
     @classmethod
@@ -187,12 +209,33 @@ class WorktreeManager:
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
-    def _run(self, cmd: list[str]) -> None:
-        self._run_static(cmd)
+    def _run(
+        self,
+        cmd: list[str],
+        *,
+        extra_env: dict[str, str] | None = None,
+    ) -> None:
+        overlay = dict(self.extra_env)
+        overlay.update(extra_env or {})
+        self._run_static(cmd, extra_env=overlay)
 
     @staticmethod
-    def _run_static(cmd: list[str]) -> None:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    def _run_static(
+        cmd: list[str],
+        *,
+        extra_env: dict[str, str] | None = None,
+    ) -> None:
+        kwargs: dict[str, Any] = {
+            "check": True,
+            "capture_output": True,
+            "text": True,
+        }
+        overlay = {str(key): str(value) for key, value in dict(extra_env or {}).items()}
+        if overlay:
+            env = os.environ.copy()
+            env.update(overlay)
+            kwargs["env"] = env
+        subprocess.run(cmd, **kwargs)
 
     def _best_effort_run(self, cmd: list[str]) -> None:
         try:
@@ -207,6 +250,11 @@ class WorktreeManager:
                 check=True,
                 capture_output=True,
                 text=True,
+                **(
+                    {"env": {**os.environ, **self.extra_env}}
+                    if self.extra_env
+                    else {}
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("worktree list failed path=%s error=%s", path, exc)
@@ -237,6 +285,11 @@ class WorktreeManager:
                 check=True,
                 capture_output=True,
                 text=True,
+                **(
+                    {"env": {**os.environ, **self.extra_env}}
+                    if self.extra_env
+                    else {}
+                ),
             )
         except Exception:
             return False

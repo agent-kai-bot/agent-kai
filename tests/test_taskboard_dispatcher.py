@@ -8,11 +8,14 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
+from agent.runtime_config_resolver import RoleRuntimeConfig
 from agent.taskboard_dispatcher import (
     BACKPRESSURE_SUBJECT,
     DISPATCHER_SOURCE,
+    DaemonTaskboardSpawner,
     SPAWN_FAILED_SUBJECT,
     RepoRoutingError,
     TaskboardDispatcher,
@@ -69,6 +72,28 @@ class _FakeSessionManager:
         self.abort_calls.append(session_id)
 
 
+class _FakeRuntimeConfigResolver:
+    """Return deterministic per-role runtime config for dispatcher tests."""
+
+    def __init__(self) -> None:
+        self.roles: list[str] = []
+
+    def resolve_for_role(self, role: str, **_kwargs) -> RoleRuntimeConfig:
+        self.roles.append(role)
+        return RoleRuntimeConfig(
+            role=role,
+            forgejo_pat=f"pat-for-{role}",
+            forgejo_user=f"user-for-{role}",
+            forgejo_base_url="http://forgejo.local",
+            taskboard_base_url="",
+            taskboard_bearer_token="",
+            source="test",
+        )
+
+    def log_startup_diagnostics(self) -> None:
+        return None
+
+
 class _FakeBus:
     """Record NATS publish calls."""
 
@@ -79,6 +104,39 @@ class _FakeBus:
         """Record the publish request."""
 
         self.published.append((subject, payload))
+
+
+class _AttachOrderSession:
+    def __init__(self) -> None:
+        self.taskboard_context = None
+        self.forgejo_context = None
+        self.runtime_env = {}
+        self.attach_seen: tuple[object, object, dict] | None = None
+        self.taskboard_dispatcher = {}
+
+    def attach_runtime(self, **_kwargs):
+        self.attach_seen = (
+            self.taskboard_context,
+            self.forgejo_context,
+            dict(self.runtime_env),
+        )
+
+    def start_auto_mode(self, **_kwargs):
+        return None
+
+
+class _FakeDaemonServer:
+    def __init__(self, session: _AttachOrderSession) -> None:
+        self.bus = None
+        self.signal_consumer = None
+        self.scheduler = None
+        self.managed = SimpleNamespace(session=session, current_input_task=None)
+
+    async def get_or_create_session(self, *_args, **_kwargs):
+        return self.managed
+
+    async def run_input(self, *_args, **_kwargs):
+        return SimpleNamespace(error=None, final_text="done")
 
 
 class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
@@ -128,6 +186,11 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spawn["profile"], "xhigh")
         self.assertEqual(spawn["prompt"], "rendered prompt")
         self.assertEqual(spawn["session_token"], "")
+        self.assertEqual(spawn["runtime_config"].forgejo_pat, "pat-for-developer")
+        self.assertEqual(spawn["forgejo_context"].token, "pat-for-developer")
+        self.assertEqual(spawn["runtime_env"]["FORGEJO_TOKEN_DEVELOPER"], "pat-for-developer")
+        self.assertEqual(spawn["runtime_env"]["FORGEJO_TOKEN"], "pat-for-developer")
+        self.assertNotIn("TASKBOARD_BEARER_TOKEN", spawn["runtime_env"])
         self.assertIn(
             "taskboard_fire_spawned task_id=10152 fire_generation=7 "
             "role=Developer route_reason=status_to_in_progress "
@@ -647,6 +710,52 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(session_manager.spawn_calls[0]["prompt"], "known prompt body")
 
+    async def test_daemon_spawner_sets_contexts_before_attach_runtime(self) -> None:
+        """Session taskboard/Forgejo contexts are visible during tool attach."""
+
+        session = _AttachOrderSession()
+        daemon = _FakeDaemonServer(session)
+        runtime_config = RoleRuntimeConfig(
+            role="developer",
+            forgejo_pat="role-pat",
+            forgejo_user="agent-developer",
+            forgejo_base_url="http://forgejo.local",
+            taskboard_base_url="http://taskboard.local",
+            taskboard_bearer_token="bearer-token",
+            taskboard_session_token="session-token",
+            taskboard_session_generation=11,
+            taskboard_agent_name="developer",
+            source="test",
+        )
+
+        spawner = DaemonTaskboardSpawner(daemon)
+        session_id = await spawner.spawn(
+            session_id="session-1",
+            task_id=1,
+            fire_generation=11,
+            role="Developer",
+            agent_id="developer",
+            model="codex",
+            profile="xhigh",
+            prompt="prompt",
+            task={"id": 1, "agent": "Developer", "fire_generation": 11},
+            session_token="session-token",
+            session_generation=11,
+            taskboard_base_url="http://taskboard.local",
+            taskboard_bearer_token="bearer-token",
+            runtime_config=runtime_config,
+            runtime_env=runtime_config.env_overlay(),
+        )
+        await daemon.managed.current_input_task
+
+        self.assertEqual(session_id, "session-1")
+        self.assertIsNotNone(session.attach_seen)
+        taskboard_context, forgejo_context, runtime_env = session.attach_seen
+        self.assertEqual(taskboard_context.session_token, "session-token")
+        self.assertEqual(taskboard_context.session_generation, 11)
+        self.assertEqual(forgejo_context.token, "role-pat")
+        self.assertEqual(runtime_env["FORGEJO_TOKEN_DEVELOPER"], "role-pat")
+
     async def test_tier_mapping_table(self) -> None:
         """Every supported taskboard role maps to the required model tier."""
 
@@ -681,6 +790,7 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
             max_concurrent_spawns=max_concurrent_spawns,
             clock=lambda: NOW,
             agent_runs_client=mock.Mock(enabled=False),
+            runtime_config_resolver=_FakeRuntimeConfigResolver(),
         )
 
     def _create_pending_table(self) -> None:

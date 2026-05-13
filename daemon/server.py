@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agent_logger import get_logger, log_slash_command
 from agent.agent_runs_client import AgentRunsClient
+from agent.runtime_config_resolver import RuntimeConfigResolver
 from agent.auto_loop_brain import (
     AutoLoopBrainConfig,
     build_auto_response_evaluator,
@@ -603,6 +604,7 @@ class DaemonServer:
         taskboard_dispatcher_enabled: bool | None = None,
         heartbeat_config: HeartbeatConfig | None = None,
         runtime_config_store: RuntimeConfigStore | None = None,
+        runtime_config_resolver: RuntimeConfigResolver | None = None,
     ) -> None:
         self.agent_name = agent_name
         self.nats_url = nats_url
@@ -617,6 +619,7 @@ class DaemonServer:
         self.forgejo_webhook_secret_provider = forgejo_webhook_secret_provider
         self.taskboard_client = taskboard_client
         self.runtime_config_store = runtime_config_store or RuntimeConfigStore()
+        self.runtime_config_resolver = runtime_config_resolver or RuntimeConfigResolver()
         self.taskboard_dispatcher_enabled = _taskboard_dispatcher_enabled(
             taskboard_dispatcher_enabled
         )
@@ -926,6 +929,7 @@ class DaemonServer:
         """Connect shared resources used by daemon-backed sessions."""
         self.daemon_token = ensure_daemon_token(self.token_path)
         self.started_at_monotonic = time.monotonic()
+        self.runtime_config_resolver.log_startup_diagnostics()
         self._validate_auto_loop_brain_startup()
         try:
             apply_migrations(self.db_path)
@@ -1132,8 +1136,12 @@ class DaemonServer:
         self.taskboard_dispatcher = TaskboardDispatcher(
             db_path=self.db_path,
             task_client=self.taskboard_client,
-            session_manager=DaemonTaskboardSpawner(self),
+            session_manager=DaemonTaskboardSpawner(
+                self,
+                runtime_config_resolver=self.runtime_config_resolver,
+            ),
             nats_bus=self.bus,
+            runtime_config_resolver=self.runtime_config_resolver,
         )
         self.taskboard_dispatcher_task = asyncio.create_task(
             self.taskboard_dispatcher.run()
@@ -3030,6 +3038,7 @@ def create_app(
     taskboard_dispatcher_enabled: bool | None = None,
     heartbeat_config: HeartbeatConfig | None = None,
     runtime_config_store: RuntimeConfigStore | None = None,
+    runtime_config_resolver: RuntimeConfigResolver | None = None,
 ) -> FastAPI:
     """Build the FastAPI app that exposes the daemon WebSocket server.
 
@@ -3055,6 +3064,7 @@ def create_app(
         taskboard_dispatcher_enabled: Optional dispatcher lifecycle override.
         heartbeat_config: Optional heartbeat override for tests.
         runtime_config_store: Optional runtime override store for tests.
+        runtime_config_resolver: Optional runtime secret resolver for tests.
 
     Returns:
         Configured FastAPI application.
@@ -3073,6 +3083,7 @@ def create_app(
         taskboard_dispatcher_enabled=taskboard_dispatcher_enabled,
         heartbeat_config=heartbeat_config,
         runtime_config_store=runtime_config_store,
+        runtime_config_resolver=runtime_config_resolver,
     )
 
     @asynccontextmanager

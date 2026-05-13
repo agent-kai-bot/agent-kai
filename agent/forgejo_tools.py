@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -13,9 +14,22 @@ from urllib.parse import quote
 import requests
 from langchain_core.tools import StructuredTool
 
+from agent.runtime_config_resolver import role_env_suffix
+from agent.runtime_utils import current_session_env_overlay, session_subprocess_env
+
 
 DEFAULT_TIMEOUT_SECONDS = 30
 DEFAULT_RUN_ROOT = "/tmp/taskboard-agent-runs"
+
+
+@dataclass(frozen=True)
+class ForgejoContext:
+    """Per-session Forgejo API context."""
+
+    role: str = ""
+    token: str = ""
+    user: str = ""
+    base_url: str = ""
 
 
 def _run_root() -> Path:
@@ -28,30 +42,49 @@ def _run_root() -> Path:
     return Path(os.getenv("TASKBOARD_RUN_ROOT", DEFAULT_RUN_ROOT)).expanduser()
 
 
-def _forgejo_base_url() -> str:
+def _env_value(name: str) -> str:
+    overlay = current_session_env_overlay()
+    if name in overlay:
+        return str(overlay.get(name) or "").strip()
+    return os.getenv(name, "").strip()
+
+
+def _session_env_kwargs() -> dict[str, dict[str, str]]:
+    if not current_session_env_overlay():
+        return {}
+    return {"env": session_subprocess_env()}
+
+
+def _forgejo_base_url(context: ForgejoContext | None = None) -> str:
     """Return the configured Forgejo base URL.
 
     Returns:
         Base URL without trailing slash.
     """
 
-    return os.getenv("FORGEJO_URL", os.getenv("GITEA_URL", "")).rstrip("/")
+    if context is not None and context.base_url:
+        return context.base_url.rstrip("/")
+    return (_env_value("FORGEJO_URL") or _env_value("GITEA_URL")).rstrip("/")
 
 
-def _forgejo_token() -> str:
+def _forgejo_token(context: ForgejoContext | None = None) -> str:
     """Return the configured Forgejo token.
 
     Returns:
         Token string, or an empty string when not configured.
     """
 
-    return (
-        os.getenv("FORGEJO_TOKEN", "").strip()
-        or os.getenv("GITEA_TOKEN", "").strip()
-    )
+    if context is not None and context.token:
+        return context.token.strip()
+    role = context.role if context is not None else _env_value("KAI_AGENT_ROLE")
+    if role:
+        role_token = _env_value(f"FORGEJO_TOKEN_{role_env_suffix(role)}")
+        if role_token:
+            return role_token
+    return _env_value("FORGEJO_TOKEN") or _env_value("GITEA_TOKEN")
 
 
-def _redact(text: str) -> str:
+def _redact(text: str, context: ForgejoContext | None = None) -> str:
     """Redact configured secrets from output.
 
     Args:
@@ -61,8 +94,23 @@ def _redact(text: str) -> str:
         Redacted text.
     """
 
+    overlay = current_session_env_overlay()
+    secrets = [
+        value
+        for key, value in {**os.environ, **overlay}.items()
+        if (
+            key == "FORGEJO_TOKEN"
+            or key == "GITEA_TOKEN"
+            or str(key).startswith("FORGEJO_TOKEN_")
+        )
+    ]
+    if context is not None and context.token:
+        secrets.append(context.token)
+    token = _forgejo_token(context)
+    if token:
+        secrets.append(token)
     redacted = text
-    for secret in (_forgejo_token(),):
+    for secret in sorted({str(value) for value in secrets if value}, key=len, reverse=True):
         if secret:
             redacted = redacted.replace(secret, "[REDACTED]")
     return redacted
@@ -108,6 +156,7 @@ def _format_result(
     ok: bool,
     data: dict[str, Any] | None = None,
     error: str | None = None,
+    context: ForgejoContext | None = None,
 ) -> str:
     """Format a tool result as redacted JSON.
 
@@ -125,7 +174,7 @@ def _format_result(
         payload.update(data)
     if error:
         payload["error"] = error
-    return _redact(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return _redact(json.dumps(payload, ensure_ascii=False, sort_keys=True), context)
 
 
 def _run_git(args: list[str], cwd: str | Path) -> str:
@@ -148,6 +197,7 @@ def _run_git(args: list[str], cwd: str | Path) -> str:
             text=True,
             timeout=DEFAULT_TIMEOUT_SECONDS,
             check=False,
+            **_session_env_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
         return _format_result(ok=False, error=str(exc))
@@ -204,6 +254,7 @@ def git_prepare_task_workspace(
             text=True,
             timeout=300,
             check=False,
+            **_session_env_kwargs(),
         )
         if clone.returncode != 0:
             return _format_result(
@@ -221,6 +272,7 @@ def git_prepare_task_workspace(
             text=True,
             timeout=DEFAULT_TIMEOUT_SECONDS,
             check=False,
+            **_session_env_kwargs(),
         )
         return _format_result(
             ok=branch.returncode == 0,
@@ -284,6 +336,7 @@ def git_commit(workspace: str, message: str) -> str:
             text=True,
             timeout=DEFAULT_TIMEOUT_SECONDS,
             check=False,
+            **_session_env_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
         return _format_result(ok=False, error=str(exc))
@@ -320,6 +373,7 @@ def _forgejo_request(
     path: str,
     *,
     json_body: dict[str, Any] | None = None,
+    context: ForgejoContext | None = None,
 ) -> str:
     """Send a Forgejo API request.
 
@@ -332,10 +386,14 @@ def _forgejo_request(
         Redacted JSON result.
     """
 
-    base_url = _forgejo_base_url()
-    token = _forgejo_token()
+    base_url = _forgejo_base_url(context)
+    token = _forgejo_token(context)
     if not base_url:
-        return _format_result(ok=False, error="FORGEJO_URL is not configured")
+        return _format_result(
+            ok=False,
+            error="FORGEJO_URL is not configured",
+            context=context,
+        )
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"token {token}"
@@ -354,9 +412,10 @@ def _forgejo_request(
         return _format_result(
             ok=200 <= response.status_code < 300,
             data={"status_code": response.status_code, "body": body},
+            context=context,
         )
     except requests.RequestException as exc:
-        return _format_result(ok=False, error=str(exc))
+        return _format_result(ok=False, error=str(exc), context=context)
 
 
 def forgejo_create_pr(
@@ -386,6 +445,24 @@ def forgejo_create_pr(
         "POST",
         path,
         json_body={"title": title, "head": head, "base": base, "body": body},
+    )
+
+
+def _forgejo_create_pr_with_context(
+    context: ForgejoContext | None,
+    owner: str,
+    repo: str,
+    title: str,
+    head: str,
+    base: str = "main",
+    body: str = "",
+) -> str:
+    path = f"/api/v1/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls"
+    return _forgejo_request(
+        "POST",
+        path,
+        json_body={"title": title, "head": head, "base": base, "body": body},
+        context=context,
     )
 
 
@@ -454,12 +531,109 @@ def forgejo_submit_review(
     )
 
 
-def create_forgejo_tools() -> list[StructuredTool]:
+def _forgejo_find_pr_for_branch_with_context(
+    context: ForgejoContext | None,
+    owner: str,
+    repo: str,
+    branch: str,
+) -> str:
+    path = (
+        f"/api/v1/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+        "/pulls?state=open"
+    )
+    raw = _forgejo_request("GET", path, context=context)
+    payload = json.loads(raw)
+    body = payload.get("body")
+    matches = []
+    if isinstance(body, list):
+        for item in body:
+            head = item.get("head") if isinstance(item, dict) else None
+            if isinstance(head, dict) and head.get("ref") == branch:
+                matches.append(item)
+    return _format_result(
+        ok=bool(payload.get("ok")),
+        data={"matches": matches},
+        context=context,
+    )
+
+
+def _forgejo_submit_review_with_context(
+    context: ForgejoContext | None,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    event: str,
+    body: str,
+) -> str:
+    normalized = event.strip().upper()
+    if normalized not in {"APPROVED", "REQUEST_CHANGES"}:
+        return _format_result(
+            ok=False,
+            error="event must be APPROVED or REQUEST_CHANGES",
+            context=context,
+        )
+    path = (
+        f"/api/v1/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+        f"/pulls/{int(pr_number)}/reviews"
+    )
+    return _forgejo_request(
+        "POST",
+        path,
+        json_body={"event": normalized, "body": body},
+        context=context,
+    )
+
+
+def create_forgejo_tools(
+    context: ForgejoContext | None = None,
+) -> list[StructuredTool]:
     """Create Git and Forgejo structured tools.
 
     Returns:
         List of LangChain tools for guarded git and Forgejo operations.
     """
+
+    def _create_pr_tool(
+        owner: str,
+        repo: str,
+        title: str,
+        head: str,
+        base: str = "main",
+        body: str = "",
+    ) -> str:
+        return _forgejo_create_pr_with_context(
+            context,
+            owner,
+            repo,
+            title,
+            head,
+            base=base,
+            body=body,
+        )
+
+    def _find_pr_tool(owner: str, repo: str, branch: str) -> str:
+        return _forgejo_find_pr_for_branch_with_context(
+            context,
+            owner,
+            repo,
+            branch,
+        )
+
+    def _submit_review_tool(
+        owner: str,
+        repo: str,
+        pr_number: int,
+        event: str,
+        body: str,
+    ) -> str:
+        return _forgejo_submit_review_with_context(
+            context,
+            owner,
+            repo,
+            pr_number,
+            event,
+            body,
+        )
 
     return [
         StructuredTool.from_function(
@@ -491,17 +665,17 @@ def create_forgejo_tools() -> list[StructuredTool]:
             description="Push a non-protected task branch to origin.",
         ),
         StructuredTool.from_function(
-            func=forgejo_create_pr,
+            func=_create_pr_tool,
             name="forgejo_create_pr",
             description="Create a Forgejo pull request.",
         ),
         StructuredTool.from_function(
-            func=forgejo_find_pr_for_branch,
+            func=_find_pr_tool,
             name="forgejo_find_pr_for_branch",
             description="Find open Forgejo pull requests by branch.",
         ),
         StructuredTool.from_function(
-            func=forgejo_submit_review,
+            func=_submit_review_tool,
             name="forgejo_submit_review",
             description="Submit a formal Forgejo pull-request review.",
         ),

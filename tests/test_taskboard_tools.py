@@ -312,6 +312,29 @@ class TaskboardToolsTests(unittest.TestCase):
         self.assertIn("taskboard_submit_review_verdict", cr_names)
         self.assertNotIn("taskboard_submit_review_verdict", developer_names)
 
+    @mock.patch("agent.taskboard_tools.requests.request")
+    def test_explicit_taskboard_context_wins_over_process_env(self, request_mock) -> None:
+        """Session TaskboardContext is used before process env fallback."""
+
+        request_mock.return_value = _FakeResponse(payload={"id": 123})
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "TASKBOARD_URL": "http://env-taskboard.local",
+                "TASKBOARD_BEARER_TOKEN": "env-bearer",
+                "TASKBOARD_SESSION_TOKEN": "env-session",
+                "TASKBOARD_SESSION_GENERATION": "99",
+            },
+            clear=False,
+        ):
+            tools = create_taskboard_tools(self.context)
+            get_task_tool = next(tool for tool in tools if tool.name == "taskboard_get_task")
+            get_task_tool.func(123)
+
+        _, kwargs = request_mock.call_args
+        self.assertEqual(kwargs["url"], "http://taskboard.local/api/tasks/123")
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer bearer-secret")
+
 
 if __name__ == "__main__":
     unittest.main()
