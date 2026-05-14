@@ -30,6 +30,8 @@ from config import (
     MAX_FILE_READ_CHARS,
     MAX_OUTPUT_CHARS,
     SHELL_TIMEOUT_SECONDS,
+    VALID_REASONING_EFFORTS,
+    normalize_reasoning_effort,
 )
 from agent.runtime_utils import (
     current_session_worktree,
@@ -812,9 +814,21 @@ def _get_crypto_tools(signal_consumer=None):
 
 def _format_scheduled_job_summary(job) -> str:
     next_run = job.next_run or ("event-driven" if job.type == "event" else "n/a")
+    route = ""
+    overrides = getattr(job, "routing_overrides", lambda: {})()
+    if overrides:
+        parts = []
+        if overrides.get("target_agent_role"):
+            parts.append(f"target_agent_role={overrides['target_agent_role']}")
+        if overrides.get("reasoning_effort") or overrides.get("thinking_level"):
+            parts.append(
+                f"reasoning_effort={overrides.get('reasoning_effort') or overrides.get('thinking_level')}"
+            )
+        if parts:
+            route = " " + " ".join(parts)
     return (
         f"{job.id} [{job.status}] session={job.owner_session} "
-        f"type={job.type} next={next_run} prompt={job.prompt}"
+        f"type={job.type} next={next_run}{route} prompt={job.prompt}"
     )
 
 
@@ -825,6 +839,46 @@ def create_scheduler_tools(scheduler, session):
     def _resolve_session(target_session: str | None = None) -> str:
         name = target_session or getattr(session_obj, "name", "")
         return str(name).strip()
+
+    def _validate_scheduler_overrides(
+        *,
+        reasoning_effort: str | None = None,
+        thinking_level: str | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> tuple[str | None, str | None, dict[str, str] | None]:
+        normalized: dict[str, str] = {}
+        for field_name, raw_value in (
+            ("reasoning_effort", reasoning_effort),
+            ("thinking_level", thinking_level),
+        ):
+            if raw_value is None:
+                continue
+            canonical = normalize_reasoning_effort(raw_value)
+            if canonical is None:
+                raise ValueError(
+                    f"invalid {field_name} '{raw_value}'; valid: {', '.join(VALID_REASONING_EFFORTS)}"
+                )
+            normalized[field_name] = canonical
+        if (
+            normalized.get("reasoning_effort") is not None
+            and normalized.get("thinking_level") is not None
+            and normalized["reasoning_effort"] != normalized["thinking_level"]
+        ):
+            raise ValueError("reasoning_effort and thinking_level must match when both are set")
+        normalized_env = None
+        if extra_env is not None:
+            if not isinstance(extra_env, dict):
+                raise ValueError("extra_env must be an object")
+            normalized_env = {
+                str(key): str(value)
+                for key, value in extra_env.items()
+                if key and value is not None
+            }
+        return (
+            normalized.get("reasoning_effort"),
+            normalized.get("thinking_level"),
+            normalized_env,
+        )
 
     def _loop_guard(job_type: str, target_session: str, prompt: str, spec: dict | None = None) -> str | None:
         if getattr(session_obj, "current_source", "user") != "scheduler":
@@ -849,8 +903,17 @@ def create_scheduler_tools(scheduler, session):
         prompt: str,
         session: str | None = None,
         tool_budget: int | None = None,
+        target_agent_role: str | None = None,
+        reasoning_effort: str | None = None,
+        thinking_level: str | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> str:
         owner_session = _resolve_session(session)
+        normalized_reasoning, normalized_thinking, normalized_env = _validate_scheduler_overrides(
+            reasoning_effort=reasoning_effort,
+            thinking_level=thinking_level,
+            extra_env=extra_env,
+        )
         warning = _loop_guard("absolute", owner_session, prompt)
         if warning:
             return warning
@@ -860,6 +923,10 @@ def create_scheduler_tools(scheduler, session):
             owner_session=owner_session,
             created_by="agent",
             tool_budget=tool_budget,
+            target_agent_role=target_agent_role,
+            reasoning_effort=normalized_reasoning,
+            thinking_level=normalized_thinking,
+            extra_env=normalized_env,
         )
         return f"Scheduled {job.id} at {job.next_run} for session {job.owner_session}."
 
@@ -869,8 +936,17 @@ def create_scheduler_tools(scheduler, session):
         session: str | None = None,
         max_runs: int | None = None,
         tool_budget: int | None = None,
+        target_agent_role: str | None = None,
+        reasoning_effort: str | None = None,
+        thinking_level: str | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> str:
         owner_session = _resolve_session(session)
+        normalized_reasoning, normalized_thinking, normalized_env = _validate_scheduler_overrides(
+            reasoning_effort=reasoning_effort,
+            thinking_level=thinking_level,
+            extra_env=extra_env,
+        )
         spec = {"cron": cron, "tz": scheduler.timezone_name}
         warning = _loop_guard("cron", owner_session, prompt, spec)
         if warning:
@@ -882,6 +958,10 @@ def create_scheduler_tools(scheduler, session):
             created_by="agent",
             max_runs=max_runs,
             tool_budget=tool_budget,
+            target_agent_role=target_agent_role,
+            reasoning_effort=normalized_reasoning,
+            thinking_level=normalized_thinking,
+            extra_env=normalized_env,
         )
         return f"Scheduled recurring job {job.id} next={job.next_run} for session {job.owner_session}."
 
@@ -891,8 +971,17 @@ def create_scheduler_tools(scheduler, session):
         session: str | None = None,
         max_runs: int | None = None,
         tool_budget: int | None = None,
+        target_agent_role: str | None = None,
+        reasoning_effort: str | None = None,
+        thinking_level: str | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> str:
         owner_session = _resolve_session(session)
+        normalized_reasoning, normalized_thinking, normalized_env = _validate_scheduler_overrides(
+            reasoning_effort=reasoning_effort,
+            thinking_level=thinking_level,
+            extra_env=extra_env,
+        )
         spec = {
             "channel": condition.get("channel"),
             "filter": condition.get("filter"),
@@ -907,6 +996,10 @@ def create_scheduler_tools(scheduler, session):
             created_by="agent",
             max_runs=max_runs,
             tool_budget=tool_budget,
+            target_agent_role=target_agent_role,
+            reasoning_effort=normalized_reasoning,
+            thinking_level=normalized_thinking,
+            extra_env=normalized_env,
         )
         return f"Scheduled event job {job.id} on channel {job.spec['channel']} for session {job.owner_session}."
 
@@ -946,17 +1039,26 @@ def create_scheduler_tools(scheduler, session):
         StructuredTool.from_function(
             func=_schedule_at,
             name="schedule_at",
-            description="Schedule a one-shot prompt at an ISO 8601 timestamp. Inputs: when, prompt, optional session.",
+            description=(
+                "Schedule a one-shot prompt at an ISO 8601 timestamp. Inputs: when, prompt, optional "
+                "session, tool_budget, target_agent_role, reasoning_effort, thinking_level, extra_env."
+            ),
         ),
         StructuredTool.from_function(
             func=_schedule_recurring,
             name="schedule_recurring",
-            description="Schedule a recurring prompt on a cron expression. Inputs: cron, prompt, optional session, optional max_runs.",
+            description=(
+                "Schedule a recurring prompt on a cron expression. Inputs: cron, prompt, optional "
+                "session, max_runs, tool_budget, target_agent_role, reasoning_effort, thinking_level, extra_env."
+            ),
         ),
         StructuredTool.from_function(
             func=_schedule_when,
             name="schedule_when",
-            description="Schedule a prompt on an event condition. Inputs: condition object, prompt, optional session, optional max_runs.",
+            description=(
+                "Schedule a prompt on an event condition. Inputs: condition object, prompt, optional "
+                "session, max_runs, tool_budget, target_agent_role, reasoning_effort, thinking_level, extra_env."
+            ),
         ),
         StructuredTool.from_function(
             func=_list_scheduled_jobs,

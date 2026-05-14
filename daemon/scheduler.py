@@ -25,7 +25,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-from config import WORKSPACES_DIR
+from config import WORKSPACES_DIR, normalize_reasoning_effort
 
 NonEmptyString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 JobType = Literal["absolute", "cron", "event"]
@@ -36,6 +36,10 @@ EventCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 SchedulerEventCallback = Callable[..., Awaitable[None] | None]
 SCHEDULER_ROOT_DIR = Path(WORKSPACES_DIR) / "scheduler"
 SCHEDULER_JOBS_PATH = SCHEDULER_ROOT_DIR / "jobs.json"
+SCHEDULER_V2_ROUTING_KEY = "v2_routing"
+SCHEDULER_V2_ROUTING_FIELDS = frozenset(
+    {"target_agent_role", "reasoning_effort", "thinking_level", "extra_env"}
+)
 
 STRUCTURED_FILTER_SCHEMA = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -220,6 +224,37 @@ class ScheduledJob(BaseModel):
     last_result_preview: str | None = None
     concurrency: JobConcurrency = "queue"
     tool_budget: int | None = Field(default=None)
+    target_agent_role: NonEmptyString | None = None
+    reasoning_effort: str | None = None
+    thinking_level: str | None = None
+    extra_env: dict[str, str] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_routing_overrides(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        normalized = dict(values)
+        canonical_values: dict[str, str] = {}
+        for field_name in ("reasoning_effort", "thinking_level"):
+            raw_value = normalized.get(field_name)
+            if raw_value is None:
+                continue
+            canonical = normalize_reasoning_effort(raw_value)
+            if canonical is None:
+                raise ValueError(f"invalid {field_name}: {raw_value!r}")
+            normalized[field_name] = canonical
+            canonical_values[field_name] = canonical
+        if (
+            canonical_values.get("reasoning_effort") is not None
+            and canonical_values.get("thinking_level") is not None
+            and canonical_values["reasoning_effort"] != canonical_values["thinking_level"]
+        ):
+            raise ValueError("reasoning_effort and thinking_level must match when both are set")
+        extra_env = normalized.get("extra_env")
+        if extra_env is not None and not isinstance(extra_env, dict):
+            raise ValueError("extra_env must be an object")
+        return normalized
 
     @model_validator(mode="after")
     def validate_job(self) -> "ScheduledJob":
@@ -257,6 +292,55 @@ class ScheduledJob(BaseModel):
                 raise ValueError("event schedules require a non-empty channel")
             validate_structured_filter(self.spec.get("filter"))
         return self
+
+    @property
+    def effective_reasoning_effort(self) -> str | None:
+        return self.reasoning_effort or self.thinking_level
+
+    def routing_overrides(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        for field_name in sorted(SCHEDULER_V2_ROUTING_FIELDS):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if field_name == "extra_env" and not value:
+                continue
+            payload[field_name] = value
+        return payload
+
+    def has_routing_overrides(self) -> bool:
+        return bool(self.routing_overrides())
+
+
+class ScheduledJobRoutingOverride(BaseModel):
+    """Rollback-safe v2 routing sidecar entry for one scheduled job."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_agent_role: NonEmptyString | None = None
+    reasoning_effort: str | None = None
+    thinking_level: str | None = None
+    extra_env: dict[str, str] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_overrides(cls, values: Any) -> Any:
+        return ScheduledJob.normalize_routing_overrides(values)
+
+    @property
+    def effective_reasoning_effort(self) -> str | None:
+        return self.reasoning_effort or self.thinking_level
+
+    def routing_overrides(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        for field_name in sorted(SCHEDULER_V2_ROUTING_FIELDS):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if field_name == "extra_env" and not value:
+                continue
+            payload[field_name] = value
+        return payload
 
 
 class DaemonEventBus:
@@ -365,6 +449,10 @@ class Scheduler:
         max_runs: int | None = 1,
         concurrency: JobConcurrency = "queue",
         tool_budget: int | None = None,
+        target_agent_role: str | None = None,
+        reasoning_effort: str | None = None,
+        thinking_level: str | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> ScheduledJob:
         self._enforce_session_job_limit(owner_session)
         job = ScheduledJob.model_validate(
@@ -379,6 +467,12 @@ class Scheduler:
                 "max_runs": max_runs,
                 "concurrency": concurrency,
                 "tool_budget": tool_budget,
+                **self._routing_create_payload(
+                    target_agent_role=target_agent_role,
+                    reasoning_effort=reasoning_effort,
+                    thinking_level=thinking_level,
+                    extra_env=extra_env,
+                ),
             }
         )
         self.schedule_job(job)
@@ -396,6 +490,10 @@ class Scheduler:
         concurrency: JobConcurrency = "queue",
         tool_budget: int | None = None,
         timezone_name: str | None = None,
+        target_agent_role: str | None = None,
+        reasoning_effort: str | None = None,
+        thinking_level: str | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> ScheduledJob:
         self._enforce_session_job_limit(owner_session)
         job = ScheduledJob.model_validate(
@@ -410,6 +508,12 @@ class Scheduler:
                 "max_runs": max_runs,
                 "concurrency": concurrency,
                 "tool_budget": tool_budget,
+                **self._routing_create_payload(
+                    target_agent_role=target_agent_role,
+                    reasoning_effort=reasoning_effort,
+                    thinking_level=thinking_level,
+                    extra_env=extra_env,
+                ),
             }
         )
         self.schedule_job(job)
@@ -426,6 +530,10 @@ class Scheduler:
         max_runs: int | None = None,
         concurrency: JobConcurrency = "queue",
         tool_budget: int | None = None,
+        target_agent_role: str | None = None,
+        reasoning_effort: str | None = None,
+        thinking_level: str | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> ScheduledJob:
         self._enforce_session_job_limit(owner_session)
         spec = {
@@ -444,6 +552,12 @@ class Scheduler:
                 "max_runs": max_runs,
                 "concurrency": concurrency,
                 "tool_budget": tool_budget,
+                **self._routing_create_payload(
+                    target_agent_role=target_agent_role,
+                    reasoning_effort=reasoning_effort,
+                    thinking_level=thinking_level,
+                    extra_env=extra_env,
+                ),
             }
         )
         self.schedule_job(job)
@@ -457,17 +571,51 @@ class Scheduler:
         if not isinstance(raw_jobs, dict):
             self._jobs = {}
             return jobs
+        raw_routing = payload.get(SCHEDULER_V2_ROUTING_KEY, {})
+        if raw_routing is None:
+            raw_routing = {}
+        if not isinstance(raw_routing, dict):
+            self.log.warning(
+                "dropping invalid scheduler %s sidecar: expected object",
+                SCHEDULER_V2_ROUTING_KEY,
+            )
+            raw_routing = {}
         loaded: dict[str, ScheduledJob] = {}
         for job_id, raw_job in raw_jobs.items():
             if not isinstance(job_id, str) or not isinstance(raw_job, dict):
                 continue
+            merged_job = dict(raw_job)
+            raw_override = raw_routing.get(job_id)
+            if raw_override is not None:
+                if not isinstance(raw_override, dict):
+                    self.log.warning(
+                        "dropping invalid scheduler routing sidecar for job %s: expected object",
+                        job_id,
+                    )
+                else:
+                    try:
+                        override = ScheduledJobRoutingOverride.model_validate(raw_override)
+                    except Exception as exc:  # noqa: BLE001
+                        self.log.warning(
+                            "dropping invalid scheduler routing sidecar for job %s: %s",
+                            job_id,
+                            exc,
+                        )
+                    else:
+                        merged_job.update(override.routing_overrides())
             try:
-                job = ScheduledJob.model_validate(raw_job)
+                job = ScheduledJob.model_validate(merged_job)
             except Exception as exc:  # noqa: BLE001
                 self.log.warning("dropping invalid persisted job %s: %s", job_id, exc)
                 continue
             loaded[job.id] = job
             jobs.append(job)
+        for job_id in sorted(raw_routing):
+            if job_id not in raw_jobs:
+                self.log.warning(
+                    "skipping scheduler routing sidecar for unknown job %s",
+                    job_id,
+                )
         self._jobs = loaded
         return jobs
 
@@ -677,16 +825,50 @@ class Scheduler:
             existing = payload.get("jobs")
             jobs_payload = existing if isinstance(existing, dict) else {}
             current_jobs = {
-                job_id: job.model_dump(mode="json")
+                job_id: job.model_dump(mode="json", exclude=SCHEDULER_V2_ROUTING_FIELDS)
                 for job_id, job in self._jobs.items()
             }
             jobs_payload.update(current_jobs)
             for job_id in list(jobs_payload):
                 if job_id not in current_jobs:
                     jobs_payload.pop(job_id, None)
+            existing_routing = payload.get(SCHEDULER_V2_ROUTING_KEY)
+            routing_payload = existing_routing if isinstance(existing_routing, dict) else {}
+            current_routing = {
+                job_id: routing
+                for job_id, job in self._jobs.items()
+                if (routing := job.routing_overrides())
+            }
+            routing_payload.update(current_routing)
+            for job_id in list(routing_payload):
+                if job_id not in current_jobs or job_id not in current_routing:
+                    routing_payload.pop(job_id, None)
             payload["version"] = 1
             payload["jobs"] = jobs_payload
+            if routing_payload:
+                payload[SCHEDULER_V2_ROUTING_KEY] = routing_payload
+            else:
+                payload.pop(SCHEDULER_V2_ROUTING_KEY, None)
             _write_json_dict_unlocked(self.jobs_path, payload)
+
+    @staticmethod
+    def _routing_create_payload(
+        *,
+        target_agent_role: str | None = None,
+        reasoning_effort: str | None = None,
+        thinking_level: str | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if target_agent_role is not None:
+            payload["target_agent_role"] = target_agent_role
+        if reasoning_effort is not None:
+            payload["reasoning_effort"] = reasoning_effort
+        if thinking_level is not None:
+            payload["thinking_level"] = thinking_level
+        if extra_env is not None:
+            payload["extra_env"] = extra_env
+        return payload
 
     def _recover_loaded_jobs(self) -> None:
         now = _utc_now()

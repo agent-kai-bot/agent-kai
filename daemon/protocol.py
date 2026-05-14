@@ -226,33 +226,57 @@ class ScheduledJobTriggeredEnvelope(ProtocolModel):
     type: Literal["scheduled_job_triggered"]
     job_id: NonEmptyString
     fired_at: NonEmptyString
+    target_agent_role: str | None = None
+    reasoning_effort: str | None = None
+    thinking_level: str | None = None
+    extra_env: dict[str, str] | None = None
 
 
 class ScheduledJobCompletedEnvelope(ProtocolModel):
     type: Literal["scheduled_job_completed"]
     job_id: NonEmptyString
     result_preview: str | None = None
+    target_agent_role: str | None = None
+    reasoning_effort: str | None = None
+    thinking_level: str | None = None
+    extra_env: dict[str, str] | None = None
 
 
 class ScheduledJobFailedEnvelope(ProtocolModel):
     type: Literal["scheduled_job_failed"]
     job_id: NonEmptyString
     error: str
+    target_agent_role: str | None = None
+    reasoning_effort: str | None = None
+    thinking_level: str | None = None
+    extra_env: dict[str, str] | None = None
 
 
 class ScheduledJobCancelledEnvelope(ProtocolModel):
     type: Literal["scheduled_job_cancelled"]
     job_id: NonEmptyString
+    target_agent_role: str | None = None
+    reasoning_effort: str | None = None
+    thinking_level: str | None = None
+    extra_env: dict[str, str] | None = None
 
 
 class ScheduledJobPausedEnvelope(ProtocolModel):
     type: Literal["scheduled_job_paused"]
     job_id: NonEmptyString
+    target_agent_role: str | None = None
+    reasoning_effort: str | None = None
+    thinking_level: str | None = None
+    extra_env: dict[str, str] | None = None
 
 
 class ScheduledJobResumedEnvelope(ProtocolModel):
     type: Literal["scheduled_job_resumed"]
     job_id: NonEmptyString
+    target_agent_role: str | None = None
+    reasoning_effort: str | None = None
+    thinking_level: str | None = None
+    extra_env: dict[str, str] | None = None
 
 
 class OptimizerCompletedEnvelope(ProtocolModel):

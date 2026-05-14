@@ -46,6 +46,7 @@ from config import (
     get_memory_path,
     get_skills_dir,
     get_user_profile_path,
+    normalize_reasoning_effort,
 )
 
 DEFAULT_LLM_HISTORY_MAX_MESSAGES = 80
@@ -647,10 +648,32 @@ def render_skill_catalog(store: SkillStore | None) -> str:
     return "\n".join(lines)
 
 
+def _apply_reasoning_effort_override(cfg: dict, reasoning_effort: str | None) -> dict:
+    if reasoning_effort is None:
+        return cfg
+    canonical = normalize_reasoning_effort(reasoning_effort)
+    if canonical is None:
+        raise ValueError(f"invalid reasoning_effort override: {reasoning_effort!r}")
+
+    updated = dict(cfg)
+    endpoint = updated.get("endpoint")
+    if isinstance(endpoint, dict):
+        updated["endpoint"] = {**endpoint, "reasoning_effort": canonical}
+
+    fallback_chain = []
+    for fallback in updated.get("fallback_endpoints") or []:
+        if isinstance(fallback, dict):
+            fallback_chain.append({**fallback, "reasoning_effort": canonical})
+    updated["fallback_endpoints"] = fallback_chain
+    updated["fallback_endpoint"] = fallback_chain[0] if fallback_chain else None
+    updated["reasoning_effort"] = canonical
+    return updated
+
+
 class AgentRunner:
     """Manages the LangChain agent with primary/fallback LLM endpoints."""
 
-    def __init__(self, tools, bus=None, agent_name=None):
+    def __init__(self, tools, bus=None, agent_name=None, *, reasoning_effort_override: str | None = None):
         self.bus = bus
         self.telemetry = None
         self.chat_history = []
@@ -666,6 +689,7 @@ class AgentRunner:
         self._active_tool_call_count = 0
 
         cfg = get_agent_config(agent_name) if agent_name else {}
+        cfg = _apply_reasoning_effort_override(cfg, reasoning_effort_override)
         self._endpoint_cfg = cfg.get("endpoint")
         # Full chain — first failure walks the list in order
         self._fallback_chain_cfg = cfg.get("fallback_endpoints") or []

@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_logger import get_logger, log_slash_command
+from agent.core import AgentRunner
 from agent.agent_runs_client import AgentRunsClient
 from agent.runtime_config_resolver import RuntimeConfigResolver
 from agent.auto_loop_brain import (
@@ -36,6 +37,7 @@ from agent.taskboard_dispatcher import (
     reap_orphan_ledger_rows,
 )
 from agent.signal_consumer import Signal, SignalConsumer
+from agent.tools import create_tools
 from agent.strategy_agent_tools import (
     InProcessStrategyRuntime,
     get_strategy_lineage,
@@ -56,6 +58,7 @@ from config import (
     NATS_URL,
     get_agent_config,
     list_endpoint_models,
+    normalize_reasoning_effort,
     set_agent_reasoning_effort,
 )
 from daemon.auth import (
@@ -225,6 +228,46 @@ def _sanitize_auto_loop_brain_error(exc: Exception) -> str:
     redacted = redact_prompt_secrets(text)
     safe = str(redacted).replace("\n", " ").replace("\r", " ").strip()
     return safe[:300] or exc.__class__.__name__
+
+
+def _normalize_scheduled_reasoning_override(
+    *,
+    reasoning_effort: str | None = None,
+    thinking_level: str | None = None,
+) -> str | None:
+    normalized: dict[str, str] = {}
+    for field_name, raw_value in (
+        ("reasoning_effort", reasoning_effort),
+        ("thinking_level", thinking_level),
+    ):
+        if raw_value is None:
+            continue
+        canonical = normalize_reasoning_effort(raw_value)
+        if canonical is None:
+            raise ValueError(f"invalid {field_name}: {raw_value!r}")
+        normalized[field_name] = canonical
+    if (
+        normalized.get("reasoning_effort") is not None
+        and normalized.get("thinking_level") is not None
+        and normalized["reasoning_effort"] != normalized["thinking_level"]
+    ):
+        raise ValueError("reasoning_effort and thinking_level must match when both are set")
+    return normalized.get("reasoning_effort") or normalized.get("thinking_level")
+
+
+def _scheduled_job_override_payload(job: Any) -> dict[str, Any]:
+    routing_overrides = getattr(job, "routing_overrides", None)
+    if callable(routing_overrides):
+        return dict(routing_overrides())
+    payload: dict[str, Any] = {}
+    for field_name in ("target_agent_role", "reasoning_effort", "thinking_level", "extra_env"):
+        value = getattr(job, field_name, None)
+        if value is None:
+            continue
+        if field_name == "extra_env" and not value:
+            continue
+        payload[field_name] = value
+    return payload
 
 
 def _parse_schedule_at_value(raw: str, *, now: datetime | None = None) -> str:
@@ -1373,6 +1416,60 @@ class DaemonServer:
         self._refresh_session_auto_loop_brain_evaluator(managed)
         return managed
 
+    def _create_agent_runner_override(
+        self,
+        managed: ManagedSession,
+        *,
+        target_agent_role: str | None = None,
+        reasoning_effort: str | None = None,
+        thinking_level: str | None = None,
+    ) -> AgentRunner | None:
+        effective_reasoning = _normalize_scheduled_reasoning_override(
+            reasoning_effort=reasoning_effort,
+            thinking_level=thinking_level,
+        )
+        normalized_role = str(target_agent_role or "").strip() or None
+        if normalized_role is None and effective_reasoning is None:
+            return None
+
+        agent_name = normalized_role or managed.session.agent_name or self.agent_name
+        if agent_name not in AGENTS:
+            raise KeyError(f"unknown agent '{agent_name}'")
+
+        tools = create_tools(
+            self.bus,
+            managed.session.sub_agent_registry if self.bus is not None else None,
+            signal_consumer=managed.session.signal_consumer or self.signal_consumer,
+            scheduler=self.scheduler,
+            session=managed.session,
+        )
+        runner = AgentRunner(
+            tools=tools,
+            bus=self.bus,
+            agent_name=agent_name,
+            reasoning_effort_override=effective_reasoning,
+        )
+        runner.telemetry = managed.session
+        runner.chat_history = managed.session.chat_history
+        if managed.session.auto_mode:
+            runner._auto_readonly = managed.session.auto_readonly
+            runner.set_auto_mode(
+                True,
+                max_iterations=max(
+                    1,
+                    managed.session.auto_iterations_remaining
+                    or managed.session.auto_iterations_total
+                    or 1,
+                ),
+            )
+        self.log.info(
+            "SCHEDULED_JOB_RUNNER_OVERRIDE owner_session=%s target_agent=%s reasoning=%s",
+            managed.session.name,
+            agent_name,
+            effective_reasoning,
+        )
+        return runner
+
     async def run_input(
         self,
         managed: ManagedSession,
@@ -1381,6 +1478,10 @@ class DaemonServer:
         source: str = "user",
         job_id: str | None = None,
         tool_budget: int | None = None,
+        target_agent_role: str | None = None,
+        reasoning_effort: str | None = None,
+        thinking_level: str | None = None,
+        extra_env: dict[str, str] | None = None,
         single_auto_iteration: bool = False,
         pre_injected_input: bool = False,
     ) -> InputRunResult:
@@ -1390,12 +1491,23 @@ class DaemonServer:
             self._refresh_session_auto_loop_brain_evaluator(managed)
             managed.current_input_task = asyncio.current_task()
             managed.session.set_activity_status("thinking...")
+            original_runner = managed.session.agent_runner
+            override_runner: AgentRunner | None = None
             try:
+                override_runner = self._create_agent_runner_override(
+                    managed,
+                    target_agent_role=target_agent_role,
+                    reasoning_effort=reasoning_effort,
+                    thinking_level=thinking_level,
+                )
+                if override_runner is not None:
+                    managed.session.agent_runner = override_runner
                 async for event in managed.session.stream_agent_events(
                     text,
                     source=source,
                     job_id=job_id,
                     tool_budget=tool_budget,
+                    extra_env=extra_env,
                     single_auto_iteration=single_auto_iteration,
                     pre_injected_input=pre_injected_input,
                 ):
@@ -1430,6 +1542,10 @@ class DaemonServer:
                 result.error = str(exc)
                 managed.session.publish_event("agent.error", {"value": str(exc)})
             finally:
+                if override_runner is not None:
+                    managed.session.agent_runner = original_runner
+                    if original_runner is not None:
+                        original_runner.chat_history = managed.session.chat_history
                 if managed.current_input_task is asyncio.current_task():
                     managed.current_input_task = None
                 managed.session.set_activity_status("idle")
@@ -1763,6 +1879,10 @@ class DaemonServer:
             source="scheduler",
             job_id=job.id,
             tool_budget=job.tool_budget,
+            target_agent_role=job.target_agent_role,
+            reasoning_effort=job.reasoning_effort,
+            thinking_level=job.thinking_level,
+            extra_env=job.extra_env,
         )
         if outcome.error:
             self.scheduler.record_failure(job.id, fired_at=fired_at, error=outcome.error)
@@ -1792,9 +1912,14 @@ class DaemonServer:
         if not topic:
             return
 
+        override_payload = _scheduled_job_override_payload(job)
         event_payload: dict[str, Any]
         if event_type == "created":
-            event_payload = {"job": job.model_dump(mode="json")}
+            job_payload = job.model_dump(mode="json")
+            for field_name in ("target_agent_role", "reasoning_effort", "thinking_level", "extra_env"):
+                if field_name not in override_payload:
+                    job_payload.pop(field_name, None)
+            event_payload = {"job": job_payload}
         elif event_type == "triggered":
             event_payload = {"job_id": job.id, "fired_at": payload.get("fired_at")}
         elif event_type == "completed":
@@ -1807,6 +1932,7 @@ class DaemonServer:
         else:
             event_payload = {"job_id": job.id}
 
+        event_payload.update(override_payload)
         managed.session.publish_event(topic, event_payload)
 
     async def handle_schedule_command(self, managed: ManagedSession, command_text: str) -> str:
@@ -2094,9 +2220,19 @@ class DaemonServer:
     @staticmethod
     def _format_scheduled_job(job, *, include_prompt: bool = False) -> str:
         next_run = job.next_run or ("event-driven" if job.type == "event" else "n/a")
+        override_payload = _scheduled_job_override_payload(job)
+        route = ""
+        route_parts = []
+        if override_payload.get("target_agent_role"):
+            route_parts.append(f"target_agent_role={override_payload['target_agent_role']}")
+        effective_reasoning = override_payload.get("reasoning_effort") or override_payload.get("thinking_level")
+        if effective_reasoning:
+            route_parts.append(f"reasoning_effort={effective_reasoning}")
+        if route_parts:
+            route = " " + " ".join(route_parts)
         text = (
             f"{job.id} [{job.status}] session={job.owner_session} "
-            f"type={job.type} next={next_run}"
+            f"type={job.type} next={next_run}{route}"
         )
         if include_prompt:
             text = f"{text} prompt={job.prompt}"
@@ -2503,6 +2639,10 @@ class DaemonServer:
                 type="scheduled_job_triggered",
                 job_id=str(payload.get("job_id") or ""),
                 fired_at=str(payload.get("fired_at") or ""),
+                target_agent_role=payload.get("target_agent_role"),
+                reasoning_effort=payload.get("reasoning_effort"),
+                thinking_level=payload.get("thinking_level"),
+                extra_env=payload.get("extra_env"),
             )
 
         if topic == "scheduled_job.completed":
@@ -2510,6 +2650,10 @@ class DaemonServer:
                 type="scheduled_job_completed",
                 job_id=str(payload.get("job_id") or ""),
                 result_preview=payload.get("result_preview"),
+                target_agent_role=payload.get("target_agent_role"),
+                reasoning_effort=payload.get("reasoning_effort"),
+                thinking_level=payload.get("thinking_level"),
+                extra_env=payload.get("extra_env"),
             )
 
         if topic == "scheduled_job.failed":
@@ -2517,24 +2661,40 @@ class DaemonServer:
                 type="scheduled_job_failed",
                 job_id=str(payload.get("job_id") or ""),
                 error=str(payload.get("error") or "job failed"),
+                target_agent_role=payload.get("target_agent_role"),
+                reasoning_effort=payload.get("reasoning_effort"),
+                thinking_level=payload.get("thinking_level"),
+                extra_env=payload.get("extra_env"),
             )
 
         if topic == "scheduled_job.cancelled":
             return ScheduledJobCancelledEnvelope(
                 type="scheduled_job_cancelled",
                 job_id=str(payload.get("job_id") or ""),
+                target_agent_role=payload.get("target_agent_role"),
+                reasoning_effort=payload.get("reasoning_effort"),
+                thinking_level=payload.get("thinking_level"),
+                extra_env=payload.get("extra_env"),
             )
 
         if topic == "scheduled_job.paused":
             return ScheduledJobPausedEnvelope(
                 type="scheduled_job_paused",
                 job_id=str(payload.get("job_id") or ""),
+                target_agent_role=payload.get("target_agent_role"),
+                reasoning_effort=payload.get("reasoning_effort"),
+                thinking_level=payload.get("thinking_level"),
+                extra_env=payload.get("extra_env"),
             )
 
         if topic == "scheduled_job.resumed":
             return ScheduledJobResumedEnvelope(
                 type="scheduled_job_resumed",
                 job_id=str(payload.get("job_id") or ""),
+                target_agent_role=payload.get("target_agent_role"),
+                reasoning_effort=payload.get("reasoning_effort"),
+                thinking_level=payload.get("thinking_level"),
+                extra_env=payload.get("extra_env"),
             )
 
         if topic == "optimizer.completed":

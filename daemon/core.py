@@ -1121,6 +1121,7 @@ class Session:
         source: str = "user",
         job_id: str | None = None,
         tool_budget: int | None = None,
+        extra_env: dict[str, str] | None = None,
         single_auto_iteration: bool = False,
         pre_injected_input: bool = False,
     ):
@@ -1186,8 +1187,11 @@ class Session:
                             worktree_path = str(
                                 self.taskboard_dispatcher.get("worktree_path") or ""
                             )
+                        runtime_env = dict(getattr(self, "runtime_env", {}) or {})
+                        if extra_env:
+                            runtime_env.update(extra_env)
                         with session_worktree_context(worktree_path or None):
-                            with session_env_context(getattr(self, "runtime_env", {})):
+                            with session_env_context(runtime_env):
                                 async for event in self.agent_runner.run(
                                     current_input,
                                     pre_injected_input=pre_injected_input
