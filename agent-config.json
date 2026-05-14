@@ -425,6 +425,11 @@
       "prompt_template_path": "prompts/heartbeat/main.md.tmpl",
       "max_injected_turns_per_hour": 0
     },
+    "session_lifecycle": {
+      "idle_ttl_seconds": 86400,
+      "sweep_interval_seconds": 300,
+      "on_disk_retention_seconds": 604800
+    },
     "alert_subscriber": {
       "enabled": false,
       "kill_switch": false,

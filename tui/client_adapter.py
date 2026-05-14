@@ -30,7 +30,9 @@ from daemon.protocol import (
     ScheduledJobFailedEnvelope,
     ScheduledJobPausedEnvelope,
     ScheduledJobResumedEnvelope,
+    ScheduledJobSessionClosedEnvelope,
     ScheduledJobTriggeredEnvelope,
+    SessionIdleTimeoutEnvelope,
     SessionAttachedEnvelope,
     SignalEnvelope,
     StatusEnvelope,
@@ -382,13 +384,15 @@ class RemoteSession:
         if isinstance(
             envelope,
             OptimizerCompletedEnvelope
+            | SessionIdleTimeoutEnvelope
             | ScheduledJobCreatedEnvelope
             | ScheduledJobTriggeredEnvelope
             | ScheduledJobCompletedEnvelope
             | ScheduledJobFailedEnvelope
             | ScheduledJobCancelledEnvelope
             | ScheduledJobPausedEnvelope
-            | ScheduledJobResumedEnvelope,
+            | ScheduledJobResumedEnvelope
+            | ScheduledJobSessionClosedEnvelope,
         ):
             return {"type": envelope.type, "data": encode_envelope(envelope)}
 

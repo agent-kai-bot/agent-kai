@@ -14,8 +14,10 @@ from daemon.protocol import (
     NatsEventEnvelope,
     OptimizerCompletedEnvelope,
     ScheduledJobCreatedEnvelope,
+    ScheduledJobSessionClosedEnvelope,
     ScheduledJobTriggeredEnvelope,
     SessionAttachedEnvelope,
+    SessionIdleTimeoutEnvelope,
     SessionStateSnapshot,
     StatusEnvelope,
     ToolEndEnvelope,
@@ -239,6 +241,35 @@ class ServerEnvelopeTests(unittest.TestCase):
         self.assertEqual(created.job["id"], "job-1")
         self.assertEqual(triggered.type, "scheduled_job_triggered")
         self.assertEqual(triggered.job_id, "job-1")
+
+    def test_session_lifecycle_envelopes_round_trip(self):
+        timeout = decode_server_envelope(
+            encode_envelope(
+                SessionIdleTimeoutEnvelope(
+                    type="session_idle_timeout",
+                    session="terminal",
+                    last_activity="2026-04-10T00:00:00Z",
+                    idle_seconds=86401,
+                    idle_ttl_seconds=86400,
+                    closed_at="2026-04-11T00:00:01Z",
+                )
+            )
+        )
+        closed = decode_server_envelope(
+            encode_envelope(
+                ScheduledJobSessionClosedEnvelope(
+                    type="scheduled_job_session_closed",
+                    job_id="job-1",
+                    session="agent:kai:cron-wake:run_1",
+                    closed_at="2026-04-10T00:01:00Z",
+                )
+            )
+        )
+
+        self.assertEqual(timeout.type, "session_idle_timeout")
+        self.assertEqual(timeout.session, "terminal")
+        self.assertEqual(closed.type, "scheduled_job_session_closed")
+        self.assertEqual(closed.reason, "completed")
 
     def test_optimizer_completed_envelope_round_trip(self):
         decoded = decode_server_envelope(

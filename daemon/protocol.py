@@ -217,6 +217,15 @@ class ErrorEnvelope(ProtocolModel):
     message: str
 
 
+class SessionIdleTimeoutEnvelope(ProtocolModel):
+    type: Literal["session_idle_timeout"]
+    session: NonEmptyString
+    last_activity: NonEmptyString
+    idle_seconds: int = 0
+    idle_ttl_seconds: int = 0
+    closed_at: NonEmptyString
+
+
 class ScheduledJobCreatedEnvelope(ProtocolModel):
     type: Literal["scheduled_job_created"]
     job: Any
@@ -279,6 +288,14 @@ class ScheduledJobResumedEnvelope(ProtocolModel):
     extra_env: dict[str, str] | None = None
 
 
+class ScheduledJobSessionClosedEnvelope(ProtocolModel):
+    type: Literal["scheduled_job_session_closed"]
+    job_id: NonEmptyString
+    session: NonEmptyString
+    closed_at: NonEmptyString
+    reason: str = "completed"
+
+
 class OptimizerCompletedEnvelope(ProtocolModel):
     type: Literal["optimizer_completed"]
     session: NonEmptyString
@@ -303,6 +320,7 @@ ServerEnvelope = Annotated[
     | ChartViewEnvelope
     | WatchlistEnvelope
     | NatsEventEnvelope
+    | SessionIdleTimeoutEnvelope
     | ScheduledJobCreatedEnvelope
     | ScheduledJobTriggeredEnvelope
     | ScheduledJobCompletedEnvelope
@@ -310,6 +328,7 @@ ServerEnvelope = Annotated[
     | ScheduledJobCancelledEnvelope
     | ScheduledJobPausedEnvelope
     | ScheduledJobResumedEnvelope
+    | ScheduledJobSessionClosedEnvelope
     | OptimizerCompletedEnvelope
     | ErrorEnvelope,
     Field(discriminator="type"),

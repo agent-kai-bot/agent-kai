@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import secrets
@@ -67,6 +68,7 @@ from daemon.auth import (
     is_local_client_host,
     parse_bearer_token,
 )
+import daemon.core as daemon_core
 from daemon.db import DEFAULT_DB_PATH as DEFAULT_DAEMON_DB_PATH, apply_migrations
 from daemon.forgejo_webhook_auth import (
     HEADER_DELIVERY as FORGEJO_HEADER_DELIVERY,
@@ -156,7 +158,9 @@ from daemon.protocol import (
     ScheduledJobFailedEnvelope,
     ScheduledJobPausedEnvelope,
     ScheduledJobResumedEnvelope,
+    ScheduledJobSessionClosedEnvelope,
     ScheduledJobTriggeredEnvelope,
+    SessionIdleTimeoutEnvelope,
     SessionAttachedEnvelope,
     SessionStateSnapshot,
     SignalEnvelope,
@@ -193,6 +197,43 @@ SNAPSHOT_CHAT_HISTORY_MAX_MESSAGES = 200
 SNAPSHOT_CHAT_HISTORY_MAX_CHARS = 180_000
 TOKEN_FLUSH_INTERVAL_SECONDS = 0.04
 TOKEN_FLUSH_CHARS = 48
+SCHEDULED_JOB_SESSION_PREFIX = "agent:kai:cron-wake:"
+SESSION_DISK_GC_INTERVAL_SECONDS = 3600.0
+
+
+@dataclass(frozen=True)
+class SessionLifecycleConfig:
+    """Runtime configuration for daemon-owned session cleanup."""
+
+    idle_ttl_seconds: float = 86400.0
+    sweep_interval_seconds: float = 300.0
+    on_disk_retention_seconds: float = 604800.0
+
+
+def load_session_lifecycle_config(
+    config: dict[str, Any] | None = None,
+) -> SessionLifecycleConfig:
+    """Load session lifecycle cleanup config from agent-config.json."""
+
+    lifecycle = ((config or {}).get("daemon") or {}).get("session_lifecycle") or {}
+
+    def _number(name: str, default: float) -> float:
+        try:
+            return float(lifecycle.get(name, default))
+        except (TypeError, ValueError):
+            return default
+
+    return SessionLifecycleConfig(
+        idle_ttl_seconds=max(0.0, _number("idle_ttl_seconds", 86400.0)),
+        sweep_interval_seconds=max(
+            0.1,
+            _number("sweep_interval_seconds", 300.0),
+        ),
+        on_disk_retention_seconds=max(
+            0.0,
+            _number("on_disk_retention_seconds", 604800.0),
+        ),
+    )
 
 
 def _taskboard_dispatcher_enabled(value: bool | None) -> bool:
@@ -221,6 +262,24 @@ def _env_float(name: str, *, default: float) -> float:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _parse_utc_datetime(value: str) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _is_scheduled_job_session_name(name: str) -> bool:
+    # The cron-wake sessions predate lifecycle metadata in the session index.
+    # The stable production prefix is the backward-compatible origin marker.
+    return str(name or "").startswith(SCHEDULED_JOB_SESSION_PREFIX)
 
 
 def _sanitize_auto_loop_brain_error(exc: Exception) -> str:
@@ -646,6 +705,7 @@ class DaemonServer:
         taskboard_client: Any | None = None,
         taskboard_dispatcher_enabled: bool | None = None,
         heartbeat_config: HeartbeatConfig | None = None,
+        session_lifecycle_config: SessionLifecycleConfig | None = None,
         runtime_config_store: RuntimeConfigStore | None = None,
         runtime_config_resolver: RuntimeConfigResolver | None = None,
     ) -> None:
@@ -670,6 +730,7 @@ class DaemonServer:
         self.taskboard_dispatcher_task: asyncio.Task[None] | None = None
         self.bus: Any | None = None
         self.sessions: dict[str, ManagedSession] = {}
+        self.websocket_clients_by_session: Counter[str] = Counter()
         self.event_bus = DaemonEventBus()
         self.signal_consumer = SignalConsumer()
         self.scheduler: Scheduler | None = None
@@ -714,6 +775,11 @@ class DaemonServer:
         self.signal_router_subscriptions: list[Any] = []
         self.signal_router_sub_agent_manager: Any | None = None
         self.heartbeat_config = heartbeat_config or load_heartbeat_config(agent_config)
+        self.session_lifecycle_config = (
+            session_lifecycle_config or load_session_lifecycle_config(agent_config)
+        )
+        self.session_lifecycle_sweep_task: asyncio.Task[None] | None = None
+        self.session_disk_gc_task: asyncio.Task[None] | None = None
         self.heartbeat_prompt_template = HeartbeatPromptTemplate.load(
             self.heartbeat_config.prompt_template_path
         )
@@ -1032,11 +1098,13 @@ class DaemonServer:
             enabled=self.heartbeat_config.enabled,
         )
         await self.heartbeat_service.start()
+        self._start_session_lifecycle_tasks()
         await self._start_taskboard_dispatcher()
 
     async def shutdown(self) -> None:
         """Stop all managed runtime resources."""
         await self._stop_taskboard_dispatcher()
+        await self._stop_session_lifecycle_tasks()
         if self.heartbeat_service is not None:
             with suppress(Exception):
                 await self.heartbeat_service.shutdown()
@@ -1058,6 +1126,68 @@ class DaemonServer:
             with suppress(Exception):
                 await self.bus.disconnect()
             self.bus = None
+
+    def _start_session_lifecycle_tasks(self) -> None:
+        """Start daemon-owned session cleanup loops."""
+
+        if (
+            self.session_lifecycle_sweep_task is None
+            or self.session_lifecycle_sweep_task.done()
+        ):
+            self.session_lifecycle_sweep_task = asyncio.create_task(
+                self._run_idle_session_sweeper(),
+                name="daemon-session-idle-sweeper",
+            )
+            self.session_lifecycle_sweep_task.add_done_callback(
+                self._consume_background_task_exception
+            )
+        if self.session_disk_gc_task is None or self.session_disk_gc_task.done():
+            self.session_disk_gc_task = asyncio.create_task(
+                self._run_session_disk_gc(),
+                name="daemon-session-disk-gc",
+            )
+            self.session_disk_gc_task.add_done_callback(
+                self._consume_background_task_exception
+            )
+
+    async def _stop_session_lifecycle_tasks(self) -> None:
+        """Cancel daemon-owned session cleanup loops."""
+
+        tasks = [
+            task
+            for task in (
+                self.session_lifecycle_sweep_task,
+                self.session_disk_gc_task,
+            )
+            if task is not None
+        ]
+        self.session_lifecycle_sweep_task = None
+        self.session_disk_gc_task = None
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+
+    async def _run_idle_session_sweeper(self) -> None:
+        while True:
+            await asyncio.sleep(self.session_lifecycle_config.sweep_interval_seconds)
+            try:
+                await self.sweep_idle_sessions()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("session idle sweeper failed: %s", exc)
+
+    async def _run_session_disk_gc(self) -> None:
+        while True:
+            await asyncio.sleep(SESSION_DISK_GC_INTERVAL_SECONDS)
+            try:
+                self.gc_orphan_session_files()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("session disk GC failed: %s", exc)
 
     async def _handle_heartbeat_tick(self, tick: HeartbeatTick) -> None:
         """Fan out one daemon-owned heartbeat tick, then wake eligible sessions."""
@@ -1085,6 +1215,191 @@ class DaemonServer:
             task.exception()
         except asyncio.CancelledError:
             return
+
+    def _register_websocket_client(self, session_name: str) -> None:
+        self.websocket_clients_by_session[session_name] += 1
+
+    def _unregister_websocket_client(self, session_name: str) -> None:
+        remaining = self.websocket_clients_by_session.get(session_name, 0) - 1
+        if remaining <= 0:
+            self.websocket_clients_by_session.pop(session_name, None)
+            return
+        self.websocket_clients_by_session[session_name] = remaining
+
+    def active_websocket_clients(self, session_name: str) -> int:
+        return max(0, int(self.websocket_clients_by_session.get(session_name, 0)))
+
+    async def _delete_session_if_present(self, name: str) -> dict[str, Any]:
+        try:
+            return await self.delete_session(name)
+        except (KeyError, TypeError, ValueError):
+            return {"deleted": False, "name": name}
+
+    async def _close_scheduled_job_session(
+        self,
+        session_name: str,
+        *,
+        job_id: str,
+        reason: str = "completed",
+    ) -> dict[str, Any]:
+        if not _is_scheduled_job_session_name(session_name):
+            return {"closed": False, "name": session_name}
+
+        managed = self.sessions.get(session_name)
+        closed_at = _utc_now().isoformat()
+        if managed is not None:
+            managed.session.publish_event(
+                "scheduled_job.session_closed",
+                {
+                    "job_id": job_id,
+                    "session": session_name,
+                    "closed_at": closed_at,
+                    "reason": reason,
+                },
+            )
+        result = await self._delete_session_if_present(session_name)
+        return {
+            "closed": bool(result.get("deleted")),
+            "name": session_name,
+            "job_id": job_id,
+        }
+
+    @staticmethod
+    def _read_session_state(entry) -> dict[str, Any]:
+        try:
+            raw = Path(entry.state_path).read_text(encoding="utf-8")
+        except OSError:
+            return {}
+        if not raw.strip():
+            return {}
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _indexed_session_runtime_state(self, entry) -> tuple[str, int]:
+        managed = self.sessions.get(entry.name)
+        if managed is not None:
+            return managed.session.activity_status, len(managed.session.input_queue)
+
+        state = self._read_session_state(entry)
+        ui_state = state.get("ui_state")
+        activity_status = (
+            ui_state.get("activity_status")
+            if isinstance(ui_state, dict)
+            else None
+        )
+        queue_items = state.get("input_queue")
+        queued_inputs = len(queue_items) if isinstance(queue_items, list) else 0
+        return str(activity_status or "idle"), queued_inputs
+
+    async def sweep_idle_sessions(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Close indexed interactive sessions that exceeded the configured idle TTL."""
+
+        reference = now or _utc_now()
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=timezone.utc)
+        reference = reference.astimezone(timezone.utc)
+        closed: list[dict[str, Any]] = []
+        ttl_seconds = self.session_lifecycle_config.idle_ttl_seconds
+
+        for entry in list_indexed_sessions():
+            if _is_scheduled_job_session_name(entry.name):
+                continue
+            last_activity = _parse_utc_datetime(entry.last_activity)
+            if last_activity is None:
+                continue
+            idle_seconds = (reference - last_activity).total_seconds()
+            if idle_seconds < ttl_seconds:
+                continue
+
+            activity_status, queued_inputs = self._indexed_session_runtime_state(entry)
+            managed = self.sessions.get(entry.name)
+            if activity_status != "idle" or queued_inputs != 0:
+                continue
+            if self.active_websocket_clients(entry.name) > 0:
+                continue
+            if managed is not None and (
+                managed.input_lock.locked() or managed.current_input_task is not None
+            ):
+                continue
+
+            payload = {
+                "session": entry.name,
+                "last_activity": entry.last_activity,
+                "idle_seconds": max(0, int(idle_seconds)),
+                "idle_ttl_seconds": int(ttl_seconds),
+                "closed_at": reference.isoformat(),
+            }
+            if managed is not None:
+                managed.session.publish_event("session.idle_timeout", payload)
+            result = await self._delete_session_if_present(entry.name)
+            if result.get("deleted"):
+                closed.append(payload)
+                self.log.info(
+                    "session idle timeout closed session=%s idle_seconds=%s ttl=%s",
+                    entry.name,
+                    int(idle_seconds),
+                    int(ttl_seconds),
+                )
+
+        return closed
+
+    def gc_orphan_session_files(
+        self,
+        *,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Delete old orphan session state files not present in the active index."""
+
+        sessions_root = daemon_core.SESSIONS_ROOT_DIR
+        if not sessions_root.exists():
+            return {"deleted_files": [], "deleted_locks": [], "removed_dirs": []}
+
+        active_names = {entry.name for entry in list_indexed_sessions()}
+        reference = time.time() if now is None else float(now)
+        retention = self.session_lifecycle_config.on_disk_retention_seconds
+        deleted_files: list[str] = []
+        deleted_locks: list[str] = []
+        removed_dirs: list[str] = []
+
+        for path in sessions_root.glob("*.json"):
+            if path.name == "index.json" or path.name.startswith("index.json."):
+                continue
+            if path.stem in active_names:
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if reference - mtime < retention:
+                continue
+
+            with suppress(FileNotFoundError):
+                path.unlink()
+                deleted_files.append(str(path))
+
+            lock_path = path.with_suffix(path.suffix + ".lock")
+            with suppress(FileNotFoundError):
+                lock_path.unlink()
+                deleted_locks.append(str(lock_path))
+
+            session_dir = path.with_suffix("")
+            if session_dir.exists() and session_dir.is_dir():
+                with suppress(OSError):
+                    session_dir.rmdir()
+                    removed_dirs.append(str(session_dir))
+
+        return {
+            "deleted_files": deleted_files,
+            "deleted_locks": deleted_locks,
+            "removed_dirs": removed_dirs,
+        }
 
     def heartbeat_subscribers_count(self) -> int:
         return sum(
@@ -1851,9 +2166,11 @@ class DaemonServer:
 
     async def _handle_scheduled_job_trigger(self, job, fired_at) -> None:
         """Dispatch one scheduled job into its owner session."""
-        if self.scheduler is None:
+        scheduler = self.scheduler
+        if scheduler is None:
             return
-        self.scheduler.notify_triggered(job.id, fired_at=fired_at)
+        scheduler.notify_triggered(job.id, fired_at=fired_at)
+        should_close_session = _is_scheduled_job_session_name(job.owner_session)
 
         try:
             managed = await self.get_or_create_session(
@@ -1861,37 +2178,61 @@ class DaemonServer:
                 create_if_missing=False,
             )
         except Exception as exc:  # noqa: BLE001
-            self.scheduler.record_failure(job.id, fired_at=fired_at, error=str(exc))
+            scheduler.record_failure(job.id, fired_at=fired_at, error=str(exc))
             self.log.warning("scheduled job %s failed to attach session: %s", job.id, exc)
+            if should_close_session:
+                await self._close_scheduled_job_session(
+                    job.owner_session,
+                    job_id=job.id,
+                    reason="attach_failed",
+                )
             return
 
-        if job.concurrency == "skip" and managed.input_lock.locked():
-            self.log.info(
-                "scheduled job %s skipped because session %s is busy",
+        close_reason = "completed"
+        try:
+            if job.concurrency == "skip" and managed.input_lock.locked():
+                close_reason = "skipped_busy"
+                self.log.info(
+                    "scheduled job %s skipped because session %s is busy",
+                    job.id,
+                    job.owner_session,
+                )
+                return
+
+            try:
+                outcome = await self.run_input(
+                    managed,
+                    job.prompt,
+                    source="scheduler",
+                    job_id=job.id,
+                    tool_budget=job.tool_budget,
+                    target_agent_role=job.target_agent_role,
+                    reasoning_effort=job.reasoning_effort,
+                    thinking_level=job.thinking_level,
+                    extra_env=job.extra_env,
+                )
+            except Exception as exc:  # noqa: BLE001
+                close_reason = "failed"
+                scheduler.record_failure(job.id, fired_at=fired_at, error=str(exc))
+                self.log.warning("scheduled job %s failed during run: %s", job.id, exc)
+                return
+
+            if outcome.error:
+                close_reason = "failed"
+                scheduler.record_failure(job.id, fired_at=fired_at, error=outcome.error)
+                return
+            scheduler.record_completion(
                 job.id,
-                job.owner_session,
+                fired_at=fired_at,
+                result_preview=outcome.final_text,
             )
-            return
-
-        outcome = await self.run_input(
-            managed,
-            job.prompt,
-            source="scheduler",
-            job_id=job.id,
-            tool_budget=job.tool_budget,
-            target_agent_role=job.target_agent_role,
-            reasoning_effort=job.reasoning_effort,
-            thinking_level=job.thinking_level,
-            extra_env=job.extra_env,
-        )
-        if outcome.error:
-            self.scheduler.record_failure(job.id, fired_at=fired_at, error=outcome.error)
-            return
-        self.scheduler.record_completion(
-            job.id,
-            fired_at=fired_at,
-            result_preview=outcome.final_text,
-        )
+        finally:
+            if should_close_session:
+                await self._close_scheduled_job_session(
+                    job.owner_session,
+                    job_id=job.id,
+                    reason=close_reason,
+                )
 
     def _handle_scheduler_event(self, event_type: str, *, job, **payload: Any) -> None:
         """Publish scheduler lifecycle events onto the owner session bus."""
@@ -2628,6 +2969,16 @@ class DaemonServer:
                 payload=payload.get("payload"),
             )
 
+        if topic == "session.idle_timeout":
+            return SessionIdleTimeoutEnvelope(
+                type="session_idle_timeout",
+                session=str(payload.get("session") or session.name),
+                last_activity=str(payload.get("last_activity") or ""),
+                idle_seconds=int(payload.get("idle_seconds") or 0),
+                idle_ttl_seconds=int(payload.get("idle_ttl_seconds") or 0),
+                closed_at=str(payload.get("closed_at") or ""),
+            )
+
         if topic == "scheduled_job.created":
             return ScheduledJobCreatedEnvelope(
                 type="scheduled_job_created",
@@ -2695,6 +3046,15 @@ class DaemonServer:
                 reasoning_effort=payload.get("reasoning_effort"),
                 thinking_level=payload.get("thinking_level"),
                 extra_env=payload.get("extra_env"),
+            )
+
+        if topic == "scheduled_job.session_closed":
+            return ScheduledJobSessionClosedEnvelope(
+                type="scheduled_job_session_closed",
+                job_id=str(payload.get("job_id") or ""),
+                session=str(payload.get("session") or session.name),
+                closed_at=str(payload.get("closed_at") or ""),
+                reason=str(payload.get("reason") or "completed"),
             )
 
         if topic == "optimizer.completed":
@@ -3663,6 +4023,7 @@ def create_app(
             return
 
         session = managed.session
+        daemon_server._register_websocket_client(session.name)
         subscriptions: dict[str, Any] = {"signals": False, "chart": set(), "nats": False}
         event_queue = session.subscribe_events()
         forward_task = asyncio.create_task(
@@ -3969,6 +4330,7 @@ def create_app(
         finally:
             if session.auto_mode:
                 session.stop_auto_mode("client disconnected")
+            daemon_server._unregister_websocket_client(session.name)
             session.event_bus.unsubscribe(event_queue)
             forward_task.cancel()
             with suppress(asyncio.CancelledError):
