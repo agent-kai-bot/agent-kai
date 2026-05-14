@@ -54,13 +54,13 @@
         "gpt-5.5": {
           "context_window": 200000,
           "max_tokens": 16384,
-          "reasoning_effort": "medium",
+          "reasoning_effort": "xhigh",
           "text_verbosity": "medium"
         },
         "gpt-5.4": {
           "context_window": 200000,
           "max_tokens": 16384,
-          "reasoning_effort": "medium",
+          "reasoning_effort": "xhigh",
           "text_verbosity": "medium"
         },
         "gpt-5.3": {
@@ -72,7 +72,7 @@
         "gpt-5.1-codex-mini": {
           "context_window": 128000,
           "max_tokens": 8192,
-          "reasoning_effort": "medium",
+          "reasoning_effort": "xhigh",
           "text_verbosity": "low"
         }
       }
@@ -371,7 +371,7 @@
       "client": "codex-cli",
       "endpoint": null,
       "model_id": "gpt-5.5",
-      "codex_reasoning_effort": "medium",
+      "codex_reasoning_effort": "xhigh",
       "max_history_tokens": 16000,
       "temperature": 0.0,
       "min_continue_confidence": 0.85,
