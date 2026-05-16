@@ -471,6 +471,7 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 "gate_type": "qa",
                 "verdict": "REQUEST_CHANGES",
                 "review_id": 314,
+                "cycle": 3,
             },
         )
         task = {
@@ -509,7 +510,97 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(session_manager.spawn_calls, [])
         renderer.assert_not_called()
-        self.assertEqual(self._pending_row(row_id)["dispatch_status"], "move_only")
+        row = self._pending_row(row_id)
+        self.assertEqual(row["dispatch_status"], "move_only")
+        self.assertIsNotNone(row["audit_posted_at"])
+        self.assertEqual(
+            task_client.comments,
+            [
+                (
+                    10447,
+                    "[Orchestrator] REQUEST_CHANGES received cycle 3; "
+                    "moved Review -> Fixing; awaiting task.status_changed webhook "
+                    f"for Developer spawn (move_only delivery ID: {row_id})",
+                )
+            ],
+        )
+
+    async def test_request_changes_move_only_audit_is_per_cycle_idempotent(self) -> None:
+        """Each REQUEST_CHANGES cycle gets one move-only audit, without re-post spam."""
+
+        first_row_id = self._insert_pending(
+            10453,
+            1,
+            "Developer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Review",
+            extra_payload={
+                "gate_type": "qa",
+                "verdict": "REQUEST_CHANGES",
+                "review_id": 320,
+                "cycle": 1,
+            },
+        )
+        task = {
+            "id": 10453,
+            "agent": "Developer",
+            "implementation_agent": "Developer",
+            "status": "Review",
+            "fire_generation": 1,
+            "project": {"repoUrl": _DEFAULT_REPO_URL},
+        }
+        task_client = _FakeTaskClient({10453: task})
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        self.assertEqual(await dispatcher.run_once(), {"move_only": 1})
+
+        second_row_id = self._insert_pending(
+            10453,
+            2,
+            "Developer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Fixing",
+            extra_payload={
+                "gate_type": "qa",
+                "verdict": "REQUEST_CHANGES",
+                "review_id": 321,
+                "cycle": 2,
+            },
+        )
+
+        self.assertEqual(await dispatcher.run_once(), {"move_only": 1})
+        self.assertEqual(await dispatcher.run_once(), {})
+        self.assertEqual(session_manager.spawn_calls, [])
+        self.assertEqual(len(task_client.comments), 2)
+        self.assertEqual(
+            task_client.comments[0],
+            (
+                10453,
+                "[Orchestrator] REQUEST_CHANGES received cycle 1; "
+                "moved Review -> Fixing; awaiting task.status_changed webhook "
+                f"for Developer spawn (move_only delivery ID: {first_row_id})",
+            ),
+        )
+        self.assertEqual(
+            task_client.comments[1],
+            (
+                10453,
+                "[Orchestrator] REQUEST_CHANGES received cycle 2; "
+                "moved Review -> Fixing; awaiting task.status_changed webhook "
+                f"for Developer spawn (move_only delivery ID: {second_row_id})",
+            ),
+        )
+        self.assertIsNotNone(self._pending_row(first_row_id)["audit_posted_at"])
+        self.assertIsNotNone(self._pending_row(second_row_id)["audit_posted_at"])
 
     async def test_request_changes_move_failure_marks_move_failed(self) -> None:
         """If taskboard rejects /move, the verdict row fails closed without spawn."""
@@ -526,6 +617,7 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 "gate_type": "code",
                 "verdict": "REQUEST_CHANGES",
                 "review_id": 319,
+                "cycle": 4,
             },
         )
         task = {
@@ -561,11 +653,13 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
             [
                 (
                     10452,
-                    "[System] move to Fixing failed for #10452: taskboard 500; "
-                    "fix taskboard status, then retry with agent-ops fire 10452",
+                    "[Orchestrator] REQUEST_CHANGES received cycle 4; "
+                    "/move to Fixing failed: taskboard 500; "
+                    "manual intervention required",
                 )
             ],
         )
+        self.assertIsNotNone(row["audit_posted_at"])
 
     async def test_h2_restart_between_move_and_webhook_spawns_once_from_status(self) -> None:
         """A new dispatcher process needs no memory of the verdict-side move."""
@@ -781,10 +875,10 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(session_manager.spawn_calls), 1)
         self.assertEqual(self._pending_statuses(), ["move_only", "spawned", "duplicate"])
 
-    async def test_architect_request_changes_moves_then_fixing_webhook_spawns_architect(self) -> None:
-        """Architect fix-loops use the same status-driven handoff as Developer."""
+    async def test_architect_request_changes_skips_auto_move_and_spawn(self) -> None:
+        """Architect REQUEST_CHANGES stays out of the Developer-only stop-gap."""
 
-        self._insert_pending(
+        row_id = self._insert_pending(
             10449,
             6,
             "Code Reviewer",
@@ -796,6 +890,7 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 "gate_type": "code",
                 "verdict": "REQUEST_CHANGES",
                 "review_id": 316,
+                "cycle": 6,
             },
         )
         task = {
@@ -820,30 +915,24 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         ):
             first_counts = await dispatcher.run_once()
 
-        self.assertEqual(first_counts, {"move_only": 1})
+        self.assertEqual(first_counts, {"skipped_non_developer_role": 1})
         self.assertEqual(session_manager.spawn_calls, [])
-        self.assertEqual(task_client.moves[0][2:], (SELF_MOVE_REASON, "User"))
-
-        self._insert_pending(
-            10449,
-            7,
-            "Code Reviewer",
-            event_type="task.status_changed",
-            from_status="Review",
-            to_status="Fixing",
-            task_status="Fixing",
+        self.assertEqual(task_client.moves, [])
+        row = self._pending_row(row_id)
+        self.assertEqual(row["dispatch_status"], "skipped_non_developer_role")
+        self.assertIsNotNone(row["audit_posted_at"])
+        self.assertEqual(
+            task_client.comments,
+            [
+                (
+                    10449,
+                    "[Orchestrator] REQUEST_CHANGES for Architect; auto-move skipped "
+                    "(only Developer auto-moves in current dispatcher; see "
+                    "docs/architecture/10460-dynamic-flow-engine.md Phase 1 "
+                    "for role coverage)",
+                )
+            ],
         )
-        with mock.patch(
-            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
-            return_value="architect prompt",
-        ):
-            second_counts = await dispatcher.run_once()
-
-        self.assertEqual(second_counts, {"spawned": 1})
-        spawn = session_manager.spawn_calls[0]
-        self.assertEqual(spawn["role"], "Architect")
-        self.assertEqual(spawn["agent_id"], "architect")
-        self.assertEqual(spawn["task"]["status"], "Fixing")
 
     async def test_dedup_marks_second_row_duplicate(self) -> None:
         """Two rows with the same task/fire/agent key spawn only once."""

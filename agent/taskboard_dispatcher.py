@@ -36,7 +36,14 @@ BACKPRESSURE_SUBJECT = "ops.alerts.taskboard_dispatcher_backpressure"
 SPAWN_FAILED_SUBJECT = "ops.alerts.taskboard_dispatcher.spawn_failed"
 DISPATCHER_SOURCE = "taskboard_dispatcher"
 ACTIVE_SESSION_STATUSES = ("accepted", "spawning", "starting", "running")
-AUDIT_PENDING_STATUSES = ("spawned", "spawn_failed", "move_failed", "stuck_aborted")
+AUDIT_PENDING_STATUSES = (
+    "spawned",
+    "spawn_failed",
+    "move_only",
+    "move_failed",
+    "skipped_non_developer_role",
+    "stuck_aborted",
+)
 DEFAULT_MAX_CONCURRENT_SPAWNS = 6
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_SWEEP_INTERVAL_SECONDS = 60.0
@@ -1337,9 +1344,31 @@ class TaskboardDispatcher:
     ) -> str:
         """Move REQUEST_CHANGES fix-loop tasks into ``Fixing`` without spawning."""
 
+        implementation_role = _implementation_agent_role(latest_task)
+        if implementation_role != "Developer":
+            self._store.mark_processed(row, "skipped_non_developer_role")
+            await self._post_request_changes_skip_audit(
+                row=row,
+                task_id=task_id,
+                role=implementation_role or "unknown role",
+            )
+            LOGGER.info(
+                "taskboard_fire_request_changes_skip_non_developer task_id=%d "
+                "fire_generation=%d implementation_role=%s",
+                task_id,
+                fire_generation,
+                implementation_role or "unknown",
+            )
+            return "skipped_non_developer_role"
+
         current_status = _normalize_status_token(latest_task.get("status"))
         if current_status == "fixing":
             self._store.mark_processed(row, "move_only")
+            await self._post_move_only_audit(
+                row=row,
+                task_id=task_id,
+                fire_generation=fire_generation,
+            )
             return "move_only"
         if current_status and current_status not in _ACTIVE_REVIEW_STATUSES:
             self._store.mark_processed(row, "no_op_transition")
@@ -1378,6 +1407,11 @@ class TaskboardDispatcher:
             )
             return "move_failed"
         self._store.mark_processed(row, "move_only")
+        await self._post_move_only_audit(
+            row=row,
+            task_id=task_id,
+            fire_generation=fire_generation,
+        )
         LOGGER.info(
             "taskboard_fire_move_only task_id=%d fire_generation=%d status=Fixing reason=%s",
             task_id,
@@ -1439,14 +1473,34 @@ class TaskboardDispatcher:
                     error_message=error_message,
                 ),
             )
+        if status == "move_only":
+            return await self._post_audit_comment(
+                task_id,
+                _move_only_comment(
+                    fire_generation=_request_changes_cycle(
+                        row.payload,
+                        fallback=fire_generation,
+                    ),
+                    delivery_id=row.row_id,
+                ),
+            )
         if status == "move_failed":
             error_message = row.last_error or "unknown error"
             return await self._post_audit_comment(
                 task_id,
                 _move_failure_comment(
-                    task_id=task_id,
+                    fire_generation=_request_changes_cycle(
+                        row.payload,
+                        fallback=fire_generation,
+                    ),
                     error_message=error_message,
                 ),
+            )
+        if status == "skipped_non_developer_role":
+            role = _implementation_agent_role(payload_task) or role_text or "unknown role"
+            return await self._post_audit_comment(
+                task_id,
+                _request_changes_skip_comment(role=role),
             )
         if status == "stuck_aborted":
             session_id = row.session_id or self._store.session_id_for_row(row.row_id)
@@ -1508,7 +1562,13 @@ class TaskboardDispatcher:
         error_message = _redact_known_secrets(str(error))
         posted = await self._post_audit_comment(
             task_id,
-            _move_failure_comment(task_id=task_id, error_message=error_message),
+            _move_failure_comment(
+                fire_generation=_request_changes_cycle(
+                    row.payload,
+                    fallback=fire_generation,
+                ),
+                error_message=error_message,
+            ),
         )
         if posted:
             self._store.mark_audit_posted(row)
@@ -1518,6 +1578,40 @@ class TaskboardDispatcher:
             fire_generation,
             error_message,
         )
+
+    async def _post_move_only_audit(
+        self,
+        *,
+        row: PendingWebhookRow,
+        task_id: int,
+        fire_generation: int,
+    ) -> None:
+        posted = await self._post_audit_comment(
+            task_id,
+            _move_only_comment(
+                fire_generation=_request_changes_cycle(
+                    row.payload,
+                    fallback=fire_generation,
+                ),
+                delivery_id=row.row_id,
+            ),
+        )
+        if posted:
+            self._store.mark_audit_posted(row)
+
+    async def _post_request_changes_skip_audit(
+        self,
+        *,
+        row: PendingWebhookRow,
+        task_id: int,
+        role: str,
+    ) -> None:
+        posted = await self._post_audit_comment(
+            task_id,
+            _request_changes_skip_comment(role=role),
+        )
+        if posted:
+            self._store.mark_audit_posted(row)
 
     def _mint_taskboard_session_token(
         self,
@@ -2548,6 +2642,25 @@ def _is_request_changes_verdict(payload: dict[str, Any]) -> bool:
     return verdict in _REQUEST_CHANGES_VERDICTS
 
 
+def _implementation_agent_role(task: dict[str, Any]) -> str:
+    value = task.get("implementation_agent")
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    try:
+        return resolve_taskboard_role(value).role
+    except ValueError:
+        return value.strip()
+
+
+def _request_changes_cycle(payload: dict[str, Any], *, fallback: int) -> int:
+    body = _event_body(payload)
+    value = body.get("cycle", payload.get("cycle", fallback))
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
 def _audit_actor_for_content(content: str) -> str:
     if content.startswith("[System]"):
         return "System"
@@ -2576,11 +2689,27 @@ def _spawn_failure_comment(*, task_id: int, error_message: str) -> str:
     )
 
 
-def _move_failure_comment(*, task_id: int, error_message: str) -> str:
+def _move_only_comment(*, fire_generation: int, delivery_id: Any) -> str:
+    return (
+        f"[Orchestrator] REQUEST_CHANGES received cycle {fire_generation}; "
+        "moved Review -> Fixing; awaiting task.status_changed webhook for "
+        f"Developer spawn (move_only delivery ID: {delivery_id})"
+    )
+
+
+def _move_failure_comment(*, fire_generation: int, error_message: str) -> str:
     safe_error = _redact_known_secrets(error_message).replace("\n", " ")[:500]
     return (
-        f"[System] move to Fixing failed for #{task_id}: {safe_error}; "
-        f"fix taskboard status, then retry with agent-ops fire {task_id}"
+        f"[Orchestrator] REQUEST_CHANGES received cycle {fire_generation}; "
+        f"/move to Fixing failed: {safe_error}; manual intervention required"
+    )
+
+
+def _request_changes_skip_comment(*, role: str) -> str:
+    return (
+        f"[Orchestrator] REQUEST_CHANGES for {role}; auto-move skipped "
+        "(only Developer auto-moves in current dispatcher; see "
+        "docs/architecture/10460-dynamic-flow-engine.md Phase 1 for role coverage)"
     )
 
 

@@ -81,15 +81,16 @@ def test_request_changes_move_only_spawns_from_real_taskboard_status_webhook(
                 task_id = _seed_review_task(
                     taskboard_app,
                     client,
-                    agent="Architect",
-                    task_type="Design",
-                    implementation_agent="Architect",
+                    agent="Developer",
+                    task_type="Feature",
+                    implementation_agent="Developer",
                 )
                 service = TaskboardServiceClient(
                     "http://taskboard.test",
                     bearer_token=BOOTSTRAP_TOKEN,
                     request_func=_testclient_request(client),
                 )
+                repo_service = _RepoAwareTaskboardServiceClient(service)
                 kai_db = tmp_path / "kai-daemon-state.sqlite3"
                 _create_kai_pending_table(kai_db)
                 _insert_kai_pending(
@@ -104,7 +105,7 @@ def test_request_changes_move_only_spawns_from_real_taskboard_status_webhook(
                         "task": {
                             "id": task_id,
                             "agent": "Code Reviewer",
-                            "implementation_agent": "Architect",
+                            "implementation_agent": "Developer",
                             "status": "Review",
                             "fire_generation": 1,
                         },
@@ -113,7 +114,7 @@ def test_request_changes_move_only_spawns_from_real_taskboard_status_webhook(
                 first_spawner = _FakeSessionManager()
                 first_dispatcher = _dispatcher(
                     kai_db,
-                    service,
+                    repo_service,
                     first_spawner,
                 )
 
@@ -131,7 +132,7 @@ def test_request_changes_move_only_spawns_from_real_taskboard_status_webhook(
                 second_spawner = _FakeSessionManager()
                 second_dispatcher = _dispatcher(
                     kai_db,
-                    service,
+                    repo_service,
                     second_spawner,
                 )
                 with mock.patch(
@@ -142,7 +143,7 @@ def test_request_changes_move_only_spawns_from_real_taskboard_status_webhook(
 
                 assert second_counts == {"spawned": 1}
                 assert len(second_spawner.spawn_calls) == 1
-                assert second_spawner.spawn_calls[0]["role"] == "Architect"
+                assert second_spawner.spawn_calls[0]["role"] == "Developer"
                 assert second_spawner.spawn_calls[0]["task"]["status"] == "Fixing"
                 assert _kai_pending_statuses(kai_db) == ["move_only", "spawned"]
 
@@ -333,6 +334,35 @@ class _FakeSessionManager:
 
     async def abort(self, session_id: str) -> None:
         raise AssertionError(f"unexpected abort: {session_id}")
+
+
+class _RepoAwareTaskboardServiceClient:
+    def __init__(self, inner: TaskboardServiceClient) -> None:
+        self.inner = inner
+
+    def fetch_task(self, task_id: int) -> dict[str, Any]:
+        task = self.inner.fetch_task(task_id)
+        task["repo_url"] = "https://forgejo.example/alpha-tech-org/example.git"
+        task["default_branch"] = "main"
+        return task
+
+    def post_audit_comment(self, task_id: int, content: str) -> dict[str, Any]:
+        return self.inner.post_audit_comment(task_id, content)
+
+    def move_task_status(
+        self,
+        task_id: int,
+        status: str,
+        *,
+        reason: str = "",
+        agent: str = "Orchestrator",
+    ) -> dict[str, Any]:
+        return self.inner.move_task_status(
+            task_id,
+            status,
+            reason=reason,
+            agent=agent,
+        )
 
 
 class _FakeRuntimeConfigResolver:
