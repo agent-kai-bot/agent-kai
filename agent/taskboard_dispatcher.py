@@ -44,6 +44,9 @@ DEFAULT_STUCK_AFTER_SECONDS = 60 * 60
 DEFAULT_MAX_SESSION_SECONDS = 4 * 60 * 60
 WORKTREE_ISOLATION_ENV = "KAI_WORKTREE_ISOLATION_ENABLED"
 MULTI_REPO_ROUTING_ENV = "TASKBOARD_MULTI_REPO_ROUTING"
+SELF_MOVE_ORIGINATOR = "kai-dispatcher-self-move"
+SELF_MOVE_REASON = f"{SELF_MOVE_ORIGINATOR}: REQUEST_CHANGES fix-loop"
+SELF_MOVE_SUPPRESS_TTL_SECONDS = 30
 
 # Phase 0 (#10247) — fleet hardening. Per-role max_iterations cascade:
 #   1. env  KAI_MAX_ITERATIONS_<ROLE_UPPER>   (escape hatch per role)
@@ -513,6 +516,10 @@ class DaemonTaskboardSpawner:
         self.worktree_manager = WorktreeManager(self.repo_root)
         self._session_repo_roots: dict[str, Path] = {}
         self.runtime_config_resolver = runtime_config_resolver
+        try:
+            setattr(daemon_server, "taskboard_spawner", self)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def spawn(self, **kwargs: Any) -> str:
         """Create a live daemon session and submit the rendered prompt.
@@ -836,6 +843,7 @@ class TaskboardDispatcher:
         self._store = _TaskboardQueueStore(self.db_path, clock=self.clock)
         self._stop_event = asyncio.Event()
         self._last_sweep_at = datetime.min.replace(tzinfo=timezone.utc)
+        self._recent_self_moves: dict[tuple[int, str, str, str], datetime] = {}
         # agent_runs ledger client (Phase 1 of epic #10028, taskboard task #10223).
         # When None, the dispatcher initialises one from env at first use.
         # Best-effort: ledger writes never raise into the spawn flow.
@@ -1003,6 +1011,9 @@ class TaskboardDispatcher:
             fire_generation = _extract_fire_generation(row.payload, payload_task)
             if fire_generation is None:
                 raise ValueError("taskboard payload is missing fire_generation")
+            if self._is_recent_self_move_status_webhook(row.payload, task_id):
+                self._store.mark_processed(row, "self_move_suppressed")
+                return "self_move_suppressed"
             latest_task = await self._fetch_latest_task(task_id)
             review_context = self._build_review_context(latest_task)
             route_decisions = route_event(row.payload, latest_task, review_context)
@@ -1053,6 +1064,7 @@ class TaskboardDispatcher:
                     self._validate_spawn_contract(route=route, task=latest_task)
                     latest_task = await self._ensure_fixing_for_request_changes(
                         decision=decision,
+                        route=route,
                         task_id=task_id,
                         latest_task=latest_task,
                     )
@@ -1316,12 +1328,15 @@ class TaskboardDispatcher:
         self,
         *,
         decision: Any,
+        route: TaskboardRoleRoute,
         task_id: int,
         latest_task: dict[str, Any],
     ) -> dict[str, Any]:
-        """Move REQUEST_CHANGES fix-loop tasks into ``Fixing`` before spawn."""
+        """Move Developer REQUEST_CHANGES fix-loop tasks into ``Fixing`` before spawn."""
 
         if getattr(decision, "reason", "") != "review_verdict_request_changes":
+            return latest_task
+        if route.agent_id != "developer":
             return latest_task
         if _normalize_status_token(latest_task.get("status")) == "fixing":
             return latest_task
@@ -1333,14 +1348,65 @@ class TaskboardDispatcher:
         result = mover(
             task_id,
             "Fixing",
-            reason="kai dispatcher REQUEST_CHANGES fix-loop",
-            agent="Orchestrator",
+            reason=SELF_MOVE_REASON,
+            agent="User",
         )
         if inspect.isawaitable(result):
             await result
+        self._remember_self_move(
+            task_id=task_id,
+            from_status=latest_task.get("status"),
+            to_status="Fixing",
+        )
         updated_task = dict(latest_task)
         updated_task["status"] = "Fixing"
         return updated_task
+
+    def _remember_self_move(
+        self,
+        *,
+        task_id: int,
+        from_status: Any,
+        to_status: Any,
+    ) -> None:
+        self._prune_recent_self_moves()
+        key = (
+            int(task_id),
+            _normalize_status_token(from_status),
+            _normalize_status_token(to_status),
+            SELF_MOVE_ORIGINATOR,
+        )
+        self._recent_self_moves[key] = self.clock()
+
+    def _is_recent_self_move_status_webhook(
+        self,
+        payload: dict[str, Any],
+        task_id: int,
+    ) -> bool:
+        if str(payload.get("event_type") or "").strip() != "task.status_changed":
+            return False
+        actor = payload.get("actor")
+        actor_agent = ""
+        if isinstance(actor, dict):
+            actor_agent = _normalize_role(str(actor.get("agent") or ""))
+        if actor_agent and actor_agent != "user":
+            return False
+        key = (
+            int(task_id),
+            _normalize_status_token(payload.get("from_status")),
+            _normalize_status_token(payload.get("to_status")),
+            SELF_MOVE_ORIGINATOR,
+        )
+        self._prune_recent_self_moves()
+        return key in self._recent_self_moves
+
+    def _prune_recent_self_moves(self) -> None:
+        if not self._recent_self_moves:
+            return
+        cutoff = self.clock() - timedelta(seconds=SELF_MOVE_SUPPRESS_TTL_SECONDS)
+        for key, seen_at in list(self._recent_self_moves.items()):
+            if seen_at < cutoff:
+                self._recent_self_moves.pop(key, None)
 
     async def _post_audit_for_row(self, row: PendingWebhookRow) -> bool:
         status = row.dispatch_status or ""
@@ -2720,8 +2786,7 @@ def _cleanup_dispatcher_worktree(daemon_server: Any, session_id: str) -> None:
     """Best-effort session worktree cleanup after terminal ledger updates."""
     try:
         repo_root = Path(__file__).resolve().parents[1]
-        dispatcher = getattr(daemon_server, "taskboard_dispatcher", None)
-        repo_roots = getattr(dispatcher, "_session_repo_roots", None) if dispatcher else None
+        repo_roots = _session_repo_roots_for_cleanup(daemon_server)
         if not _worktree_isolation_enabled() and (
             not isinstance(repo_roots, dict) or session_id not in repo_roots
         ):
@@ -2732,6 +2797,20 @@ def _cleanup_dispatcher_worktree(daemon_server: Any, session_id: str) -> None:
         manager.cleanup(session_id)
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("worktree cleanup failed session_id=%s error=%s", session_id, exc)
+
+
+def _session_repo_roots_for_cleanup(daemon_server: Any) -> dict[str, Path] | None:
+    dispatcher = getattr(daemon_server, "taskboard_dispatcher", None)
+    candidates = [
+        getattr(daemon_server, "taskboard_spawner", None),
+        getattr(dispatcher, "session_manager", None) if dispatcher else None,
+        dispatcher,
+    ]
+    for candidate in candidates:
+        repo_roots = getattr(candidate, "_session_repo_roots", None)
+        if isinstance(repo_roots, dict):
+            return repo_roots
+    return None
 
 
 def _derive_dispatcher_inprocess_outcome(

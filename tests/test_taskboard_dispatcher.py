@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import asyncio
+import os
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -16,7 +20,9 @@ from agent.taskboard_dispatcher import (
     BACKPRESSURE_SUBJECT,
     DISPATCHER_SOURCE,
     DaemonTaskboardSpawner,
+    SELF_MOVE_REASON,
     SPAWN_FAILED_SUBJECT,
+    WORKTREE_ISOLATION_ENV,
     RepoRoutingError,
     TaskboardDispatcher,
     resolve_taskboard_role,
@@ -478,8 +484,8 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 (
                     10447,
                     "Fixing",
-                    "kai dispatcher REQUEST_CHANGES fix-loop",
-                    "Orchestrator",
+                    SELF_MOVE_REASON,
+                    "User",
                 )
             ],
         )
@@ -488,6 +494,121 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         spawn = session_manager.spawn_calls[0]
         self.assertEqual(spawn["role"], "Developer")
         self.assertEqual(spawn["task"]["status"], "Fixing")
+
+    async def test_request_changes_self_move_status_webhook_does_not_spawn_twice(self) -> None:
+        """The dispatcher suppresses the status webhook created by its own move."""
+
+        self._insert_pending(
+            10448,
+            3,
+            "Developer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Review",
+            extra_payload={
+                "gate_type": "qa",
+                "verdict": "REQUEST_CHANGES",
+                "review_id": 315,
+            },
+        )
+        task = {
+            "id": 10448,
+            "agent": "Developer",
+            "implementation_agent": "Developer",
+            "status": "Review",
+            "fire_generation": 3,
+            "project": {"repoUrl": _DEFAULT_REPO_URL},
+        }
+        task_client = _FakeTaskClient({10448: task})
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="rendered prompt",
+        ):
+            first_counts = await dispatcher.run_once()
+
+        self.assertEqual(first_counts, {"spawned": 1})
+        self.assertEqual(len(session_manager.spawn_calls), 1)
+        self.assertEqual(task_client.moves[0][2:], (SELF_MOVE_REASON, "User"))
+
+        status_row = self._insert_pending(
+            10448,
+            4,
+            "Developer",
+            event_type="task.status_changed",
+            from_status="Review",
+            to_status="Fixing",
+            task_status="Fixing",
+            extra_payload={
+                "event_id": "self-move-status-10448",
+                "actor": {
+                    "type": "operator",
+                    "agent": "User",
+                    "principal_id": None,
+                },
+            },
+        )
+        second_counts = await dispatcher.run_once()
+
+        self.assertEqual(second_counts, {"self_move_suppressed": 1})
+        self.assertEqual(len(session_manager.spawn_calls), 1)
+        self.assertEqual(
+            self._pending_row(status_row)["dispatch_status"],
+            "self_move_suppressed",
+        )
+
+    async def test_architect_request_changes_does_not_auto_move_to_fixing(self) -> None:
+        """Architect fix-loops stay in Review until the Architect contract exists."""
+
+        self._insert_pending(
+            10449,
+            6,
+            "Code Reviewer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Review",
+            extra_payload={
+                "gate_type": "code",
+                "verdict": "REQUEST_CHANGES",
+                "review_id": 316,
+            },
+        )
+        task = {
+            "id": 10449,
+            "agent": "Code Reviewer",
+            "implementation_agent": "Architect",
+            "status": "Review",
+            "fire_generation": 6,
+            "task_type": "design",
+        }
+        task_client = _FakeTaskClient({10449: task}, default_repo_metadata=False)
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="architect prompt",
+        ):
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawned": 1})
+        self.assertEqual(task_client.moves, [])
+        spawn = session_manager.spawn_calls[0]
+        self.assertEqual(spawn["role"], "Architect")
+        self.assertEqual(spawn["agent_id"], "architect")
+        self.assertEqual(spawn["task"]["status"], "Review")
 
     async def test_dedup_marks_second_row_duplicate(self) -> None:
         """Two rows with the same task/fire/agent key spawn only once."""
@@ -1116,6 +1237,76 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(taskboard_context.session_generation, 11)
         self.assertEqual(forgejo_context.token, "role-pat")
         self.assertEqual(runtime_env["FORGEJO_TOKEN_DEVELOPER"], "role-pat")
+
+    async def test_developer_forced_isolation_cleans_worktree_when_global_flag_off(self) -> None:
+        """Developer worktrees are cleaned after finalization even when global isolation is off."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir) / "repo"
+            repo_root.mkdir()
+            subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "checkout", "-b", "main"], cwd=repo_root, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "kai-test@example.invalid"], cwd=repo_root, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "KAI Test"], cwd=repo_root, check=True, capture_output=True, text=True)
+            (repo_root / "README.md").write_text("test repo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo_root, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "-c", "commit.gpgsign=false", "commit", "-m", "initial"],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            session_id = f"m2-cleanup-{os.getpid()}-{id(self)}"
+            session_path = Path("/tmp/kai/sessions") / session_id
+            shutil.rmtree(session_path, ignore_errors=True)
+            session = _AttachOrderSession()
+            daemon = _FakeDaemonServer(session)
+            spawner = DaemonTaskboardSpawner(daemon, repo_root=repo_root)
+            daemon.taskboard_dispatcher = SimpleNamespace(session_manager=spawner)
+
+            try:
+                with mock.patch.dict("os.environ", {WORKTREE_ISOLATION_ENV: "0"}, clear=False), \
+                     mock.patch(
+                         "agent.taskboard_dispatcher.WorktreeManager.ensure_repo_clone",
+                         return_value=repo_root,
+                     ), mock.patch(
+                         "agent.taskboard_dispatcher._resolve_max_iterations_for_role",
+                         return_value=1,
+                     ), mock.patch(
+                         "agent.agent_runs_client.AgentRunsClient.from_env",
+                         return_value=mock.Mock(enabled=False),
+                     ):
+                    created_session = await spawner.spawn(
+                        session_id=session_id,
+                        task_id=10450,
+                        fire_generation=17,
+                        role="Developer",
+                        agent_id="developer",
+                        model="codex",
+                        profile="xhigh",
+                        prompt="prompt",
+                        task={
+                            "id": 10450,
+                            "agent": "Developer",
+                            "fire_generation": 17,
+                            "project": {
+                                "repoUrl": str(repo_root),
+                                "defaultBranch": "main",
+                            },
+                        },
+                        session_token="session-token",
+                        session_generation=17,
+                    )
+                    self.assertEqual(created_session, session_id)
+                    self.assertTrue(session_path.exists())
+                    await daemon.managed.current_input_task
+                    await asyncio.sleep(0)
+
+                self.assertFalse(session_path.exists())
+            finally:
+                shutil.rmtree(session_path, ignore_errors=True)
 
     async def test_daemon_spawner_resolves_role_config_before_clone_with_auth_env(self) -> None:
         """Worktree clone receives the resolver auth env after role resolution."""
