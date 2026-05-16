@@ -413,6 +413,65 @@ class WebhookMigrationTests(unittest.TestCase):
             applied_again = apply_migrations(db_path)
             self.assertEqual(applied_again, [])
 
+    def test_taskboard_session_progress_migration_resumes_after_column_added(
+        self,
+    ) -> None:
+        """Migration 006 tolerates a pre-existing progress column."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "daemon-state.sqlite3"
+            apply_migrations(db_path)
+            conn = connect(db_path)
+            try:
+                conn.execute("DELETE FROM schema_migrations WHERE version = 6")
+                conn.execute("DROP INDEX IF EXISTS idx_sessions_dispatcher_progress")
+                conn.execute(
+                    """
+                    INSERT INTO sessions (
+                        session_id, taskboard_task_id, fire_generation, agent_id,
+                        source, status, created_at, updated_at, last_progress_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        "partial-006-session",
+                        10446,
+                        2,
+                        "developer",
+                        "taskboard_dispatcher",
+                        "running",
+                        "2026-05-16T10:00:00Z",
+                        "2026-05-16T10:05:00Z",
+                    ),
+                )
+            finally:
+                conn.close()
+
+            applied = apply_migrations(db_path)
+
+            self.assertEqual(applied, [6])
+            conn = connect(db_path)
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 6"
+                ).fetchone()
+                self.assertEqual(row["count"], 1)
+                progress = conn.execute(
+                    "SELECT last_progress_at FROM sessions WHERE session_id = ?",
+                    ("partial-006-session",),
+                ).fetchone()
+                self.assertEqual(progress["last_progress_at"], "2026-05-16T10:05:00Z")
+                index_row = conn.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'index'
+                      AND name = 'idx_sessions_dispatcher_progress'
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertIsNotNone(index_row)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

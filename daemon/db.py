@@ -84,6 +84,50 @@ def _applied_versions(conn: sqlite3.Connection) -> set[int]:
     return {int(row["version"]) for row in cur.fetchall()}
 
 
+def _quote_identifier(identifier: str) -> str:
+    """Return a double-quoted SQLite identifier."""
+
+    if not identifier or "\x00" in identifier:
+        raise ValueError(f"invalid SQLite identifier: {identifier!r}")
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Return column names for ``table``."""
+
+    quoted_table = _quote_identifier(table)
+    cur = conn.execute(f"PRAGMA table_info({quoted_table})")
+    return {str(row["name"]) for row in cur.fetchall()}
+
+
+def _add_column_if_missing(
+    conn: sqlite3.Connection,
+    *,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    """Add a SQLite column only when the target table lacks it."""
+
+    if column in _table_columns(conn, table):
+        return
+    quoted_table = _quote_identifier(table)
+    quoted_column = _quote_identifier(column)
+    conn.execute(f"ALTER TABLE {quoted_table} ADD COLUMN {quoted_column} {definition}")
+
+
+def _prepare_migration(conn: sqlite3.Connection, version: int) -> None:
+    """Run guarded Python-side preparation required by a migration."""
+
+    if version == 6:
+        _add_column_if_missing(
+            conn,
+            table="sessions",
+            column="last_progress_at",
+            definition="TEXT",
+        )
+
+
 def _discover_migrations(migrations_dir: Path) -> list[tuple[int, str, Path]]:
     """Return ``(version, name, path)`` triples for every migration file.
 
@@ -139,9 +183,10 @@ def apply_migrations(
             timestamp = datetime.now(timezone.utc).isoformat()
             # ``executescript`` issues its own ``COMMIT`` before running the
             # migration body, so a Python-level ``BEGIN`` cannot wrap it.
-            # The migration files use ``CREATE ... IF NOT EXISTS`` for
-            # idempotency, and ``schema_migrations`` is updated only after
-            # the script completes successfully so a re-run will resume.
+            # Migration SQL and guarded Python pre-steps must be idempotent
+            # because ``schema_migrations`` is updated only after the script
+            # completes successfully, so a re-run must resume safely.
+            _prepare_migration(conn, version)
             conn.executescript(sql)
             conn.execute(
                 "INSERT INTO schema_migrations(version, name, applied_at)"

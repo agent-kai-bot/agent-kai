@@ -3,8 +3,8 @@
 -- Track dispatcher-session progress separately from creation time so the
 -- stuck-session sweeper can distinguish "no progress" from long active runs.
 
-ALTER TABLE sessions
-    ADD COLUMN last_progress_at TEXT;
+-- daemon.db adds last_progress_at with a PRAGMA guard before executing this
+-- migration body. Keep the SQL below safe to re-run after a partial apply.
 
 UPDATE sessions
 SET last_progress_at = COALESCE(updated_at, created_at)

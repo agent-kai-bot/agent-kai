@@ -897,6 +897,64 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNotNone(self._pending_row(row_id)["audit_posted_at"])
 
+    async def test_stuck_session_sweep_posts_max_runtime_audit_comment(self) -> None:
+        """The absolute runtime ceiling has distinct audit wording."""
+
+        row_id = self._insert_pending(10159, 9, "Developer")
+        self._create_full_sessions_table()
+        old_created_at = self._iso(NOW - timedelta(hours=4, minutes=1))
+        recent_progress_at = self._iso(NOW - timedelta(minutes=5))
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE webhook_pending
+                SET processed_at = ?, dispatch_status = ?, session_id = ?
+                WHERE id = ?
+                """,
+                (self._iso(NOW), "spawned", "session-max-runtime", row_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO sessions (
+                    session_id, taskboard_task_id, fire_generation, agent_id,
+                    source, status, webhook_pending_id, created_at, updated_at,
+                    last_progress_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "session-max-runtime",
+                    10159,
+                    9,
+                    "developer",
+                    DISPATCHER_SOURCE,
+                    "running",
+                    str(row_id),
+                    old_created_at,
+                    recent_progress_at,
+                    recent_progress_at,
+                ),
+            )
+        task_client = _FakeTaskClient({})
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        count = await dispatcher.sweep_stuck_sessions()
+
+        self.assertEqual(count, 1)
+        self.assertEqual(session_manager.abort_calls, ["session-max-runtime"])
+        comment = task_client.comments[0][1]
+        self.assertEqual(
+            comment,
+            "[System] sweeper aborted stuck session for #10159 "
+            "after exceeding 240min max runtime (session_id=session-max-runtime)",
+        )
+        self.assertNotIn("without progress", comment)
+
     async def test_comment_post_failure_is_non_fatal_and_retryable(self) -> None:
         """Comment failures leave the spawned session intact for retry."""
 
