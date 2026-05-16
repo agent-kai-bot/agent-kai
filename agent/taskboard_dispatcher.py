@@ -36,7 +36,7 @@ BACKPRESSURE_SUBJECT = "ops.alerts.taskboard_dispatcher_backpressure"
 SPAWN_FAILED_SUBJECT = "ops.alerts.taskboard_dispatcher.spawn_failed"
 DISPATCHER_SOURCE = "taskboard_dispatcher"
 ACTIVE_SESSION_STATUSES = ("accepted", "spawning", "starting", "running")
-AUDIT_PENDING_STATUSES = ("spawned", "spawn_failed", "stuck_aborted")
+AUDIT_PENDING_STATUSES = ("spawned", "spawn_failed", "move_failed", "stuck_aborted")
 DEFAULT_MAX_CONCURRENT_SPAWNS = 6
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_SWEEP_INTERVAL_SECONDS = 60.0
@@ -46,7 +46,13 @@ WORKTREE_ISOLATION_ENV = "KAI_WORKTREE_ISOLATION_ENABLED"
 MULTI_REPO_ROUTING_ENV = "TASKBOARD_MULTI_REPO_ROUTING"
 SELF_MOVE_ORIGINATOR = "kai-dispatcher-self-move"
 SELF_MOVE_REASON = f"{SELF_MOVE_ORIGINATOR}: REQUEST_CHANGES fix-loop"
-SELF_MOVE_SUPPRESS_TTL_SECONDS = 30
+_VERDICT_EVENT_TYPES = {"review.verdict_submitted", "task.review_verdict_submitted"}
+_REQUEST_CHANGES_VERDICTS = {
+    "request_changes",
+    "changes_requested",
+    "requested_changes",
+}
+_ACTIVE_REVIEW_STATUSES = {"review", "code_review", "security_audit", "qa"}
 
 # Phase 0 (#10247) — fleet hardening. Per-role max_iterations cascade:
 #   1. env  KAI_MAX_ITERATIONS_<ROLE_UPPER>   (escape hatch per role)
@@ -843,7 +849,6 @@ class TaskboardDispatcher:
         self._store = _TaskboardQueueStore(self.db_path, clock=self.clock)
         self._stop_event = asyncio.Event()
         self._last_sweep_at = datetime.min.replace(tzinfo=timezone.utc)
-        self._recent_self_moves: dict[tuple[int, str, str, str], datetime] = {}
         # agent_runs ledger client (Phase 1 of epic #10028, taskboard task #10223).
         # When None, the dispatcher initialises one from env at first use.
         # Best-effort: ledger writes never raise into the spawn flow.
@@ -1011,10 +1016,14 @@ class TaskboardDispatcher:
             fire_generation = _extract_fire_generation(row.payload, payload_task)
             if fire_generation is None:
                 raise ValueError("taskboard payload is missing fire_generation")
-            if self._is_recent_self_move_status_webhook(row.payload, task_id):
-                self._store.mark_processed(row, "self_move_suppressed")
-                return "self_move_suppressed"
             latest_task = await self._fetch_latest_task(task_id)
+            if _is_request_changes_verdict(row.payload):
+                return await self._move_request_changes_to_fixing(
+                    row=row,
+                    task_id=task_id,
+                    fire_generation=fire_generation,
+                    latest_task=latest_task,
+                )
             review_context = self._build_review_context(latest_task)
             route_decisions = route_event(row.payload, latest_task, review_context)
             if not route_decisions:
@@ -1062,12 +1071,6 @@ class TaskboardDispatcher:
 
                 try:
                     self._validate_spawn_contract(route=route, task=latest_task)
-                    latest_task = await self._ensure_fixing_for_request_changes(
-                        decision=decision,
-                        route=route,
-                        task_id=task_id,
-                        latest_task=latest_task,
-                    )
                 except Exception as exc:  # noqa: BLE001
                     self._store.mark_session_failed(*reserved_key)
                     error_message = _redact_known_secrets(str(exc))
@@ -1324,89 +1327,64 @@ class TaskboardDispatcher:
             role=route.role,
         )
 
-    async def _ensure_fixing_for_request_changes(
+    async def _move_request_changes_to_fixing(
         self,
         *,
-        decision: Any,
-        route: TaskboardRoleRoute,
+        row: PendingWebhookRow,
         task_id: int,
+        fire_generation: int,
         latest_task: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Move Developer REQUEST_CHANGES fix-loop tasks into ``Fixing`` before spawn."""
+    ) -> str:
+        """Move REQUEST_CHANGES fix-loop tasks into ``Fixing`` without spawning."""
 
-        if getattr(decision, "reason", "") != "review_verdict_request_changes":
-            return latest_task
-        if route.agent_id != "developer":
-            return latest_task
-        if _normalize_status_token(latest_task.get("status")) == "fixing":
-            return latest_task
+        current_status = _normalize_status_token(latest_task.get("status"))
+        if current_status == "fixing":
+            self._store.mark_processed(row, "move_only")
+            return "move_only"
+        if current_status and current_status not in _ACTIVE_REVIEW_STATUSES:
+            self._store.mark_processed(row, "no_op_transition")
+            return "no_op_transition"
         mover = getattr(self.task_client, "move_task_status", None)
         if not callable(mover):
-            raise RuntimeError(
+            error = RuntimeError(
                 "taskboard client cannot move REQUEST_CHANGES task to Fixing"
             )
-        result = mover(
+            error_message = _redact_known_secrets(str(error))
+            self._store.mark_processed(row, "move_failed", error=error_message)
+            await self._post_move_failure_audit(
+                row=row,
+                task_id=task_id,
+                fire_generation=fire_generation,
+                error=error,
+            )
+            return "move_failed"
+        try:
+            result = mover(
+                task_id,
+                "Fixing",
+                reason=SELF_MOVE_REASON,
+                agent="User",
+            )
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:  # noqa: BLE001
+            error_message = _redact_known_secrets(str(exc))
+            self._store.mark_processed(row, "move_failed", error=error_message)
+            await self._post_move_failure_audit(
+                row=row,
+                task_id=task_id,
+                fire_generation=fire_generation,
+                error=exc,
+            )
+            return "move_failed"
+        self._store.mark_processed(row, "move_only")
+        LOGGER.info(
+            "taskboard_fire_move_only task_id=%d fire_generation=%d status=Fixing reason=%s",
             task_id,
-            "Fixing",
-            reason=SELF_MOVE_REASON,
-            agent="User",
+            fire_generation,
+            SELF_MOVE_REASON,
         )
-        if inspect.isawaitable(result):
-            await result
-        self._remember_self_move(
-            task_id=task_id,
-            from_status=latest_task.get("status"),
-            to_status="Fixing",
-        )
-        updated_task = dict(latest_task)
-        updated_task["status"] = "Fixing"
-        return updated_task
-
-    def _remember_self_move(
-        self,
-        *,
-        task_id: int,
-        from_status: Any,
-        to_status: Any,
-    ) -> None:
-        self._prune_recent_self_moves()
-        key = (
-            int(task_id),
-            _normalize_status_token(from_status),
-            _normalize_status_token(to_status),
-            SELF_MOVE_ORIGINATOR,
-        )
-        self._recent_self_moves[key] = self.clock()
-
-    def _is_recent_self_move_status_webhook(
-        self,
-        payload: dict[str, Any],
-        task_id: int,
-    ) -> bool:
-        if str(payload.get("event_type") or "").strip() != "task.status_changed":
-            return False
-        actor = payload.get("actor")
-        actor_agent = ""
-        if isinstance(actor, dict):
-            actor_agent = _normalize_role(str(actor.get("agent") or ""))
-        if actor_agent and actor_agent != "user":
-            return False
-        key = (
-            int(task_id),
-            _normalize_status_token(payload.get("from_status")),
-            _normalize_status_token(payload.get("to_status")),
-            SELF_MOVE_ORIGINATOR,
-        )
-        self._prune_recent_self_moves()
-        return key in self._recent_self_moves
-
-    def _prune_recent_self_moves(self) -> None:
-        if not self._recent_self_moves:
-            return
-        cutoff = self.clock() - timedelta(seconds=SELF_MOVE_SUPPRESS_TTL_SECONDS)
-        for key, seen_at in list(self._recent_self_moves.items()):
-            if seen_at < cutoff:
-                self._recent_self_moves.pop(key, None)
+        return "move_only"
 
     async def _post_audit_for_row(self, row: PendingWebhookRow) -> bool:
         status = row.dispatch_status or ""
@@ -1461,6 +1439,15 @@ class TaskboardDispatcher:
                     error_message=error_message,
                 ),
             )
+        if status == "move_failed":
+            error_message = row.last_error or "unknown error"
+            return await self._post_audit_comment(
+                task_id,
+                _move_failure_comment(
+                    task_id=task_id,
+                    error_message=error_message,
+                ),
+            )
         if status == "stuck_aborted":
             session_id = row.session_id or self._store.session_id_for_row(row.row_id)
             if not session_id:
@@ -1508,6 +1495,28 @@ class TaskboardDispatcher:
             fire_generation=fire_generation,
             role=role,
             error=error,
+        )
+
+    async def _post_move_failure_audit(
+        self,
+        *,
+        row: PendingWebhookRow,
+        task_id: int,
+        fire_generation: int,
+        error: Exception,
+    ) -> None:
+        error_message = _redact_known_secrets(str(error))
+        posted = await self._post_audit_comment(
+            task_id,
+            _move_failure_comment(task_id=task_id, error_message=error_message),
+        )
+        if posted:
+            self._store.mark_audit_posted(row)
+        LOGGER.warning(
+            "taskboard_fire_move_failed task_id=%d fire_generation=%d error=%s",
+            task_id,
+            fire_generation,
+            error_message,
         )
 
     def _mint_taskboard_session_token(
@@ -2525,6 +2534,20 @@ def _normalize_status_token(status: Any) -> str:
     return str(status or "").strip().lower().replace("-", "_").replace(" ", "_")
 
 
+def _event_body(payload: dict[str, Any]) -> dict[str, Any]:
+    body = payload.get("payload")
+    return body if isinstance(body, dict) else payload
+
+
+def _is_request_changes_verdict(payload: dict[str, Any]) -> bool:
+    event_type = str(payload.get("event_type") or "").strip()
+    if event_type not in _VERDICT_EVENT_TYPES:
+        return False
+    body = _event_body(payload)
+    verdict = _normalize_status_token(body.get("verdict"))
+    return verdict in _REQUEST_CHANGES_VERDICTS
+
+
 def _audit_actor_for_content(content: str) -> str:
     if content.startswith("[System]"):
         return "System"
@@ -2550,6 +2573,14 @@ def _spawn_failure_comment(*, task_id: int, error_message: str) -> str:
     return (
         f"[System] spawn failed for #{task_id}: {safe_error}; "
         f"retry with agent-ops fire {task_id}"
+    )
+
+
+def _move_failure_comment(*, task_id: int, error_message: str) -> str:
+    safe_error = _redact_known_secrets(error_message).replace("\n", " ")[:500]
+    return (
+        f"[System] move to Fixing failed for #{task_id}: {safe_error}; "
+        f"fix taskboard status, then retry with agent-ops fire {task_id}"
     )
 
 

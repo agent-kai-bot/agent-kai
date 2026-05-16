@@ -395,10 +395,10 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_request_changes_missing_repo_fails_closed_before_spawn(self) -> None:
-        """REQUEST_CHANGES Developer fix-loop cannot spawn without repo metadata."""
+    async def test_request_changes_missing_repo_fails_closed_on_status_webhook(self) -> None:
+        """Developer repo validation still fails closed before the status-webhook spawn."""
 
-        row_id = self._insert_pending(
+        verdict_row = self._insert_pending(
             10446,
             2,
             "Developer",
@@ -428,20 +428,38 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with mock.patch("agent.taskboard_dispatcher.render_taskboard_fire_prompt") as renderer:
-            counts = await dispatcher.run_once()
+            first_counts = await dispatcher.run_once()
 
-        self.assertEqual(counts, {"spawn_failed": 1})
+        self.assertEqual(first_counts, {"move_only": 1})
         self.assertEqual(session_manager.spawn_calls, [])
         renderer.assert_not_called()
-        self.assertEqual(task_client.moves, [])
-        row = self._pending_row(row_id)
+        self.assertEqual(task_client.moves[0][2:], (SELF_MOVE_REASON, "User"))
+        row = self._pending_row(verdict_row)
+        self.assertEqual(row["dispatch_status"], "move_only")
+
+        status_row = self._insert_pending(
+            10446,
+            3,
+            "Developer",
+            event_type="task.status_changed",
+            from_status="Review",
+            to_status="Fixing",
+            task_status="Fixing",
+        )
+        with mock.patch("agent.taskboard_dispatcher.render_taskboard_fire_prompt") as renderer:
+            second_counts = await dispatcher.run_once()
+
+        self.assertEqual(second_counts, {"spawn_failed": 1})
+        self.assertEqual(session_manager.spawn_calls, [])
+        renderer.assert_not_called()
+        row = self._pending_row(status_row)
         self.assertEqual(row["dispatch_status"], "spawn_failed")
         self.assertIn("missing repo routing metadata", row["last_error"])
 
-    async def test_request_changes_moves_review_task_to_fixing_before_developer_spawn(self) -> None:
-        """Fix-loop verdicts put the task in Fixing before Developer starts."""
+    async def test_request_changes_verdict_moves_only_without_developer_spawn(self) -> None:
+        """Fix-loop verdict rows move the task; the status webhook owns spawning."""
 
-        self._insert_pending(
+        row_id = self._insert_pending(
             10447,
             3,
             "Developer",
@@ -477,7 +495,7 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         ) as renderer:
             counts = await dispatcher.run_once()
 
-        self.assertEqual(counts, {"spawned": 1})
+        self.assertEqual(counts, {"move_only": 1})
         self.assertEqual(
             task_client.moves,
             [
@@ -489,14 +507,68 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 )
             ],
         )
-        rendered_task = renderer.call_args.args[1]
-        self.assertEqual(rendered_task["status"], "Fixing")
-        spawn = session_manager.spawn_calls[0]
-        self.assertEqual(spawn["role"], "Developer")
-        self.assertEqual(spawn["task"]["status"], "Fixing")
+        self.assertEqual(session_manager.spawn_calls, [])
+        renderer.assert_not_called()
+        self.assertEqual(self._pending_row(row_id)["dispatch_status"], "move_only")
 
-    async def test_request_changes_self_move_status_webhook_does_not_spawn_twice(self) -> None:
-        """The dispatcher suppresses the status webhook created by its own move."""
+    async def test_request_changes_move_failure_marks_move_failed(self) -> None:
+        """If taskboard rejects /move, the verdict row fails closed without spawn."""
+
+        row_id = self._insert_pending(
+            10452,
+            4,
+            "Developer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Review",
+            extra_payload={
+                "gate_type": "code",
+                "verdict": "REQUEST_CHANGES",
+                "review_id": 319,
+            },
+        )
+        task = {
+            "id": 10452,
+            "agent": "Developer",
+            "implementation_agent": "Developer",
+            "status": "Review",
+            "fire_generation": 4,
+            "project": {"repoUrl": _DEFAULT_REPO_URL},
+        }
+        task_client = _FakeTaskClient({10452: task})
+
+        async def _fail_move(*_args, **_kwargs) -> None:
+            raise RuntimeError("taskboard 500")
+
+        task_client.move_task_status = _fail_move
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"move_failed": 1})
+        self.assertEqual(session_manager.spawn_calls, [])
+        row = self._pending_row(row_id)
+        self.assertEqual(row["dispatch_status"], "move_failed")
+        self.assertIn("taskboard 500", row["last_error"])
+        self.assertEqual(
+            task_client.comments,
+            [
+                (
+                    10452,
+                    "[System] move to Fixing failed for #10452: taskboard 500; "
+                    "fix taskboard status, then retry with agent-ops fire 10452",
+                )
+            ],
+        )
+
+    async def test_h2_restart_between_move_and_webhook_spawns_once_from_status(self) -> None:
+        """A new dispatcher process needs no memory of the verdict-side move."""
 
         self._insert_pending(
             10448,
@@ -534,8 +606,8 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         ):
             first_counts = await dispatcher.run_once()
 
-        self.assertEqual(first_counts, {"spawned": 1})
-        self.assertEqual(len(session_manager.spawn_calls), 1)
+        self.assertEqual(first_counts, {"move_only": 1})
+        self.assertEqual(session_manager.spawn_calls, [])
         self.assertEqual(task_client.moves[0][2:], (SELF_MOVE_REASON, "User"))
 
         status_row = self._insert_pending(
@@ -555,17 +627,162 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 },
             },
         )
-        second_counts = await dispatcher.run_once()
-
-        self.assertEqual(second_counts, {"self_move_suppressed": 1})
-        self.assertEqual(len(session_manager.spawn_calls), 1)
-        self.assertEqual(
-            self._pending_row(status_row)["dispatch_status"],
-            "self_move_suppressed",
+        restarted_session_manager = _FakeSessionManager()
+        restarted_dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=restarted_session_manager,
         )
 
-    async def test_architect_request_changes_does_not_auto_move_to_fixing(self) -> None:
-        """Architect fix-loops stay in Review until the Architect contract exists."""
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="rendered prompt",
+        ):
+            second_counts = await restarted_dispatcher.run_once()
+
+        self.assertEqual(second_counts, {"spawned": 1})
+        self.assertEqual(len(restarted_session_manager.spawn_calls), 1)
+        self.assertEqual(restarted_session_manager.spawn_calls[0]["role"], "Developer")
+        self.assertEqual(self._pending_row(status_row)["dispatch_status"], "spawned")
+
+    async def test_h2_slow_outbox_after_sixty_seconds_spawns_once_from_status(self) -> None:
+        """Late status webhooks still spawn because there is no TTL-based suppressor."""
+
+        self._insert_pending(
+            10450,
+            8,
+            "Developer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Review",
+            extra_payload={
+                "gate_type": "qa",
+                "verdict": "REQUEST_CHANGES",
+                "review_id": 317,
+            },
+        )
+        task = {
+            "id": 10450,
+            "agent": "Developer",
+            "implementation_agent": "Developer",
+            "status": "Review",
+            "fire_generation": 8,
+            "project": {"repoUrl": _DEFAULT_REPO_URL},
+        }
+        task_client = _FakeTaskClient({10450: task})
+        session_manager = _FakeSessionManager()
+        current_time = NOW
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+            clock=lambda: current_time,
+        )
+
+        first_counts = await dispatcher.run_once()
+
+        self.assertEqual(first_counts, {"move_only": 1})
+        self.assertEqual(session_manager.spawn_calls, [])
+
+        current_time = NOW + timedelta(seconds=61)
+        status_row = self._insert_pending(
+            10450,
+            9,
+            "Developer",
+            received_at=self._iso(current_time),
+            event_type="task.status_changed",
+            from_status="Review",
+            to_status="Fixing",
+            task_status="Fixing",
+        )
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="rendered prompt",
+        ):
+            second_counts = await dispatcher.run_once()
+
+        self.assertEqual(second_counts, {"spawned": 1})
+        self.assertEqual(len(session_manager.spawn_calls), 1)
+        self.assertEqual(self._pending_row(status_row)["dispatch_status"], "spawned")
+
+    async def test_h2_operator_race_is_not_suppressed(self) -> None:
+        """A human Review -> Fixing event is processed, not hidden by self-move state."""
+
+        self._insert_pending(
+            10451,
+            10,
+            "Developer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Review",
+            extra_payload={
+                "gate_type": "code",
+                "verdict": "REQUEST_CHANGES",
+                "review_id": 318,
+            },
+        )
+        task = {
+            "id": 10451,
+            "agent": "Developer",
+            "implementation_agent": "Developer",
+            "status": "Review",
+            "fire_generation": 10,
+            "project": {"repoUrl": _DEFAULT_REPO_URL},
+        }
+        task_client = _FakeTaskClient({10451: task})
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        self.assertEqual(await dispatcher.run_once(), {"move_only": 1})
+
+        self._insert_pending(
+            10451,
+            11,
+            "Developer",
+            event_type="task.status_changed",
+            from_status="Review",
+            to_status="Fixing",
+            task_status="Fixing",
+            extra_payload={
+                "event_id": "kai-move-status-10451",
+                "actor": {"type": "operator", "agent": "User", "principal_id": None},
+            },
+        )
+        self._insert_pending(
+            10451,
+            11,
+            "Developer",
+            event_type="task.status_changed",
+            from_status="Review",
+            to_status="Fixing",
+            task_status="Fixing",
+            extra_payload={
+                "event_id": "operator-move-status-10451",
+                "actor": {
+                    "type": "operator",
+                    "agent": "User",
+                    "principal_id": "human-operator",
+                },
+            },
+        )
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="rendered prompt",
+        ):
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawned": 1, "duplicate": 1})
+        self.assertEqual(len(session_manager.spawn_calls), 1)
+        self.assertEqual(self._pending_statuses(), ["move_only", "spawned", "duplicate"])
+
+    async def test_architect_request_changes_moves_then_fixing_webhook_spawns_architect(self) -> None:
+        """Architect fix-loops use the same status-driven handoff as Developer."""
 
         self._insert_pending(
             10449,
@@ -601,14 +818,32 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
             "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
             return_value="architect prompt",
         ):
-            counts = await dispatcher.run_once()
+            first_counts = await dispatcher.run_once()
 
-        self.assertEqual(counts, {"spawned": 1})
-        self.assertEqual(task_client.moves, [])
+        self.assertEqual(first_counts, {"move_only": 1})
+        self.assertEqual(session_manager.spawn_calls, [])
+        self.assertEqual(task_client.moves[0][2:], (SELF_MOVE_REASON, "User"))
+
+        self._insert_pending(
+            10449,
+            7,
+            "Code Reviewer",
+            event_type="task.status_changed",
+            from_status="Review",
+            to_status="Fixing",
+            task_status="Fixing",
+        )
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="architect prompt",
+        ):
+            second_counts = await dispatcher.run_once()
+
+        self.assertEqual(second_counts, {"spawned": 1})
         spawn = session_manager.spawn_calls[0]
         self.assertEqual(spawn["role"], "Architect")
         self.assertEqual(spawn["agent_id"], "architect")
-        self.assertEqual(spawn["task"]["status"], "Review")
+        self.assertEqual(spawn["task"]["status"], "Fixing")
 
     async def test_dedup_marks_second_row_duplicate(self) -> None:
         """Two rows with the same task/fire/agent key spawn only once."""
@@ -1421,6 +1656,7 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         session_manager: _FakeSessionManager,
         nats_bus=None,
         max_concurrent_spawns: int = 6,
+        clock=None,
     ) -> TaskboardDispatcher:
         return TaskboardDispatcher(
             db_path=self.db_path,
@@ -1428,7 +1664,7 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
             session_manager=session_manager,
             nats_bus=nats_bus,
             max_concurrent_spawns=max_concurrent_spawns,
-            clock=lambda: NOW,
+            clock=clock or (lambda: NOW),
             agent_runs_client=mock.Mock(enabled=False),
             runtime_config_resolver=_FakeRuntimeConfigResolver(),
         )

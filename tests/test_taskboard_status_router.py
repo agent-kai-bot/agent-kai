@@ -199,7 +199,7 @@ def test_late_approve_verdict_after_done_is_noop() -> None:
     ) == ()
 
 
-def test_request_changes_verdict_routes_to_implementation_agent() -> None:
+def test_request_changes_verdict_is_move_only_for_dispatcher() -> None:
     assert _route(
         {
             "event_type": "review.verdict_submitted",
@@ -207,10 +207,21 @@ def test_request_changes_verdict_routes_to_implementation_agent() -> None:
             "verdict": "REQUEST_CHANGES",
         },
         task={"id": 15, "agent": "Code Reviewer", "implementation_agent": "Architect"},
+    ) == ()
+
+
+def test_fixing_status_prefers_implementation_agent() -> None:
+    assert _route(
+        {
+            "event_type": "task.status_changed",
+            "from_status": "Code Review",
+            "to_status": "Fixing",
+        },
+        task={"id": 15, "agent": "Code Reviewer", "implementation_agent": "Architect"},
     ) == (
         RouteDecision(
             role="Architect",
-            reason="review_verdict_request_changes",
+            reason="status_to_fixing",
             concurrency_group="implementation",
             allow_parallel=False,
         ),

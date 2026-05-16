@@ -15,10 +15,11 @@ SPEC v23 sequential staged-review pipeline:
     *  -> "Ready to Merge"  : []   (orchestrator/merger TBD; not auto-fired)
     *  -> "Review" (legacy) : ["Code Reviewer"]   (forward-compat alias)
 
-Implementation stages route by ``latest_task.agent`` (Router v2 #10258):
+Implementation stages route by task ownership (Router v2 #10258):
 
     *  -> "In Progress"     : route by ``latest_task.agent``
-    *  -> "Fixing"          : route by ``latest_task.agent``
+    *  -> "Fixing"          : route by ``latest_task.implementation_agent``
+                              when present, otherwise ``latest_task.agent``
 
 When ``latest_task.agent`` is missing, fall back to a ``task_type`` -> role
 table, and if that is also missing fail-closed (return ``()``) so the
@@ -155,21 +156,15 @@ def _review_verdict_body(payload: dict[str, Any]) -> dict[str, Any]:
     return body if isinstance(body, dict) else payload
 
 
-def _resolve_implementation_role_for_task(latest_task: dict[str, Any] | None) -> str | None:
+def _resolve_fixing_role_for_task(latest_task: dict[str, Any] | None) -> str | None:
     if not latest_task:
         return None
-    for key in ("implementation_agent", "agent"):
-        value = latest_task.get(key)
-        if isinstance(value, str) and value.strip():
-            role = _AGENT_TO_ROLE.get(value.strip().lower())
-            if role in _IMPLEMENTATION_ROLES:
-                return role
-    task_type = latest_task.get("task_type")
-    if isinstance(task_type, str) and task_type.strip():
-        role = _TASK_TYPE_TO_ROLE.get(task_type.strip().lower())
+    value = latest_task.get("implementation_agent")
+    if isinstance(value, str) and value.strip():
+        role = _AGENT_TO_ROLE.get(value.strip().lower())
         if role in _IMPLEMENTATION_ROLES:
             return role
-    return "Developer"
+    return resolve_role_for_task(latest_task)
 
 
 def _latest_task_status(latest_task: dict[str, Any] | None) -> str:
@@ -213,17 +208,7 @@ def _review_verdict_route(
         return ()
 
     if verdict in {"request_changes", "changes_requested", "requested_changes"}:
-        role = _resolve_implementation_role_for_task(latest_task)
-        if role is None:
-            return ()
-        return (
-            RouteDecision(
-                role=role,
-                reason="review_verdict_request_changes",
-                concurrency_group=_CONCURRENCY_GROUP_FOR_ROLE.get(role, "implementation"),
-                allow_parallel=False,
-            ),
-        )
+        return ()
 
     return ()
 
@@ -272,7 +257,11 @@ def route_event(
     if reason is None:
         return ()
 
-    role = resolve_role_for_task(latest_task)
+    role = (
+        _resolve_fixing_role_for_task(latest_task)
+        if reason == "status_to_fixing"
+        else resolve_role_for_task(latest_task)
+    )
     if role is None:
         return ()
     return (
