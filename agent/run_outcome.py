@@ -233,15 +233,15 @@ def derive_outcome_from_agent_events(
             last_final = ev
 
     # Order of precedence:
-    #   1. A final [AUTO_STATE: done] beats a later wall-clock sentinel. The
-    #      runtime can emit both when a long last turn finishes successfully.
+    #   1. A final [AUTO_STATE: done] beats any late auto_stopped sentinel.
+    #      The runtime can emit both when a last turn completes successfully
+    #      and then an auto-mode guard also fires.
     #   2. auto_stopped beats other cases (we want the gate reason)
     #   3. error beats final (a final after error is the "agent returned
     #      an empty response" sentinel)
     #   4. final implies success unless empty sentinel
     if (
         last_auto_stopped is not None
-        and _is_wall_clock_budget_stop(last_auto_stopped)
         and last_error is None
         and _final_text_declares_done(last_final, final_text)
     ):
@@ -372,14 +372,6 @@ def _auto_stopped_reason(event: Mapping[str, Any]) -> str:
     if isinstance(data, Mapping):
         return str(data.get("reason") or "").strip().lower()
     return _normalize_data_for_match(data).strip()
-
-
-def _is_wall_clock_budget_stop(event: Mapping[str, Any]) -> bool:
-    reason = _auto_stopped_reason(event)
-    return (
-        "wall-clock budget exceeded" in reason
-        or "wall clock budget exceeded" in reason
-    )
 
 
 def _auto_stop_detail(data: Any, *, fallback: str = "auto_stopped") -> str:

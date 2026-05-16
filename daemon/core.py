@@ -1272,6 +1272,11 @@ class Session:
                         ],
                     )
 
+                    if auto_state == "done":
+                        stopped = self.stop_auto_mode(auto_reason or "task complete")
+                        yield {"type": "auto_stopped", "data": stopped}
+                        break
+
                     if auto_state not in {"done", "pause"}:
                         if self.auto_iterations_remaining <= 0:
                             stopped = self.stop_auto_mode("iteration budget exhausted")
@@ -1432,10 +1437,6 @@ class Session:
                         is_auto_continuation = True
                         continue
 
-                    if auto_state == "done":
-                        stopped = self.stop_auto_mode(auto_reason or "task complete")
-                        yield {"type": "auto_stopped", "data": stopped}
-                        break
                     if auto_state == "pause":
                         stopped = self.stop_auto_mode(auto_reason or "paused")
                         yield {"type": "auto_stopped", "data": stopped}

@@ -79,6 +79,32 @@ class TaskboardServiceClient:
             )
         return payload
 
+    def move_task_status(
+        self,
+        task_id: int,
+        status: str,
+        *,
+        reason: str = "",
+        agent: str = "Orchestrator",
+    ) -> dict[str, Any]:
+        """Move one task through the taskboard workflow as a service actor."""
+
+        payload = self._request_json(
+            "POST",
+            f"/api/tasks/{int(task_id)}/move",
+            params={
+                "status": str(status),
+                "agent": str(agent),
+                "reason": str(reason),
+            },
+        )
+        if not isinstance(payload, dict):
+            raise TaskboardServiceError(
+                "taskboard move response was not a JSON object",
+                body=self._redact_body(payload),
+            )
+        return payload
+
     def _request_json(
         self,
         method: str,

@@ -188,6 +188,24 @@ class DeriveFromAgentEventsTests(unittest.TestCase):
         self.assertEqual(out.status, "succeeded")
         self.assertIsNone(out.failure_class)
 
+    def test_final_auto_state_done_beats_late_loop_auto_stops(self) -> None:
+        for reason in (
+            "loop detected: repeated tool call",
+            "loop detected: consecutive no-tool turns",
+            "loop detected: repeated final response",
+        ):
+            with self.subTest(reason=reason):
+                events = [
+                    {
+                        "type": "final",
+                        "data": "Wrote artifact.\n[AUTO_STATE: done]",
+                    },
+                    {"type": "auto_stopped", "data": {"reason": reason}},
+                ]
+                out = derive_outcome_from_agent_events(events)
+                self.assertEqual(out.status, "succeeded")
+                self.assertIsNone(out.failure_class)
+
     def test_auto_stopped_missing_auto_state_footer(self) -> None:
         events = [
             {

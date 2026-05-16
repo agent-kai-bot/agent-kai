@@ -188,10 +188,40 @@ class SessionAutoModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runner.inputs, ["Analyze"])
         self.assertEqual(events[-1]["data"]["reason"], "missing or malformed AUTO_STATE footer")
 
-    async def test_evaluator_continue_overrides_done_and_injects_template(self):
+    async def test_done_footer_bypasses_evaluator_continuation(self):
         session, runner = self._make_session(
             [
                 {"final": "Next I will update tests.\n[AUTO_STATE: done]"},
+            ]
+        )
+        session.auto_evaluator_enabled = True
+        session.auto_evaluator_shadow = False
+        evaluator = _StaticEvaluator(
+            [
+                AutoEvaluationDecision(
+                    "CONTINUE",
+                    0.95,
+                    "main stopped prematurely",
+                    "declared_next_step",
+                    "finish_requested_artifact",
+                ),
+            ]
+        )
+        session.auto_response_evaluator = evaluator
+        session.start_auto_mode(max_iterations=5)
+
+        events = await _collect_events(session, "Do the task")
+
+        self.assertEqual(runner.inputs, ["Do the task"])
+        self.assertEqual(evaluator.inputs, [])
+        self.assertNotIn("auto_evaluation", [event["type"] for event in events])
+        self.assertNotIn("auto_reply", [event["type"] for event in events])
+        self.assertEqual(events[-1]["data"]["reason"], "task complete")
+
+    async def test_evaluator_continue_injects_template_on_continue_footer(self):
+        session, runner = self._make_session(
+            [
+                {"final": "Next I will update tests.\n[AUTO_STATE: continue]"},
                 {"final": "Task complete.\n[AUTO_STATE: done]"},
             ]
         )
@@ -473,19 +503,19 @@ class SessionAutoModeTests(unittest.IsolatedAsyncioTestCase):
             [
                 {
                     "tools": [("file_read", {"path": "/tmp/data", "api_key": secret})],
-                    "final": "Done.\n[AUTO_STATE: done]",
+                    "final": "Need one more check.\n[AUTO_STATE: continue]",
                 }
             ]
         )
         session.auto_evaluator_enabled = True
-        session.auto_evaluator_shadow = True
+        session.auto_evaluator_shadow = False
         evaluator = _StaticEvaluator(
             [
                 AutoEvaluationDecision(
-                    "ACCEPT_MAIN_STATE",
+                    "PAUSE",
                     1.0,
-                    "accepted",
-                    "main_done_accepted",
+                    "captured digest",
+                    "test_pause",
                 )
             ]
         )
@@ -571,6 +601,31 @@ class SessionAutoModeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(runner.inputs), 3)
         self.assertEqual(events[-1]["data"]["reason"], "loop detected: repeated tool call")
+
+    async def test_done_footer_beats_repeated_tool_loop_detection(self):
+        repeated_tool = [("query_ohlcv", {"symbol": "BTC"})]
+        session, runner = self._make_session(
+            [
+                {"tools": repeated_tool, "final": "One.\n[AUTO_STATE: continue]"},
+                {"tools": repeated_tool, "final": "Two.\n[AUTO_STATE: continue]"},
+                {"tools": repeated_tool, "final": "Fixed.\n[AUTO_STATE: done]"},
+            ]
+        )
+        session.start_auto_mode(max_iterations=5)
+
+        events = await _collect_events(session, "Repeat tool then finish")
+
+        self.assertEqual(len(runner.inputs), 3)
+        self.assertEqual(events[-1]["type"], "auto_stopped")
+        self.assertEqual(events[-1]["data"]["reason"], "task complete")
+        self.assertNotIn(
+            "loop detected: repeated tool call",
+            [
+                event["data"].get("reason")
+                for event in events
+                if isinstance(event.get("data"), dict)
+            ],
+        )
 
     async def test_runtime_pause_reason_stops_the_loop(self):
         session, runner = self._make_session([{"pause_reason": "requires approval for shell_exec"}])

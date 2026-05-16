@@ -248,6 +248,31 @@ class FinalizeInprocessRunTests(unittest.TestCase):
         body = self._terminal()
         self.assertEqual(body, {"status": "succeeded"})
 
+    def test_done_final_text_wins_over_late_loop_auto_stops(self) -> None:
+        for reason in (
+            "loop detected: repeated tool call",
+            "loop detected: consecutive no-tool turns",
+            "loop detected: repeated final response",
+        ):
+            with self.subTest(reason=reason):
+                self.client.patches.clear()
+                self.cleanup_calls.clear()
+                task = _make_task(
+                    result=_StubInputRunResult(
+                        final_text="Wrote final artifact.\n[AUTO_STATE: done]",
+                        auto_stopped_data={"reason": reason},
+                    )
+                )
+                td._finalize_dispatcher_inprocess_run(
+                    task,
+                    daemon_server=None,
+                    session_id="sess-x",
+                    task_id=10247,
+                    role="cr",
+                )
+                body = self._terminal()
+                self.assertEqual(body, {"status": "succeeded"})
+
     def test_wall_clock_auto_stop_maps_specific_failure_class(self) -> None:
         task = _make_task(
             result=_StubInputRunResult(
