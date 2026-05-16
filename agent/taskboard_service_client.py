@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urljoin
 
 import requests
@@ -44,10 +44,12 @@ class TaskboardServiceClient:
         *,
         bearer_token: str = "",
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        request_func: Callable[..., requests.Response] | None = None,
     ) -> None:
         self.base_url = str(base_url).rstrip("/")
         self.bearer_token = bearer_token.strip()
         self.timeout_seconds = timeout_seconds
+        self._request_func = request_func or requests.request
 
     def fetch_task(self, task_id: int) -> dict[str, Any]:
         """Fetch one taskboard task as a full JSON dictionary."""
@@ -79,6 +81,32 @@ class TaskboardServiceClient:
             )
         return payload
 
+    def move_task_status(
+        self,
+        task_id: int,
+        status: str,
+        *,
+        reason: str = "",
+        agent: str = "Orchestrator",
+    ) -> dict[str, Any]:
+        """Move one task through the taskboard workflow as a service actor."""
+
+        payload = self._request_json(
+            "POST",
+            f"/api/tasks/{int(task_id)}/move",
+            params={
+                "status": str(status),
+                "agent": str(agent),
+                "reason": str(reason),
+            },
+        )
+        if not isinstance(payload, dict):
+            raise TaskboardServiceError(
+                "taskboard move response was not a JSON object",
+                body=self._redact_body(payload),
+            )
+        return payload
+
     def _request_json(
         self,
         method: str,
@@ -95,7 +123,7 @@ class TaskboardServiceClient:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
 
         try:
-            response = requests.request(
+            response = self._request_func(
                 method=method,
                 url=url,
                 params=params,

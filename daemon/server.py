@@ -1785,6 +1785,23 @@ class DaemonServer:
         )
         return runner
 
+    def _mark_taskboard_dispatcher_progress(
+        self,
+        managed: ManagedSession,
+        event_type: str | None,
+    ) -> None:
+        if event_type not in {"tool_start", "tool_end", "tool_result", "final"}:
+            return
+        if not isinstance(getattr(managed.session, "taskboard_dispatcher", None), dict):
+            return
+        dispatcher = self.taskboard_dispatcher
+        store = getattr(dispatcher, "_store", None) if dispatcher is not None else None
+        marker = getattr(store, "mark_session_progress", None)
+        if not callable(marker):
+            return
+        with suppress(Exception):
+            marker(managed.session.name)
+
     async def run_input(
         self,
         managed: ManagedSession,
@@ -1827,6 +1844,7 @@ class DaemonServer:
                     pre_injected_input=pre_injected_input,
                 ):
                     etype = event.get("type")
+                    self._mark_taskboard_dispatcher_progress(managed, etype)
                     if etype == "final":
                         result.final_text = str(event.get("data") or "")
                     elif etype == "error":

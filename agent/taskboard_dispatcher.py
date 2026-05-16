@@ -36,13 +36,30 @@ BACKPRESSURE_SUBJECT = "ops.alerts.taskboard_dispatcher_backpressure"
 SPAWN_FAILED_SUBJECT = "ops.alerts.taskboard_dispatcher.spawn_failed"
 DISPATCHER_SOURCE = "taskboard_dispatcher"
 ACTIVE_SESSION_STATUSES = ("accepted", "spawning", "starting", "running")
-AUDIT_PENDING_STATUSES = ("spawned", "spawn_failed", "stuck_aborted")
+AUDIT_PENDING_STATUSES = (
+    "spawned",
+    "spawn_failed",
+    "move_only",
+    "move_failed",
+    "skipped_non_developer_role",
+    "stuck_aborted",
+)
 DEFAULT_MAX_CONCURRENT_SPAWNS = 6
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_SWEEP_INTERVAL_SECONDS = 60.0
 DEFAULT_STUCK_AFTER_SECONDS = 60 * 60
+DEFAULT_MAX_SESSION_SECONDS = 4 * 60 * 60
 WORKTREE_ISOLATION_ENV = "KAI_WORKTREE_ISOLATION_ENABLED"
 MULTI_REPO_ROUTING_ENV = "TASKBOARD_MULTI_REPO_ROUTING"
+SELF_MOVE_ORIGINATOR = "kai-dispatcher-self-move"
+SELF_MOVE_REASON = f"{SELF_MOVE_ORIGINATOR}: REQUEST_CHANGES fix-loop"
+_VERDICT_EVENT_TYPES = {"review.verdict_submitted", "task.review_verdict_submitted"}
+_REQUEST_CHANGES_VERDICTS = {
+    "request_changes",
+    "changes_requested",
+    "requested_changes",
+}
+_ACTIVE_REVIEW_STATUSES = {"review", "code_review", "security_audit", "qa"}
 
 # Phase 0 (#10247) — fleet hardening. Per-role max_iterations cascade:
 #   1. env  KAI_MAX_ITERATIONS_<ROLE_UPPER>   (escape hatch per role)
@@ -164,6 +181,26 @@ class TaskboardTaskClient(Protocol):
             Optional taskboard client result.
         """
 
+    def move_task_status(
+        self,
+        task_id: int,
+        status: str,
+        *,
+        reason: str = "",
+        agent: str = "Orchestrator",
+    ) -> Any | Awaitable[Any]:
+        """Move a task through the taskboard workflow as a service actor.
+
+        Args:
+            task_id: Taskboard task id.
+            status: Target task status.
+            reason: Audit reason for the transition.
+            agent: Actor name to send to the taskboard.
+
+        Returns:
+            Optional taskboard client result.
+        """
+
 
 class TaskboardSessionManager(Protocol):
     """Protocol for spawning and aborting taskboard sessions.
@@ -248,6 +285,7 @@ class StuckSession:
         task_id: Taskboard task id linked to the session, if known.
         fire_generation: Taskboard fire generation linked to the session.
         agent_id: Dispatcher agent id linked to the session.
+        reason: Why the sweeper selected the session.
     """
 
     session_id: str
@@ -255,6 +293,7 @@ class StuckSession:
     task_id: int | None
     fire_generation: int | None
     agent_id: str | None
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -411,6 +450,45 @@ class DefaultTaskboardTaskClient:
         except TaskboardServiceError as exc:
             raise RuntimeError(str(exc)) from exc
 
+    def move_task_status(
+        self,
+        task_id: int,
+        status: str,
+        *,
+        reason: str = "",
+        agent: str = "Orchestrator",
+    ) -> dict[str, Any]:
+        """Move one task through the taskboard workflow.
+
+        Args:
+            task_id: Taskboard task id.
+            status: Target task status.
+            reason: Transition reason.
+            agent: Actor name to send to the taskboard.
+
+        Returns:
+            Parsed taskboard response envelope.
+
+        Raises:
+            RuntimeError: If the taskboard reports a failed response.
+            ValueError: If the response cannot be interpreted as JSON.
+        """
+
+        client = TaskboardServiceClient(
+            self.base_url,
+            bearer_token=self.bearer_token,
+            timeout_seconds=self.timeout_seconds,
+        )
+        try:
+            return client.move_task_status(
+                task_id,
+                status,
+                reason=reason,
+                agent=agent,
+            )
+        except TaskboardServiceError as exc:
+            raise RuntimeError(str(exc)) from exc
+
 
 @dataclass(frozen=True)
 class RepoTarget:
@@ -451,6 +529,10 @@ class DaemonTaskboardSpawner:
         self.worktree_manager = WorktreeManager(self.repo_root)
         self._session_repo_roots: dict[str, Path] = {}
         self.runtime_config_resolver = runtime_config_resolver
+        try:
+            setattr(daemon_server, "taskboard_spawner", self)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def spawn(self, **kwargs: Any) -> str:
         """Create a live daemon session and submit the rendered prompt.
@@ -532,19 +614,33 @@ class DaemonTaskboardSpawner:
         primary_repo_path = ""
         workspace_manifest_path = ""
         repo_routing_mode = str(task_payload.get("repo_routing_mode") or "")
-        if _worktree_isolation_enabled():
-            task_id = kwargs.get("task_id") or task_payload.get("id") or "unknown"
-            fire_generation = kwargs.get("fire_generation")
-            branch_name = f"task-{task_id}-{agent_id}-{fire_generation}"
+        role_text = str(kwargs.get("role") or agent_id)
+        normalized_role = _normalize_role(role_text)
+        is_developer_session = normalized_role == "developer"
+        isolate_worktree = _worktree_isolation_enabled() or is_developer_session
+        repo_target: RepoTarget | None = None
+        if is_developer_session:
             repo_target = _resolve_repo_target(
                 task_payload,
                 fallback_repo_root=self.repo_root,
-                role=str(kwargs.get("role") or agent_id),
+                role=role_text,
+            )
+        if isolate_worktree:
+            task_id = kwargs.get("task_id") or task_payload.get("id") or "unknown"
+            fire_generation = kwargs.get("fire_generation")
+            branch_name = f"task-{task_id}-{agent_id}-{fire_generation}"
+            if repo_target is None:
+                repo_target = _resolve_repo_target(
+                    task_payload,
+                    fallback_repo_root=self.repo_root,
+                    role=role_text,
             )
             repo_root = self.repo_root
             multi_repo_enabled = _multi_repo_routing_enabled()
-            normalized_role = _normalize_role(str(kwargs.get("role") or agent_id))
-            if repo_target.routing_mode == "explicit" and multi_repo_enabled:
+            if (
+                repo_target.routing_mode == "explicit"
+                and (multi_repo_enabled or is_developer_session)
+            ):
                 repo_root = WorktreeManager.ensure_repo_clone(
                     repo_target.repo_url,
                     repo_key=repo_target.repo_key,
@@ -552,12 +648,6 @@ class DaemonTaskboardSpawner:
                     auth_env=runtime_env,
                 )
             elif repo_target.routing_mode == "explicit" and not multi_repo_enabled:
-                if normalized_role == "developer":
-                    raise RepoRoutingError(
-                        "explicit repo routing metadata present for role="
-                        f"{kwargs.get('role') or agent_id} but "
-                        f"{MULTI_REPO_ROUTING_ENV}=0; refusing local-repo fallback"
-                    )
                 repo_target = RepoTarget(
                     repo_key=WorktreeManager.repo_key_for_url(
                         str(self.repo_root),
@@ -596,7 +686,7 @@ class DaemonTaskboardSpawner:
                     session_id=session_id,
                     fire_generation=_coerce_positive_int(fire_generation),
                     agent_id=agent_id,
-                    role=str(kwargs.get("role") or agent_id),
+                    role=role_text,
                     primary_repo_path=repo_root,
                     repo_url=repo_target.repo_url,
                     default_branch=repo_target.default_branch,
@@ -607,7 +697,7 @@ class DaemonTaskboardSpawner:
             )
             task_payload["workspace_manifest_path"] = workspace_manifest_path
             prompt = render_taskboard_fire_prompt(
-                str(kwargs.get("role") or agent_id),
+                role_text,
                 task_payload,
                 session_token=str(kwargs.get("session_token") or ""),
                 session_generation=kwargs.get("session_generation"),
@@ -725,8 +815,9 @@ class TaskboardDispatcher:
         max_concurrent_spawns: Active dispatcher session cap.
         poll_interval_seconds: Queue polling cadence.
         sweep_interval_seconds: Stuck-session sweep cadence.
-        stuck_after_seconds: Age after which active dispatcher sessions are
-            considered stuck.
+        stuck_after_seconds: No-progress age after which active dispatcher
+            sessions are considered stuck.
+        max_session_seconds: Absolute runtime ceiling for dispatcher sessions.
         clock: Optional UTC clock for tests.
 
     Example:
@@ -744,6 +835,7 @@ class TaskboardDispatcher:
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         sweep_interval_seconds: float = DEFAULT_SWEEP_INTERVAL_SECONDS,
         stuck_after_seconds: int = DEFAULT_STUCK_AFTER_SECONDS,
+        max_session_seconds: int = DEFAULT_MAX_SESSION_SECONDS,
         clock: Callable[[], datetime] | None = None,
         agent_runs_client: Any | None = None,
         runtime_config_resolver: RuntimeConfigResolver | None = None,
@@ -758,6 +850,7 @@ class TaskboardDispatcher:
         self.poll_interval_seconds = poll_interval_seconds
         self.sweep_interval_seconds = sweep_interval_seconds
         self.stuck_after_seconds = stuck_after_seconds
+        self.max_session_seconds = max_session_seconds
         self.clock = clock or _utc_now
         self.runtime_config_resolver = runtime_config_resolver or RuntimeConfigResolver()
         self._store = _TaskboardQueueStore(self.db_path, clock=self.clock)
@@ -890,7 +983,10 @@ class TaskboardDispatcher:
             Number of sessions marked as stuck-aborted.
         """
 
-        stuck_sessions = self._store.stuck_sessions(self.stuck_after_seconds)
+        stuck_sessions = self._store.stuck_sessions(
+            self.stuck_after_seconds,
+            max_session_seconds=self.max_session_seconds,
+        )
         for session in stuck_sessions:
             result = self.session_manager.abort(session.session_id)
             if inspect.isawaitable(result):
@@ -906,6 +1002,9 @@ class TaskboardDispatcher:
                 content = _stuck_session_comment(
                     task_id=session.task_id,
                     session_id=session.session_id,
+                    reason=session.reason,
+                    stuck_after_seconds=self.stuck_after_seconds,
+                    max_session_seconds=self.max_session_seconds,
                 )
                 posted = await self._post_audit_comment(session.task_id, content)
                 if posted and session.webhook_pending_id is not None:
@@ -925,6 +1024,13 @@ class TaskboardDispatcher:
             if fire_generation is None:
                 raise ValueError("taskboard payload is missing fire_generation")
             latest_task = await self._fetch_latest_task(task_id)
+            if _is_request_changes_verdict(row.payload):
+                return await self._move_request_changes_to_fixing(
+                    row=row,
+                    task_id=task_id,
+                    fire_generation=fire_generation,
+                    latest_task=latest_task,
+                )
             review_context = self._build_review_context(latest_task)
             route_decisions = route_event(row.payload, latest_task, review_context)
             if not route_decisions:
@@ -969,6 +1075,22 @@ class TaskboardDispatcher:
                     duplicate_count += 1
                     continue
                 reserved_key = (task_id, fire_generation, route.agent_id)
+
+                try:
+                    self._validate_spawn_contract(route=route, task=latest_task)
+                except Exception as exc:  # noqa: BLE001
+                    self._store.mark_session_failed(*reserved_key)
+                    error_message = _redact_known_secrets(str(exc))
+                    self._store.mark_processed(row, "spawn_failed", error=error_message)
+                    await self._post_spawn_failure_audit(
+                        row=row,
+                        task_id=task_id,
+                        fire_generation=fire_generation,
+                        role=route.agent_id,
+                        error=exc,
+                    )
+                    reserved_key = None
+                    return "spawn_failed"
 
                 try:
                     runtime_config = self.runtime_config_resolver.resolve_for_role(
@@ -1196,6 +1318,108 @@ class TaskboardDispatcher:
             result = await result
         return _extract_task(result)
 
+    def _validate_spawn_contract(
+        self,
+        *,
+        route: TaskboardRoleRoute,
+        task: dict[str, Any],
+    ) -> None:
+        """Fail closed before prompt render when a role requires repo metadata."""
+
+        if route.agent_id != "developer":
+            return
+        _resolve_repo_target(
+            task,
+            fallback_repo_root=Path(__file__).resolve().parents[1],
+            role=route.role,
+        )
+
+    async def _move_request_changes_to_fixing(
+        self,
+        *,
+        row: PendingWebhookRow,
+        task_id: int,
+        fire_generation: int,
+        latest_task: dict[str, Any],
+    ) -> str:
+        """Move REQUEST_CHANGES fix-loop tasks into ``Fixing`` without spawning."""
+
+        implementation_role = _implementation_agent_role(latest_task)
+        if implementation_role != "Developer":
+            self._store.mark_processed(row, "skipped_non_developer_role")
+            await self._post_request_changes_skip_audit(
+                row=row,
+                task_id=task_id,
+                role=implementation_role or "unknown role",
+            )
+            LOGGER.info(
+                "taskboard_fire_request_changes_skip_non_developer task_id=%d "
+                "fire_generation=%d implementation_role=%s",
+                task_id,
+                fire_generation,
+                implementation_role or "unknown",
+            )
+            return "skipped_non_developer_role"
+
+        current_status = _normalize_status_token(latest_task.get("status"))
+        if current_status == "fixing":
+            self._store.mark_processed(row, "move_only")
+            await self._post_move_only_audit(
+                row=row,
+                task_id=task_id,
+                fire_generation=fire_generation,
+            )
+            return "move_only"
+        if current_status and current_status not in _ACTIVE_REVIEW_STATUSES:
+            self._store.mark_processed(row, "no_op_transition")
+            return "no_op_transition"
+        mover = getattr(self.task_client, "move_task_status", None)
+        if not callable(mover):
+            error = RuntimeError(
+                "taskboard client cannot move REQUEST_CHANGES task to Fixing"
+            )
+            error_message = _redact_known_secrets(str(error))
+            self._store.mark_processed(row, "move_failed", error=error_message)
+            await self._post_move_failure_audit(
+                row=row,
+                task_id=task_id,
+                fire_generation=fire_generation,
+                error=error,
+            )
+            return "move_failed"
+        try:
+            result = mover(
+                task_id,
+                "Fixing",
+                reason=SELF_MOVE_REASON,
+                agent="User",
+            )
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:  # noqa: BLE001
+            error_message = _redact_known_secrets(str(exc))
+            self._store.mark_processed(row, "move_failed", error=error_message)
+            await self._post_move_failure_audit(
+                row=row,
+                task_id=task_id,
+                fire_generation=fire_generation,
+                error=exc,
+            )
+            return "move_failed"
+        self._store.mark_processed(row, "move_only")
+        await self._post_move_only_audit(
+            row=row,
+            task_id=task_id,
+            fire_generation=fire_generation,
+        )
+        LOGGER.info(
+            "taskboard_fire_move_only task_id=%d fire_generation=%d status=Fixing reason=%s",
+            task_id,
+            fire_generation,
+            SELF_MOVE_REASON,
+        )
+        return "move_only"
+
     async def _post_audit_for_row(self, row: PendingWebhookRow) -> bool:
         status = row.dispatch_status or ""
         payload_task = _extract_task(row.payload)
@@ -1249,6 +1473,35 @@ class TaskboardDispatcher:
                     error_message=error_message,
                 ),
             )
+        if status == "move_only":
+            return await self._post_audit_comment(
+                task_id,
+                _move_only_comment(
+                    fire_generation=_request_changes_cycle(
+                        row.payload,
+                        fallback=fire_generation,
+                    ),
+                    delivery_id=row.row_id,
+                ),
+            )
+        if status == "move_failed":
+            error_message = row.last_error or "unknown error"
+            return await self._post_audit_comment(
+                task_id,
+                _move_failure_comment(
+                    fire_generation=_request_changes_cycle(
+                        row.payload,
+                        fallback=fire_generation,
+                    ),
+                    error_message=error_message,
+                ),
+            )
+        if status == "skipped_non_developer_role":
+            role = _implementation_agent_role(payload_task) or role_text or "unknown role"
+            return await self._post_audit_comment(
+                task_id,
+                _request_changes_skip_comment(role=role),
+            )
         if status == "stuck_aborted":
             session_id = row.session_id or self._store.session_id_for_row(row.row_id)
             if not session_id:
@@ -1259,7 +1512,13 @@ class TaskboardDispatcher:
                 return False
             return await self._post_audit_comment(
                 task_id,
-                _stuck_session_comment(task_id=task_id, session_id=session_id),
+                _stuck_session_comment(
+                    task_id=task_id,
+                    session_id=session_id,
+                    reason="no_progress",
+                    stuck_after_seconds=self.stuck_after_seconds,
+                    max_session_seconds=self.max_session_seconds,
+                ),
             )
         LOGGER.debug(
             "taskboard_audit_comment_skip_status row_id=%s status=%s generation=%s",
@@ -1291,6 +1550,68 @@ class TaskboardDispatcher:
             role=role,
             error=error,
         )
+
+    async def _post_move_failure_audit(
+        self,
+        *,
+        row: PendingWebhookRow,
+        task_id: int,
+        fire_generation: int,
+        error: Exception,
+    ) -> None:
+        error_message = _redact_known_secrets(str(error))
+        posted = await self._post_audit_comment(
+            task_id,
+            _move_failure_comment(
+                fire_generation=_request_changes_cycle(
+                    row.payload,
+                    fallback=fire_generation,
+                ),
+                error_message=error_message,
+            ),
+        )
+        if posted:
+            self._store.mark_audit_posted(row)
+        LOGGER.warning(
+            "taskboard_fire_move_failed task_id=%d fire_generation=%d error=%s",
+            task_id,
+            fire_generation,
+            error_message,
+        )
+
+    async def _post_move_only_audit(
+        self,
+        *,
+        row: PendingWebhookRow,
+        task_id: int,
+        fire_generation: int,
+    ) -> None:
+        posted = await self._post_audit_comment(
+            task_id,
+            _move_only_comment(
+                fire_generation=_request_changes_cycle(
+                    row.payload,
+                    fallback=fire_generation,
+                ),
+                delivery_id=row.row_id,
+            ),
+        )
+        if posted:
+            self._store.mark_audit_posted(row)
+
+    async def _post_request_changes_skip_audit(
+        self,
+        *,
+        row: PendingWebhookRow,
+        task_id: int,
+        role: str,
+    ) -> None:
+        posted = await self._post_audit_comment(
+            task_id,
+            _request_changes_skip_comment(role=role),
+        )
+        if posted:
+            self._store.mark_audit_posted(row)
 
     def _mint_taskboard_session_token(
         self,
@@ -1940,9 +2261,10 @@ class _TaskboardQueueStore:
                         status,
                         webhook_pending_id,
                         created_at,
-                        updated_at
+                        updated_at,
+                        last_progress_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         None,
@@ -1952,6 +2274,7 @@ class _TaskboardQueueStore:
                         DISPATCHER_SOURCE,
                         "spawning",
                         webhook_pending_id,
+                        now,
                         now,
                         now,
                     ),
@@ -1973,7 +2296,7 @@ class _TaskboardQueueStore:
             conn.execute(
                 """
                 UPDATE sessions
-                SET session_id = ?, status = ?, updated_at = ?
+                SET session_id = ?, status = ?, updated_at = ?, last_progress_at = ?
                 WHERE taskboard_task_id = ?
                   AND fire_generation = ?
                   AND agent_id = ?
@@ -1982,10 +2305,31 @@ class _TaskboardQueueStore:
                     session_id,
                     "running",
                     now,
+                    now,
                     task_id,
                     fire_generation,
                     agent_id,
                 ),
+            )
+
+    def mark_session_progress(self, session_id: str) -> None:
+        if not self.db_path.exists():
+            return
+        now = _utc_iso(self.clock())
+        with self._connect(create=False) as conn:
+            if not self._table_exists(conn, "sessions"):
+                return
+            if "last_progress_at" not in self._columns(conn, "sessions"):
+                return
+            conn.execute(
+                """
+                UPDATE sessions
+                SET updated_at = ?, last_progress_at = ?
+                WHERE session_id = ?
+                  AND source = ?
+                  AND status IN ('accepted', 'spawning', 'starting', 'running')
+                """,
+                (now, now, session_id, DISPATCHER_SOURCE),
             )
 
     # Phase 0 follow-up (#10247) — eliminate orphan-sweep false positives.
@@ -2046,22 +2390,40 @@ class _TaskboardQueueStore:
                 (local_status, now, session_id),
             )
 
-    def stuck_sessions(self, older_than_seconds: int) -> list[StuckSession]:
+    def stuck_sessions(
+        self,
+        older_than_seconds: int,
+        *,
+        max_session_seconds: int = DEFAULT_MAX_SESSION_SECONDS,
+    ) -> list[StuckSession]:
         if not self.db_path.exists():
             return []
-        cutoff = _utc_iso(self.clock() - timedelta(seconds=older_than_seconds))
+        self.ensure_sessions_schema()
+        now = self.clock()
+        progress_cutoff = _utc_iso(now - timedelta(seconds=older_than_seconds))
+        absolute_cutoff = _utc_iso(now - timedelta(seconds=max_session_seconds))
         with self._connect(create=False) as conn:
             if not self._table_exists(conn, "sessions"):
                 return []
             placeholders = ",".join("?" for _ in ACTIVE_SESSION_STATUSES)
             rows = conn.execute(
                 "SELECT session_id, webhook_pending_id, taskboard_task_id,"
-                " fire_generation, agent_id FROM sessions"
+                " fire_generation, agent_id,"
+                " CASE WHEN created_at < ? THEN 'max_duration'"
+                " ELSE 'no_progress' END AS stuck_reason"
+                " FROM sessions"
                 " WHERE source = ?"
                 f" AND status IN ({placeholders})"
-                " AND created_at < ?"
+                " AND (COALESCE(last_progress_at, updated_at, created_at) < ?"
+                " OR created_at < ?)"
                 " AND session_id IS NOT NULL",
-                (DISPATCHER_SOURCE, *ACTIVE_SESSION_STATUSES, cutoff),
+                (
+                    absolute_cutoff,
+                    DISPATCHER_SOURCE,
+                    *ACTIVE_SESSION_STATUSES,
+                    progress_cutoff,
+                    absolute_cutoff,
+                ),
             ).fetchall()
             return [
                 StuckSession(
@@ -2084,6 +2446,7 @@ class _TaskboardQueueStore:
                     agent_id=(
                         str(row["agent_id"]) if row["agent_id"] is not None else None
                     ),
+                    reason=str(row["stuck_reason"] or "no_progress"),
                 )
                 for row in rows
             ]
@@ -2138,6 +2501,7 @@ class _TaskboardQueueStore:
                     webhook_pending_id TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    last_progress_at TEXT,
                     aborted_at TEXT
                 )
                 """
@@ -2153,6 +2517,7 @@ class _TaskboardQueueStore:
                 "webhook_pending_id": "TEXT",
                 "created_at": "TEXT",
                 "updated_at": "TEXT",
+                "last_progress_at": "TEXT",
                 "aborted_at": "TEXT",
             }
             for column, definition in additions.items():
@@ -2160,11 +2525,25 @@ class _TaskboardQueueStore:
                     conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} {definition}")
             conn.execute(
                 """
+                UPDATE sessions
+                SET last_progress_at = COALESCE(last_progress_at, updated_at, created_at)
+                WHERE last_progress_at IS NULL
+                """
+            )
+            conn.execute(
+                """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_taskboard_fire_agent
                 ON sessions (taskboard_task_id, fire_generation, agent_id)
                 WHERE taskboard_task_id IS NOT NULL
                   AND fire_generation IS NOT NULL
                   AND agent_id IS NOT NULL
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sessions_dispatcher_progress
+                ON sessions (source, status, last_progress_at, created_at)
+                WHERE session_id IS NOT NULL
                 """
             )
 
@@ -2245,6 +2624,43 @@ def _normalize_role(role: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+def _normalize_status_token(status: Any) -> str:
+    return str(status or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _event_body(payload: dict[str, Any]) -> dict[str, Any]:
+    body = payload.get("payload")
+    return body if isinstance(body, dict) else payload
+
+
+def _is_request_changes_verdict(payload: dict[str, Any]) -> bool:
+    event_type = str(payload.get("event_type") or "").strip()
+    if event_type not in _VERDICT_EVENT_TYPES:
+        return False
+    body = _event_body(payload)
+    verdict = _normalize_status_token(body.get("verdict"))
+    return verdict in _REQUEST_CHANGES_VERDICTS
+
+
+def _implementation_agent_role(task: dict[str, Any]) -> str:
+    value = task.get("implementation_agent")
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    try:
+        return resolve_taskboard_role(value).role
+    except ValueError:
+        return value.strip()
+
+
+def _request_changes_cycle(payload: dict[str, Any], *, fallback: int) -> int:
+    body = _event_body(payload)
+    value = body.get("cycle", payload.get("cycle", fallback))
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
 def _audit_actor_for_content(content: str) -> str:
     if content.startswith("[System]"):
         return "System"
@@ -2273,9 +2689,46 @@ def _spawn_failure_comment(*, task_id: int, error_message: str) -> str:
     )
 
 
-def _stuck_session_comment(*, task_id: int, session_id: str) -> str:
+def _move_only_comment(*, fire_generation: int, delivery_id: Any) -> str:
     return (
-        f"[System] sweeper aborted stuck session for #{task_id} after 60min "
+        f"[Orchestrator] REQUEST_CHANGES received cycle {fire_generation}; "
+        "moved Review -> Fixing; awaiting task.status_changed webhook for "
+        f"Developer spawn (move_only delivery ID: {delivery_id})"
+    )
+
+
+def _move_failure_comment(*, fire_generation: int, error_message: str) -> str:
+    safe_error = _redact_known_secrets(error_message).replace("\n", " ")[:500]
+    return (
+        f"[Orchestrator] REQUEST_CHANGES received cycle {fire_generation}; "
+        f"/move to Fixing failed: {safe_error}; manual intervention required"
+    )
+
+
+def _request_changes_skip_comment(*, role: str) -> str:
+    return (
+        f"[Orchestrator] REQUEST_CHANGES for {role}; auto-move skipped "
+        "(only Developer auto-moves in current dispatcher; see "
+        "docs/architecture/10460-dynamic-flow-engine.md Phase 1 for role coverage)"
+    )
+
+
+def _stuck_session_comment(
+    *,
+    task_id: int,
+    session_id: str,
+    reason: str,
+    stuck_after_seconds: int,
+    max_session_seconds: int,
+) -> str:
+    if reason == "max_duration":
+        max_minutes = max(1, int(max_session_seconds / 60))
+        detail = f"after exceeding {max_minutes}min max runtime"
+    else:
+        idle_minutes = max(1, int(stuck_after_seconds / 60))
+        detail = f"after {idle_minutes}min without progress"
+    return (
+        f"[System] sweeper aborted stuck session for #{task_id} {detail} "
         f"(session_id={session_id})"
     )
 
@@ -2491,18 +2944,33 @@ def _normalize_spawn_session_id(result: Any, *, default: str) -> str:
 
 def _cleanup_dispatcher_worktree(daemon_server: Any, session_id: str) -> None:
     """Best-effort session worktree cleanup after terminal ledger updates."""
-    if not _worktree_isolation_enabled():
-        return
     try:
         repo_root = Path(__file__).resolve().parents[1]
-        dispatcher = getattr(daemon_server, "taskboard_dispatcher", None)
-        repo_roots = getattr(dispatcher, "_session_repo_roots", None) if dispatcher else None
+        repo_roots = _session_repo_roots_for_cleanup(daemon_server)
+        if not _worktree_isolation_enabled() and (
+            not isinstance(repo_roots, dict) or session_id not in repo_roots
+        ):
+            return
         if isinstance(repo_roots, dict):
             repo_root = Path(repo_roots.pop(session_id, repo_root))
         manager = WorktreeManager(repo_root)
         manager.cleanup(session_id)
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("worktree cleanup failed session_id=%s error=%s", session_id, exc)
+
+
+def _session_repo_roots_for_cleanup(daemon_server: Any) -> dict[str, Path] | None:
+    dispatcher = getattr(daemon_server, "taskboard_dispatcher", None)
+    candidates = [
+        getattr(daemon_server, "taskboard_spawner", None),
+        getattr(dispatcher, "session_manager", None) if dispatcher else None,
+        dispatcher,
+    ]
+    for candidate in candidates:
+        repo_roots = getattr(candidate, "_session_repo_roots", None)
+        if isinstance(repo_roots, dict):
+            return repo_roots
+    return None
 
 
 def _derive_dispatcher_inprocess_outcome(

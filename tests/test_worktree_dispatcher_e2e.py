@@ -138,23 +138,27 @@ class WorktreeDispatcherE2ETests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("sess-e2e", cleanup_calls)
 
-    async def test_spawn_fails_closed_for_developer_when_multi_repo_flag_disabled(self) -> None:
+    async def test_developer_spawn_uses_explicit_repo_when_multi_repo_flag_disabled(self) -> None:
         daemon = _FakeDaemon()
         spawner = DaemonTaskboardSpawner(daemon_server=daemon, repo_root=Path("/srv/local/kai"))
 
-        with mock.patch("agent.taskboard_dispatcher._worktree_isolation_enabled", return_value=True), \
-            mock.patch("agent.taskboard_dispatcher._multi_repo_routing_enabled", return_value=False), \
-            mock.patch("agent.taskboard_dispatcher.WorktreeManager.ensure_repo_clone") as ensure_repo_clone, \
-            mock.patch("agent.taskboard_dispatcher.WorktreeManager.create") as create_worktree, \
-            mock.patch("agent.taskboard_dispatcher.WorktreeManager.write_workspace_manifest") as write_manifest, \
-            mock.patch("agent.taskboard_dispatcher._resolve_max_iterations_for_role", return_value=5), \
-            mock.patch("agent.agent_runs_client.AgentRunsClient.from_env") as from_env:
-            client = mock.Mock(enabled=True)
-            client.list_for_task.return_value = [{"id": 8, "session_id": "sess-local", "status": "spawning"}]
-            client.patch.return_value = None
-            from_env.return_value = client
-            with self.assertRaises(RepoRoutingError) as err:
-                await spawner.spawn(
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            primary_repo = temp_root / "primary"
+            worktree = temp_root / "worktree"
+            manifest = worktree / ".kai" / "workspace-manifest.json"
+            with mock.patch("agent.taskboard_dispatcher._worktree_isolation_enabled", return_value=True), \
+                mock.patch("agent.taskboard_dispatcher._multi_repo_routing_enabled", return_value=False), \
+                mock.patch("agent.taskboard_dispatcher.WorktreeManager.ensure_repo_clone", return_value=primary_repo) as ensure_repo_clone, \
+                mock.patch("agent.taskboard_dispatcher.WorktreeManager.create", return_value=worktree) as create_worktree, \
+                mock.patch("agent.taskboard_dispatcher.WorktreeManager.write_workspace_manifest", return_value=manifest) as write_manifest, \
+                mock.patch("agent.taskboard_dispatcher._resolve_max_iterations_for_role", return_value=5), \
+                mock.patch("agent.agent_runs_client.AgentRunsClient.from_env") as from_env:
+                client = mock.Mock(enabled=True)
+                client.list_for_task.return_value = [{"id": 8, "session_id": "sess-local", "status": "spawning"}]
+                client.patch.return_value = None
+                from_env.return_value = client
+                session_id = await spawner.spawn(
                     session_id="sess-local",
                     task_id=10367,
                     fire_generation=2,
@@ -171,9 +175,103 @@ class WorktreeDispatcherE2ETests(unittest.IsolatedAsyncioTestCase):
                     session_token="",
                     session_generation=None,
                 )
+                await daemon.managed.current_input_task
 
-        self.assertIn("TASKBOARD_MULTI_REPO_ROUTING=0", str(err.exception))
-        ensure_repo_clone.assert_not_called()
+        self.assertEqual(session_id, "sess-local")
+        ensure_repo_clone.assert_called_once()
+        create_worktree.assert_called_once()
+        write_manifest.assert_called_once()
+        self.assertIn(f"Worktree path: {worktree}", daemon.last_prompt)
+
+    async def test_developer_spawn_fails_closed_without_repo_when_isolation_off(self) -> None:
+        daemon = _FakeDaemon()
+        spawner = DaemonTaskboardSpawner(
+            daemon_server=daemon,
+            repo_root=Path("/srv/local/kai"),
+        )
+
+        with mock.patch(
+            "agent.taskboard_dispatcher._worktree_isolation_enabled",
+            return_value=False,
+        ), mock.patch(
+            "agent.taskboard_dispatcher.WorktreeManager.create"
+        ) as create_worktree:
+            with self.assertRaises(RepoRoutingError) as err:
+                await spawner.spawn(
+                    session_id="sess-missing-repo",
+                    task_id=10446,
+                    fire_generation=2,
+                    role="Developer",
+                    agent_id="developer",
+                    model="codex",
+                    profile="xhigh",
+                    prompt="orig prompt",
+                    task={"id": 10446, "agent": "Developer", "fire_generation": 2},
+                    session_token="",
+                    session_generation=None,
+                )
+
+        self.assertIn("missing repo routing metadata", str(err.exception))
         create_worktree.assert_not_called()
-        write_manifest.assert_not_called()
         self.assertEqual(daemon.last_prompt, None)
+        self.assertEqual(daemon.sessions, {})
+
+    async def test_developer_spawn_isolates_worktree_when_global_isolation_off(self) -> None:
+        daemon = _FakeDaemon()
+        spawner = DaemonTaskboardSpawner(
+            daemon_server=daemon,
+            repo_root=Path("/srv/local/kai"),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            primary_repo = temp_root / "primary"
+            worktree = temp_root / "worktree"
+            manifest = worktree / ".kai" / "workspace-manifest.json"
+            with mock.patch(
+                "agent.taskboard_dispatcher._worktree_isolation_enabled",
+                return_value=False,
+            ), mock.patch(
+                "agent.taskboard_dispatcher._multi_repo_routing_enabled",
+                return_value=False,
+            ), mock.patch(
+                "agent.taskboard_dispatcher.WorktreeManager.ensure_repo_clone",
+                return_value=primary_repo,
+            ), mock.patch(
+                "agent.taskboard_dispatcher.WorktreeManager.create",
+                return_value=worktree,
+            ), mock.patch(
+                "agent.taskboard_dispatcher.WorktreeManager.write_workspace_manifest",
+                return_value=manifest,
+            ), mock.patch(
+                "agent.taskboard_dispatcher._resolve_max_iterations_for_role",
+                return_value=5,
+            ):
+                session_id = await spawner.spawn(
+                    session_id="sess-isolated-dev",
+                    task_id=10447,
+                    fire_generation=3,
+                    role="Developer",
+                    agent_id="developer",
+                    model="codex",
+                    profile="xhigh",
+                    prompt="orig prompt",
+                    task={
+                        "id": 10447,
+                        "agent": "Developer",
+                        "fire_generation": 3,
+                        "project": {
+                            "repoUrl": "https://forgejo.example/openclawdev/taskboard.git"
+                        },
+                    },
+                    session_token="tok",
+                    session_generation=3,
+                )
+                await daemon.managed.current_input_task
+
+        self.assertEqual(session_id, "sess-isolated-dev")
+        self.assertIn(f"Worktree path: {worktree}", daemon.last_prompt)
+        self.assertEqual(
+            daemon.managed.session.taskboard_dispatcher["worktree_path"],
+            str(worktree),
+        )

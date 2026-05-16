@@ -46,14 +46,15 @@ def _seed_session(db: Path, session_id: str, status: str = "running") -> None:
             webhook_pending_id TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
+            last_progress_at TEXT,
             aborted_at TEXT
         )
         """
     )
     now = _utc_now().isoformat()
     conn.execute(
-        "INSERT INTO sessions (session_id, taskboard_task_id, fire_generation, agent_id, source, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (session_id, 9999, 1, "developer", "taskboard_dispatcher", status, now, now),
+        "INSERT INTO sessions (session_id, taskboard_task_id, fire_generation, agent_id, source, status, created_at, updated_at, last_progress_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (session_id, 9999, 1, "developer", "taskboard_dispatcher", status, now, now, now),
     )
     conn.commit()
     conn.close()
@@ -150,13 +151,16 @@ class MarkSessionTerminalTests(unittest.TestCase):
         # Seed a "stuck" session, finalize it, then ask the sweeper
         # for stuck rows older than 60s. Should be empty.
         _seed_session(self.db, "sess-not-stuck")
-        # Backdate created_at (the column the sweeper actually filters on)
-        # so the row is "old enough" for sweep.
+        # Backdate progress so the row is "no-progress old enough" for sweep.
         conn = sqlite3.connect(self.db)
         old = (_utc_now() - timedelta(hours=2)).isoformat()
         conn.execute(
-            "UPDATE sessions SET created_at = ? WHERE session_id = ?",
-            (old, "sess-not-stuck"),
+            """
+            UPDATE sessions
+            SET created_at = ?, updated_at = ?, last_progress_at = ?
+            WHERE session_id = ?
+            """,
+            (old, old, old, "sess-not-stuck"),
         )
         conn.commit()
         conn.close()

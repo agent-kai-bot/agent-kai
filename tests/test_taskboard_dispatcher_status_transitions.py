@@ -21,6 +21,7 @@ class _FakeTaskClient:
         self.tasks = tasks
         self.fetches: list[int] = []
         self.comments: list[tuple[int, str]] = []
+        self.moves: list[tuple[int, str, str, str]] = []
 
     async def fetch_task(self, task_id: int) -> dict:
         self.fetches.append(task_id)
@@ -28,6 +29,18 @@ class _FakeTaskClient:
 
     async def post_audit_comment(self, task_id: int, content: str) -> None:
         self.comments.append((task_id, content))
+
+    async def move_task_status(
+        self,
+        task_id: int,
+        status: str,
+        *,
+        reason: str = "",
+        agent: str = "Orchestrator",
+    ) -> None:
+        self.moves.append((task_id, status, reason, agent))
+        self.tasks[task_id] = dict(self.tasks[task_id])
+        self.tasks[task_id]["status"] = status
 
 
 class _FakeSessionSpawner:
@@ -395,6 +408,7 @@ class TaskboardDispatcherStatusTransitionTests(unittest.IsolatedAsyncioTestCase)
             "agent_id": "developer",
             "task_type": "Feature",
             "priority": "High",
+            "project": {"repoUrl": "https://forgejo.example/alpha-tech-org/example.git"},
             "project_id": 7,
             "epic_id": 10021,
             "source_ref": "test",

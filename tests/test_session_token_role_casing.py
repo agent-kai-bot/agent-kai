@@ -48,12 +48,25 @@ class _FakeTaskClient:
     def __init__(self, tasks: dict[int, dict]) -> None:
         self.tasks = tasks
         self.comments: list[tuple[int, str]] = []
+        self.moves: list[tuple[int, str, str, str]] = []
 
     async def fetch_task(self, task_id: int) -> dict:
         return dict(self.tasks[task_id])
 
     async def post_audit_comment(self, task_id: int, content: str) -> None:
         self.comments.append((task_id, content))
+
+    async def move_task_status(
+        self,
+        task_id: int,
+        status: str,
+        *,
+        reason: str = "",
+        agent: str = "Orchestrator",
+    ) -> None:
+        self.moves.append((task_id, status, reason, agent))
+        self.tasks[task_id] = dict(self.tasks[task_id])
+        self.tasks[task_id]["status"] = status
 
 
 class _GateRuntimeConfigResolver:
@@ -246,7 +259,12 @@ class SessionTokenRoleCasingTests(unittest.IsolatedAsyncioTestCase):
         conn.commit()
         conn.close()
 
-        task = {"id": 902, "agent": "Developer", "fire_generation": 1}
+        task = {
+            "id": 902,
+            "agent": "Developer",
+            "fire_generation": 1,
+            "project": {"repoUrl": "https://forgejo.example/alpha-tech-org/example.git"},
+        }
         spawner = _CaptureSpawner()
         dispatcher = TaskboardDispatcher(
             db_path=self.db,

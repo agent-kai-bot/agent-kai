@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import asyncio
+import os
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -16,7 +20,9 @@ from agent.taskboard_dispatcher import (
     BACKPRESSURE_SUBJECT,
     DISPATCHER_SOURCE,
     DaemonTaskboardSpawner,
+    SELF_MOVE_REASON,
     SPAWN_FAILED_SUBJECT,
+    WORKTREE_ISOLATION_ENV,
     RepoRoutingError,
     TaskboardDispatcher,
     resolve_taskboard_role,
@@ -27,20 +33,39 @@ from agent.taskboard_status_router import route_event
 NOW = datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc)
 
 
+_DEFAULT_REPO_URL = "https://forgejo.example/alpha-tech-org/example.git"
+
+
 class _FakeTaskClient:
     """In-memory taskboard client for dispatcher tests."""
 
-    def __init__(self, tasks: dict[int, dict], *, fail_comments: bool = False) -> None:
+    def __init__(
+        self,
+        tasks: dict[int, dict],
+        *,
+        fail_comments: bool = False,
+        default_repo_metadata: bool = True,
+    ) -> None:
         self.tasks = tasks
         self.fetches: list[int] = []
         self.comments: list[tuple[int, str]] = []
+        self.moves: list[tuple[int, str, str, str]] = []
         self.fail_comments = fail_comments
+        self.default_repo_metadata = default_repo_metadata
 
     async def fetch_task(self, task_id: int) -> dict:
         """Return the configured task for ``task_id``."""
 
         self.fetches.append(task_id)
-        return dict(self.tasks[task_id])
+        task = dict(self.tasks[task_id])
+        if (
+            self.default_repo_metadata
+            and task.get("agent") == "Developer"
+            and not task.get("repo_url")
+            and not task.get("project")
+        ):
+            task["project"] = {"repoUrl": _DEFAULT_REPO_URL}
+        return task
 
     async def post_audit_comment(self, task_id: int, content: str) -> None:
         """Record or reject a taskboard audit comment."""
@@ -48,6 +73,18 @@ class _FakeTaskClient:
         if self.fail_comments:
             raise RuntimeError("taskboard comment endpoint failed")
         self.comments.append((task_id, content))
+
+    async def move_task_status(
+        self,
+        task_id: int,
+        status: str,
+        *,
+        reason: str = "",
+        agent: str = "Orchestrator",
+    ) -> None:
+        self.moves.append((task_id, status, reason, agent))
+        self.tasks[task_id] = dict(self.tasks[task_id])
+        self.tasks[task_id]["status"] = status
 
 
 class _FakeSessionManager:
@@ -319,23 +356,338 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_explicit_repo_with_multi_repo_disabled_marks_spawn_failed(self) -> None:
-        """Developer dispatch fails closed when explicit repo routing cannot be honored."""
+    async def test_invalid_developer_repo_metadata_marks_spawn_failed(self) -> None:
+        """Developer dispatch fails closed before prompt render on invalid repo metadata."""
 
         row_id = self._insert_pending(10367, 8, "Developer")
         task = {
             "id": 10367,
             "agent": "Developer",
             "fire_generation": 8,
-            "project": {"repoUrl": "https://forgejo.example/openclawdev/taskboard.git"},
+            "project": {"repoUrl": "not-a-repo-target"},
         }
         task_client = _FakeTaskClient({10367: task})
-        session_manager = _FakeSessionManager(
-            spawn_error=RepoRoutingError(
-                "explicit repo routing metadata present for role=Developer but "
-                "TASKBOARD_MULTI_REPO_ROUTING=0; refusing local-repo fallback"
-            )
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
         )
+
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="rendered prompt",
+        ) as renderer:
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawn_failed": 1})
+        self.assertEqual(session_manager.spawn_calls, [])
+        renderer.assert_not_called()
+        self.assertEqual(self._pending_row(row_id)["dispatch_status"], "spawn_failed")
+        self.assertEqual(
+            task_client.comments,
+            [
+                (
+                    10367,
+                    "[System] spawn failed for #10367: invalid repo routing metadata for role=Developer: "
+                    "'not-a-repo-target'; retry with agent-ops fire 10367",
+                )
+            ],
+        )
+
+    async def test_request_changes_missing_repo_fails_closed_on_status_webhook(self) -> None:
+        """Developer repo validation still fails closed before the status-webhook spawn."""
+
+        verdict_row = self._insert_pending(
+            10446,
+            2,
+            "Developer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Review",
+            extra_payload={
+                "gate_type": "code",
+                "verdict": "REQUEST_CHANGES",
+                "review_id": 312,
+            },
+        )
+        task = {
+            "id": 10446,
+            "agent": "Developer",
+            "implementation_agent": "Developer",
+            "status": "Review",
+            "fire_generation": 2,
+        }
+        task_client = _FakeTaskClient({10446: task}, default_repo_metadata=False)
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        with mock.patch("agent.taskboard_dispatcher.render_taskboard_fire_prompt") as renderer:
+            first_counts = await dispatcher.run_once()
+
+        self.assertEqual(first_counts, {"move_only": 1})
+        self.assertEqual(session_manager.spawn_calls, [])
+        renderer.assert_not_called()
+        self.assertEqual(task_client.moves[0][2:], (SELF_MOVE_REASON, "User"))
+        row = self._pending_row(verdict_row)
+        self.assertEqual(row["dispatch_status"], "move_only")
+
+        status_row = self._insert_pending(
+            10446,
+            3,
+            "Developer",
+            event_type="task.status_changed",
+            from_status="Review",
+            to_status="Fixing",
+            task_status="Fixing",
+        )
+        with mock.patch("agent.taskboard_dispatcher.render_taskboard_fire_prompt") as renderer:
+            second_counts = await dispatcher.run_once()
+
+        self.assertEqual(second_counts, {"spawn_failed": 1})
+        self.assertEqual(session_manager.spawn_calls, [])
+        renderer.assert_not_called()
+        row = self._pending_row(status_row)
+        self.assertEqual(row["dispatch_status"], "spawn_failed")
+        self.assertIn("missing repo routing metadata", row["last_error"])
+
+    async def test_request_changes_verdict_moves_only_without_developer_spawn(self) -> None:
+        """Fix-loop verdict rows move the task; the status webhook owns spawning."""
+
+        row_id = self._insert_pending(
+            10447,
+            3,
+            "Developer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Review",
+            extra_payload={
+                "gate_type": "qa",
+                "verdict": "REQUEST_CHANGES",
+                "review_id": 314,
+                "cycle": 3,
+            },
+        )
+        task = {
+            "id": 10447,
+            "agent": "Developer",
+            "implementation_agent": "Developer",
+            "status": "Review",
+            "fire_generation": 3,
+            "project": {"repoUrl": _DEFAULT_REPO_URL},
+        }
+        task_client = _FakeTaskClient({10447: task})
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="rendered prompt",
+        ) as renderer:
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"move_only": 1})
+        self.assertEqual(
+            task_client.moves,
+            [
+                (
+                    10447,
+                    "Fixing",
+                    SELF_MOVE_REASON,
+                    "User",
+                )
+            ],
+        )
+        self.assertEqual(session_manager.spawn_calls, [])
+        renderer.assert_not_called()
+        row = self._pending_row(row_id)
+        self.assertEqual(row["dispatch_status"], "move_only")
+        self.assertIsNotNone(row["audit_posted_at"])
+        self.assertEqual(
+            task_client.comments,
+            [
+                (
+                    10447,
+                    "[Orchestrator] REQUEST_CHANGES received cycle 3; "
+                    "moved Review -> Fixing; awaiting task.status_changed webhook "
+                    f"for Developer spawn (move_only delivery ID: {row_id})",
+                )
+            ],
+        )
+
+    async def test_request_changes_move_only_audit_is_per_cycle_idempotent(self) -> None:
+        """Each REQUEST_CHANGES cycle gets one move-only audit, without re-post spam."""
+
+        first_row_id = self._insert_pending(
+            10453,
+            1,
+            "Developer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Review",
+            extra_payload={
+                "gate_type": "qa",
+                "verdict": "REQUEST_CHANGES",
+                "review_id": 320,
+                "cycle": 1,
+            },
+        )
+        task = {
+            "id": 10453,
+            "agent": "Developer",
+            "implementation_agent": "Developer",
+            "status": "Review",
+            "fire_generation": 1,
+            "project": {"repoUrl": _DEFAULT_REPO_URL},
+        }
+        task_client = _FakeTaskClient({10453: task})
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        self.assertEqual(await dispatcher.run_once(), {"move_only": 1})
+
+        second_row_id = self._insert_pending(
+            10453,
+            2,
+            "Developer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Fixing",
+            extra_payload={
+                "gate_type": "qa",
+                "verdict": "REQUEST_CHANGES",
+                "review_id": 321,
+                "cycle": 2,
+            },
+        )
+
+        self.assertEqual(await dispatcher.run_once(), {"move_only": 1})
+        self.assertEqual(await dispatcher.run_once(), {})
+        self.assertEqual(session_manager.spawn_calls, [])
+        self.assertEqual(len(task_client.comments), 2)
+        self.assertEqual(
+            task_client.comments[0],
+            (
+                10453,
+                "[Orchestrator] REQUEST_CHANGES received cycle 1; "
+                "moved Review -> Fixing; awaiting task.status_changed webhook "
+                f"for Developer spawn (move_only delivery ID: {first_row_id})",
+            ),
+        )
+        self.assertEqual(
+            task_client.comments[1],
+            (
+                10453,
+                "[Orchestrator] REQUEST_CHANGES received cycle 2; "
+                "moved Review -> Fixing; awaiting task.status_changed webhook "
+                f"for Developer spawn (move_only delivery ID: {second_row_id})",
+            ),
+        )
+        self.assertIsNotNone(self._pending_row(first_row_id)["audit_posted_at"])
+        self.assertIsNotNone(self._pending_row(second_row_id)["audit_posted_at"])
+
+    async def test_request_changes_move_failure_marks_move_failed(self) -> None:
+        """If taskboard rejects /move, the verdict row fails closed without spawn."""
+
+        row_id = self._insert_pending(
+            10452,
+            4,
+            "Developer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Review",
+            extra_payload={
+                "gate_type": "code",
+                "verdict": "REQUEST_CHANGES",
+                "review_id": 319,
+                "cycle": 4,
+            },
+        )
+        task = {
+            "id": 10452,
+            "agent": "Developer",
+            "implementation_agent": "Developer",
+            "status": "Review",
+            "fire_generation": 4,
+            "project": {"repoUrl": _DEFAULT_REPO_URL},
+        }
+        task_client = _FakeTaskClient({10452: task})
+
+        async def _fail_move(*_args, **_kwargs) -> None:
+            raise RuntimeError("taskboard 500")
+
+        task_client.move_task_status = _fail_move
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"move_failed": 1})
+        self.assertEqual(session_manager.spawn_calls, [])
+        row = self._pending_row(row_id)
+        self.assertEqual(row["dispatch_status"], "move_failed")
+        self.assertIn("taskboard 500", row["last_error"])
+        self.assertEqual(
+            task_client.comments,
+            [
+                (
+                    10452,
+                    "[Orchestrator] REQUEST_CHANGES received cycle 4; "
+                    "/move to Fixing failed: taskboard 500; "
+                    "manual intervention required",
+                )
+            ],
+        )
+        self.assertIsNotNone(row["audit_posted_at"])
+
+    async def test_h2_restart_between_move_and_webhook_spawns_once_from_status(self) -> None:
+        """A new dispatcher process needs no memory of the verdict-side move."""
+
+        self._insert_pending(
+            10448,
+            3,
+            "Developer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Review",
+            extra_payload={
+                "gate_type": "qa",
+                "verdict": "REQUEST_CHANGES",
+                "review_id": 315,
+            },
+        )
+        task = {
+            "id": 10448,
+            "agent": "Developer",
+            "implementation_agent": "Developer",
+            "status": "Review",
+            "fire_generation": 3,
+            "project": {"repoUrl": _DEFAULT_REPO_URL},
+        }
+        task_client = _FakeTaskClient({10448: task})
+        session_manager = _FakeSessionManager()
         dispatcher = self._dispatcher(
             tasks={},
             task_client=task_client,
@@ -346,18 +698,238 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
             "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
             return_value="rendered prompt",
         ):
+            first_counts = await dispatcher.run_once()
+
+        self.assertEqual(first_counts, {"move_only": 1})
+        self.assertEqual(session_manager.spawn_calls, [])
+        self.assertEqual(task_client.moves[0][2:], (SELF_MOVE_REASON, "User"))
+
+        status_row = self._insert_pending(
+            10448,
+            4,
+            "Developer",
+            event_type="task.status_changed",
+            from_status="Review",
+            to_status="Fixing",
+            task_status="Fixing",
+            extra_payload={
+                "event_id": "self-move-status-10448",
+                "actor": {
+                    "type": "operator",
+                    "agent": "User",
+                    "principal_id": None,
+                },
+            },
+        )
+        restarted_session_manager = _FakeSessionManager()
+        restarted_dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=restarted_session_manager,
+        )
+
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="rendered prompt",
+        ):
+            second_counts = await restarted_dispatcher.run_once()
+
+        self.assertEqual(second_counts, {"spawned": 1})
+        self.assertEqual(len(restarted_session_manager.spawn_calls), 1)
+        self.assertEqual(restarted_session_manager.spawn_calls[0]["role"], "Developer")
+        self.assertEqual(self._pending_row(status_row)["dispatch_status"], "spawned")
+
+    async def test_h2_slow_outbox_after_sixty_seconds_spawns_once_from_status(self) -> None:
+        """Late status webhooks still spawn because there is no TTL-based suppressor."""
+
+        self._insert_pending(
+            10450,
+            8,
+            "Developer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Review",
+            extra_payload={
+                "gate_type": "qa",
+                "verdict": "REQUEST_CHANGES",
+                "review_id": 317,
+            },
+        )
+        task = {
+            "id": 10450,
+            "agent": "Developer",
+            "implementation_agent": "Developer",
+            "status": "Review",
+            "fire_generation": 8,
+            "project": {"repoUrl": _DEFAULT_REPO_URL},
+        }
+        task_client = _FakeTaskClient({10450: task})
+        session_manager = _FakeSessionManager()
+        current_time = NOW
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+            clock=lambda: current_time,
+        )
+
+        first_counts = await dispatcher.run_once()
+
+        self.assertEqual(first_counts, {"move_only": 1})
+        self.assertEqual(session_manager.spawn_calls, [])
+
+        current_time = NOW + timedelta(seconds=61)
+        status_row = self._insert_pending(
+            10450,
+            9,
+            "Developer",
+            received_at=self._iso(current_time),
+            event_type="task.status_changed",
+            from_status="Review",
+            to_status="Fixing",
+            task_status="Fixing",
+        )
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="rendered prompt",
+        ):
+            second_counts = await dispatcher.run_once()
+
+        self.assertEqual(second_counts, {"spawned": 1})
+        self.assertEqual(len(session_manager.spawn_calls), 1)
+        self.assertEqual(self._pending_row(status_row)["dispatch_status"], "spawned")
+
+    async def test_h2_operator_race_is_not_suppressed(self) -> None:
+        """A human Review -> Fixing event is processed, not hidden by self-move state."""
+
+        self._insert_pending(
+            10451,
+            10,
+            "Developer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Review",
+            extra_payload={
+                "gate_type": "code",
+                "verdict": "REQUEST_CHANGES",
+                "review_id": 318,
+            },
+        )
+        task = {
+            "id": 10451,
+            "agent": "Developer",
+            "implementation_agent": "Developer",
+            "status": "Review",
+            "fire_generation": 10,
+            "project": {"repoUrl": _DEFAULT_REPO_URL},
+        }
+        task_client = _FakeTaskClient({10451: task})
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        self.assertEqual(await dispatcher.run_once(), {"move_only": 1})
+
+        self._insert_pending(
+            10451,
+            11,
+            "Developer",
+            event_type="task.status_changed",
+            from_status="Review",
+            to_status="Fixing",
+            task_status="Fixing",
+            extra_payload={
+                "event_id": "kai-move-status-10451",
+                "actor": {"type": "operator", "agent": "User", "principal_id": None},
+            },
+        )
+        self._insert_pending(
+            10451,
+            11,
+            "Developer",
+            event_type="task.status_changed",
+            from_status="Review",
+            to_status="Fixing",
+            task_status="Fixing",
+            extra_payload={
+                "event_id": "operator-move-status-10451",
+                "actor": {
+                    "type": "operator",
+                    "agent": "User",
+                    "principal_id": "human-operator",
+                },
+            },
+        )
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="rendered prompt",
+        ):
             counts = await dispatcher.run_once()
 
-        self.assertEqual(counts, {"spawn_failed": 1})
+        self.assertEqual(counts, {"spawned": 1, "duplicate": 1})
+        self.assertEqual(len(session_manager.spawn_calls), 1)
+        self.assertEqual(self._pending_statuses(), ["move_only", "spawned", "duplicate"])
+
+    async def test_architect_request_changes_skips_auto_move_and_spawn(self) -> None:
+        """Architect REQUEST_CHANGES stays out of the Developer-only stop-gap."""
+
+        row_id = self._insert_pending(
+            10449,
+            6,
+            "Code Reviewer",
+            event_type="review.verdict_submitted",
+            from_status=None,
+            to_status=None,
+            task_status="Review",
+            extra_payload={
+                "gate_type": "code",
+                "verdict": "REQUEST_CHANGES",
+                "review_id": 316,
+                "cycle": 6,
+            },
+        )
+        task = {
+            "id": 10449,
+            "agent": "Code Reviewer",
+            "implementation_agent": "Architect",
+            "status": "Review",
+            "fire_generation": 6,
+            "task_type": "design",
+        }
+        task_client = _FakeTaskClient({10449: task}, default_repo_metadata=False)
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="architect prompt",
+        ):
+            first_counts = await dispatcher.run_once()
+
+        self.assertEqual(first_counts, {"skipped_non_developer_role": 1})
         self.assertEqual(session_manager.spawn_calls, [])
-        self.assertEqual(self._pending_row(row_id)["dispatch_status"], "spawn_failed")
+        self.assertEqual(task_client.moves, [])
+        row = self._pending_row(row_id)
+        self.assertEqual(row["dispatch_status"], "skipped_non_developer_role")
+        self.assertIsNotNone(row["audit_posted_at"])
         self.assertEqual(
             task_client.comments,
             [
                 (
-                    10367,
-                    "[System] spawn failed for #10367: explicit repo routing metadata present for role=Developer but "
-                    "TASKBOARD_MULTI_REPO_ROUTING=0; refusing local-repo fallback; retry with agent-ops fire 10367",
+                    10449,
+                    "[Orchestrator] REQUEST_CHANGES for Architect; auto-move skipped "
+                    "(only Developer auto-moves in current dispatcher; see "
+                    "docs/architecture/10460-dynamic-flow-engine.md Phase 1 "
+                    "for role coverage)",
                 )
             ],
         )
@@ -613,6 +1185,57 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._pending_row(row_id)["dispatch_status"], "stuck_aborted")
         self.assertEqual(self._session_row()["status"], "aborted")
 
+    async def test_recent_tool_progress_prevents_stuck_sweep(self) -> None:
+        """A long-running session with recent progress is not stuck."""
+
+        row_id = self._insert_pending(701, 2, "Developer")
+        self._create_full_sessions_table()
+        stale_created_at = self._iso(NOW - timedelta(minutes=75))
+        recent_progress_at = self._iso(NOW - timedelta(minutes=5))
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE webhook_pending
+                SET processed_at = ?, dispatch_status = ?, session_id = ?
+                WHERE id = ?
+                """,
+                (self._iso(NOW), "spawned", "session-active", row_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO sessions (
+                    session_id, taskboard_task_id, fire_generation, agent_id,
+                    source, status, webhook_pending_id, created_at, updated_at,
+                    last_progress_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "session-active",
+                    701,
+                    2,
+                    "developer",
+                    DISPATCHER_SOURCE,
+                    "running",
+                    str(row_id),
+                    stale_created_at,
+                    stale_created_at,
+                    recent_progress_at,
+                ),
+            )
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            session_manager=session_manager,
+        )
+
+        count = await dispatcher.sweep_stuck_sessions()
+
+        self.assertEqual(count, 0)
+        self.assertEqual(session_manager.abort_calls, [])
+        self.assertEqual(self._pending_row(row_id)["dispatch_status"], "spawned")
+        self.assertEqual(self._session_row()["status"], "running")
+
     async def test_completed_qa_fire_is_not_marked_stuck_aborted(self) -> None:
         """A finished QA fire must leave the sweeper's active-session set."""
 
@@ -713,11 +1336,69 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 (
                     10156,
                     "[System] sweeper aborted stuck session for #10156 "
-                    "after 60min (session_id=session-stuck-audit)",
+                    "after 60min without progress (session_id=session-stuck-audit)",
                 )
             ],
         )
         self.assertIsNotNone(self._pending_row(row_id)["audit_posted_at"])
+
+    async def test_stuck_session_sweep_posts_max_runtime_audit_comment(self) -> None:
+        """The absolute runtime ceiling has distinct audit wording."""
+
+        row_id = self._insert_pending(10159, 9, "Developer")
+        self._create_full_sessions_table()
+        old_created_at = self._iso(NOW - timedelta(hours=4, minutes=1))
+        recent_progress_at = self._iso(NOW - timedelta(minutes=5))
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE webhook_pending
+                SET processed_at = ?, dispatch_status = ?, session_id = ?
+                WHERE id = ?
+                """,
+                (self._iso(NOW), "spawned", "session-max-runtime", row_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO sessions (
+                    session_id, taskboard_task_id, fire_generation, agent_id,
+                    source, status, webhook_pending_id, created_at, updated_at,
+                    last_progress_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "session-max-runtime",
+                    10159,
+                    9,
+                    "developer",
+                    DISPATCHER_SOURCE,
+                    "running",
+                    str(row_id),
+                    old_created_at,
+                    recent_progress_at,
+                    recent_progress_at,
+                ),
+            )
+        task_client = _FakeTaskClient({})
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        count = await dispatcher.sweep_stuck_sessions()
+
+        self.assertEqual(count, 1)
+        self.assertEqual(session_manager.abort_calls, ["session-max-runtime"])
+        comment = task_client.comments[0][1]
+        self.assertEqual(
+            comment,
+            "[System] sweeper aborted stuck session for #10159 "
+            "after exceeding 240min max runtime (session_id=session-max-runtime)",
+        )
+        self.assertNotIn("without progress", comment)
 
     async def test_comment_post_failure_is_non_fatal_and_retryable(self) -> None:
         """Comment failures leave the spawned session intact for retry."""
@@ -831,24 +1512,47 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
 
         spawner = DaemonTaskboardSpawner(daemon)
-        session_id = await spawner.spawn(
-            session_id="session-1",
-            task_id=1,
-            fire_generation=11,
-            role="Developer",
-            agent_id="developer",
-            model="codex",
-            profile="xhigh",
-            prompt="prompt",
-            task={"id": 1, "agent": "Developer", "fire_generation": 11},
-            session_token="session-token",
-            session_generation=11,
-            taskboard_base_url="http://taskboard.local",
-            taskboard_bearer_token="bearer-token",
-            runtime_config=runtime_config,
-            runtime_env=runtime_config.env_overlay(),
-        )
-        await daemon.managed.current_input_task
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            primary_repo = temp_root / "primary"
+            worktree = temp_root / "worktree"
+            manifest = worktree / ".kai" / "workspace-manifest.json"
+            with mock.patch(
+                "agent.taskboard_dispatcher._multi_repo_routing_enabled",
+                return_value=True,
+            ), mock.patch(
+                "agent.taskboard_dispatcher.WorktreeManager.ensure_repo_clone",
+                return_value=primary_repo,
+            ), mock.patch(
+                "agent.taskboard_dispatcher.WorktreeManager.create",
+                return_value=worktree,
+            ), mock.patch(
+                "agent.taskboard_dispatcher.WorktreeManager.write_workspace_manifest",
+                return_value=manifest,
+            ):
+                session_id = await spawner.spawn(
+                    session_id="session-1",
+                    task_id=1,
+                    fire_generation=11,
+                    role="Developer",
+                    agent_id="developer",
+                    model="codex",
+                    profile="xhigh",
+                    prompt="prompt",
+                    task={
+                        "id": 1,
+                        "agent": "Developer",
+                        "fire_generation": 11,
+                        "project": {"repoUrl": _DEFAULT_REPO_URL},
+                    },
+                    session_token="session-token",
+                    session_generation=11,
+                    taskboard_base_url="http://taskboard.local",
+                    taskboard_bearer_token="bearer-token",
+                    runtime_config=runtime_config,
+                    runtime_env=runtime_config.env_overlay(),
+                )
+                await daemon.managed.current_input_task
 
         self.assertEqual(session_id, "session-1")
         self.assertIsNotNone(session.attach_seen)
@@ -857,6 +1561,76 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(taskboard_context.session_generation, 11)
         self.assertEqual(forgejo_context.token, "role-pat")
         self.assertEqual(runtime_env["FORGEJO_TOKEN_DEVELOPER"], "role-pat")
+
+    async def test_developer_forced_isolation_cleans_worktree_when_global_flag_off(self) -> None:
+        """Developer worktrees are cleaned after finalization even when global isolation is off."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir) / "repo"
+            repo_root.mkdir()
+            subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "checkout", "-b", "main"], cwd=repo_root, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "kai-test@example.invalid"], cwd=repo_root, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "KAI Test"], cwd=repo_root, check=True, capture_output=True, text=True)
+            (repo_root / "README.md").write_text("test repo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo_root, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "-c", "commit.gpgsign=false", "commit", "-m", "initial"],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            session_id = f"m2-cleanup-{os.getpid()}-{id(self)}"
+            session_path = Path("/tmp/kai/sessions") / session_id
+            shutil.rmtree(session_path, ignore_errors=True)
+            session = _AttachOrderSession()
+            daemon = _FakeDaemonServer(session)
+            spawner = DaemonTaskboardSpawner(daemon, repo_root=repo_root)
+            daemon.taskboard_dispatcher = SimpleNamespace(session_manager=spawner)
+
+            try:
+                with mock.patch.dict("os.environ", {WORKTREE_ISOLATION_ENV: "0"}, clear=False), \
+                     mock.patch(
+                         "agent.taskboard_dispatcher.WorktreeManager.ensure_repo_clone",
+                         return_value=repo_root,
+                     ), mock.patch(
+                         "agent.taskboard_dispatcher._resolve_max_iterations_for_role",
+                         return_value=1,
+                     ), mock.patch(
+                         "agent.agent_runs_client.AgentRunsClient.from_env",
+                         return_value=mock.Mock(enabled=False),
+                     ):
+                    created_session = await spawner.spawn(
+                        session_id=session_id,
+                        task_id=10450,
+                        fire_generation=17,
+                        role="Developer",
+                        agent_id="developer",
+                        model="codex",
+                        profile="xhigh",
+                        prompt="prompt",
+                        task={
+                            "id": 10450,
+                            "agent": "Developer",
+                            "fire_generation": 17,
+                            "project": {
+                                "repoUrl": str(repo_root),
+                                "defaultBranch": "main",
+                            },
+                        },
+                        session_token="session-token",
+                        session_generation=17,
+                    )
+                    self.assertEqual(created_session, session_id)
+                    self.assertTrue(session_path.exists())
+                    await daemon.managed.current_input_task
+                    await asyncio.sleep(0)
+
+                self.assertFalse(session_path.exists())
+            finally:
+                shutil.rmtree(session_path, ignore_errors=True)
 
     async def test_daemon_spawner_resolves_role_config_before_clone_with_auth_env(self) -> None:
         """Worktree clone receives the resolver auth env after role resolution."""
@@ -971,6 +1745,7 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         session_manager: _FakeSessionManager,
         nats_bus=None,
         max_concurrent_spawns: int = 6,
+        clock=None,
     ) -> TaskboardDispatcher:
         return TaskboardDispatcher(
             db_path=self.db_path,
@@ -978,7 +1753,7 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
             session_manager=session_manager,
             nats_bus=nats_bus,
             max_concurrent_spawns=max_concurrent_spawns,
-            clock=lambda: NOW,
+            clock=clock or (lambda: NOW),
             agent_runs_client=mock.Mock(enabled=False),
             runtime_config_resolver=_FakeRuntimeConfigResolver(),
         )
@@ -1013,6 +1788,7 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
                     webhook_pending_id TEXT,
                     created_at TEXT,
                     updated_at TEXT,
+                    last_progress_at TEXT,
                     aborted_at TEXT
                 )
                 """
@@ -1033,6 +1809,7 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
                     webhook_pending_id TEXT,
                     created_at TEXT,
                     updated_at TEXT,
+                    last_progress_at TEXT,
                     aborted_at TEXT
                 )
                 """
