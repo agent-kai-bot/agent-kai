@@ -92,6 +92,43 @@ class TaskboardServiceClientTests(unittest.TestCase):
         self.assertNotIn("bearer-secret", str(exc.body))
 
     @mock.patch("agent.taskboard_service_client.requests.request")
+    def test_get_project_returns_project_payload(self, request_mock) -> None:
+        """Project fetches use the service bearer against the project detail endpoint."""
+
+        request_mock.return_value = _FakeResponse(
+            payload={
+                "id": 9,
+                "name": "kai-autofire-smoke",
+                "git_url": "https://forgejo.example/alpha-tech-org/kai.git",
+            }
+        )
+        client = TaskboardServiceClient(
+            "http://taskboard.local",
+            bearer_token="bearer-secret",
+        )
+
+        result = client.get_project(9)
+
+        self.assertEqual(result["git_url"], "https://forgejo.example/alpha-tech-org/kai.git")
+        request_mock.assert_called_once()
+        _, kwargs = request_mock.call_args
+        self.assertEqual(kwargs["method"], "GET")
+        self.assertEqual(kwargs["url"], "http://taskboard.local/api/projects/9")
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer bearer-secret")
+
+    @mock.patch("agent.taskboard_service_client.requests.request")
+    def test_get_project_returns_none_for_404(self, request_mock) -> None:
+        """Missing projects are represented as ``None`` for lazy enrichment."""
+
+        request_mock.return_value = _FakeResponse(
+            status_code=404,
+            payload={"detail": "Project not found"},
+        )
+        client = TaskboardServiceClient("http://taskboard.local")
+
+        self.assertIsNone(client.get_project(999))
+
+    @mock.patch("agent.taskboard_service_client.requests.request")
     def test_post_audit_comment_request_shape(self, request_mock) -> None:
         """Audit comments match the live taskboard comment endpoint shape."""
 

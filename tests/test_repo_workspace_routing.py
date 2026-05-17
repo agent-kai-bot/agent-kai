@@ -17,6 +17,37 @@ from agent.worktree_manager import WorktreeManager
 
 
 class RepoWorkspaceRoutingTests(unittest.TestCase):
+    def test_resolve_repo_target_accepts_task_git_url(self) -> None:
+        target = _resolve_repo_target(
+            {
+                "git_url": "https://forgejo.example/openclawdev/taskboard.git",
+                "defaultBranch": "develop",
+            },
+            fallback_repo_root=Path("/srv/local/kai"),
+            role="Developer",
+        )
+        self.assertEqual(target.repo_url, "https://forgejo.example/openclawdev/taskboard.git")
+        self.assertEqual(target.default_branch, "develop")
+        self.assertEqual(target.source, "task.git_url")
+        self.assertEqual(target.routing_mode, "explicit")
+
+    def test_resolve_repo_target_accepts_project_git_url(self) -> None:
+        target = _resolve_repo_target(
+            {
+                "project": {
+                    "git_url": "https://forgejo.example/openclawdev/taskboard.git",
+                    "defaultBranch": "develop",
+                    "slug": "taskboard",
+                }
+            },
+            fallback_repo_root=Path("/srv/local/kai"),
+            role="Developer",
+        )
+        self.assertEqual(target.repo_url, "https://forgejo.example/openclawdev/taskboard.git")
+        self.assertEqual(target.default_branch, "develop")
+        self.assertEqual(target.source, "task.project.git_url")
+        self.assertEqual(target.display_name, "taskboard")
+
     def test_resolve_repo_target_uses_project_repo_url(self) -> None:
         target = _resolve_repo_target(
             {

@@ -59,6 +59,24 @@ class TaskboardServiceClient:
             raise TaskboardServiceError(
                 "taskboard fetch_task response was not a JSON object",
                 body=self._redact_body(payload),
+        )
+        return payload
+
+    def get_project(self, project_id: int) -> dict[str, Any] | None:
+        """Fetch one taskboard project as a JSON dictionary, or ``None`` for 404."""
+
+        try:
+            payload = self._request_json("GET", f"/api/projects/{int(project_id)}")
+        except TaskboardServiceError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        if payload is None:
+            return None
+        if not isinstance(payload, dict):
+            raise TaskboardServiceError(
+                "taskboard get_project response was not a JSON object",
+                body=self._redact_body(payload),
             )
         return payload
 
