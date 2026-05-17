@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import os
 import tempfile
@@ -25,6 +26,7 @@ from agent.auto_evaluator import AutoEvaluationDecision
 from agent.auto_loop_brain import AutoLoopBrainConfig, LLMResult, TokenUsage, build_auto_response_evaluator
 from agent.core import AgentRunner
 from agent.tools import file_read, file_write, shell_exec
+import daemon.core as daemon_core
 from daemon.core import Session
 
 
@@ -110,6 +112,30 @@ class _FakeRunner:
 
 async def _collect_events(session: Session, text: str) -> list[dict]:
     return [event async for event in session.stream_agent_events(text)]
+
+
+def test_default_auto_max_duration_seconds_is_long_and_env_tunable(monkeypatch):
+    original_env = os.environ.get("KAI_AUTO_MAX_DURATION_SECONDS")
+
+    try:
+        monkeypatch.delenv("KAI_AUTO_MAX_DURATION_SECONDS", raising=False)
+        reloaded = importlib.reload(daemon_core)
+        assert reloaded.DEFAULT_AUTO_MAX_DURATION_SECONDS >= 3600
+        assert reloaded.DEFAULT_AUTO_MAX_DURATION_SECONDS == 14400.0
+
+        monkeypatch.setenv("KAI_AUTO_MAX_DURATION_SECONDS", "600")
+        reloaded = importlib.reload(daemon_core)
+        assert reloaded.DEFAULT_AUTO_MAX_DURATION_SECONDS == 600.0
+
+        monkeypatch.setenv("KAI_AUTO_MAX_DURATION_SECONDS", "abc")
+        reloaded = importlib.reload(daemon_core)
+        assert reloaded.DEFAULT_AUTO_MAX_DURATION_SECONDS == 14400.0
+    finally:
+        if original_env is None:
+            monkeypatch.delenv("KAI_AUTO_MAX_DURATION_SECONDS", raising=False)
+        else:
+            monkeypatch.setenv("KAI_AUTO_MAX_DURATION_SECONDS", original_env)
+        importlib.reload(daemon_core)
 
 
 class SessionAutoModeTests(unittest.IsolatedAsyncioTestCase):
