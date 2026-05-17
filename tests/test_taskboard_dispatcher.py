@@ -43,11 +43,14 @@ class _FakeTaskClient:
         self,
         tasks: dict[int, dict],
         *,
+        projects: dict[int, dict | None] | None = None,
         fail_comments: bool = False,
         default_repo_metadata: bool = True,
     ) -> None:
         self.tasks = tasks
+        self.projects = projects or {}
         self.fetches: list[int] = []
+        self.project_fetches: list[int] = []
         self.comments: list[tuple[int, str]] = []
         self.moves: list[tuple[int, str, str, str]] = []
         self.fail_comments = fail_comments
@@ -66,6 +69,13 @@ class _FakeTaskClient:
         ):
             task["project"] = {"repoUrl": _DEFAULT_REPO_URL}
         return task
+
+    async def get_project(self, project_id: int) -> dict | None:
+        """Return a configured project for lazy dispatcher enrichment."""
+
+        self.project_fetches.append(project_id)
+        project = self.projects.get(project_id)
+        return dict(project) if project is not None else None
 
     async def post_audit_comment(self, task_id: int, content: str) -> None:
         """Record or reject a taskboard audit comment."""
@@ -455,6 +465,160 @@ class TaskboardDispatcherTests(unittest.IsolatedAsyncioTestCase):
         row = self._pending_row(status_row)
         self.assertEqual(row["dispatch_status"], "spawn_failed")
         self.assertIn("missing repo routing metadata", row["last_error"])
+
+    async def test_project_id_only_task_fetches_project_before_spawn(self) -> None:
+        """Developer validation fetches project git_url when task.project is absent."""
+
+        row_id = self._insert_pending(10470, 1, "Developer")
+        task = {
+            "id": 10470,
+            "agent": "Developer",
+            "fire_generation": 1,
+            "project": None,
+            "project_id": 9,
+        }
+        task_client = _FakeTaskClient(
+            {10470: task},
+            projects={
+                9: {
+                    "id": 9,
+                    "slug": "kai-autofire-smoke",
+                    "git_url": _DEFAULT_REPO_URL,
+                    "defaultBranch": "develop",
+                }
+            },
+            default_repo_metadata=False,
+        )
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="rendered prompt",
+        ):
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawned": 1})
+        self.assertEqual(task_client.project_fetches, [9])
+        self.assertEqual(len(session_manager.spawn_calls), 1)
+        spawn_task = session_manager.spawn_calls[0]["task"]
+        self.assertEqual(spawn_task["project"]["git_url"], _DEFAULT_REPO_URL)
+        self.assertEqual(self._pending_row(row_id)["dispatch_status"], "spawned")
+
+    async def test_project_id_missing_still_fails_closed_without_project_fetch(self) -> None:
+        """Missing nested project and missing project_id remains a hard failure."""
+
+        row_id = self._insert_pending(10471, 1, "Developer")
+        task = {
+            "id": 10471,
+            "agent": "Developer",
+            "fire_generation": 1,
+            "project": None,
+        }
+        task_client = _FakeTaskClient(
+            {10471: task},
+            default_repo_metadata=False,
+        )
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        with mock.patch("agent.taskboard_dispatcher.render_taskboard_fire_prompt") as renderer:
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawn_failed": 1})
+        self.assertEqual(task_client.project_fetches, [])
+        self.assertEqual(session_manager.spawn_calls, [])
+        renderer.assert_not_called()
+        row = self._pending_row(row_id)
+        self.assertEqual(row["dispatch_status"], "spawn_failed")
+        self.assertIn("missing repo routing metadata", row["last_error"])
+
+    async def test_fetched_project_without_git_url_still_fails_closed(self) -> None:
+        """Fetching a project does not relax Developer repo validation."""
+
+        row_id = self._insert_pending(10472, 1, "Developer")
+        task = {
+            "id": 10472,
+            "agent": "Developer",
+            "fire_generation": 1,
+            "project": None,
+            "project_id": 1,
+        }
+        task_client = _FakeTaskClient(
+            {10472: task},
+            projects={1: {"id": 1, "name": "Default Project", "git_url": None}},
+            default_repo_metadata=False,
+        )
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        with mock.patch("agent.taskboard_dispatcher.render_taskboard_fire_prompt") as renderer:
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawn_failed": 1})
+        self.assertEqual(task_client.project_fetches, [1])
+        self.assertEqual(session_manager.spawn_calls, [])
+        renderer.assert_not_called()
+        row = self._pending_row(row_id)
+        self.assertEqual(row["dispatch_status"], "spawn_failed")
+        self.assertIn("missing repo routing metadata", row["last_error"])
+
+    async def test_project_fetch_cache_hits_for_second_spawn_within_ttl(self) -> None:
+        """A dispatcher caches project fetches for repeated project_id validations."""
+
+        first_row = self._insert_pending(10473, 1, "Developer")
+        second_row = self._insert_pending(10474, 1, "Developer")
+        tasks = {
+            10473: {
+                "id": 10473,
+                "agent": "Developer",
+                "fire_generation": 1,
+                "project": None,
+                "project_id": 9,
+            },
+            10474: {
+                "id": 10474,
+                "agent": "Developer",
+                "fire_generation": 1,
+                "project": None,
+                "project_id": 9,
+            },
+        }
+        task_client = _FakeTaskClient(
+            tasks,
+            projects={9: {"id": 9, "git_url": _DEFAULT_REPO_URL}},
+            default_repo_metadata=False,
+        )
+        session_manager = _FakeSessionManager()
+        dispatcher = self._dispatcher(
+            tasks={},
+            task_client=task_client,
+            session_manager=session_manager,
+        )
+
+        with mock.patch(
+            "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+            return_value="rendered prompt",
+        ):
+            counts = await dispatcher.run_once()
+
+        self.assertEqual(counts, {"spawned": 2})
+        self.assertEqual(task_client.project_fetches, [9])
+        self.assertEqual(len(session_manager.spawn_calls), 2)
+        self.assertEqual(self._pending_row(first_row)["dispatch_status"], "spawned")
+        self.assertEqual(self._pending_row(second_row)["dispatch_status"], "spawned")
 
     async def test_request_changes_verdict_moves_only_without_developer_spawn(self) -> None:
         """Fix-loop verdict rows move the task; the status webhook owns spawning."""

@@ -26,6 +26,7 @@ TASKBOARD_ROOT = Path("/home/atc/git/OPS/openclawdev-taskboard")
 TASKBOARD_APP = TASKBOARD_ROOT / "app.py"
 BOOTSTRAP_TOKEN = "bootstrap-v2-token-123456"
 NOW = datetime(2026, 4, 28, 12, 0, 0, tzinfo=timezone.utc)
+DEFAULT_REPO_URL = "https://forgejo.example/alpha-tech-org/example.git"
 
 
 def test_move_task_status_user_actor_succeeds_against_taskboard_contract(
@@ -148,6 +149,76 @@ def test_request_changes_move_only_spawns_from_real_taskboard_status_webhook(
                 assert _kai_pending_statuses(kai_db) == ["move_only", "spawned"]
 
 
+def test_project_id_only_status_webhook_fetches_real_taskboard_project_before_spawn(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Real taskboard payloads with project=None resolve repo routing via GET project."""
+
+    taskboard_app = _load_taskboard_app(monkeypatch)
+    monkeypatch.setenv(
+        taskboard_app.webhook_outbox.ENV_TASKBOARD_WEBHOOK_SECRET,
+        "test-secret-value",
+    )
+    with _isolated_taskboard_db(taskboard_app, tmp_path / "taskboard.db"):
+        with patch.object(taskboard_app.manager, "broadcast", new=AsyncMock()):
+            with TestClient(
+                taskboard_app.app,
+                base_url="http://taskboard.test",
+            ) as client:
+                _seed_status_subscription(taskboard_app)
+                task_id = _seed_review_task(
+                    taskboard_app,
+                    client,
+                    agent="Developer",
+                    task_type="Feature",
+                    implementation_agent="Developer",
+                )
+                project_id = _set_project_git_url_for_task(
+                    taskboard_app,
+                    task_id,
+                    DEFAULT_REPO_URL,
+                )
+                service = TaskboardServiceClient(
+                    "http://taskboard.test",
+                    bearer_token=BOOTSTRAP_TOKEN,
+                    request_func=_testclient_request(client),
+                )
+
+                moved = service.move_task_status(
+                    task_id,
+                    "Fixing",
+                    reason=SELF_MOVE_REASON,
+                    agent="User",
+                )
+                assert moved["status"] == "moved"
+
+                payload = _single_status_outbox_payload(taskboard_app, task_id)
+                assert payload["event_type"] == "task.status_changed"
+                assert payload["task"]["project_id"] == project_id
+                assert "repo_url" not in payload["task"]
+                assert "git_url" not in payload["task"]
+                payload["task"]["project"] = None
+
+                kai_db = tmp_path / "kai-daemon-state.sqlite3"
+                _create_kai_pending_table(kai_db)
+                _insert_kai_pending(kai_db, payload)
+                spawner = _FakeSessionManager()
+                dispatcher = _dispatcher(kai_db, service, spawner)
+                with mock.patch(
+                    "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+                    side_effect=lambda role, task, **_: f"prompt for {role} #{task['id']}",
+                ):
+                    counts = asyncio.run(dispatcher.run_once())
+
+                assert counts == {"spawned": 1}
+                assert len(spawner.spawn_calls) == 1
+                spawn_task = spawner.spawn_calls[0]["task"]
+                assert spawn_task["project_id"] == project_id
+                assert spawn_task["project"]["git_url"] == DEFAULT_REPO_URL
+                assert spawner.spawn_calls[0]["role"] == "Developer"
+
+
 def _load_taskboard_app(monkeypatch):
     monkeypatch.setenv("TASKBOARD_WEBHOOK_WORKER_DISABLED", "1")
     existing = sys.modules.get("app")
@@ -249,6 +320,39 @@ def _seed_status_subscription(taskboard_app: Any) -> None:
         conn.commit()
 
 
+def _set_project_git_url_for_task(
+    taskboard_app: Any,
+    task_id: int,
+    git_url: str,
+) -> int:
+    with taskboard_app.get_db() as conn:
+        task_row = conn.execute(
+            "SELECT project_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assert task_row is not None
+        project_id = int(task_row["project_id"])
+        project_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(projects)").fetchall()
+        }
+        updates = ["git_url = ?", "updated_at = ?"]
+        params: list[Any] = [git_url, _iso(NOW)]
+        if "git_branch" in project_columns:
+            updates.append("git_branch = ?")
+            params.append("main")
+        if "default_branch" in project_columns:
+            updates.append("default_branch = ?")
+            params.append("main")
+        params.append(project_id)
+        conn.execute(
+            f"UPDATE projects SET {', '.join(updates)} WHERE id = ?",
+            params,
+        )
+        conn.commit()
+    return project_id
+
+
 def _single_status_outbox_payload(taskboard_app: Any, task_id: int) -> dict[str, Any]:
     with taskboard_app.get_db() as conn:
         rows = conn.execute(
@@ -342,7 +446,7 @@ class _RepoAwareTaskboardServiceClient:
 
     def fetch_task(self, task_id: int) -> dict[str, Any]:
         task = self.inner.fetch_task(task_id)
-        task["repo_url"] = "https://forgejo.example/alpha-tech-org/example.git"
+        task["repo_url"] = DEFAULT_REPO_URL
         task["default_branch"] = "main"
         return task
 

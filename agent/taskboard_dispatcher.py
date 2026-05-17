@@ -9,12 +9,11 @@ import logging
 import os
 import re
 import sqlite3
-from collections.abc import Awaitable, Callable
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
-from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from collections.abc import Iterable
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
@@ -49,6 +48,8 @@ DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_SWEEP_INTERVAL_SECONDS = 60.0
 DEFAULT_STUCK_AFTER_SECONDS = 60 * 60
 DEFAULT_MAX_SESSION_SECONDS = 4 * 60 * 60
+PROJECT_CACHE_MAX_ENTRIES = 50
+PROJECT_CACHE_TTL = timedelta(minutes=5)
 WORKTREE_ISOLATION_ENV = "KAI_WORKTREE_ISOLATION_ENABLED"
 MULTI_REPO_ROUTING_ENV = "TASKBOARD_MULTI_REPO_ROUTING"
 SELF_MOVE_ORIGINATOR = "kai-dispatcher-self-move"
@@ -60,6 +61,15 @@ _REQUEST_CHANGES_VERDICTS = {
     "requested_changes",
 }
 _ACTIVE_REVIEW_STATUSES = {"review", "code_review", "security_audit", "qa"}
+_REPO_TARGET_FIELD_ALIASES = (
+    "repo_url",
+    "repoUrl",
+    "repository_url",
+    "repositoryUrl",
+    "git_url",
+    "gitUrl",
+)
+_PROJECT_ID_FIELD_ALIASES = ("project_id", "projectId")
 
 # Phase 0 (#10247) — fleet hardening. Per-role max_iterations cascade:
 #   1. env  KAI_MAX_ITERATIONS_<ROLE_UPPER>   (escape hatch per role)
@@ -164,6 +174,19 @@ class TaskboardTaskClient(Protocol):
 
         Returns:
             Latest task payload as a dictionary.
+        """
+
+    def get_project(
+        self,
+        project_id: int,
+    ) -> dict[str, Any] | None | Awaitable[dict[str, Any] | None]:
+        """Fetch a project by id.
+
+        Args:
+            project_id: Taskboard project id.
+
+        Returns:
+            Project payload as a dictionary, or ``None`` when unavailable.
         """
 
     def post_audit_comment(
@@ -424,6 +447,19 @@ class DefaultTaskboardTaskClient:
         except TaskboardServiceError as exc:
             raise RuntimeError(str(exc)) from exc
         return _extract_task(payload)
+
+    def get_project(self, project_id: int) -> dict[str, Any] | None:
+        """Fetch one taskboard project by id."""
+
+        client = TaskboardServiceClient(
+            self.base_url,
+            bearer_token=self.bearer_token,
+            timeout_seconds=self.timeout_seconds,
+        )
+        try:
+            return client.get_project(project_id)
+        except TaskboardServiceError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     def post_audit_comment(self, task_id: int, content: str) -> dict[str, Any]:
         """Post one dispatcher audit comment to the taskboard.
@@ -854,6 +890,7 @@ class TaskboardDispatcher:
         self.clock = clock or _utc_now
         self.runtime_config_resolver = runtime_config_resolver or RuntimeConfigResolver()
         self._store = _TaskboardQueueStore(self.db_path, clock=self.clock)
+        self._project_cache: OrderedDict[int, tuple[datetime, dict[str, Any] | None]] = OrderedDict()
         self._stop_event = asyncio.Event()
         self._last_sweep_at = datetime.min.replace(tzinfo=timezone.utc)
         # agent_runs ledger client (Phase 1 of epic #10028, taskboard task #10223).
@@ -1077,7 +1114,7 @@ class TaskboardDispatcher:
                 reserved_key = (task_id, fire_generation, route.agent_id)
 
                 try:
-                    self._validate_spawn_contract(route=route, task=latest_task)
+                    await self._validate_spawn_contract(route=route, task=latest_task)
                 except Exception as exc:  # noqa: BLE001
                     self._store.mark_session_failed(*reserved_key)
                     error_message = _redact_known_secrets(str(exc))
@@ -1318,7 +1355,7 @@ class TaskboardDispatcher:
             result = await result
         return _extract_task(result)
 
-    def _validate_spawn_contract(
+    async def _validate_spawn_contract(
         self,
         *,
         route: TaskboardRoleRoute,
@@ -1328,11 +1365,92 @@ class TaskboardDispatcher:
 
         if route.agent_id != "developer":
             return
-        _resolve_repo_target(
-            task,
-            fallback_repo_root=Path(__file__).resolve().parents[1],
-            role=route.role,
+        try:
+            _resolve_repo_target(
+                task,
+                fallback_repo_root=Path(__file__).resolve().parents[1],
+                role=route.role,
+            )
+            return
+        except RepoRoutingError:
+            if await self._enrich_task_project_for_repo_validation(task):
+                _resolve_repo_target(
+                    task,
+                    fallback_repo_root=Path(__file__).resolve().parents[1],
+                    role=route.role,
+                )
+                return
+            raise
+
+    async def _enrich_task_project_for_repo_validation(self, task: dict[str, Any]) -> bool:
+        """Attach ``task.project`` from ``project_id`` when the webhook omitted it."""
+
+        if not isinstance(task, dict):
+            return False
+        project = task.get("project")
+        if isinstance(project, Mapping) and project:
+            return False
+        if project not in (None, "") and not (isinstance(project, Mapping) and not project):
+            return False
+        project_id = _coerce_project_id(_field_value(task, *_PROJECT_ID_FIELD_ALIASES))
+        if project_id is None:
+            return False
+        fetched_project = await self._project_for_repo_validation(project_id)
+        if fetched_project is None:
+            return False
+        task["project"] = fetched_project
+        LOGGER.info(
+            "taskboard_project_enriched_for_repo_validation task_id=%s project_id=%s",
+            task.get("id"),
+            project_id,
         )
+        return True
+
+    async def _project_for_repo_validation(
+        self,
+        project_id: int,
+    ) -> dict[str, Any] | None:
+        now = self.clock()
+        cached = self._project_cache.get(project_id)
+        if cached is not None:
+            fetched_at, cached_project = cached
+            if now - fetched_at <= PROJECT_CACHE_TTL:
+                self._project_cache.move_to_end(project_id)
+                return dict(cached_project) if cached_project is not None else None
+            self._project_cache.pop(project_id, None)
+
+        getter = getattr(self.task_client, "get_project", None)
+        if not callable(getter):
+            return None
+        try:
+            result = getter(project_id)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "taskboard_project_fetch_failed project_id=%s error=%s",
+                project_id,
+                _redact_known_secrets(str(exc)),
+            )
+            return None
+
+        fetched_project = dict(result) if isinstance(result, Mapping) else None
+        self._cache_project_for_repo_validation(project_id, fetched_project, now)
+        return dict(fetched_project) if fetched_project is not None else None
+
+    def _cache_project_for_repo_validation(
+        self,
+        project_id: int,
+        project: dict[str, Any] | None,
+        fetched_at: datetime,
+    ) -> None:
+        self._project_cache[project_id] = (
+            fetched_at,
+            dict(project) if project is not None else None,
+        )
+        self._project_cache.move_to_end(project_id)
+        while len(self._project_cache) > PROJECT_CACHE_MAX_ENTRIES:
+            self._project_cache.popitem(last=False)
 
     async def _move_request_changes_to_fixing(
         self,
@@ -2819,6 +2937,24 @@ def _field_value(mapping: Mapping[str, Any], *names: str) -> Any:
     return None
 
 
+def _field_name_and_value(
+    mapping: Mapping[str, Any],
+    *names: str,
+) -> tuple[str | None, Any]:
+    for name in names:
+        if name in mapping and mapping.get(name) not in (None, ""):
+            return name, mapping.get(name)
+    return None, None
+
+
+def _coerce_project_id(value: Any) -> int | None:
+    try:
+        project_id = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return project_id if project_id > 0 else None
+
+
 def _resolve_repo_target(
     task: Mapping[str, Any],
     *,
@@ -2829,19 +2965,17 @@ def _resolve_repo_target(
 
     task_mapping: Mapping[str, Any] = task if isinstance(task, Mapping) else {}
     project = _mapping_value(task_mapping, "project")
-    repo_url = _field_value(
+    repo_field_name, repo_url = _field_name_and_value(
         task_mapping,
-        "repo_url",
-        "repoUrl",
-        "repository_url",
-        "repositoryUrl",
-    ) or _field_value(
-        project,
-        "repo_url",
-        "repoUrl",
-        "repository_url",
-        "repositoryUrl",
+        *_REPO_TARGET_FIELD_ALIASES,
     )
+    repo_source = f"task.{repo_field_name}" if repo_field_name else ""
+    if repo_url is None:
+        repo_field_name, repo_url = _field_name_and_value(
+            project,
+            *_REPO_TARGET_FIELD_ALIASES,
+        )
+        repo_source = f"task.project.{repo_field_name}" if repo_field_name else ""
     default_branch = str(
         _field_value(task_mapping, "default_branch", "defaultBranch")
         or _field_value(project, "default_branch", "defaultBranch")
@@ -2858,14 +2992,11 @@ def _resolve_repo_target(
                     f"invalid repo routing metadata for role={role or 'unknown'}: {raw_repo_value!r}"
                 )
         else:
-            source = "task.repo_url"
-            if _field_value(project, "repo_url", "repoUrl", "repository_url", "repositoryUrl") == repo_url:
-                source = "task.project.repoUrl"
             return RepoTarget(
                 repo_key=WorktreeManager.repo_key_for_url(raw_repo_value),
                 repo_url=raw_repo_value,
                 default_branch=default_branch,
-                source=source,
+                source=repo_source or "task.repo_url",
                 routing_mode="explicit",
                 display_name=str(
                     _field_value(project, "slug", "name")
