@@ -131,6 +131,61 @@ describe("daemon client helpers", () => {
     );
   });
 
+  it("loads scheduler job inventory without owner filtering", async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          jobs: [
+            {
+              id: "job-a",
+              type: "cron",
+              cron: "0 11 * * *",
+              schedule: "0 11 * * *",
+              prompt_preview: "Morning brief",
+              owner_session: "polymarket",
+              next_run: "2026-05-18T11:00:00+00:00",
+              status: "active",
+              last_run: "2026-05-17T11:00:00+00:00",
+              run_count: 6,
+              max_runs: null,
+            },
+            {
+              id: "job-b",
+              type: "cron",
+              cron: "0 9 * * *",
+              schedule: "0 9 * * *",
+              prompt_preview: "Gameday retrospective",
+              owner_session: "polymarket-main",
+              next_run: "2026-05-18T09:00:00+00:00",
+              status: "active",
+              last_run: "2026-05-17T09:00:00+00:00",
+              run_count: 2,
+              max_runs: null,
+            },
+          ],
+        }),
+      ),
+    );
+
+    const client = new DaemonClient({
+      baseHttpUrl: "http://127.0.0.1:8765",
+      fetchImpl,
+      webSocketFactory: vi.fn() as never,
+    });
+
+    const jobs = await client.fetchSchedulerJobs("secret");
+
+    expect(jobs.map((job) => job.owner_session)).toEqual([
+      "polymarket",
+      "polymarket-main",
+    ]);
+    expect(jobs[0]?.cron).toBe("0 11 * * *");
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "http://127.0.0.1:8765/api/scheduler/jobs",
+      { headers: { Authorization: "Bearer secret" } },
+    );
+  });
+
   it("loads and updates model selection through daemon REST API", async () => {
     const fetchImpl = vi
       .fn()

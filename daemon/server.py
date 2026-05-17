@@ -1562,17 +1562,7 @@ class DaemonServer:
             name: len(managed.session.input_queue)
             for name, managed in sorted(self.sessions.items())
         }
-        indexed_session_names = {entry.name for entry in list_indexed_sessions()}
-        visible_session_names = set(self.sessions) | indexed_session_names
         scheduler_jobs = self.scheduler.list_jobs() if self.scheduler is not None else []
-        if visible_session_names:
-            scheduler_jobs = [
-                job
-                for job in scheduler_jobs
-                if job.owner_session in visible_session_names
-            ]
-        else:
-            scheduler_jobs = []
         scheduler_status_counts = Counter(job.status for job in scheduler_jobs)
         heartbeat_last_tick = None
         if (
@@ -1631,6 +1621,41 @@ class DaemonServer:
                 "status_counts": dict(sorted(scheduler_status_counts.items())),
             },
         }
+
+    @staticmethod
+    def _scheduler_job_row(job) -> dict[str, Any]:
+        """Return the operator-facing scheduler row for one persisted job."""
+        spec = job.spec if isinstance(job.spec, dict) else {}
+        prompt_preview = " ".join(str(job.prompt).split())[:80]
+        cron = spec.get("cron") if job.type == "cron" else None
+        schedule = cron
+        if schedule is None and job.type == "absolute":
+            schedule = spec.get("at")
+        if schedule is None and job.type == "event":
+            schedule = spec.get("channel")
+        return {
+            "id": job.id,
+            "type": job.type,
+            "cron": cron,
+            "schedule": schedule,
+            "spec": spec,
+            "prompt_preview": prompt_preview,
+            "owner_session": job.owner_session,
+            "next_run": job.next_run,
+            "status": job.status,
+            "last_run": job.last_run,
+            "run_count": job.run_count,
+            "max_runs": job.max_runs,
+            "created_at": job.created_at,
+            "created_by": job.created_by,
+            "last_result_preview": job.last_result_preview,
+        }
+
+    def scheduler_jobs_snapshot(self) -> list[dict[str, Any]]:
+        """Return all persisted scheduler jobs regardless of session visibility."""
+        if self.scheduler is None:
+            return []
+        return [self._scheduler_job_row(job) for job in self.scheduler.list_jobs()]
 
     def health_snapshot(self) -> dict[str, Any]:
         """Return a compact health payload for readiness checks."""
@@ -3763,6 +3788,11 @@ def create_app(
     async def metrics_endpoint(request: Request) -> dict[str, Any]:
         daemon_server.require_http_auth(request)
         return daemon_server.metrics_snapshot()
+
+    @app.get("/api/scheduler/jobs")
+    async def scheduler_jobs_endpoint(request: Request) -> dict[str, Any]:
+        daemon_server.require_http_auth(request)
+        return {"jobs": daemon_server.scheduler_jobs_snapshot()}
 
     @app.get("/api/sessions")
     async def list_sessions_endpoint(request: Request) -> dict[str, Any]:

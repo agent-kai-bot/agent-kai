@@ -12,6 +12,7 @@ import type {
   ServerEnvelope,
   SessionAttachedEnvelope,
   SessionSummary,
+  ScheduledJobRow,
   SignalRouterConfig,
   SignalRouterHealth,
   StatusEnvelope,
@@ -343,6 +344,13 @@ export class DaemonClient {
       agents: Array.isArray(payload.agents) ? payload.agents : [],
       endpoints: Array.isArray(payload.endpoints) ? payload.endpoints : [],
     };
+  }
+
+  async fetchSchedulerJobs(token = ""): Promise<ScheduledJobRow[]> {
+    const payload = (await this.requestJson("/api/scheduler/jobs", token)) as {
+      jobs?: ScheduledJobRow[];
+    };
+    return Array.isArray(payload.jobs) ? payload.jobs : [];
   }
 
   async fetchAutoLoopBrainHealth(token = ""): Promise<AutoLoopBrainHealth> {

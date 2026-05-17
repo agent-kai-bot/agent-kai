@@ -50,6 +50,7 @@
     ModelAgentSummary,
     PortfolioSnapshot,
     ScheduledJobEnvelope,
+    ScheduledJobRow,
     ServerEnvelope,
     SessionSummary,
     WatchlistQuote,
@@ -61,6 +62,7 @@
   import EventPanel, { type EventRow } from "$lib/components/EventPanel.svelte";
   import OverviewPanel from "$lib/components/OverviewPanel.svelte";
   import PositionsPanel from "$lib/components/PositionsPanel.svelte";
+  import SchedulerPanel from "$lib/components/SchedulerPanel.svelte";
   import SignalPanel from "$lib/components/SignalPanel.svelte";
   import WatchlistPanel from "$lib/components/WatchlistPanel.svelte";
 
@@ -106,6 +108,8 @@
   let selectedSignalId = $state("");
   let natsEvents = $state<EventRow[]>([]);
   let schedulerEvents = $state<EventRow[]>([]);
+  let schedulerJobs = $state<ScheduledJobRow[]>([]);
+  let schedulerJobsError = $state("");
   let inputDraft = $state("");
   let paletteOpen = $state(false);
   let paletteQuery = $state("");
@@ -784,13 +788,26 @@
     portfolio = portfolioSnapshot;
   }
 
+  async function refreshSchedulerJobs(): Promise<void> {
+    if (!daemonConnection) {
+      schedulerJobs = [];
+      return;
+    }
+    try {
+      schedulerJobs = await client.fetchSchedulerJobs(token);
+      schedulerJobsError = "";
+    } catch (error) {
+      schedulerJobsError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
   function startPolling(): void {
     stopPolling();
     if (typeof window === "undefined") {
       return;
     }
     pollingHandle = window.setInterval(() => {
-      void Promise.all([refreshSidebarData(), refreshChartData()]);
+      void Promise.all([refreshSidebarData(), refreshChartData(), refreshSchedulerJobs()]);
     }, 15_000);
   }
 
@@ -819,7 +836,7 @@
   function applyEnvelope(envelope: ServerEnvelope): void {
     if (envelope.type === "session_attached") {
       applySnapshot();
-      void Promise.all([refreshSidebarData(), refreshChartData()]);
+      void Promise.all([refreshSidebarData(), refreshChartData(), refreshSchedulerJobs()]);
       return;
     }
 
@@ -896,6 +913,7 @@
 
     if (isScheduledJobEnvelope(envelope)) {
       schedulerEvents = pushRow(schedulerEvents, schedulerSummary(envelope));
+      void refreshSchedulerJobs();
       return;
     }
 
@@ -979,6 +997,7 @@
         chartBars = [];
         chartStatus = "waiting for a session";
         chatActivity = clearChatActivityState();
+        schedulerJobs = [];
         stopPolling();
       };
       daemonConnection.subscribe("signals");
@@ -991,7 +1010,7 @@
       resetChartBarsForMarket();
       await refreshModelInfo();
       await refreshSessions();
-      await Promise.all([refreshSidebarData(), refreshChartData()]);
+      await Promise.all([refreshSidebarData(), refreshChartData(), refreshSchedulerJobs()]);
       startPolling();
     } catch (error) {
       attachError = error instanceof Error ? error.message : String(error);
@@ -1028,6 +1047,8 @@
     selectedSignalId = "";
     natsEvents = [];
     schedulerEvents = [];
+    schedulerJobs = [];
+    schedulerJobsError = "";
     chatMessages = [];
     streamingReply = "";
     chatActivity = clearChatActivityState();
@@ -1502,7 +1523,7 @@
             positionsCount={portfolio.positions.length}
             watchlistCount={watchlist.length}
             signalCount={signalAlerts.length}
-            schedulerEventCount={schedulerEvents.length}
+            schedulerEventCount={schedulerJobs.length}
             natsEventCount={natsEvents.length}
             attachError={attachError}
             initiallyOpen={false}
@@ -1525,14 +1546,12 @@
             subtitle={`${natsEvents.length} recent`}
             title="NATS"
           />
-          <EventPanel
-            eyebrow="Scheduler"
-            emptyMessage="No scheduler activity yet."
+          <SchedulerPanel
+            emptyMessage={schedulerJobsError || "No scheduled jobs found."}
             initiallyOpen={false}
-            items={schedulerEvents}
+            jobs={schedulerJobs}
             mobileCollapsible={true}
-            subtitle={`${schedulerEvents.length} recent`}
-            title="Scheduled Jobs"
+            subtitle={`${schedulerJobs.length} total`}
           />
         </div>
       </div>

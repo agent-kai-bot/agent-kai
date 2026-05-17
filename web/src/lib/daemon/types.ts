@@ -211,6 +211,24 @@ export type WatchlistState = {
   watchlist_symbols: string[];
 };
 
+export type ScheduledJobRow = {
+  id: string;
+  type: string;
+  cron?: string | null;
+  schedule?: string | null;
+  spec?: Record<string, unknown>;
+  prompt_preview: string;
+  owner_session: string;
+  next_run?: string | null;
+  status: string;
+  last_run?: string | null;
+  run_count: number;
+  max_runs?: number | null;
+  created_at?: string;
+  created_by?: string;
+  last_result_preview?: string | null;
+};
+
 export type WatchlistPatch = {
   symbols?: string[];
   add?: string;

@@ -140,6 +140,77 @@ class DaemonServerTests(unittest.TestCase):
         )
         return TestClient(app)
 
+    def test_scheduler_jobs_endpoint_includes_unindexed_owner_sessions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jobs_path = Path(tmpdir) / "scheduler" / "jobs.json"
+
+            def scheduler_factory(*, dispatch_callback, event_bus, event_callback, **_kwargs):
+                return Scheduler(
+                    dispatch_callback=dispatch_callback,
+                    event_bus=event_bus,
+                    event_callback=event_callback,
+                    jobs_path=jobs_path,
+                )
+
+            app = create_app(
+                agent_name="kai",
+                nats_url="nats://unit-test",
+                bus_factory=_FakeBus,
+                scheduler_factory=scheduler_factory,
+            )
+
+            with mock.patch.dict("os.environ", {"KAI_AUTO_LOOP_BRAIN_KILL_SWITCH": "1"}):
+                with TestClient(app) as client:
+                    server = client.app.state.daemon_server
+                    self.assertIsNotNone(server.scheduler)
+                    created_at = _utc_now().isoformat()
+                    long_prompt = (
+                        "Daily polymarket morning briefing with game card, bankroll, "
+                        "positions, and edge summary."
+                    )
+                    server.scheduler.schedule_job(
+                        {
+                            "id": "job-polymarket",
+                            "type": "cron",
+                            "spec": {"cron": "0 11 * * *", "tz": "UTC"},
+                            "prompt": long_prompt,
+                            "owner_session": "polymarket",
+                            "created_at": created_at,
+                            "created_by": "agent",
+                            "status": "active",
+                        },
+                        persist=False,
+                    )
+                    server.scheduler.schedule_job(
+                        {
+                            "id": "job-polymarket-main",
+                            "type": "cron",
+                            "spec": {"cron": "0 9 * * *", "tz": "UTC"},
+                            "prompt": "Daily gameday retrospective.",
+                            "owner_session": "polymarket-main",
+                            "created_at": created_at,
+                            "created_by": "agent",
+                            "status": "active",
+                            "run_count": 2,
+                        },
+                        persist=False,
+                    )
+
+                    metrics = client.get("/api/metrics")
+                    self.assertEqual(metrics.status_code, 200)
+                    self.assertEqual(metrics.json()["scheduler"]["job_count"], 2)
+
+                    response = client.get("/api/scheduler/jobs")
+                    self.assertEqual(response.status_code, 200)
+                    jobs = response.json()["jobs"]
+                    self.assertEqual(
+                        [job["owner_session"] for job in jobs],
+                        ["polymarket", "polymarket-main"],
+                    )
+                    self.assertEqual(jobs[0]["cron"], "0 11 * * *")
+                    self.assertLessEqual(len(jobs[0]["prompt_preview"]), 80)
+                    self.assertEqual(jobs[1]["run_count"], 2)
+
     @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
     def test_attach_and_input_stream_agent_events(self, attach_runtime):
         attach_runtime.side_effect = _fake_attach_runtime
@@ -1264,11 +1335,12 @@ class DaemonServerHealthTests(unittest.TestCase):
     """Validate the Phase 7 health and metrics payloads."""
 
     @staticmethod
-    def _make_client(token_path: Path) -> TestClient:
+    def _make_client(token_path: Path, *, scheduler_factory=None) -> TestClient:
         app = create_app(
             agent_name="kai",
             nats_url="nats://unit-test",
             bus_factory=_FakeBus,
+            scheduler_factory=scheduler_factory,
             token_path=token_path,
             allow_unauthenticated_local=False,
         )
@@ -1289,11 +1361,23 @@ class DaemonServerHealthTests(unittest.TestCase):
             token_path = Path(tmpdir) / "daemon-token.txt"
             token_path.write_text("secret-token\n", encoding="utf-8")
             headers = {"Authorization": "Bearer secret-token"}
+            jobs_path = Path(tmpdir) / "scheduler" / "jobs.json"
+
+            def scheduler_factory(*, dispatch_callback, event_bus, event_callback, **_kwargs):
+                return Scheduler(
+                    dispatch_callback=dispatch_callback,
+                    event_bus=event_bus,
+                    event_callback=event_callback,
+                    jobs_path=jobs_path,
+                )
 
             with mock.patch("daemon.core.SESSIONS_ROOT_DIR", base_dir), mock.patch(
                 "daemon.core.SESSION_INDEX_PATH", base_dir / "index.json"
             ):
-                with self._make_client(token_path) as client:
+                with self._make_client(
+                    token_path,
+                    scheduler_factory=scheduler_factory,
+                ) as client:
                     created = client.post(
                         "/api/sessions",
                         headers=headers,
