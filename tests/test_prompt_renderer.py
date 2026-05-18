@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from agent.prompt_renderer import (
     _extract_substitutions,
     _normalize_role,
+    max_rendered_prompt_chars,
     render_taskboard_fire_prompt,
 )
 
@@ -230,6 +232,27 @@ class PromptRendererTests(unittest.TestCase):
             substitutions["branch_name_suggestion"],
             "task-10153-kai-prompt-templates-for-taskboard-auto-fire-phase-3",
         )
+
+    def test_rendered_prompt_cap_default_env_and_malformed_fallback(self) -> None:
+        """Rendered prompt cap is raised, env-tunable, and typo-tolerant."""
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertGreaterEqual(max_rendered_prompt_chars(), 250_000)
+            self.assertEqual(max_rendered_prompt_chars(), 250_000)
+
+        with mock.patch.dict(
+            "os.environ",
+            {"KAI_MAX_RENDERED_PROMPT_CHARS": "123456"},
+            clear=True,
+        ):
+            self.assertEqual(max_rendered_prompt_chars(), 123456)
+
+        with mock.patch.dict(
+            "os.environ",
+            {"KAI_MAX_RENDERED_PROMPT_CHARS": "bad"},
+            clear=True,
+        ):
+            self.assertEqual(max_rendered_prompt_chars(), 250_000)
 
 
 if __name__ == "__main__":

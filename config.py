@@ -15,6 +15,7 @@ from pydantic import (
 )
 
 import yaml
+from daemon.env_utils import _env_positive_int
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "agent-config.json")
 AGENTS_YAML_PATH = os.path.join(os.path.dirname(__file__), "agents.yaml")
@@ -26,6 +27,9 @@ DEFAULT_CAPACITY_FEEDBACK_CODES = [429, 503]
 DEFAULT_COOLDOWN_SECONDS = 300
 DEFAULT_EXECUTOR = "codex"
 DEFAULT_OVERFLOW_EXECUTOR = "claude"
+DEFAULT_SHELL_TIMEOUT_SECONDS = 1800
+DEFAULT_MAX_FILE_READ_CHARS = 250_000
+DEFAULT_MAX_OUTPUT_CHARS = 200_000
 VALID_EXECUTORS: tuple[str, ...] = ("codex", "claude", "local-llm")
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
@@ -362,9 +366,51 @@ SKILLS_ENABLED = bool(_skills_cfg.get("enabled", True))
 
 # Tool safety
 _tool_safety = _config.get("tool_safety", {})
-SHELL_TIMEOUT_SECONDS = _tool_safety.get("shell_timeout_seconds", 30)
-MAX_FILE_READ_CHARS = _tool_safety.get("max_file_read_chars", 10_000)
-MAX_OUTPUT_CHARS = _tool_safety.get("max_output_chars", 5_000)
+
+
+def _configured_positive_int(value, *, default: int) -> int:
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return max(1, int(default))
+
+
+def get_shell_timeout_seconds() -> int:
+    configured = _configured_positive_int(
+        _tool_safety.get("shell_timeout_seconds", DEFAULT_SHELL_TIMEOUT_SECONDS),
+        default=DEFAULT_SHELL_TIMEOUT_SECONDS,
+    )
+    return max(
+        1,
+        _env_positive_int("KAI_SHELL_TIMEOUT_SECONDS", default=configured),
+    )
+
+
+def get_max_file_read_chars() -> int:
+    configured = _configured_positive_int(
+        _tool_safety.get("max_file_read_chars", DEFAULT_MAX_FILE_READ_CHARS),
+        default=DEFAULT_MAX_FILE_READ_CHARS,
+    )
+    return max(
+        1,
+        _env_positive_int("KAI_MAX_FILE_READ_CHARS", default=configured),
+    )
+
+
+def get_max_output_chars() -> int:
+    configured = _configured_positive_int(
+        _tool_safety.get("max_output_chars", DEFAULT_MAX_OUTPUT_CHARS),
+        default=DEFAULT_MAX_OUTPUT_CHARS,
+    )
+    return max(
+        1,
+        _env_positive_int("KAI_MAX_OUTPUT_CHARS", default=configured),
+    )
+
+
+SHELL_TIMEOUT_SECONDS = get_shell_timeout_seconds()
+MAX_FILE_READ_CHARS = get_max_file_read_chars()
+MAX_OUTPUT_CHARS = get_max_output_chars()
 
 # Docker sandbox tool settings — defaults that apply to every sandboxed
 # container run. These are deliberately strict so the LLM can opt into

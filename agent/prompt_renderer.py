@@ -9,13 +9,28 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from daemon.env_utils import _env_positive_int
+
 
 PROMPTS_ROOT = Path(__file__).resolve().parents[1] / "prompts"
 TASKBOARD_PROMPT_ROOT = PROMPTS_ROOT / "taskboard-fire"
 FORGEJO_PR_PROMPT_ROOT = PROMPTS_ROOT / "forgejo-pr-fire"
 PROMPT_ROOT = TASKBOARD_PROMPT_ROOT
 DEFAULT_TEMPLATE = "default.md.tmpl"
-MAX_RENDERED_PROMPT_CHARS = 60_000
+DEFAULT_MAX_RENDERED_PROMPT_CHARS = 250_000
+
+
+def max_rendered_prompt_chars() -> int:
+    return max(
+        1,
+        _env_positive_int(
+            "KAI_MAX_RENDERED_PROMPT_CHARS",
+            default=DEFAULT_MAX_RENDERED_PROMPT_CHARS,
+        ),
+    )
+
+
+MAX_RENDERED_PROMPT_CHARS = max_rendered_prompt_chars()
 
 _ROLE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _ROLE_SEPARATOR_RE = re.compile(r"[\s_]+")
@@ -701,10 +716,11 @@ def _cap_prompt(
 ) -> str:
     """Cap rendered prompt size without cutting the STOP marker first."""
 
-    if len(rendered) <= MAX_RENDERED_PROMPT_CHARS:
+    cap = max_rendered_prompt_chars()
+    if len(rendered) <= cap:
         return rendered
     marker = f"\nSTOP: {stop_marker}"
-    budget = MAX_RENDERED_PROMPT_CHARS - len(marker) - 64
+    budget = cap - len(marker) - 64
     if budget <= 0:
         raise PromptRenderError("rendered prompt cap is too small")
     return rendered[:budget].rstrip() + "\n\n[Prompt truncated by renderer]\n" + marker

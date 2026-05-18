@@ -27,10 +27,10 @@ from config import (
     DOCKER_SANDBOX_PIDS,
     DOCKER_SANDBOX_TMPFS_SIZE,
     DOCKER_SANDBOX_USER,
-    MAX_FILE_READ_CHARS,
-    MAX_OUTPUT_CHARS,
-    SHELL_TIMEOUT_SECONDS,
     VALID_REASONING_EFFORTS,
+    get_max_file_read_chars,
+    get_max_output_chars,
+    get_shell_timeout_seconds,
     normalize_reasoning_effort,
 )
 from agent.runtime_utils import (
@@ -38,6 +38,20 @@ from agent.runtime_utils import (
     session_subprocess_env,
     session_worktree_context,
 )
+
+
+def _truncate_output(output: str) -> str:
+    limit = get_max_output_chars()
+    if len(output) > limit:
+        return output[:limit] + f"\n... [truncated at {limit} chars]"
+    return output
+
+
+def _truncate_read_text(text: str, *, prefix: str = "\n") -> str:
+    limit = get_max_file_read_chars()
+    if len(text) > limit:
+        return text[:limit] + f"{prefix}... [truncated at {limit} chars]"
+    return text
 
 
 # ── File Read ────────────────────────────────────────────────
@@ -48,10 +62,11 @@ def _file_read(path: str) -> str:
     if not os.path.isfile(path):
         return f"Error: '{path}' is not a file or does not exist."
     try:
+        limit = get_max_file_read_chars()
         with open(path, "r", errors="replace") as f:
-            content = f.read(MAX_FILE_READ_CHARS)
-        if len(content) == MAX_FILE_READ_CHARS:
-            content += f"\n\n... [truncated at {MAX_FILE_READ_CHARS} chars]"
+            content = f.read(limit)
+        if len(content) == limit:
+            content += f"\n\n... [truncated at {limit} chars]"
         return content
     except Exception as e:
         return f"Error reading file: {e}"
@@ -125,6 +140,7 @@ file_edit = StructuredTool.from_function(
 
 def _shell_exec(command: str) -> str:
     """Execute a shell command and return stdout + stderr."""
+    timeout = get_shell_timeout_seconds()
     try:
         cwd = current_session_worktree() or None
         env = session_subprocess_env(worktree=cwd)
@@ -133,7 +149,7 @@ def _shell_exec(command: str) -> str:
             shell=True,
             capture_output=True,
             text=True,
-            timeout=SHELL_TIMEOUT_SECONDS,
+            timeout=timeout,
             cwd=cwd,
             env=env,
         )
@@ -146,11 +162,9 @@ def _shell_exec(command: str) -> str:
             output += f"\n[exit code: {result.returncode}]"
         if not output.strip():
             output = "(no output)"
-        if len(output) > MAX_OUTPUT_CHARS:
-            output = output[:MAX_OUTPUT_CHARS] + f"\n... [truncated at {MAX_OUTPUT_CHARS} chars]"
-        return output
+        return _truncate_output(output)
     except subprocess.TimeoutExpired:
-        return f"Error: command timed out after {SHELL_TIMEOUT_SECONDS}s"
+        return f"Error: command timed out after {timeout}s"
     except Exception as e:
         return f"Error executing command: {e}"
 
@@ -174,9 +188,7 @@ def _python_exec(code: str) -> str:
         output = stdout_capture.getvalue()
         if not output.strip():
             output = "(no output)"
-        if len(output) > MAX_OUTPUT_CHARS:
-            output = output[:MAX_OUTPUT_CHARS] + f"\n... [truncated at {MAX_OUTPUT_CHARS} chars]"
-        return output
+        return _truncate_output(output)
     except Exception as e:
         return f"Error: {type(e).__name__}: {e}"
 
@@ -216,9 +228,7 @@ def _web_fetch(url: str) -> str:
             text = stripper.get_text()
         else:
             text = resp.text
-        if len(text) > MAX_FILE_READ_CHARS:
-            text = text[:MAX_FILE_READ_CHARS] + f"\n... [truncated at {MAX_FILE_READ_CHARS} chars]"
-        return text
+        return _truncate_read_text(text)
     except Exception as e:
         return f"Error fetching URL: {e}"
 
@@ -264,9 +274,7 @@ def _codex_exec(prompt: str, working_directory: str = "") -> str:
             output += f"\n[exit code: {result.returncode}]"
         if not output.strip():
             output = "(no output)"
-        if len(output) > MAX_OUTPUT_CHARS:
-            output = output[:MAX_OUTPUT_CHARS] + f"\n... [truncated at {MAX_OUTPUT_CHARS} chars]"
-        return output
+        return _truncate_output(output)
     except subprocess.TimeoutExpired:
         return f"Error: codex timed out after {CODEX_TIMEOUT}s"
     except Exception as e:
@@ -322,9 +330,7 @@ def _claude_exec(prompt: str, working_directory: str = "", model: str = "") -> s
             output += f"\n[exit code: {result.returncode}]"
         if not output.strip():
             output = "(no output)"
-        if len(output) > MAX_OUTPUT_CHARS:
-            output = output[:MAX_OUTPUT_CHARS] + f"\n... [truncated at {MAX_OUTPUT_CHARS} chars]"
-        return output
+        return _truncate_output(output)
     except subprocess.TimeoutExpired:
         return f"Error: claude timed out after {CLAUDE_TIMEOUT}s"
     except Exception as e:
@@ -489,9 +495,7 @@ def _docker_sandbox(
     output = "\n".join(p for p in parts if p).rstrip()
     if not output:
         output = "(no output)"
-    if len(output) > MAX_OUTPUT_CHARS:
-        output = output[:MAX_OUTPUT_CHARS] + f"\n... [truncated at {MAX_OUTPUT_CHARS} chars]"
-    return output
+    return _truncate_output(output)
 
 
 def create_docker_sandbox_tool(workspace_host_path: str | None = None):
