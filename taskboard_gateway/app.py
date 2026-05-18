@@ -9,8 +9,9 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, status
 
+import config
 from agent.taskboard_tools import TaskboardContext
-from daemon.core import Session
+from daemon.core import DEFAULT_AUTO_MAX_ITERATIONS, Session, max_auto_iterations_cap
 from taskboard_gateway.agent_map import resolve_agent_id
 from taskboard_gateway.config import (
     allow_unauthenticated_local,
@@ -31,6 +32,23 @@ from taskboard_gateway.runs import RunStore, TaskboardRun, extract_session_bindi
 
 RunExecutor = Callable[[TaskboardRun, RunStore], Awaitable[None]]
 MessageExecutor = Callable[..., Awaitable[str]]
+
+
+def _coerce_positive_int(raw: Any) -> int | None:
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _resolve_gateway_max_iterations(agent_name: str | None) -> int:
+    agent_cfg = config.AGENTS.get(agent_name or "", {})
+    configured = None
+    if isinstance(agent_cfg, dict):
+        configured = _coerce_positive_int(agent_cfg.get("max_iterations"))
+    requested = configured or DEFAULT_AUTO_MAX_ITERATIONS
+    return max(1, min(max_auto_iterations_cap(), requested))
 
 
 def _is_local_client(request: Request) -> bool:
@@ -186,7 +204,7 @@ async def execute_run_with_local_session(run: TaskboardRun, store: RunStore) -> 
     )
     session.attach_runtime(agent_name=run.local_agent_name)
     session.start_auto_mode(
-        max_iterations=20,
+        max_iterations=_resolve_gateway_max_iterations(run.local_agent_name),
         readonly=False,
         heartbeat_subscribed=False,
     )

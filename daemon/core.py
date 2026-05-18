@@ -42,34 +42,8 @@ from agent.runtime_utils import session_env_context, session_worktree_context
 from agent.tools import create_tools
 from agent_logger import log_auto_event
 from config import AGENTS, WORKSPACES_DIR
+from daemon.env_utils import _env_flag, _env_float, _env_positive_int
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-
-
-def _env_flag(name: str, *, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _env_float(name: str, *, default: float) -> float:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return float(default)
-    try:
-        return float(raw)
-    except ValueError:
-        return float(default)
-
-
-def _env_positive_int(name: str, *, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return max(0, int(default))
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return max(0, int(default))
 
 
 DEFAULT_SESSION_NAME = "terminal"
@@ -82,10 +56,20 @@ DEFAULT_AUTO_MAX_ITERATIONS = 20
 # when writing files / running tests / opening PRs. Raise to 10000 — well
 # above any legitimate working ceiling — and surface as env-tunable so
 # operators can lower it if a runaway loop becomes a concern.
-import os as _os
-MAX_AUTO_ITERATIONS = max(
-    1, int(_os.environ.get("KAI_AUTO_ITERATIONS_CAP", "10000") or "10000")
-)
+DEFAULT_AUTO_ITERATIONS_CAP = 10000
+
+
+def max_auto_iterations_cap() -> int:
+    return max(
+        1,
+        _env_positive_int(
+            "KAI_AUTO_ITERATIONS_CAP",
+            default=DEFAULT_AUTO_ITERATIONS_CAP,
+        ),
+    )
+
+
+MAX_AUTO_ITERATIONS = max_auto_iterations_cap()
 # Raised from 180s after CR/SA reviews on non-trivial PRs (#195) were silently
 # killed mid-read with `wall-clock budget exceeded`. 4h matches the
 # "timeouts need to be like 4 hours by default for any agent" operator policy.
@@ -848,7 +832,7 @@ class Session:
     def _normalize_auto_iterations(max_iterations: int | None) -> int:
         if max_iterations is None:
             return DEFAULT_AUTO_MAX_ITERATIONS
-        return max(1, min(MAX_AUTO_ITERATIONS, int(max_iterations)))
+        return max(1, min(max_auto_iterations_cap(), int(max_iterations)))
 
     @staticmethod
     def _tool_input_key(value: Any) -> str:

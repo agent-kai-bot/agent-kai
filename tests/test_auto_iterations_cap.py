@@ -25,8 +25,13 @@ def _resolve_cap(env: dict[str, str]) -> int:
     Kept in lockstep with that file. If you change the cap-resolution
     logic in daemon.core, update this helper to match.
     """
-    raw = env.get("KAI_AUTO_ITERATIONS_CAP", "10000") or "10000"
-    return max(1, int(raw))
+    raw = env.get("KAI_AUTO_ITERATIONS_CAP", "").strip()
+    if not raw:
+        return 10000
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 10000
 
 
 class MaxAutoIterationsCapTests(unittest.TestCase):
@@ -43,6 +48,9 @@ class MaxAutoIterationsCapTests(unittest.TestCase):
     def test_empty_env_falls_back_to_default(self) -> None:
         self.assertEqual(_resolve_cap({"KAI_AUTO_ITERATIONS_CAP": ""}), 10000)
 
+    def test_malformed_env_falls_back_to_default(self) -> None:
+        self.assertEqual(_resolve_cap({"KAI_AUTO_ITERATIONS_CAP": "bad"}), 10000)
+
     def test_cap_resolution_matches_daemon_core_source(self) -> None:
         """The cap-resolution helper here must stay in sync with the real
         expression in daemon/core.py. Source-line check guards against
@@ -55,7 +63,7 @@ class MaxAutoIterationsCapTests(unittest.TestCase):
         with open(path, encoding="utf-8") as f:
             content = f.read()
         self.assertIn("KAI_AUTO_ITERATIONS_CAP", content)
-        self.assertIn('"10000"', content)
+        self.assertIn("DEFAULT_AUTO_ITERATIONS_CAP = 10000", content)
         # Old hard-coded 100 cap must be gone.
         self.assertNotIn("MAX_AUTO_ITERATIONS = 100", content)
 

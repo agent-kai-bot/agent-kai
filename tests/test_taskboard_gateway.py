@@ -11,7 +11,11 @@ from unittest import mock
 
 from fastapi.testclient import TestClient
 
-from taskboard_gateway.app import create_gateway_app
+from taskboard_gateway.app import (
+    _resolve_gateway_max_iterations,
+    create_gateway_app,
+    execute_run_with_local_session,
+)
 from taskboard_gateway.runs import RunStore, TaskboardRun
 
 
@@ -29,6 +33,7 @@ class _FakeSession:
         self.saved = False
         self.agent_name = None
         self.auto_started = False
+        self.max_iterations = None
         self.heartbeat_subscribed = None
 
     instances: list["_FakeSession"] = []
@@ -70,6 +75,7 @@ class _FakeSession:
         """
 
         self.auto_started = True
+        self.max_iterations = max_iterations
         self.heartbeat_subscribed = heartbeat_subscribed
         return {
             "iterations_total": max_iterations,
@@ -523,6 +529,39 @@ class TaskboardGatewayTests(unittest.TestCase):
         self.assertEqual(context.session_token, "tok-123")
         self.assertEqual(context.session_generation, 3)
         self.assertFalse(_FakeSession.instances[0].heartbeat_subscribed)
+
+    def test_gateway_max_iterations_uses_agent_config_not_hardcoded_20(self) -> None:
+        """Taskboard auto-runs inherit the local agent's configured budget."""
+
+        _FakeSession.instances.clear()
+        run = self.store.create_run(
+            requested_agent_id="code-reviewer",
+            local_agent_name="code-reviewer",
+            prompt="Task #195: review it",
+            label="task-195",
+            cleanup="keep",
+        )
+
+        with mock.patch("taskboard_gateway.app.Session", _FakeSession):
+            asyncio.run(execute_run_with_local_session(run, self.store))
+
+        self.assertEqual(_FakeSession.instances[-1].max_iterations, 2000)
+        self.assertNotEqual(_FakeSession.instances[-1].max_iterations, 20)
+
+    def test_gateway_max_iterations_default_env_and_malformed_fallback(self) -> None:
+        """Gateway max-iteration cap is env-tunable and typo-tolerant."""
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertGreaterEqual(
+                _resolve_gateway_max_iterations("code-reviewer"),
+                200,
+            )
+
+        with mock.patch.dict("os.environ", {"KAI_AUTO_ITERATIONS_CAP": "321"}, clear=True):
+            self.assertEqual(_resolve_gateway_max_iterations("code-reviewer"), 321)
+
+        with mock.patch.dict("os.environ", {"KAI_AUTO_ITERATIONS_CAP": "bad"}, clear=True):
+            self.assertEqual(_resolve_gateway_max_iterations("code-reviewer"), 2000)
 
 
 if __name__ == "__main__":
