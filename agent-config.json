@@ -77,6 +77,19 @@
         }
       }
     },
+    "claude-oauth": {
+      "provider": "claude-oauth",
+      "base_url": "https://api.anthropic.com",
+      "default_model": "claude-opus-4-7",
+      "models": {
+        "claude-opus-4-7": {
+          "context_window": 200000,
+          "max_tokens": 16384,
+          "effort": "xhigh",
+          "thinking": "adaptive"
+        }
+      }
+    },
     "openai-direct": {
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -130,7 +143,8 @@
     },
     "architect": {
       "description": "System designer \u2014 blueprints, API contracts, data models, design docs",
-      "endpoint": "codex-cli",
+      "endpoint": "claude-oauth",
+      "model": "claude-opus-4-7",
       "fallback_endpoint": null,
       "workspace": "architect",
       "max_iterations": 2000
@@ -165,7 +179,8 @@
     },
     "security-auditor": {
       "description": "Taskboard Security Auditor \u2014 vulnerability review, secret handling, tenant isolation, and security verdicts",
-      "endpoint": "codex-cli",
+      "endpoint": "claude-oauth",
+      "model": "claude-opus-4-7",
       "fallback_endpoint": null,
       "workspace": "security-auditor",
       "max_iterations": 2000

@@ -16,8 +16,11 @@ executors:
     overflow_executor: claude
 
   claude:
-    provider: claude-cli
-    model: sonnet
+    provider: claude-oauth
+    endpoint: claude-oauth
+    model: claude-opus-4-7
+    effort: xhigh
+    thinking: adaptive
     health_probe:
       command: "echo healthy"
       interval_seconds: 60

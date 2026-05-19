@@ -585,6 +585,9 @@ def get_endpoint(name, model_name=None):
             # Codex / responses-API specific knobs
             "reasoning_effort": mcfg.get("reasoning_effort", ep.get("reasoning_effort")),
             "text_verbosity": mcfg.get("text_verbosity", ep.get("text_verbosity")),
+            # Claude OAuth / Messages API specific knobs
+            "effort": mcfg.get("effort", ep.get("effort")),
+            "thinking": mcfg.get("thinking", ep.get("thinking")),
         }
 
     # Legacy single-model endpoint
@@ -600,6 +603,8 @@ def get_endpoint(name, model_name=None):
         "top_p": ep.get("top_p", 0.95),
         "reasoning_effort": ep.get("reasoning_effort"),
         "text_verbosity": ep.get("text_verbosity"),
+        "effort": ep.get("effort"),
+        "thinking": ep.get("thinking"),
     }
 
 

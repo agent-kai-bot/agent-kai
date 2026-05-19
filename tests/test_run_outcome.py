@@ -103,6 +103,21 @@ class DeriveFromAgentEventsTests(unittest.TestCase):
         out = derive_outcome_from_agent_events(events)
         self.assertEqual(out.failure_class, "endpoint_timeout")
 
+    def test_primary_endpoint_transport_drop(self) -> None:
+        events = [
+            {
+                "type": "error",
+                "data": (
+                    "Primary endpoint failed: endpoint_transport_drop: "
+                    "claude transport retry exhausted after 4 attempts: "
+                    "peer closed connection"
+                ),
+            },
+        ]
+        out = derive_outcome_from_agent_events(events)
+        self.assertEqual(out.status, "endpoint_failed")
+        self.assertEqual(out.failure_class, "endpoint_transport_drop")
+
     def test_primary_endpoint_empty(self) -> None:
         events = [
             {"type": "error", "data": "Primary endpoint returned an empty response."},
@@ -400,7 +415,7 @@ class TaskboardEnumLockstepTests(unittest.TestCase):
         self.assertEqual(len(AGENT_RUN_STATUSES), 16)
 
     def test_failure_class_count(self) -> None:
-        self.assertEqual(len(AGENT_RUN_FAILURE_CLASSES), 25)
+        self.assertEqual(len(AGENT_RUN_FAILURE_CLASSES), 26)
 
     def test_terminal_statuses_documented(self) -> None:
         # Specifically the cases that bit us today must be terminal.

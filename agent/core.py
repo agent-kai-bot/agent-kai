@@ -3,8 +3,11 @@
 import asyncio
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from functools import cached_property
+import logging
 import os
 from pathlib import Path
+import time
 from typing import Any, AsyncIterator
 
 
@@ -15,9 +18,12 @@ from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import StructuredTool
+from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
+import anthropic
+import httpx
 from openai import APIStatusError
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 
 from agent.auto_prompt import build_auto_suffix, parse_auto_state
 from agent.memory_store import MemoryStore
@@ -54,6 +60,24 @@ DEFAULT_LLM_HISTORY_MAX_CHARS = 80_000
 CODEX_OPERATOR_REAUTH_MESSAGE = (
     "Codex OAuth refresh failed — operator must run `codex login --device-auth`"
 )
+CLAUDE_OPERATOR_REAUTH_MESSAGE = (
+    "Claude OAuth refresh failed - operator must run `claude auth login --claudeai`"
+)
+CLAUDE_TRANSPORT_RETRY_BACKOFF_SECONDS = (60, 180, 540)
+CLAUDE_TRANSPORT_ERROR_MARKERS = (
+    "peer closed connection",
+    "incomplete chunked read",
+    "remoteprotocolerror",
+    "connection reset",
+    "readerror",
+    "read timeout",
+)
+CLAUDE_CODE_BETAS = ("claude-code-20250219", "oauth-2025-04-20")
+logger = logging.getLogger(__name__)
+
+
+class ClaudeTransportDrop(RuntimeError):
+    """Raised when Claude streaming transport retries are exhausted."""
 
 
 def _env_int(name: str, default: int) -> int:
@@ -193,6 +217,10 @@ def create_llm(endpoint_cfg=None):
       OAuth credentials from ``~/.codex/auth.json`` and routes any
       system message into the Responses API ``instructions`` field.
 
+    - ``claude-oauth`` (or the legacy ``claude-cli`` provider name):
+      uses ``ChatClaudeOAuth``, a ``ChatAnthropic`` subclass that loads
+      Claude Code OAuth credentials from ``~/.claude/.credentials.json``.
+
     - everything else: standard ``ChatOpenAI`` against an
       OpenAI-compatible endpoint (the existing path for vLLM, the
       cloud kai-* endpoints, OpenAI direct, OpenRouter, etc.).
@@ -205,6 +233,11 @@ def create_llm(endpoint_cfg=None):
     base_url = endpoint_cfg.get("base_url") or ""
     if provider == "codex-cli" or "chatgpt.com" in base_url:
         return _create_codex_chat_model(endpoint_cfg)
+    if (
+        provider in ("claude-oauth", "claude-cli")
+        or "anthropic.com" in base_url
+    ):
+        return _create_claude_chat_model(endpoint_cfg)
 
     return ChatOpenAI(
         base_url=endpoint_cfg["base_url"],
@@ -267,6 +300,52 @@ def _create_codex_chat_model(endpoint_cfg: dict):
         use_responses_api=True,
         streaming=True,  # Codex Responses requires stream=true
         extra_body=extra_body,
+    )
+
+
+def _create_claude_chat_model(endpoint_cfg: dict):
+    """Build a Claude Messages chat model bound to Claude Code subscription OAuth."""
+    from agent.claude_auth import DEFAULT_AUTH_PATH, get_valid_credentials
+
+    try:
+        creds = get_valid_credentials()
+    except RuntimeError as exc:
+        raise RuntimeError(CLAUDE_OPERATOR_REAUTH_MESSAGE) from exc
+    if creds is None:
+        raise RuntimeError(
+            "Claude endpoint requires OAuth credentials. Run "
+            "`claude auth login --claudeai` or log in through Claude Code, "
+            f"then ensure {DEFAULT_AUTH_PATH} exists."
+        )
+
+    model = endpoint_cfg.get("model") or "claude-opus-4-7"
+    base_url = endpoint_cfg.get("base_url") or "https://api.anthropic.com"
+    effort = (
+        endpoint_cfg.get("effort")
+        or endpoint_cfg.get("reasoning_effort")
+        or "xhigh"
+    )
+    thinking_type = endpoint_cfg.get("thinking") or "adaptive"
+    max_tokens = endpoint_cfg.get("max_tokens", 16384)
+
+    return ChatClaudeOAuth(
+        base_url=base_url,
+        api_key="not-used",
+        oauth_access_token=SecretStr(creds.access_token),
+        model_name=model,
+        max_tokens=max_tokens,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        thinking={"type": thinking_type},
+        model_kwargs={"output_config": {"effort": effort}},
+        default_headers={
+            "User-Agent": "kai-agent (linux)",
+            "anthropic-beta": ",".join(CLAUDE_CODE_BETAS),
+        },
+        betas=list(CLAUDE_CODE_BETAS),
+        streaming=True,
+        max_retries=0,
     )
 
 
@@ -430,6 +509,243 @@ class ChatCodex(ChatOpenAI):
         return result
 
 
+class ChatClaudeOAuth(ChatAnthropic):
+    """ChatAnthropic subclass for Claude Code subscription OAuth.
+
+    ``langchain-anthropic`` exposes API-key authentication but not the
+    ``auth_token`` constructor path needed for Claude Code OAuth. This subclass
+    swaps the underlying Anthropic client to bearer-token auth, strips sampling
+    knobs Opus 4.7 rejects, and mirrors ChatCodex's one-refresh 401 retry.
+    """
+
+    oauth_access_token: SecretStr = Field(default=SecretStr(""))
+    http_client: Any = Field(default=None, exclude=True)
+    http_async_client: Any = Field(default=None, exclude=True)
+
+    @property
+    def _client_params(self) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "auth_token": self.oauth_access_token.get_secret_value(),
+            "base_url": self.anthropic_api_url,
+            "max_retries": self.max_retries,
+            "default_headers": (self.default_headers or None),
+        }
+        if self.default_request_timeout is None or self.default_request_timeout > 0:
+            params["timeout"] = self.default_request_timeout
+        return params
+
+    @cached_property
+    def _client(self) -> anthropic.Client:
+        params = dict(self._client_params)
+        if self.http_client is not None:
+            params["http_client"] = self.http_client
+        return anthropic.Client(**params)
+
+    @cached_property
+    def _async_client(self) -> anthropic.AsyncClient:
+        params = dict(self._client_params)
+        if self.http_async_client is not None:
+            params["http_client"] = self.http_async_client
+        return anthropic.AsyncClient(**params)
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        for rejected in ("temperature", "top_p", "top_k", "budget_tokens"):
+            payload.pop(rejected, None)
+        return payload
+
+    def _refresh_claude_credentials_for_retry(self) -> None:
+        from agent.claude_auth import get_valid_credentials
+
+        try:
+            creds = get_valid_credentials(force_refresh=True)
+        except RuntimeError as exc:
+            raise RuntimeError(CLAUDE_OPERATOR_REAUTH_MESSAGE) from exc
+        if creds is None:
+            raise RuntimeError(CLAUDE_OPERATOR_REAUTH_MESSAGE)
+        _apply_claude_credentials(self, creds)
+
+    def _invoke_with_claude_auth_retry(self, call):
+        try:
+            return call()
+        except anthropic.APIStatusError as exc:
+            if not _is_claude_unauthorized_error(exc):
+                raise
+            self._refresh_claude_credentials_for_retry()
+
+        try:
+            return call()
+        except anthropic.APIStatusError as exc:
+            if _is_claude_unauthorized_error(exc):
+                raise RuntimeError(CLAUDE_OPERATOR_REAUTH_MESSAGE) from exc
+            raise
+
+    def _collect_stream_with_claude_auth_retry(self, stream_factory):
+        chunks = []
+        try:
+            for chunk in stream_factory():
+                chunks.append(chunk)
+            return chunks
+        except anthropic.APIStatusError as exc:
+            if chunks or not _is_claude_unauthorized_error(exc):
+                raise
+            self._refresh_claude_credentials_for_retry()
+
+        try:
+            return list(stream_factory())
+        except anthropic.APIStatusError as exc:
+            if _is_claude_unauthorized_error(exc):
+                raise RuntimeError(CLAUDE_OPERATOR_REAUTH_MESSAGE) from exc
+            raise
+
+    async def _acollect_stream_with_claude_auth_retry(self, stream_factory):
+        chunks = []
+        try:
+            async for chunk in stream_factory():
+                chunks.append(chunk)
+            return chunks
+        except anthropic.APIStatusError as exc:
+            if chunks or not _is_claude_unauthorized_error(exc):
+                raise
+            await asyncio.to_thread(self._refresh_claude_credentials_for_retry)
+
+        try:
+            chunks = []
+            async for chunk in stream_factory():
+                chunks.append(chunk)
+            return chunks
+        except anthropic.APIStatusError as exc:
+            if _is_claude_unauthorized_error(exc):
+                raise RuntimeError(CLAUDE_OPERATOR_REAUTH_MESSAGE) from exc
+            raise
+
+    def _stream_with_claude_auth_retry(self, stream_factory):
+        for chunk in self._collect_stream_with_claude_auth_retry(stream_factory):
+            yield chunk
+
+    async def _astream_with_claude_auth_retry(self, stream_factory):
+        for chunk in await self._acollect_stream_with_claude_auth_retry(stream_factory):
+            yield chunk
+
+    def _stream_with_claude_transport_retry(self, stream_factory, run_manager=None):
+        retry_index = 0
+        while True:
+            try:
+                chunks = self._collect_stream_with_claude_auth_retry(stream_factory)
+                for chunk in chunks:
+                    _notify_sync_chunk(run_manager, chunk)
+                    yield chunk
+                return
+            except Exception as exc:  # noqa: BLE001
+                if not _is_retryable_claude_transport_error(exc):
+                    raise
+                if retry_index >= len(CLAUDE_TRANSPORT_RETRY_BACKOFF_SECONDS):
+                    raise ClaudeTransportDrop(
+                        "endpoint_transport_drop: claude transport retry exhausted "
+                        f"after {retry_index + 1} attempts: {exc}"
+                    ) from exc
+                delay = CLAUDE_TRANSPORT_RETRY_BACKOFF_SECONDS[retry_index]
+                logger.warning(
+                    "claude transport retry %d/%d delay=%ss error=%s",
+                    retry_index + 1,
+                    len(CLAUDE_TRANSPORT_RETRY_BACKOFF_SECONDS),
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+                retry_index += 1
+
+    async def _astream_with_claude_transport_retry(self, stream_factory, run_manager=None):
+        retry_index = 0
+        while True:
+            try:
+                chunks = await self._acollect_stream_with_claude_auth_retry(stream_factory)
+                for chunk in chunks:
+                    await _notify_async_chunk(run_manager, chunk)
+                    yield chunk
+                return
+            except Exception as exc:  # noqa: BLE001
+                if not _is_retryable_claude_transport_error(exc):
+                    raise
+                if retry_index >= len(CLAUDE_TRANSPORT_RETRY_BACKOFF_SECONDS):
+                    raise ClaudeTransportDrop(
+                        "endpoint_transport_drop: claude transport retry exhausted "
+                        f"after {retry_index + 1} attempts: {exc}"
+                    ) from exc
+                delay = CLAUDE_TRANSPORT_RETRY_BACKOFF_SECONDS[retry_index]
+                logger.warning(
+                    "claude transport retry %d/%d delay=%ss error=%s",
+                    retry_index + 1,
+                    len(CLAUDE_TRANSPORT_RETRY_BACKOFF_SECONDS),
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+                retry_index += 1
+
+    async def _astream(self, *args, **kwargs):
+        run_manager = kwargs.pop("run_manager", None)
+
+        async def stream_once():
+            async for chunk in super(ChatClaudeOAuth, self)._astream(
+                *args,
+                run_manager=None,
+                **kwargs,
+            ):
+                yield chunk
+
+        async for chunk in self._astream_with_claude_transport_retry(
+            stream_once,
+            run_manager=run_manager,
+        ):
+            yield chunk
+
+    def _stream(self, *args, **kwargs):
+        run_manager = kwargs.pop("run_manager", None)
+
+        def stream_once():
+            for chunk in super(ChatClaudeOAuth, self)._stream(
+                *args,
+                run_manager=None,
+                **kwargs,
+            ):
+                yield chunk
+
+        yield from self._stream_with_claude_transport_retry(
+            stream_once,
+            run_manager=run_manager,
+        )
+
+    def _generate(self, *args, **kwargs):
+        def generate_once():
+            return super(ChatClaudeOAuth, self)._generate(*args, **kwargs)
+
+        return (
+            generate_once()
+            if self.streaming
+            else self._invoke_with_claude_auth_retry(generate_once)
+        )
+
+    async def _agenerate(self, *args, **kwargs):
+        async def generate_once():
+            return await super(ChatClaudeOAuth, self)._agenerate(*args, **kwargs)
+
+        if self.streaming:
+            return await generate_once()
+        try:
+            return await generate_once()
+        except anthropic.APIStatusError as exc:
+            if not _is_claude_unauthorized_error(exc):
+                raise
+            await asyncio.to_thread(self._refresh_claude_credentials_for_retry)
+            try:
+                return await generate_once()
+            except anthropic.APIStatusError as retry_exc:
+                if _is_claude_unauthorized_error(retry_exc):
+                    raise RuntimeError(CLAUDE_OPERATOR_REAUTH_MESSAGE) from retry_exc
+                raise
+
+
 def _apply_codex_credentials(model: ChatCodex, creds) -> None:
     """Update a live ChatCodex instance with freshly refreshed OAuth credentials."""
     model.openai_api_key = SecretStr(creds.access_token)
@@ -456,6 +772,62 @@ def _is_codex_unauthorized_error(exc: APIStatusError) -> bool:
         return True
     response = getattr(exc, "response", None)
     return getattr(response, "status_code", None) == 401
+
+
+def _apply_claude_credentials(model: ChatClaudeOAuth, creds) -> None:
+    """Update a live ChatClaudeOAuth instance with refreshed OAuth credentials."""
+    model.oauth_access_token = SecretStr(creds.access_token)
+    for client in (
+        model.__dict__.get("_client"),
+        model.__dict__.get("_async_client"),
+    ):
+        if client is not None and hasattr(client, "auth_token"):
+            client.auth_token = creds.access_token
+
+
+def _is_claude_unauthorized_error(exc: anthropic.APIStatusError) -> bool:
+    """Return True for Claude 401s that should trigger one OAuth refresh."""
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 401:
+        return True
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) == 401
+
+
+def _is_retryable_claude_transport_error(exc: BaseException) -> bool:
+    """Return True for transient Claude stream transport drops."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return (
+        isinstance(
+            exc,
+            (
+                anthropic.APIConnectionError,
+                anthropic.APITimeoutError,
+                httpx.RemoteProtocolError,
+                httpx.ReadError,
+                httpx.ReadTimeout,
+            ),
+        )
+        or any(marker in text for marker in CLAUDE_TRANSPORT_ERROR_MARKERS)
+    )
+
+
+def _notify_sync_chunk(run_manager, chunk) -> None:
+    if run_manager is None or chunk is None:
+        return
+    message = getattr(chunk, "message", None)
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        run_manager.on_llm_new_token(content, chunk=chunk)
+
+
+async def _notify_async_chunk(run_manager, chunk) -> None:
+    if run_manager is None or chunk is None:
+        return
+    message = getattr(chunk, "message", None)
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        await run_manager.on_llm_new_token(content, chunk=chunk)
 
 
 def _flatten_chat_chunk(chunk):

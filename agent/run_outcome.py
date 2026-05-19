@@ -92,6 +92,7 @@ AGENT_RUN_FAILURE_CLASSES: frozenset[str] = frozenset({
     "endpoint_rate_limited",
     "endpoint_timeout",
     "endpoint_invalid_response",
+    "endpoint_transport_drop",
     "config_placeholder_value",
     "config_missing_required",
     "config_unresolved_hostname",
@@ -417,6 +418,12 @@ def _outcome_from_error(event: Mapping[str, Any]) -> RunOutcome:
     # agent runtime emits in agent/core.py.
     if "primary endpoint failed" in raw:
         # Drill into the underlying cause keyword.
+        if "endpoint_transport_drop" in raw or "transport retry exhausted" in raw:
+            return RunOutcome(
+                status="endpoint_failed",
+                failure_class="endpoint_transport_drop",
+                failure_detail=_truncate(detail),
+            )
         if "connection error" in raw or "connecterror" in raw:
             return RunOutcome(
                 status="endpoint_failed",
