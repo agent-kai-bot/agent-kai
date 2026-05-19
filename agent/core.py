@@ -3,9 +3,13 @@
 import asyncio
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import logging
 import os
 from pathlib import Path
+import time
 from typing import Any, AsyncIterator
+
+import httpx
 
 
 def _now_ts() -> str:
@@ -16,7 +20,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
-from openai import APIStatusError
+from openai import APIConnectionError, APIStatusError, APITimeoutError
 from pydantic import SecretStr
 
 from agent.auto_prompt import build_auto_suffix, parse_auto_state
@@ -51,9 +55,24 @@ from config import (
 
 DEFAULT_LLM_HISTORY_MAX_MESSAGES = 80
 DEFAULT_LLM_HISTORY_MAX_CHARS = 80_000
+LOGGER = logging.getLogger(__name__)
 CODEX_OPERATOR_REAUTH_MESSAGE = (
     "Codex OAuth refresh failed — operator must run `codex login --device-auth`"
 )
+CODEX_TRANSPORT_RETRY_BACKOFF_SECONDS = (60, 180, 540)
+CODEX_TRANSPORT_ERROR_MARKERS = (
+    "peer closed connection",
+    "incomplete chunked read",
+    "connection reset",
+    "remoteprotocolerror",
+    "readerror",
+)
+
+
+class CodexTransportDrop(RuntimeError):
+    """Raised when the codex HTTP stream drops mid-response and retries are exhausted."""
+
+    pass
 
 
 def _env_int(name: str, default: int) -> int:
@@ -270,6 +289,23 @@ def _create_codex_chat_model(endpoint_cfg: dict):
     )
 
 
+def _is_retryable_codex_transport_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return (
+        isinstance(
+            exc,
+            (
+                APIConnectionError,
+                APITimeoutError,
+                httpx.RemoteProtocolError,
+                httpx.ReadError,
+                httpx.ReadTimeout,
+            ),
+        )
+        or any(marker in text for marker in CODEX_TRANSPORT_ERROR_MARKERS)
+    )
+
+
 class ChatCodex(ChatOpenAI):
     """ChatOpenAI subclass that adapts to Codex's Responses API quirks.
 
@@ -371,6 +407,70 @@ class ChatCodex(ChatOpenAI):
                 raise RuntimeError(CODEX_OPERATOR_REAUTH_MESSAGE) from exc
             raise
 
+    def _stream_with_codex_retries(self, stream_factory):
+        """Wrap Codex auth retry with bounded retry for dropped HTTP streams.
+
+        Chunks are buffered per attempt so a partial broken stream is never
+        emitted to callers. A successful retry emits only the full recovered
+        response, preserving LangChain's in-turn scratchpad for the retried
+        model call.
+        """
+        max_retries = len(CODEX_TRANSPORT_RETRY_BACKOFF_SECONDS)
+        for attempt in range(1, max_retries + 2):
+            try:
+                buffered = []
+                for chunk in self._stream_with_codex_auth_retry(stream_factory):
+                    buffered.append(chunk)
+                for chunk in buffered:
+                    yield chunk
+                return
+            except Exception as exc:
+                retryable = _is_retryable_codex_transport_error(exc)
+                if not retryable or attempt > max_retries:
+                    if retryable:
+                        raise CodexTransportDrop(
+                            f"codex transport retry exhausted after {attempt} attempts: {exc}"
+                        ) from exc
+                    raise
+                delay = CODEX_TRANSPORT_RETRY_BACKOFF_SECONDS[attempt - 1]
+                LOGGER.warning(
+                    "codex transport retry %d/%d delay=%ss error=%s",
+                    attempt,
+                    max_retries,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+
+    async def _astream_with_codex_retries(self, stream_factory):
+        """Async equivalent of _stream_with_codex_retries."""
+        max_retries = len(CODEX_TRANSPORT_RETRY_BACKOFF_SECONDS)
+        for attempt in range(1, max_retries + 2):
+            try:
+                buffered = []
+                async for chunk in self._astream_with_codex_auth_retry(stream_factory):
+                    buffered.append(chunk)
+                for chunk in buffered:
+                    yield chunk
+                return
+            except Exception as exc:
+                retryable = _is_retryable_codex_transport_error(exc)
+                if not retryable or attempt > max_retries:
+                    if retryable:
+                        raise CodexTransportDrop(
+                            f"codex transport retry exhausted after {attempt} attempts: {exc}"
+                        ) from exc
+                    raise
+                delay = CODEX_TRANSPORT_RETRY_BACKOFF_SECONDS[attempt - 1]
+                LOGGER.warning(
+                    "codex transport retry %d/%d delay=%ss error=%s",
+                    attempt,
+                    max_retries,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+
     # ── Content-flattening overrides ────────────────────────────
     # All four model code paths (sync/async × streaming/non-streaming)
     # need the same fix because the agent executor reaches them via
@@ -383,7 +483,7 @@ class ChatCodex(ChatOpenAI):
             async for chunk in super(ChatCodex, self)._astream(*args, **kwargs):
                 yield _flatten_chat_chunk(chunk)
 
-        async for chunk in self._astream_with_codex_auth_retry(stream_once):
+        async for chunk in self._astream_with_codex_retries(stream_once):
             yield chunk
 
     def _stream(self, *args, **kwargs):
@@ -391,7 +491,7 @@ class ChatCodex(ChatOpenAI):
             for chunk in super(ChatCodex, self)._stream(*args, **kwargs):
                 yield _flatten_chat_chunk(chunk)
 
-        yield from self._stream_with_codex_auth_retry(stream_once)
+        yield from self._stream_with_codex_retries(stream_once)
 
     def _generate(self, *args, **kwargs):
         def generate_once():

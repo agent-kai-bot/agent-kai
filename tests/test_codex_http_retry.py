@@ -5,9 +5,25 @@ import httpx
 import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from agent import core as agent_core
 from agent import codex_auth
 from agent.codex_auth import CodexCredentials
-from agent.core import CODEX_OPERATOR_REAUTH_MESSAGE, ChatCodex
+from agent.core import (
+    CODEX_OPERATOR_REAUTH_MESSAGE,
+    ChatCodex,
+    CodexTransportDrop,
+    _is_retryable_codex_transport_error,
+)
+
+
+class DroppingSSEStream(httpx.SyncByteStream):
+    def __iter__(self):
+        payload = _responses_sse("partial")
+        yield payload[: payload.index(b"data: [DONE]")]
+        raise httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)"
+        )
 
 
 def _responses_payload(text: str) -> dict:
@@ -99,6 +115,74 @@ def _chat_codex_with_transport(transport: httpx.MockTransport) -> ChatCodex:
         max_retries=0,
         http_client=httpx.Client(transport=transport),
     )
+
+
+def test_retryable_marker_detection():
+    err = RuntimeError(
+        "peer closed connection without sending complete message body "
+        "(incomplete chunked read)"
+    )
+    assert _is_retryable_codex_transport_error(err)
+
+
+def test_retryable_exception_types():
+    assert _is_retryable_codex_transport_error(httpx.RemoteProtocolError("x"))
+    assert _is_retryable_codex_transport_error(httpx.ReadError("x"))
+
+
+def test_non_retryable():
+    assert not _is_retryable_codex_transport_error(ValueError("nope"))
+
+
+def test_chat_codex_retries_dropped_stream_then_recovers(monkeypatch):
+    requests = []
+    monkeypatch.setattr(agent_core, "CODEX_TRANSPORT_RETRY_BACKOFF_SECONDS", (0,))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                stream=DroppingSSEStream(),
+                headers={"content-type": "text/event-stream"},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            content=_responses_sse("recovered"),
+            headers={"content-type": "text/event-stream"},
+            request=request,
+        )
+
+    model = _chat_codex_with_transport(httpx.MockTransport(handler))
+
+    message = model.invoke(
+        [SystemMessage(content="system"), HumanMessage(content="hello")]
+    )
+
+    assert message.content == "recovered"
+    assert len(requests) == 2
+
+
+def test_chat_codex_exhausts_dropped_stream_retries(monkeypatch):
+    requests = []
+    monkeypatch.setattr(agent_core, "CODEX_TRANSPORT_RETRY_BACKOFF_SECONDS", (0, 0))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            stream=DroppingSSEStream(),
+            headers={"content-type": "text/event-stream"},
+            request=request,
+        )
+
+    model = _chat_codex_with_transport(httpx.MockTransport(handler))
+
+    with pytest.raises(CodexTransportDrop):
+        model.invoke([SystemMessage(content="system"), HumanMessage(content="hello")])
+
+    assert len(requests) == 3
 
 
 def test_chat_codex_retries_once_with_refreshed_bearer(monkeypatch):

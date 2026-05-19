@@ -92,6 +92,7 @@ AGENT_RUN_FAILURE_CLASSES: frozenset[str] = frozenset({
     "endpoint_rate_limited",
     "endpoint_timeout",
     "endpoint_invalid_response",
+    "endpoint_transport_drop",
     "config_placeholder_value",
     "config_missing_required",
     "config_unresolved_hostname",
@@ -236,10 +237,12 @@ def derive_outcome_from_agent_events(
     #   1. A final [AUTO_STATE: done] beats any late auto_stopped sentinel.
     #      The runtime can emit both when a last turn completes successfully
     #      and then an auto-mode guard also fires.
-    #   2. auto_stopped beats other cases (we want the gate reason)
-    #   3. error beats final (a final after error is the "agent returned
+    #   2. exhausted Codex transport retries beat the later malformed-footer
+    #      auto_stopped symptom.
+    #   3. auto_stopped beats other cases (we want the gate reason)
+    #   4. error beats final (a final after error is the "agent returned
     #      an empty response" sentinel)
-    #   4. final implies success unless empty sentinel
+    #   5. final implies success unless empty sentinel
     if (
         last_auto_stopped is not None
         and last_error is None
@@ -250,6 +253,8 @@ def derive_outcome_from_agent_events(
             failure_class=None,
             failure_detail=None,
         )
+    if last_error is not None and _error_is_codex_transport_drop(last_error):
+        return _outcome_from_error(last_error)
     if last_auto_stopped is not None:
         return _outcome_from_auto_stopped(last_auto_stopped)
     if last_error is not None:
@@ -352,6 +357,11 @@ _PYTHON_EXCEPTION_RE = re.compile(
     r"(?:^|[\s(])(?P<class>[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))\s*:",
     re.MULTILINE,
 )
+_TRANSPORT_DROP_MARKERS = (
+    "peer closed connection",
+    "incomplete chunked read",
+    "connection reset",
+)
 
 
 def _final_text_declares_done(
@@ -383,6 +393,14 @@ def _auto_stop_detail(data: Any, *, fallback: str = "auto_stopped") -> str:
     if isinstance(elapsed, (int, float)):
         return f"{reason}; elapsed={float(elapsed):.1f}s"
     return reason
+
+
+def _error_is_codex_transport_drop(event: Mapping[str, Any]) -> bool:
+    raw = _normalize_data_for_match(event.get("data"))
+    return "codex transport retry exhausted" in raw or (
+        "primary endpoint failed" in raw
+        and any(marker in raw for marker in _TRANSPORT_DROP_MARKERS)
+    )
 
 
 def derive_outcome_from_exception(exc: BaseException) -> RunOutcome:
@@ -417,6 +435,14 @@ def _outcome_from_error(event: Mapping[str, Any]) -> RunOutcome:
     # agent runtime emits in agent/core.py.
     if "primary endpoint failed" in raw:
         # Drill into the underlying cause keyword.
+        if "codex transport retry exhausted" in raw or any(
+            marker in raw for marker in _TRANSPORT_DROP_MARKERS
+        ):
+            return RunOutcome(
+                status="endpoint_failed",
+                failure_class="endpoint_transport_drop",
+                failure_detail=_truncate(detail),
+            )
         if "connection error" in raw or "connecterror" in raw:
             return RunOutcome(
                 status="endpoint_failed",
