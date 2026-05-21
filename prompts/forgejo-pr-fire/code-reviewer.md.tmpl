@@ -30,4 +30,25 @@ Run or inspect the most relevant tests when feasible. Do not rewrite the impleme
 ## Submit
 Write the PR review summary to `{output_target}`. Lead with findings by severity, then list open questions, tests checked, and a concise verdict.
 
+## Submit formal review
+After writing `{output_target}`, you MUST submit the formal Forgejo review. This is the deliverable; an artifact file alone is not complete.
+
+Map your final decision to the CLI event: `APPROVED` -> `approved`; any blocking finding or required remediation -> `changes`.
+
+Run this command, replacing `<approved|changes>` with the mapped event and never printing tokens:
+
+```bash
+"$AGENTKAI_HOME/workspace/agent-ops-forgejo-taskboard-cli.py" --org {forgejo_org} \
+  pr-review {forgejo_repo} {pr_number} <approved|changes> "Code Reviewer" --body-file "{output_target}"
+```
+
+Then verify the review landed:
+
+```bash
+"$AGENTKAI_HOME/workspace/agent-ops-forgejo-taskboard-cli.py" --org {forgejo_org} \
+  fg-reviews {forgejo_repo} {pr_number}
+```
+
+The verification must show a review by the Code Reviewer role identity (`agent-code-reviewer`). Report the review id. If posting or verification fails, treat the run as a hard failure and do not report success.
+
 STOP: FORGEJO_PR_FIRE_PROMPT_END

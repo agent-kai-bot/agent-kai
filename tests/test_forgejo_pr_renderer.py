@@ -109,6 +109,35 @@ class ForgejoPrRendererTests(unittest.TestCase):
                 self.assertIn("STOP: FORGEJO_PR_FIRE_PROMPT_END", rendered)
                 self.assertIn("Repository: Praxis/agent-kai", rendered)
 
+    def test_review_role_prompts_require_formal_forgejo_review_submit(self) -> None:
+        """Forgejo PR reviewer prompts must land a formal PR review."""
+
+        expected_roles = {
+            "code-reviewer": ("Code Reviewer", "agent-code-reviewer"),
+            "security-auditor": ("Security Auditor", "agent-security-auditor"),
+            "qa-agent": ("QA Agent", "agent-qa"),
+        }
+
+        for role, (display_role, reviewer_user) in expected_roles.items():
+            with self.subTest(role=role):
+                rendered = render_forgejo_pr_fire_prompt(role, self._sample_pr())
+
+                self.assertIn("## Submit formal review", rendered)
+                self.assertIn("pr-review agent-kai 42 <approved|changes>", rendered)
+                self.assertIn(f'"{display_role}" --body-file', rendered)
+                self.assertIn("fg-reviews agent-kai 42", rendered)
+                self.assertIn(f"`{reviewer_user}`", rendered)
+                self.assertIn("Report the review id", rendered)
+                self.assertIn("hard failure", rendered)
+
+    def test_forgejo_cli_target_is_derived_for_rendered_submit_command(self) -> None:
+        """Rendered formal-review commands use the CLI org/repo shape."""
+
+        substitutions = _extract_pr_substitutions(self._sample_pr())
+
+        self.assertEqual(substitutions["forgejo_org"], "Praxis")
+        self.assertEqual(substitutions["forgejo_repo"], "agent-kai")
+
     def test_diff_summary_is_derived_from_files_changed(self) -> None:
         """Diff summary is derived from the files_changed array."""
 

@@ -127,13 +127,19 @@ class _FakeRuntimeConfigResolver:
 
     def resolve_for_role(self, role: str, **_kwargs) -> RoleRuntimeConfig:
         self.roles.append(role)
+        review_taskboard_token = (
+            f"taskboard-role-token-for-{role}"
+            if role in {"code-reviewer", "security-auditor", "qa-agent"}
+            else ""
+        )
         return RoleRuntimeConfig(
             role=role,
             forgejo_pat=f"pat-for-{role}",
             forgejo_user=f"user-for-{role}",
             forgejo_base_url="http://forgejo.local",
             taskboard_base_url="",
-            taskboard_bearer_token="",
+            taskboard_bearer_token=review_taskboard_token,
+            taskboard_mint_bearer_token="taskboard-admin-token",
             source="test",
         )
 

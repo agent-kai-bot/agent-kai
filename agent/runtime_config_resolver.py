@@ -443,10 +443,7 @@ class RuntimeConfigResolver:
             taskboard_base_url=str(
                 self.env.get("TASKBOARD_URL", "http://localhost:8080")
             ).strip(),
-            taskboard_bearer_token=(
-                str(taskboard_bearer_token or "").strip()
-                or taskboard_mint_bearer_token
-            ),
+            taskboard_bearer_token=str(taskboard_bearer_token or "").strip(),
             taskboard_mint_bearer_token=taskboard_mint_bearer_token,
             taskboard_agent_name=str(self.env.get("TASKBOARD_AGENT_NAME", "")).strip(),
             source=source,

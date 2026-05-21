@@ -30,4 +30,25 @@ Ground each finding in evidence from the diff or nearby code. When no issue is f
 ## Submit
 Write the security audit to `{output_target}`. Lead with high-impact findings, then note tests or checks performed and any required remediation.
 
+## Submit formal review
+After writing `{output_target}`, you MUST submit the formal Forgejo review. This is the deliverable; an artifact file alone is not complete.
+
+Map your final decision to the CLI event: `APPROVED` -> `approved`; any blocking finding or required remediation -> `changes`.
+
+Run this command, replacing `<approved|changes>` with the mapped event and never printing tokens:
+
+```bash
+"$AGENTKAI_HOME/workspace/agent-ops-forgejo-taskboard-cli.py" --org {forgejo_org} \
+  pr-review {forgejo_repo} {pr_number} <approved|changes> "Security Auditor" --body-file "{output_target}"
+```
+
+Then verify the review landed:
+
+```bash
+"$AGENTKAI_HOME/workspace/agent-ops-forgejo-taskboard-cli.py" --org {forgejo_org} \
+  fg-reviews {forgejo_repo} {pr_number}
+```
+
+The verification must show a review by the Security Auditor role identity (`agent-security-auditor`). Report the review id. If posting or verification fails, treat the run as a hard failure and do not report success.
+
 STOP: FORGEJO_PR_FIRE_PROMPT_END

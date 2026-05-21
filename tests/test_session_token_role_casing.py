@@ -81,6 +81,32 @@ class _GateRuntimeConfigResolver:
         )
 
 
+class _MissingGateRuntimeConfigResolver:
+    def resolve_for_role(self, role: str, **_kwargs) -> RoleRuntimeConfig:
+        return RoleRuntimeConfig(
+            role=role,
+            forgejo_pat=f"forgejo-pat-for-{role}",
+            taskboard_base_url="http://taskboard.local",
+            taskboard_bearer_token="",
+            taskboard_mint_bearer_token="admin-taskboard-token",
+            source="test",
+            taskboard_vault_path=f"taskboard/agent-{role}",
+        )
+
+
+class _GenericGateRuntimeConfigResolver:
+    def resolve_for_role(self, role: str, **_kwargs) -> RoleRuntimeConfig:
+        return RoleRuntimeConfig(
+            role=role,
+            forgejo_pat=f"forgejo-pat-for-{role}",
+            taskboard_base_url="http://taskboard.local",
+            taskboard_bearer_token="admin-taskboard-token",
+            taskboard_mint_bearer_token="admin-taskboard-token",
+            source="test",
+            taskboard_vault_path=f"taskboard/agent-{role}",
+        )
+
+
 def _create_pending_table(db: Path) -> None:
     conn = sqlite3.connect(db)
     conn.execute(
@@ -148,11 +174,19 @@ class SessionTokenRoleCasingTests(unittest.IsolatedAsyncioTestCase):
             session_manager=spawner,
             nats_bus=None,
             agent_runs_client=_DisabledAgentRunsClient(),
+            runtime_config_resolver=_GateRuntimeConfigResolver(),
         )
 
         mint_calls: list[tuple[int, str]] = []
 
-        def _capture_mint(self_, *, task_id: int, role: str) -> tuple[str, int]:
+        def _capture_mint(
+            self_,
+            *,
+            task_id: int,
+            role: str,
+            base_url: str | None = None,
+            bearer_token: str | None = None,
+        ) -> tuple[str, int]:
             mint_calls.append((task_id, role))
             return f"tok-{role.replace(' ', '-').lower()}", 1
 
@@ -175,6 +209,52 @@ class SessionTokenRoleCasingTests(unittest.IsolatedAsyncioTestCase):
         )
         for _, role in mint_calls:
             self.assertNotIn("-", role, f"kebab-case leaked into mint: {role}")
+
+    async def test_reviewer_missing_or_generic_taskboard_bearer_fails_closed(self) -> None:
+        cases = [
+            (_MissingGateRuntimeConfigResolver(), "identity missing"),
+            (_GenericGateRuntimeConfigResolver(), "generic daemon bearer"),
+        ]
+
+        for index, (resolver, expected_error) in enumerate(cases, start=1):
+            with self.subTest(expected_error=expected_error):
+                task_id = 910 + index
+                _seed_review_row(self.db, task_id=task_id, fire_generation=index)
+                task = {"id": task_id, "agent": "Developer", "fire_generation": index}
+                spawner = _CaptureSpawner()
+                dispatcher = TaskboardDispatcher(
+                    db_path=self.db,
+                    task_client=_FakeTaskClient({task_id: task}),
+                    session_manager=spawner,
+                    nats_bus=None,
+                    agent_runs_client=_DisabledAgentRunsClient(),
+                    runtime_config_resolver=resolver,
+                )
+
+                with mock.patch.object(
+                    TaskboardDispatcher,
+                    "_mint_taskboard_session_token",
+                    side_effect=AssertionError("must fail before minting"),
+                ), mock.patch(
+                    "agent.taskboard_dispatcher.render_taskboard_fire_prompt",
+                    return_value="rendered prompt",
+                ):
+                    counts = await dispatcher.run_once()
+
+                self.assertEqual(counts, {"spawn_failed": 1})
+                self.assertEqual(spawner.spawn_calls, [])
+                rows = sqlite3.connect(self.db)
+                rows.row_factory = sqlite3.Row
+                try:
+                    row = rows.execute(
+                        "SELECT * FROM webhook_pending WHERE payload LIKE ?",
+                        (f'%"task_id": {task_id}%',),
+                    ).fetchone()
+                finally:
+                    rows.close()
+                self.assertIsNotNone(row)
+                self.assertEqual(row["dispatch_status"], "spawn_failed")
+                self.assertIn(expected_error, row["last_error"])
 
     async def test_gate_reviewer_runtime_uses_gate_bearer_but_mint_uses_admin_bearer(self) -> None:
         _seed_review_row(self.db, task_id=903, fire_generation=4)
@@ -276,7 +356,14 @@ class SessionTokenRoleCasingTests(unittest.IsolatedAsyncioTestCase):
 
         mint_calls: list[tuple[int, str]] = []
 
-        def _capture_mint(self_, *, task_id: int, role: str) -> tuple[str, int]:
+        def _capture_mint(
+            self_,
+            *,
+            task_id: int,
+            role: str,
+            base_url: str | None = None,
+            bearer_token: str | None = None,
+        ) -> tuple[str, int]:
             mint_calls.append((task_id, role))
             return f"tok-{role}", 1
 

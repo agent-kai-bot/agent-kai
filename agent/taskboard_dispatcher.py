@@ -21,7 +21,9 @@ from agent.forgejo_tools import ForgejoContext
 from agent.prompt_renderer import render_taskboard_fire_prompt
 from agent.runtime_config_resolver import (
     RoleRuntimeConfig,
+    RuntimeConfigError,
     RuntimeConfigResolver,
+    role_env_suffix,
     redact_known_runtime_secrets,
 )
 from agent.taskboard_service_client import TaskboardServiceClient, TaskboardServiceError
@@ -59,6 +61,12 @@ _REQUEST_CHANGES_VERDICTS = {
     "request_changes",
     "changes_requested",
     "requested_changes",
+}
+_REVIEW_VERDICT_ROLES = frozenset({"code reviewer", "security auditor", "qa agent"})
+_TASKBOARD_REVIEWER_TOKEN_PATH_BY_ROLE = {
+    "code reviewer": "taskboard/agent-code-reviewer",
+    "security auditor": "taskboard/agent-security-auditor",
+    "qa agent": "taskboard/agent-qa",
 }
 _ACTIVE_REVIEW_STATUSES = {"review", "code_review", "security_audit", "qa"}
 _REPO_TARGET_FIELD_ALIASES = (
@@ -637,6 +645,12 @@ class DaemonTaskboardSpawner:
             session_generation=_coerce_positive_int(kwargs.get("session_generation")),
             agent_name=agent_id,
         )
+        role_text = str(kwargs.get("role") or agent_id)
+        _validate_reviewer_taskboard_identity(
+            role=role_text,
+            runtime_config=runtime_config,
+            generic_bearer=_process_taskboard_bearer_token(),
+        )
         runtime_env = runtime_config.env_overlay()
         runtime_env.update(
             {
@@ -650,7 +664,6 @@ class DaemonTaskboardSpawner:
         primary_repo_path = ""
         workspace_manifest_path = ""
         repo_routing_mode = str(task_payload.get("repo_routing_mode") or "")
-        role_text = str(kwargs.get("role") or agent_id)
         normalized_role = _normalize_role(role_text)
         is_developer_session = normalized_role == "developer"
         isolate_worktree = _worktree_isolation_enabled() or is_developer_session
@@ -1133,6 +1146,11 @@ class TaskboardDispatcher:
                     runtime_config = self.runtime_config_resolver.resolve_for_role(
                         route.agent_id,
                         allow_missing_forgejo_pat=True,
+                    )
+                    _validate_reviewer_taskboard_identity(
+                        role=route.role,
+                        runtime_config=runtime_config,
+                        generic_bearer=self._taskboard_bearer_token(),
                     )
                 except Exception as exc:  # noqa: BLE001
                     self._store.mark_session_failed(*reserved_key)
@@ -1807,7 +1825,7 @@ class TaskboardDispatcher:
 
     def _taskboard_bearer_token(self) -> str:
         """Resolve the taskboard bearer token (used for ledger + session-token mint)."""
-        return os.environ.get("TASKBOARD_BEARER_TOKEN", "").strip()
+        return _process_taskboard_bearer_token()
 
     def _record_agent_run_queued(
         self,
@@ -2740,6 +2758,59 @@ class _TaskboardQueueStore:
 def _normalize_role(role: str) -> str:
     text = re.sub(r"[-_]+", " ", str(role or "").strip().lower())
     return re.sub(r"\s+", " ", text)
+
+
+def _process_taskboard_bearer_token() -> str:
+    return (
+        os.environ.get("TASKBOARD_BEARER_TOKEN", "").strip()
+        or os.environ.get("OPENCLAW_GATEWAY_TOKEN", "").strip()
+        or os.environ.get("OPENCLAW_TOKEN", "").strip()
+    )
+
+
+def _validate_reviewer_taskboard_identity(
+    *,
+    role: str,
+    runtime_config: RoleRuntimeConfig,
+    generic_bearer: str = "",
+) -> None:
+    """Fail closed when a review gate would run without a role-scoped bearer."""
+
+    normalized_role = _normalize_role(role or runtime_config.role)
+    if normalized_role not in _REVIEW_VERDICT_ROLES:
+        return
+
+    role_token = str(runtime_config.taskboard_bearer_token or "").strip()
+    generic_tokens = {
+        token
+        for token in (
+            str(generic_bearer or "").strip(),
+            str(runtime_config.taskboard_mint_bearer_token or "").strip(),
+        )
+        if token
+    }
+    suffix = role_env_suffix(normalized_role)
+    token_source = (
+        runtime_config.taskboard_vault_path
+        or _TASKBOARD_REVIEWER_TOKEN_PATH_BY_ROLE.get(normalized_role)
+        or "the role taskboard Vault path"
+    )
+    source_hint = (
+        f"{token_source}, TASKBOARD_BEARER_TOKEN_{suffix}, or "
+        f"TASKBOARD_TOKEN_{suffix}"
+    )
+
+    if not role_token:
+        raise RuntimeConfigError(
+            "reviewer taskboard identity missing for role="
+            f"{role}: configure a per-role taskboard bearer via {source_hint}"
+        )
+    if role_token in generic_tokens:
+        raise RuntimeConfigError(
+            "reviewer taskboard identity for role="
+            f"{role} resolves to the generic daemon bearer; configure a distinct "
+            f"per-role taskboard bearer via {source_hint}"
+        )
 
 
 def _normalize_status_token(status: Any) -> str:

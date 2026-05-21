@@ -8,6 +8,7 @@ import unicodedata
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from daemon.env_utils import _env_positive_int
 
@@ -390,8 +391,17 @@ def _extract_pr_substitutions(pr: Mapping[str, Any]) -> dict[str, str]:
         explicit=_stringify(_field(pr_mapping, "diff_summary", "diffSummary")),
     )
 
+    repo_text = _stringify(repo).strip()
+    pr_url = _stringify(
+        _field(pr_mapping, "pr_url", "prUrl", "html_url", "htmlUrl", "url")
+        or _field(pull_request, "html_url", "htmlUrl", "url")
+    )
+    forgejo_org, forgejo_repo = _forgejo_cli_target(repo_text, pr_url)
+
     return {
-        "repo": _stringify(repo),
+        "repo": repo_text,
+        "forgejo_org": forgejo_org,
+        "forgejo_repo": forgejo_repo,
         "pr_number": _stringify(
             _field(pr_mapping, "pr_number", "prNumber", "number", "id")
             or _field(pull_request, "number", "id")
@@ -413,10 +423,7 @@ def _extract_pr_substitutions(pr: Mapping[str, Any]) -> dict[str, str]:
             _field(pr_mapping, "head_sha", "headSha", "sha")
             or _field(head, "sha")
         ),
-        "pr_url": _stringify(
-            _field(pr_mapping, "pr_url", "prUrl", "html_url", "htmlUrl", "url")
-            or _field(pull_request, "html_url", "htmlUrl", "url")
-        ),
+        "pr_url": pr_url,
         "taskboard_task_id": _stringify(
             _field(
                 pr_mapping,
@@ -686,6 +693,26 @@ def _forgejo_output_target(role: str, substitutions: Mapping[str, str]) -> str:
         f"{role_slug}/claude/artifacts/"
         f"forgejo-pr-{repo_slug}-{pr_number}-{head_sha}-final.txt"
     )
+
+
+def _forgejo_cli_target(repo: str, pr_url: str) -> tuple[str, str]:
+    """Return ``(--org, repo)`` values for the Forgejo helper CLI."""
+
+    repo_text = str(repo or "").strip().strip("/")
+    if repo_text and "://" not in repo_text and "/" in repo_text:
+        parts = [part for part in repo_text.split("/") if part]
+        if len(parts) >= 2:
+            return parts[-2], parts[-1]
+
+    path = urlsplit(str(pr_url or "")).path
+    segments = [segment for segment in path.split("/") if segment]
+    for marker in ("pulls", "pull"):
+        if marker in segments:
+            marker_index = segments.index(marker)
+            if marker_index >= 2:
+                return segments[marker_index - 2], segments[marker_index - 1]
+
+    return "atcsecure", repo_text or "repo"
 
 
 def _branch_name_suggestion(task_id: str, title: str) -> str:

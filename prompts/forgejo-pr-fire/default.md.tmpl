@@ -28,4 +28,25 @@ Review the pull request within the requested role. Ground each conclusion in the
 ## Submit
 Write the review output to `{output_target}`. Include findings, checks performed, open questions, and verdict.
 
+## Submit formal review
+After writing `{output_target}`, you MUST submit the formal Forgejo review. This is the deliverable; an artifact file alone is not complete.
+
+Map your final decision to the CLI event: `APPROVED` -> `approved`; any blocking finding or required remediation -> `changes`.
+
+Run this command, replacing `<approved|changes>` with the mapped event and never printing tokens:
+
+```bash
+"$AGENTKAI_HOME/workspace/agent-ops-forgejo-taskboard-cli.py" --org {forgejo_org} \
+  pr-review {forgejo_repo} {pr_number} <approved|changes> "{role}" --body-file "{output_target}"
+```
+
+Then verify the review landed:
+
+```bash
+"$AGENTKAI_HOME/workspace/agent-ops-forgejo-taskboard-cli.py" --org {forgejo_org} \
+  fg-reviews {forgejo_repo} {pr_number}
+```
+
+The verification must show a review by the expected role identity. Report the review id. If posting or verification fails, treat the run as a hard failure and do not report success.
+
 STOP: FORGEJO_PR_FIRE_PROMPT_END
