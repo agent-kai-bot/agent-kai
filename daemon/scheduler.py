@@ -27,6 +27,10 @@ from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from config import WORKSPACES_DIR, normalize_reasoning_effort
+from daemon.shutdown import (
+    DEFAULT_TASK_SHUTDOWN_TIMEOUT_SECONDS,
+    cancel_and_await_tasks,
+)
 
 NonEmptyString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 JobType = Literal["absolute", "cron", "event"]
@@ -394,6 +398,7 @@ class Scheduler:
         self._started = False
         self._event_callback: EventCallback | None = None
         self._startup_tasks: set[asyncio.Task] = set()
+        self._event_tasks: set[asyncio.Task] = set()
         self.log = logging.getLogger(__name__)
 
     @property
@@ -410,16 +415,26 @@ class Scheduler:
         self._recover_loaded_jobs()
         self._started = True
 
-    async def shutdown(self) -> None:
+    async def shutdown(
+        self,
+        *,
+        timeout_seconds: float = DEFAULT_TASK_SHUTDOWN_TIMEOUT_SECONDS,
+    ) -> None:
         if not self._started:
             return
         if self.event_bus is not None and self._event_callback is not None:
             self.event_bus.unsubscribe(self._event_callback)
             self._event_callback = None
-        for task in list(self._startup_tasks):
-            task.cancel()
-        self._startup_tasks.clear()
         self._scheduler.shutdown(wait=False)
+        tasks = [*self._startup_tasks, *self._event_tasks]
+        self._startup_tasks.clear()
+        self._event_tasks.clear()
+        await cancel_and_await_tasks(
+            tasks,
+            label="scheduler",
+            logger=self.log,
+            timeout_seconds=timeout_seconds,
+        )
         self._started = False
 
     def list_jobs(self) -> list[ScheduledJob]:
@@ -942,9 +957,13 @@ class Scheduler:
         if job_id not in self._jobs:
             return
         self.log.warning("scheduler catch-up firing job_id=%s reason=%s", job_id, reason)
-        task = asyncio.create_task(self._fire_scheduled_job(job_id))
+        task = asyncio.create_task(
+            self._fire_scheduled_job(job_id),
+            name=f"scheduler-catch-up-{job_id}",
+        )
         self._startup_tasks.add(task)
         task.add_done_callback(self._startup_tasks.discard)
+        task.add_done_callback(self._consume_background_task_exception)
 
     @staticmethod
     def _next_job_id() -> str:
@@ -966,4 +985,15 @@ class Scheduler:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
                 return
-            loop.create_task(maybe_awaitable)
+            task = loop.create_task(
+                maybe_awaitable,
+                name=f"scheduler-event-{event_type}-{job.id}",
+            )
+            self._event_tasks.add(task)
+            task.add_done_callback(self._event_tasks.discard)
+            task.add_done_callback(self._consume_background_task_exception)
+
+    @staticmethod
+    def _consume_background_task_exception(task: asyncio.Task[Any]) -> None:
+        with suppress(asyncio.CancelledError, Exception):
+            task.exception()

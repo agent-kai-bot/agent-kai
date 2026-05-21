@@ -959,7 +959,8 @@ class TaskboardDispatcher:
         try:
             from agent.run_outcome_reaper import reap_directory
 
-            reap_directory(
+            await asyncio.to_thread(
+                reap_directory,
                 client=self._agent_runs_client,
                 create_if_missing=True,
                 source_component="kai-dispatcher",

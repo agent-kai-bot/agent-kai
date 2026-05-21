@@ -122,6 +122,10 @@ from daemon.heartbeat import (
 )
 from daemon.runtime_config_store import RuntimeConfigStore
 from daemon.scheduler import DaemonEventBus, Scheduler
+from daemon.shutdown import (
+    DEFAULT_TASK_SHUTDOWN_TIMEOUT_SECONDS,
+    cancel_and_await_tasks,
+)
 from daemon.signal_router import (
     ExecutionContext,
     SignalRouter,
@@ -199,6 +203,7 @@ TOKEN_FLUSH_INTERVAL_SECONDS = 0.04
 TOKEN_FLUSH_CHARS = 48
 SCHEDULED_JOB_SESSION_PREFIX = "agent:kai:cron-wake:"
 SESSION_DISK_GC_INTERVAL_SECONDS = 3600.0
+DAEMON_SHUTDOWN_STEP_TIMEOUT_SECONDS = DEFAULT_TASK_SHUTDOWN_TIMEOUT_SECONDS
 
 
 @dataclass(frozen=True)
@@ -780,6 +785,7 @@ class DaemonServer:
         )
         self.session_lifecycle_sweep_task: asyncio.Task[None] | None = None
         self.session_disk_gc_task: asyncio.Task[None] | None = None
+        self.background_tasks: set[asyncio.Task[Any]] = set()
         self.heartbeat_prompt_template = HeartbeatPromptTemplate.load(
             self.heartbeat_config.prompt_template_path
         )
@@ -1103,29 +1109,141 @@ class DaemonServer:
 
     async def shutdown(self) -> None:
         """Stop all managed runtime resources."""
-        await self._stop_taskboard_dispatcher()
-        await self._stop_session_lifecycle_tasks()
+        await self._run_shutdown_step(
+            "taskboard dispatcher",
+            self._stop_taskboard_dispatcher(),
+        )
+        await self._run_shutdown_step(
+            "session lifecycle tasks",
+            self._stop_session_lifecycle_tasks(),
+        )
         if self.heartbeat_service is not None:
-            with suppress(Exception):
-                await self.heartbeat_service.shutdown()
+            await self._run_shutdown_step(
+                "heartbeat",
+                self.heartbeat_service.shutdown(
+                    timeout_seconds=DAEMON_SHUTDOWN_STEP_TIMEOUT_SECONDS
+                ),
+            )
             self.heartbeat_service = None
+        await self._run_shutdown_step(
+            "scheduler",
+            self._shutdown_scheduler(),
+        )
+        await self._run_shutdown_step(
+            "event injector",
+            self.event_injector.shutdown(
+                timeout_seconds=DAEMON_SHUTDOWN_STEP_TIMEOUT_SECONDS
+            ),
+        )
+        await self._run_shutdown_step(
+            "active session input tasks",
+            self._stop_active_session_input_tasks(),
+        )
         for managed in self.sessions.values():
-            with suppress(Exception):
-                await managed.session.sub_agent_registry.stop_all()
+            await self._run_shutdown_step(
+                f"sub-agents:{managed.session.name}",
+                managed.session.sub_agent_registry.stop_all(),
+            )
         if self.signal_router_sub_agent_manager is not None:
-            with suppress(Exception):
-                await self.signal_router_sub_agent_manager.stop_all()
+            await self._run_shutdown_step(
+                "signal router sub-agents",
+                self.signal_router_sub_agent_manager.stop_all(),
+            )
             self.signal_router_sub_agent_manager = None
-
-        if self.scheduler is not None:
-            with suppress(Exception):
-                await self.scheduler.shutdown()
-            self.scheduler = None
+        await self._run_shutdown_step(
+            "daemon background tasks",
+            self._stop_background_tasks(),
+        )
 
         if self.bus is not None:
-            with suppress(Exception):
-                await self.bus.disconnect()
+            await self._run_shutdown_step("nats bus", self.bus.disconnect())
             self.bus = None
+
+    async def _run_shutdown_step(
+        self,
+        label: str,
+        awaitable: Any,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        """Run one shutdown awaitable without allowing it to wedge shutdown."""
+
+        timeout = (
+            DAEMON_SHUTDOWN_STEP_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        task = asyncio.ensure_future(awaitable)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except TimeoutError:
+            self.log.warning(
+                "shutdown step timed out after %.1fs: %s",
+                timeout,
+                label,
+            )
+            task.cancel()
+            task.add_done_callback(self._consume_background_task_exception)
+        except asyncio.CancelledError:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("shutdown step failed: %s: %s", label, exc)
+
+    async def _shutdown_scheduler(self) -> None:
+        scheduler = self.scheduler
+        self.scheduler = None
+        if scheduler is not None:
+            await scheduler.shutdown(
+                timeout_seconds=DAEMON_SHUTDOWN_STEP_TIMEOUT_SECONDS
+            )
+
+    def _track_background_task(
+        self,
+        awaitable: Any,
+        *,
+        name: str,
+    ) -> asyncio.Task[Any] | None:
+        """Create and track a daemon-owned background task."""
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        task = loop.create_task(awaitable, name=name)
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+        task.add_done_callback(self._consume_background_task_exception)
+        return task
+
+    async def _stop_background_tasks(self) -> None:
+        tasks = list(self.background_tasks)
+        self.background_tasks.clear()
+        await cancel_and_await_tasks(
+            tasks,
+            label="daemon background",
+            logger=self.log,
+            timeout_seconds=DAEMON_SHUTDOWN_STEP_TIMEOUT_SECONDS,
+        )
+
+    async def _stop_active_session_input_tasks(self) -> None:
+        current_task = asyncio.current_task()
+        tasks: list[asyncio.Task[Any]] = []
+        for managed in self.sessions.values():
+            task = managed.current_input_task
+            if task is None or task.done() or task is current_task:
+                continue
+            tasks.append(task)
+            if managed.session.auto_mode:
+                managed.session.stop_auto_mode("daemon shutting down")
+        await cancel_and_await_tasks(
+            tasks,
+            label="active session input",
+            logger=self.log,
+            timeout_seconds=DAEMON_SHUTDOWN_STEP_TIMEOUT_SECONDS,
+        )
 
     def _start_session_lifecycle_tasks(self) -> None:
         """Start daemon-owned session cleanup loops."""
@@ -1163,11 +1281,12 @@ class DaemonServer:
         ]
         self.session_lifecycle_sweep_task = None
         self.session_disk_gc_task = None
-        for task in tasks:
-            task.cancel()
-        for task in tasks:
-            with suppress(asyncio.CancelledError):
-                await task
+        await cancel_and_await_tasks(
+            tasks,
+            label="session lifecycle",
+            logger=self.log,
+            timeout_seconds=DAEMON_SHUTDOWN_STEP_TIMEOUT_SECONDS,
+        )
 
     async def _run_idle_session_sweeper(self) -> None:
         while True:
@@ -1502,7 +1621,8 @@ class DaemonServer:
             runtime_config_resolver=self.runtime_config_resolver,
         )
         self.taskboard_dispatcher_task = asyncio.create_task(
-            self.taskboard_dispatcher.run()
+            self.taskboard_dispatcher.run(),
+            name="daemon-taskboard-dispatcher",
         )
 
     async def _sweep_orphan_ledger_rows(self) -> None:
@@ -1544,9 +1664,12 @@ class DaemonServer:
             self.taskboard_dispatcher.stop()
         task = self.taskboard_dispatcher_task
         if task is not None:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+            await cancel_and_await_tasks(
+                [task],
+                label="taskboard dispatcher",
+                logger=self.log,
+                timeout_seconds=DAEMON_SHUTDOWN_STEP_TIMEOUT_SECONDS,
+            )
         self.taskboard_dispatcher_task = None
         self.taskboard_dispatcher = None
 
@@ -1896,6 +2019,7 @@ class DaemonServer:
                 managed.session.publish_event("agent.error", {"value": result.error})
                 if managed.session.auto_mode:
                     managed.session.stop_auto_mode("stopped by user")
+                raise
             except Exception as exc:  # noqa: BLE001
                 result.error = str(exc)
                 managed.session.publish_event("agent.error", {"value": str(exc)})
@@ -2104,9 +2228,17 @@ class DaemonServer:
             managed.current_input_task is not None
             and not managed.current_input_task.done()
         ):
-            managed.current_input_task.cancel()
+            task = managed.current_input_task
             cancelled = True
-            await asyncio.sleep(0)
+            if task is not asyncio.current_task():
+                await cancel_and_await_tasks(
+                    [task],
+                    label=f"session input:{managed.session.name}",
+                    logger=self.log,
+                    timeout_seconds=DAEMON_SHUTDOWN_STEP_TIMEOUT_SECONDS,
+                )
+            else:
+                task.cancel()
 
         if managed.session.auto_mode:
             managed.session.stop_auto_mode("stopped by user")
@@ -2628,10 +2760,13 @@ class DaemonServer:
         for managed in self.sessions.values():
             managed.session.publish_event("signal.received", {"signal": payload})
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(self.publish_daemon_event("signals", payload))
+        self._track_background_task(
+            self.publish_daemon_event("signals", payload),
+            name="daemon-signal-event-publish",
+        )
 
     def _handle_signal_shadow_tap(self, signal: Signal) -> None:
         """Run legacy signal fanout and router shadow evaluation together."""
@@ -2639,11 +2774,14 @@ class DaemonServer:
             self._handle_signal(signal)
             return
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             asyncio.run(self.shadow_runner.process_signal(signal, self._handle_signal))
             return
-        loop.create_task(self.shadow_runner.process_signal(signal, self._handle_signal))
+        self._track_background_task(
+            self.shadow_runner.process_signal(signal, self._handle_signal),
+            name="daemon-signal-shadow",
+        )
 
     def _handle_nats_message(self, direction: str, subject: str, payload: dict[str, Any]) -> None:
         """Mirror shared NATS traffic into each live session bus."""

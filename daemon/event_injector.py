@@ -13,6 +13,10 @@ from langchain_core.messages import HumanMessage
 
 from agent_logger import get_logger
 from daemon.core import message_timestamp_now
+from daemon.shutdown import (
+    DEFAULT_TASK_SHUTDOWN_TIMEOUT_SECONDS,
+    cancel_and_await_tasks,
+)
 
 
 class SafeFormatDict(dict):
@@ -112,6 +116,7 @@ class EventInjector:
         self._run_input = run_input
         self._background_exception_handler = background_exception_handler
         self.log = log or get_logger("daemon.event_injector")
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     def injection_decision(self, managed: Any, request: EventInjectionRequest) -> EventInjectionDecision:
         session = managed.session
@@ -152,9 +157,28 @@ class EventInjector:
             self.run_turn(managed, request),
             name=request.task_name,
         )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
         if self._background_exception_handler is not None:
             task.add_done_callback(self._background_exception_handler)
         return decision
+
+    async def shutdown(
+        self,
+        *,
+        timeout_seconds: float = DEFAULT_TASK_SHUTDOWN_TIMEOUT_SECONDS,
+    ) -> None:
+        """Cancel and await prompt-injection turns launched in the background."""
+
+        tasks = list(self._background_tasks)
+        await cancel_and_await_tasks(
+            tasks,
+            label="event injector",
+            logger=self.log,
+            timeout_seconds=timeout_seconds,
+        )
+        for task in tasks:
+            self._background_tasks.discard(task)
 
     def publish_drop(self, managed: Any, request: EventInjectionRequest, reason: str) -> None:
         if reason in request.policy.suppress_drop_reasons:

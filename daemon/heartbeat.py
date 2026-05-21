@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -12,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from daemon.event_injector import EventInjectionTemplate, SafeFormatDict
+from daemon.shutdown import (
+    DEFAULT_TASK_SHUTDOWN_TIMEOUT_SECONDS,
+    cancel_and_await_tasks,
+)
 
 
 def utc_now() -> datetime:
@@ -179,6 +184,7 @@ class HeartbeatService:
         self.last_tick: HeartbeatTick | None = None
         self.tick_count = 0
         self.failure_count = 0
+        self.log = logging.getLogger(__name__)
 
     @property
     def running(self) -> bool:
@@ -193,18 +199,23 @@ class HeartbeatService:
             return
         self._task = asyncio.create_task(self._run(), name="daemon-heartbeat")
 
-    async def shutdown(self) -> None:
+    async def shutdown(
+        self,
+        *,
+        timeout_seconds: float = DEFAULT_TASK_SHUTDOWN_TIMEOUT_SECONDS,
+    ) -> None:
         """Cancel and await the background loop."""
 
         task = self._task
         self._task = None
         if task is None:
             return
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        await cancel_and_await_tasks(
+            [task],
+            label="heartbeat",
+            logger=self.log,
+            timeout_seconds=timeout_seconds,
+        )
 
     async def emit_once(self) -> HeartbeatTick:
         """Emit a single tick immediately; useful for tests and diagnostics."""

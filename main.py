@@ -153,6 +153,7 @@ async def _run_daemon(args: argparse.Namespace) -> None:
         host=args.host or DEFAULT_DAEMON_HOST,
         port=args.port or DEFAULT_DAEMON_PORT,
         log_level=(args.log_level or "INFO").lower(),
+        timeout_graceful_shutdown=20,
     )
     server = uvicorn.Server(config)
     await server.serve()

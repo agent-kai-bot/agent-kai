@@ -7,6 +7,7 @@ import copy
 import json
 import tempfile
 import unittest
+from contextlib import suppress
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
@@ -72,6 +73,34 @@ class _SlowRunner(_FakeRunner):
         yield {"type": "token", "data": f"started:{user_input}"}
         await asyncio.sleep(60)
         yield {"type": "final", "data": "should-not-finish"}
+
+
+class DaemonServerShutdownTests(unittest.IsolatedAsyncioTestCase):
+    """Shutdown cancellation must be bounded and cancellation-correct."""
+
+    async def test_shutdown_bounds_stubborn_background_task(self):
+        server = DaemonServer(
+            agent_name="kai",
+            nats_url="nats://unit-test",
+            bus_factory=None,
+            taskboard_dispatcher_enabled=False,
+        )
+
+        async def stubborn_task() -> None:
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                await asyncio.sleep(60)
+
+        task = asyncio.create_task(stubborn_task(), name="stubborn-shutdown-test")
+        server.session_lifecycle_sweep_task = task
+        try:
+            with mock.patch("daemon.server.DAEMON_SHUTDOWN_STEP_TIMEOUT_SECONDS", 0.02):
+                await asyncio.wait_for(server.shutdown(), timeout=0.5)
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 def _fake_attach_runtime(
@@ -699,10 +728,11 @@ class DaemonServerIndexTests(unittest.IsolatedAsyncioTestCase):
                         self.fail("input task was not registered")
 
                     stopped = await server.stop_session_run("terminal")
-                    result = await asyncio.wait_for(task, timeout=1)
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(task, timeout=1)
 
                     self.assertTrue(stopped["stopped"])
-                    self.assertEqual(result.error, "current LLM stream stopped")
+                    self.assertTrue(task.cancelled())
                     self.assertEqual(managed.session.activity_status, "idle")
                     self.assertIsNone(managed.current_input_task)
                 finally:

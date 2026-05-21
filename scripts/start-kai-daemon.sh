@@ -11,10 +11,10 @@
 
 set -euo pipefail
 
-REPO=/home/atc/git/claude-local-ai-agent
-LOG=/tmp/kai-daemon.log
-PIDFILE=/tmp/kai-daemon.pid
-PORT=18789
+REPO=${KAI_DAEMON_REPO:-/home/atc/git/claude-local-ai-agent}
+LOG=${KAI_DAEMON_LOG:-/tmp/kai-daemon.log}
+PIDFILE=${KAI_DAEMON_PIDFILE:-/tmp/kai-daemon.pid}
+PORT=${KAI_DAEMON_PORT:-18789}
 
 cd "$REPO"
 
@@ -22,23 +22,9 @@ force=0
 [[ "${1:-}" == "--force" ]] && force=1
 
 existing=$(pgrep -f "main.py --daemon --host 0.0.0.0 --port $PORT" || true)
-if [[ -n "$existing" ]]; then
-  if [[ "$force" == "1" ]]; then
-    echo "Stopping existing daemon pid(s): $existing" >&2
-    kill $existing
-    for i in $(seq 1 20); do
-      sleep 0.5
-      pgrep -f "main.py --daemon --host 0.0.0.0 --port $PORT" >/dev/null || break
-    done
-    if pgrep -f "main.py --daemon --host 0.0.0.0 --port $PORT" >/dev/null; then
-      echo "Daemon still alive after SIGTERM, sending SIGKILL" >&2
-      pkill -9 -f "main.py --daemon --host 0.0.0.0 --port $PORT" || true
-      sleep 1
-    fi
-  else
-    echo "Daemon already running: $existing (use --force to replace)" >&2
-    exit 1
-  fi
+if [[ -n "$existing" && "$force" != "1" ]]; then
+  echo "Daemon already running: $existing (use --force to replace)" >&2
+  exit 1
 fi
 
 # Required env (caller must export these before invocation).
@@ -63,6 +49,20 @@ if [[ ${#missing[@]} -gt 0 ]]; then
   echo "Hint: source the env from the prior daemon, e.g." >&2
   echo "  set -a; source <(grep -E '^(KAI_|TASKBOARD_|FORGEJO_|AGENTKAI_)' /tmp/kai-daemon.env); set +a" >&2
   exit 2
+fi
+
+if [[ -n "$existing" ]]; then
+  echo "Stopping existing daemon pid(s): $existing" >&2
+  kill $existing || true
+  for i in $(seq 1 20); do
+    sleep 0.5
+    pgrep -f "main.py --daemon --host 0.0.0.0 --port $PORT" >/dev/null || break
+  done
+  if pgrep -f "main.py --daemon --host 0.0.0.0 --port $PORT" >/dev/null; then
+    echo "Daemon still alive after SIGTERM, sending SIGKILL" >&2
+    pkill -9 -f "main.py --daemon --host 0.0.0.0 --port $PORT" || true
+    sleep 1
+  fi
 fi
 
 echo "Starting daemon from $REPO at $(date -Is)" | tee -a "$LOG"
