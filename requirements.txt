@@ -6,6 +6,7 @@ textual>=8.0,<9.0
 rich>=13.0,<15.0
 aiohttp>=3.9,<4.0
 requests>=2.31
+redis>=5.0,<7.0
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.34,<1.0
 websockets>=15.0,<16.0

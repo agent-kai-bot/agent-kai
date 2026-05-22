@@ -114,6 +114,29 @@ class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         return scheduler.get_job(job_id)
 
     @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
+    async def test_scheduled_job_fire_creates_missing_non_prefixed_owner_session(
+        self,
+        attach_runtime,
+    ):
+        attach_runtime.side_effect = _fake_attach_runtime
+        server = self._server()
+        scheduler = self._scheduler(server)
+        session_name = "lineup-eval-2026-05-21-atl-mia"
+        job = self._schedule_absolute_job(
+            scheduler,
+            job_id="job-created-owner",
+            owner_session=session_name,
+        )
+
+        await server._handle_scheduled_job_trigger(job, _utc_now())
+
+        self.assertIn(session_name, server.sessions)
+        self.assertIsNotNone(get_indexed_session(session_name))
+        updated = scheduler.get_job("job-created-owner")
+        self.assertEqual(updated.status, "completed")
+        self.assertEqual(updated.last_result_preview, "done:Check BTC")
+
+    @mock.patch("daemon.server.Session.attach_runtime", autospec=True)
     async def test_scheduled_job_fire_closes_cron_wake_session_on_success(
         self,
         attach_runtime,
@@ -170,6 +193,7 @@ class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(get_indexed_session(session_name))
         updated = scheduler.get_job("job-failure")
         self.assertEqual(updated.status, "failed")
+        self.assertEqual(updated.run_count, 1)
         self.assertEqual(updated.last_result_preview, "prompt failed")
 
     @mock.patch("daemon.server.Session.attach_runtime", autospec=True)

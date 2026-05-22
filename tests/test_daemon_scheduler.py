@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
-from datetime import timedelta
+from datetime import timezone, timedelta
 from pathlib import Path
 
 from daemon.scheduler import (
@@ -14,6 +15,58 @@ from daemon.scheduler import (
     _utc_now,
     matches_structured_filter,
 )
+
+
+class _FakeAsyncIOScheduler:
+    def __init__(self, *_, **__):
+        self.jobs = {}
+        self.listeners = []
+        self.started = False
+
+    def add_listener(self, callback, mask):
+        self.listeners.append((callback, mask))
+
+    def start(self):
+        self.started = True
+
+    def shutdown(self, wait=False):
+        self.started = False
+
+    def add_job(self, func, *, trigger, id, replace_existing=False, args=None, **kwargs):
+        self.jobs[id] = {
+            "func": func,
+            "trigger": trigger,
+            "args": args or [],
+            "kwargs": kwargs,
+            "next_run_time": trigger.get_next_fire_time(None, _utc_now()),
+        }
+
+    def get_job(self, job_id):
+        job = self.jobs.get(job_id)
+        if job is None:
+            return None
+        return type("FakeJob", (), {"next_run_time": job["next_run_time"]})()
+
+    def remove_job(self, job_id):
+        self.jobs.pop(job_id, None)
+
+    def pause_job(self, job_id):
+        if job_id in self.jobs:
+            self.jobs[job_id]["next_run_time"] = None
+
+    def resume_job(self, job_id):
+        if job_id in self.jobs:
+            trigger = self.jobs[job_id]["trigger"]
+            self.jobs[job_id]["next_run_time"] = trigger.get_next_fire_time(None, _utc_now())
+
+
+class _FakeMissedEvent:
+    def __init__(self, job_id: str, scheduled_run_time=None):
+        from apscheduler.events import EVENT_JOB_MISSED
+
+        self.code = EVENT_JOB_MISSED
+        self.job_id = job_id
+        self.scheduled_run_time = scheduled_run_time
 
 
 class SchedulerTests(unittest.IsolatedAsyncioTestCase):
@@ -308,6 +361,133 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                         owner_session="alpha",
                         created_by="user",
                     )
+            finally:
+                await scheduler.shutdown()
+
+    async def test_cron_misfire_event_triggers_catch_up_dispatch(self):
+        fired: list[str] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            async def dispatch(job, _fired_at):
+                fired.append(job.id)
+
+            scheduler = Scheduler(
+                dispatch_callback=dispatch,
+                jobs_path=Path(tmpdir) / "scheduler" / "jobs.json",
+                apscheduler_factory=_FakeAsyncIOScheduler,
+            )
+            await scheduler.start()
+            try:
+                job = scheduler.create_recurring_job(
+                    cron="55 12 * * *",
+                    prompt="Lineup watch",
+                    owner_session="alpha",
+                    created_by="agent",
+                )
+
+                scheduler._handle_apscheduler_event(_FakeMissedEvent(job.id))
+                await asyncio.sleep(0)
+
+                self.assertEqual(fired, [job.id])
+            finally:
+                await scheduler.shutdown()
+
+    async def test_old_cron_misfire_event_is_not_caught_up(self):
+        fired: list[str] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            async def dispatch(job, _fired_at):
+                fired.append(job.id)
+
+            scheduler = Scheduler(
+                dispatch_callback=dispatch,
+                jobs_path=Path(tmpdir) / "scheduler" / "jobs.json",
+                apscheduler_factory=_FakeAsyncIOScheduler,
+                catch_up_window_seconds=300,
+            )
+            await scheduler.start()
+            try:
+                job = scheduler.create_recurring_job(
+                    cron="55 12 * * *",
+                    prompt="Lineup watch",
+                    owner_session="alpha",
+                    created_by="agent",
+                )
+
+                old_run = _utc_now() - timedelta(seconds=1000)
+                scheduler._handle_apscheduler_event(_FakeMissedEvent(job.id, old_run))
+                await asyncio.sleep(0)
+
+                self.assertEqual(fired, [])
+            finally:
+                await scheduler.shutdown()
+
+    async def test_scheduled_jobs_use_catch_up_misfire_grace(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scheduler = Scheduler(
+                dispatch_callback=lambda *_args: None,
+                jobs_path=Path(tmpdir) / "scheduler" / "jobs.json",
+                apscheduler_factory=_FakeAsyncIOScheduler,
+                catch_up_window_seconds=123,
+            )
+            await scheduler.start()
+            try:
+                recurring = scheduler.create_recurring_job(
+                    cron="*/5 * * * *",
+                    prompt="Recurring check",
+                    owner_session="alpha",
+                    created_by="agent",
+                )
+                absolute = scheduler.create_absolute_job(
+                    when=(_utc_now() + timedelta(minutes=5)).astimezone(timezone.utc).isoformat(),
+                    prompt="One shot",
+                    owner_session="alpha",
+                    created_by="agent",
+                )
+
+                self.assertEqual(
+                    scheduler._scheduler.jobs[recurring.id]["kwargs"]["misfire_grace_time"],
+                    123,
+                )
+                self.assertTrue(scheduler._scheduler.jobs[recurring.id]["kwargs"]["coalesce"])
+                self.assertEqual(
+                    scheduler._scheduler.jobs[absolute.id]["kwargs"]["misfire_grace_time"],
+                    123,
+                )
+            finally:
+                await scheduler.shutdown()
+
+    async def test_failed_absolute_job_counts_as_run_attempt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scheduler = Scheduler(
+                dispatch_callback=lambda *_args: None,
+                jobs_path=Path(tmpdir) / "scheduler" / "jobs.json",
+            )
+            await scheduler.start()
+            try:
+                created_at = _utc_now().replace(microsecond=0).isoformat()
+                when = (_utc_now() + timedelta(minutes=1)).replace(microsecond=0)
+                scheduler.schedule_job(
+                    {
+                        "id": "job-failed-attempt",
+                        "type": "absolute",
+                        "spec": {"at": when.isoformat()},
+                        "prompt": "Check BTC",
+                        "owner_session": "terminal",
+                        "created_at": created_at,
+                        "created_by": "user",
+                    },
+                    persist=False,
+                )
+
+                updated = scheduler.record_failure(
+                    "job-failed-attempt",
+                    fired_at=_utc_now(),
+                    error="session missing",
+                )
+
+                self.assertEqual(updated.status, "failed")
+                self.assertEqual(updated.run_count, 1)
+                self.assertIsNotNone(updated.last_run)
+                self.assertEqual(updated.last_result_preview, "session missing")
             finally:
                 await scheduler.shutdown()
 

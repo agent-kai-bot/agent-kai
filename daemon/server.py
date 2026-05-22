@@ -2218,7 +2218,7 @@ class DaemonServer:
         try:
             managed = await self.get_or_create_session(
                 job.owner_session,
-                create_if_missing=False,
+                create_if_missing=True,
             )
         except Exception as exc:  # noqa: BLE001
             scheduler.record_failure(job.id, fired_at=fired_at, error=str(exc))

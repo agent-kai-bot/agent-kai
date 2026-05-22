@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, Literal
 from zoneinfo import ZoneInfo
 
+from apscheduler.events import EVENT_JOB_MISSED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -383,6 +384,7 @@ class Scheduler:
         self.timezone_name = timezone_name
         self._apscheduler_factory = apscheduler_factory or AsyncIOScheduler
         self._scheduler = self._apscheduler_factory(timezone=_coerce_timezone(timezone_name))
+        self._scheduler.add_listener(self._handle_apscheduler_event, EVENT_JOB_MISSED)
         self.jobs_path = jobs_path
         self.event_bus = event_bus
         self.event_callback = event_callback
@@ -759,6 +761,7 @@ class Scheduler:
         error: str,
     ) -> ScheduledJob:
         job = self._jobs[job_id]
+        run_count = job.run_count + 1
         if job.type == "absolute":
             with suppress(Exception):
                 self._scheduler.remove_job(job_id)
@@ -767,6 +770,7 @@ class Scheduler:
             last_run=fired_at.isoformat(),
             last_result_preview=_truncate_preview(error),
             next_run=None if job.type in {"absolute", "event"} else job.next_run,
+            run_count=run_count,
             status="failed",
         )
         self._emit_event("failed", updated, error=error)
@@ -796,6 +800,8 @@ class Scheduler:
             id=job.id,
             replace_existing=True,
             args=[job.id],
+            coalesce=True,
+            misfire_grace_time=self.catch_up_window_seconds,
         )
         return when
 
@@ -811,6 +817,8 @@ class Scheduler:
             id=job.id,
             replace_existing=True,
             args=[job.id],
+            coalesce=True,
+            misfire_grace_time=self.catch_up_window_seconds,
         )
         next_run = self.next_run(job.id)
         if next_run is None:
@@ -872,6 +880,7 @@ class Scheduler:
 
     def _recover_loaded_jobs(self) -> None:
         now = _utc_now()
+        should_persist = False
         for job in list(self._jobs.values()):
             if job.status != "active":
                 continue
@@ -887,21 +896,52 @@ class Scheduler:
                 if run_at <= now:
                     age = (now - run_at).total_seconds()
                     if age <= self.catch_up_window_seconds:
-                        self._schedule_catch_up(job.id)
+                        self._schedule_catch_up(job.id, reason="startup_recover_absolute")
                     else:
                         self.update_job(job.id, status="completed", next_run=None)
                     continue
                 self.schedule_job(job, persist=False)
+                should_persist = True
                 continue
 
             self.schedule_job(job, persist=False)
+            should_persist = True
             if persisted_next_run is None or persisted_next_run > now:
                 continue
             age = (now - persisted_next_run).total_seconds()
             if age <= self.catch_up_window_seconds:
-                self._schedule_catch_up(job.id)
+                self._schedule_catch_up(job.id, reason="startup_recover_cron")
+        if should_persist:
+            self._persist_jobs()
 
-    def _schedule_catch_up(self, job_id: str) -> None:
+    def _handle_apscheduler_event(self, event: Any) -> None:
+        if getattr(event, "code", None) != EVENT_JOB_MISSED:
+            return
+        job_id = str(getattr(event, "job_id", "") or "")
+        if not job_id or job_id not in self._jobs:
+            return
+        scheduled_run_time = getattr(event, "scheduled_run_time", None)
+        if isinstance(scheduled_run_time, datetime):
+            if scheduled_run_time.tzinfo is None:
+                scheduled_run_time = scheduled_run_time.replace(tzinfo=timezone.utc)
+            age = (_utc_now() - scheduled_run_time.astimezone(timezone.utc)).total_seconds()
+            max_misfire_catch_up = max(
+                self.catch_up_window_seconds * 2,
+                self.catch_up_window_seconds + 60,
+            )
+            if age > max_misfire_catch_up:
+                self.log.warning(
+                    "scheduler missed job_id=%s age_s=%.1f exceeds catch-up window; skipping",
+                    job_id,
+                    age,
+                )
+                return
+        self._schedule_catch_up(job_id, reason="apscheduler_misfire")
+
+    def _schedule_catch_up(self, job_id: str, *, reason: str = "catch_up") -> None:
+        if job_id not in self._jobs:
+            return
+        self.log.warning("scheduler catch-up firing job_id=%s reason=%s", job_id, reason)
         task = asyncio.create_task(self._fire_scheduled_job(job_id))
         self._startup_tasks.add(task)
         task.add_done_callback(self._startup_tasks.discard)

@@ -41,7 +41,7 @@ def _polymarket_bbo(token_id: str, allow_rest_fallback: bool = True) -> dict[str
     """Fetch live best bid/ask for a Polymarket token.
 
     Returns a dict like:
-      {"ok": true, "source": "nats|rest", "bid": "0.42", "ask": "0.43",
+      {"ok": true, "source": "redis|nats|rest", "bid": "0.42", "ask": "0.43",
        "ts_event": "2026-05-09T19:30:00Z", "stale": false, "fetched_at": "..."}
     Or on failure:
       {"ok": false, "error": "...", "fetched_at": "..."}
@@ -76,12 +76,15 @@ def _polymarket_bbo(token_id: str, allow_rest_fallback: bool = True) -> dict[str
         "bid": str(result.get("bid", "")),
         "ask": str(result.get("ask", "")),
         "ts_event": str(result.get("ts_event", "")),
+        "ts_ingest": str(result.get("ts_ingest", "")),
+        "age_s": str(result.get("age_s", "")),
         "stale": bool(result.get("stale", False)),
         "fetched_at": fetched_at,
     }
     if not out["ok"]:
         out["error"] = str(result.get("error") or result.get("detail") or "unknown")
         out["fallback_reason"] = str(result.get("fallback_reason", ""))
+        out["redis_error"] = str(result.get("redis_error", ""))
     return out
 
 
@@ -223,9 +226,9 @@ def create_polymarket_tools() -> list[StructuredTool]:
                 "Fetch the LIVE Polymarket order-book best bid/ask for one CLOB "
                 "token. Use this whenever you need the current price on a token "
                 "(e.g. validating a polymarket alarm before acting). Returns "
-                "{ok, source: nats|rest, bid, ask, ts_event, stale, fetched_at}. "
-                "Always check the `stale` and `source` fields — `nats` source is "
-                "live, `rest` source is the gamma fallback (slower, can lag). "
+                "{ok, source: redis|nats|rest, bid, ask, ts_event, stale, fetched_at}. "
+                "Always check the `stale` and `source` fields — `redis`/`nats` sources are "
+                "local live feed/cache, `rest` source is the public CLOB fallback (slower, can lag). "
                 "DO NOT guess prices; always call this tool."
             ),
             args_schema=PolymarketBboInput,
