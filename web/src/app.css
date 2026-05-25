@@ -69,6 +69,7 @@ body.dashboard-active {
 .dashboard-shell {
   width: 100%;
   height: 100%;
+  position: relative;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   grid-template-columns: minmax(0, 1fr);
@@ -224,6 +225,42 @@ body.dashboard-active {
   color: #ffd4d4;
 }
 
+.chat-mode-toggle {
+  position: absolute;
+  z-index: 40;
+  top: 0.85rem;
+  right: 0.85rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.45rem;
+  height: 2.45rem;
+  border: 1px solid rgba(145, 181, 221, 0.22);
+  border-radius: 999px;
+  background: rgba(7, 19, 31, 0.9);
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 1.15rem;
+  font-weight: 700;
+  line-height: 1;
+  box-shadow: 0 0.75rem 1.75rem rgba(0, 0, 0, 0.32);
+}
+
+.chat-mode-toggle:hover,
+.chat-mode-toggle:focus-visible,
+.chat-mode-toggle[aria-pressed="true"] {
+  border-color: rgba(77, 211, 168, 0.42);
+  background: rgba(77, 211, 168, 0.14);
+  outline: none;
+}
+
+.chat-mode-toggle:focus-visible {
+  box-shadow:
+    0 0 0 2px rgba(77, 211, 168, 0.24),
+    0 0.75rem 1.75rem rgba(0, 0, 0, 0.32);
+}
+
 .button-row button:disabled,
 .dashboard-actions button:disabled,
 .dashboard-actions a[aria-disabled="true"],
@@ -285,6 +322,7 @@ body.dashboard-active {
   border-radius: 1rem;
   background: rgba(5, 17, 28, 0.46);
   padding: 0.5rem 0.65rem;
+  padding-right: 3.6rem;
 }
 
 .dashboard-brand {
@@ -632,6 +670,11 @@ body.dashboard-active {
   color: #ff8f8f;
 }
 
+.chat-conversation {
+  min-height: 0;
+  overflow: hidden;
+}
+
 .chat-input {
   display: grid;
   gap: 0.75rem;
@@ -940,5 +983,136 @@ body.dashboard-active {
   .dashboard-actions button,
   .model-picker select {
     padding-block: 0.45rem;
+  }
+}
+
+body:not(.fullscreen-chat) .dashboard-commandbar {
+  padding-right: 3.6rem;
+}
+
+body.fullscreen-chat {
+  overflow: hidden;
+}
+
+.landing-shell.dashboard-mode.fullscreen-chat {
+  height: 100dvh;
+  min-height: 100dvh;
+  padding: 0;
+  overflow: hidden;
+}
+
+.fullscreen-chat .dashboard-shell {
+  height: 100dvh;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  gap: 0;
+  padding: 0;
+}
+
+.fullscreen-chat .dashboard-commandbar,
+.fullscreen-chat header > nav,
+.fullscreen-chat footer,
+.fullscreen-chat .dashboard-column.left,
+.fullscreen-chat .dashboard-column.right,
+.fullscreen-chat .pane-resizer,
+.fullscreen-chat .dashboard-column.center > :not(.chat-conversation):not(.chat-input) {
+  display: none;
+}
+
+.fullscreen-chat .dashboard-grid {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "center";
+  gap: 0;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0;
+}
+
+.fullscreen-chat .dashboard-column.center,
+.fullscreen-chat .dashboard-column.center[data-chart-mode="hide"] {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  width: 100vw;
+  max-width: 100vw;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.fullscreen-chat .chat-conversation {
+  width: 100vw;
+  max-width: 100vw;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0 1rem;
+}
+
+.fullscreen-chat .chat-conversation .panel-frame {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 3.25rem 0 0.75rem;
+}
+
+.fullscreen-chat .chat-conversation .panel-header {
+  display: none;
+}
+
+.fullscreen-chat .chat-conversation .panel-body {
+  overflow: hidden;
+}
+
+.fullscreen-chat .chat-conversation .chat-log {
+  height: 100%;
+  padding-right: 0.35rem;
+}
+
+.fullscreen-chat .chat-input {
+  width: 100vw;
+  max-width: 100vw;
+  border-right: 0;
+  border-bottom: 0;
+  border-left: 0;
+  border-radius: 0;
+  padding: 0.8rem 1rem 1rem;
+}
+
+.fullscreen-chat .prompt-presets {
+  display: none;
+}
+
+.fullscreen-chat .chat-mode-toggle {
+  position: fixed;
+  z-index: 1000;
+  top: 1rem;
+  right: 1rem;
+}
+
+@media (max-width: 700px) {
+  .fullscreen-chat .chat-conversation {
+    padding: 0 0.75rem;
+  }
+
+  .fullscreen-chat .chat-conversation .panel-frame {
+    display: grid;
+    height: 100%;
+    overflow: hidden;
+    padding-top: 3.4rem;
+  }
+
+  .fullscreen-chat .chat-conversation .panel-body {
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .fullscreen-chat .dashboard-column.center > * {
+    margin-bottom: 0;
+  }
+
+  .fullscreen-chat .chat-input {
+    padding: 0.75rem;
   }
 }

@@ -34,6 +34,10 @@
   } from "$lib/daemon/client";
   import { readStoredToken, writeStoredToken } from "$lib/daemon/storage";
   import {
+    fullscreenChatMode,
+    toggleFullscreenChatMode,
+  } from "$lib/stores/chat_mode";
+  import {
     buildSymbolSuggestions,
     normalizeMarketSymbol,
     normalizeSignalAlert,
@@ -1146,7 +1150,17 @@
     void refreshSessions();
     void refreshModelInfo();
     const onKeydown = (event: KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        event.shiftKey &&
+        event.key.toLowerCase() === "f"
+      ) {
+        event.preventDefault();
+        toggleFullscreenChatMode();
+      } else if (
+        (event.ctrlKey || event.metaKey) &&
+        event.key.toLowerCase() === "k"
+      ) {
         event.preventDefault();
         void openPalette();
       } else if (paletteOpen && event.key === "Escape") {
@@ -1177,9 +1191,12 @@
       return;
     }
     const connected = Boolean(daemonConnection);
+    const fullscreenChat = connected && $fullscreenChatMode;
     document.body.classList.toggle("dashboard-active", connected);
+    document.body.classList.toggle("fullscreen-chat", fullscreenChat);
     return () => {
       document.body.classList.remove("dashboard-active");
+      document.body.classList.remove("fullscreen-chat");
     };
   });
 </script>
@@ -1192,9 +1209,29 @@
   />
 </svelte:head>
 
-<section class="landing-shell" class:dashboard-mode={Boolean(daemonConnection)}>
+<section
+  class="landing-shell"
+  class:dashboard-mode={Boolean(daemonConnection)}
+  class:fullscreen-chat={Boolean(daemonConnection) && $fullscreenChatMode}
+>
   {#if daemonConnection}
     <div class="dashboard-shell">
+      <button
+        aria-keyshortcuts="Control+Shift+F Meta+Shift+F"
+        aria-label={$fullscreenChatMode
+          ? "Exit full-screen chat mode"
+          : "Enter full-screen chat mode"}
+        aria-pressed={$fullscreenChatMode}
+        class="chat-mode-toggle"
+        onclick={toggleFullscreenChatMode}
+        title={$fullscreenChatMode
+          ? "Exit full-screen chat mode (Ctrl+Shift+F)"
+          : "Enter full-screen chat mode (Ctrl+Shift+F)"}
+        type="button"
+      >
+        <span aria-hidden="true">{$fullscreenChatMode ? "⛗" : "⛶"}</span>
+      </button>
+
       <header class="dashboard-commandbar">
         <div class="dashboard-brand">
           <p class="eyebrow">KAI</p>
@@ -1466,13 +1503,15 @@
             type="button"
           ></button>
 
-          <ChatPanel
-            activity={chatActivity}
-            initiallyOpen={false}
-            messages={chatMessages}
-            mobileCollapsible={true}
-            {streamingReply}
-          />
+          <div class="chat-conversation">
+            <ChatPanel
+              activity={chatActivity}
+              initiallyOpen={$fullscreenChatMode}
+              messages={chatMessages}
+              mobileCollapsible={true}
+              {streamingReply}
+            />
+          </div>
 
           <form class="chat-input" onsubmit={onInputSubmit}>
             <div class="prompt-presets" aria-label="Chart analysis prompts">
