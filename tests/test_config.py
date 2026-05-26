@@ -3,7 +3,8 @@
 import os
 import unittest
 
-from config import get_endpoint
+from config import AGENTS, get_agent_config, get_endpoint
+from agent.core import create_llm
 
 
 class ConfigTests(unittest.TestCase):
@@ -23,6 +24,17 @@ class ConfigTests(unittest.TestCase):
 
         self.assertIsNotNone(endpoint)
         self.assertEqual(endpoint["api_key"], "kai-test-key")
+
+    def test_unknown_agent_config_fails_closed_without_endpoint_fallback(self):
+        """Unknown sub-agent names must not silently default to kai-fast/agent-k.ai."""
+        self.assertNotIn("retro-analyst-unit-test", AGENTS)
+        with self.assertRaisesRegex(KeyError, "unknown agent 'retro-analyst-unit-test'"):
+            get_agent_config("retro-analyst-unit-test")
+
+    def test_create_llm_requires_explicit_endpoint_config(self):
+        """The LLM factory should not choose the first configured endpoint implicitly."""
+        with self.assertRaisesRegex(ValueError, "endpoint_cfg is required"):
+            create_llm(None)
 
 
 if __name__ == "__main__":

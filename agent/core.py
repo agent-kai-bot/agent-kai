@@ -217,8 +217,7 @@ def create_llm(endpoint_cfg=None):
       cloud kai-* endpoints, OpenAI direct, OpenRouter, etc.).
     """
     if endpoint_cfg is None:
-        first = next(iter(ENDPOINTS), None)
-        endpoint_cfg = get_endpoint(first) if first else {}
+        raise ValueError("endpoint_cfg is required; refusing implicit first-endpoint fallback")
 
     provider = (endpoint_cfg.get("provider") or "").lower()
     base_url = endpoint_cfg.get("base_url") or ""

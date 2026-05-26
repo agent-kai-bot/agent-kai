@@ -708,10 +708,17 @@ def get_agent_config(agent_name):
     if isinstance(endpoint_ref, str) and explicit_model and "/" not in endpoint_ref:
         endpoint_ref = f"{endpoint_ref}/{explicit_model}"
 
-    # Default to the first available endpoint if nothing was specified
+    # A configured agent must explicitly declare its endpoint. Historically an
+    # unknown/misconfigured sub-agent silently fell back to the first endpoint in
+    # the registry (kai-fast -> agent-k.ai), which masked configuration errors as
+    # generic network "Connection error" failures. Fail closed instead so the
+    # caller sees the missing role/endpoint immediately.
     if not endpoint_ref:
-        first = next(iter(ENDPOINTS), None)
-        endpoint_ref = first
+        if agent_name not in AGENTS:
+            raise KeyError(
+                f"unknown agent {agent_name!r}; add it to agent-config.json or register an agent-pack before spawning"
+            )
+        raise ValueError(f"agent {agent_name!r} has no endpoint configured")
 
     # Build the fallback chain. Accept either the legacy singular field
     # or the new plural list. The plural takes priority.

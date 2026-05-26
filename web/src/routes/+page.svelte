@@ -1390,6 +1390,7 @@
 
         <div class="dashboard-actions">
           <a class="nav-pill" href="/router">Router</a>
+          <a class="nav-pill" href="/mobile">Mobile</a>
           <AutoLoopBrainToggle {client} {token} />
           <div class="model-picker">
             <select

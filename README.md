@@ -123,6 +123,23 @@ The browser client attaches to the same named sessions as the terminal and rende
 - signals, NATS traffic, and scheduler event panels
 - Ctrl+K slash-command palette
 
+### Mobile chat
+
+The web build also includes a phone-focused chat client at `/mobile`. It uses the
+same daemon REST endpoints and `/ws` session WebSocket, including WSS when the
+daemon is served over HTTPS.
+
+```bash
+cd web
+npm run build
+cd ..
+
+.venv/bin/uvicorn daemon.server:app --host 0.0.0.0 --port 8765
+# open http://HOST:8765/mobile on your phone, or https://HOST/mobile behind TLS
+```
+
+Remote phones must use the bearer token from `workspaces/daemon-token.txt`.
+
 ## Scheduler
 
 Scheduler jobs live in the daemon, not the terminal client, so they keep firing after you close the UI.
