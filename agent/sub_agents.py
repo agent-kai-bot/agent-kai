@@ -12,6 +12,7 @@ from agent.core import (
     render_memory_block,
     render_skill_catalog,
 )
+from agent.error_surface import surface_exception
 from agent.learning import SessionRecord, ToolCallRecorder
 from agent.memory_tool import create_memory_tool
 from agent.prompts import build_sub_agent_system_prompt
@@ -222,8 +223,15 @@ class SubAgent:
                 self.log.warning("EMPTY_RESPONSE agent=%s executor=%s", self.name, type(executor).__name__)
             return output
         except Exception as e:
-            self.log.error("INVOKE_ERROR agent=%s error=%s", self.name, str(e))
-            return f"Error: {e}"
+            surfaced = surface_exception(e)
+            self.log.warning(
+                "AGENT_TYPED_ERROR phase=sub_agent_invoke agent=%s error_class=%s error_message=%s actionable_hint=%s",
+                self.name,
+                surfaced.error_class,
+                surfaced.error_message,
+                surfaced.actionable_hint,
+            )
+            return f"Error: {surfaced.display_message()}"
 
     async def _invoke_with_fallback(self, task: str, publish_status: bool = False) -> str:
         """Run the primary executor, walking the fallback chain on failure.

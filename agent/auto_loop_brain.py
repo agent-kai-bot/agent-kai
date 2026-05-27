@@ -26,6 +26,7 @@ from agent.auto_evaluator import (
     stop_decision,
     validate_auto_evaluation_decision,
 )
+from agent.error_surface import surface_exception
 from config import load_config
 
 INDECISIVE_STOP_PATTERNS = frozenset({"unknown", "malformed_footer_recoverable"})
@@ -484,8 +485,13 @@ class LLMCriticEvaluator:
                 )
             success = not malformed
         except Exception as exc:
+            surfaced = surface_exception(exc, include_traceback=False)
             malformed = True
-            decision = stop_decision(f"auto-loop-brain failed closed: {exc.__class__.__name__}")
+            decision = stop_decision(
+                "auto-loop-brain failed closed "
+                f"[{surfaced.error_class}]: {surfaced.error_message}. "
+                f"Hint: {surfaced.actionable_hint}"
+            )
 
         latency_ms = int((time.monotonic() - started) * 1000)
         self.last_metadata = {

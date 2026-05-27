@@ -24,6 +24,7 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError
 from pydantic import SecretStr
 
 from agent.auto_prompt import build_auto_suffix, parse_auto_state
+from agent.error_surface import surface_exception
 from agent.memory_store import MemoryStore
 from agent.memory_tool import create_memory_tool
 from agent.prompts import SYSTEM_PROMPT, build_main_system_prompt
@@ -1252,12 +1253,30 @@ class AgentRunner:
                 self._last_auto_state = ("pause", self._last_auto_pause_reason)
                 return
             primary_failed = True
-            self.log.error("PRIMARY_FAILED agent=%s error=%s", self.agent_name, str(e))
-            yield {"type": "error", "data": f"Primary endpoint failed: {e}"}
+            surfaced = surface_exception(e)
+            self.log.warning(
+                "AGENT_TYPED_ERROR phase=primary agent=%s error_class=%s error_message=%s actionable_hint=%s",
+                self.agent_name,
+                surfaced.error_class,
+                surfaced.error_message,
+                surfaced.actionable_hint,
+            )
+            message = surfaced.display_message(prefix="Primary endpoint failed")
+            yield surfaced.to_event(prefix="Primary endpoint failed")
+            final_text = f"Error: {message}"
         except Exception as e:
             primary_failed = True
-            self.log.error("PRIMARY_FAILED agent=%s error=%s", self.agent_name, str(e))
-            yield {"type": "error", "data": f"Primary endpoint failed: {e}"}
+            surfaced = surface_exception(e)
+            self.log.warning(
+                "AGENT_TYPED_ERROR phase=primary agent=%s error_class=%s error_message=%s actionable_hint=%s",
+                self.agent_name,
+                surfaced.error_class,
+                surfaced.error_message,
+                surfaced.actionable_hint,
+            )
+            message = surfaced.display_message(prefix="Primary endpoint failed")
+            yield surfaced.to_event(prefix="Primary endpoint failed")
+            final_text = f"Error: {message}"
 
         # Walk the fallback chain. Each entry is tried in order until
         # one returns a non-empty, non-error result.
@@ -1304,24 +1323,32 @@ class AgentRunner:
                     self._last_auto_state = ("pause", self._last_auto_pause_reason)
                     return
                 primary_failed = True
-                self.log.error(
-                    "FALLBACK_FAILED agent=%s attempt=%d error=%s",
+                surfaced = surface_exception(e)
+                self.log.warning(
+                    "AGENT_TYPED_ERROR phase=fallback agent=%s attempt=%d error_class=%s error_message=%s actionable_hint=%s",
                     self.agent_name,
                     attempt,
-                    str(e),
+                    surfaced.error_class,
+                    surfaced.error_message,
+                    surfaced.actionable_hint,
                 )
-                yield {"type": "error", "data": f"Endpoint #{attempt} failed: {e}"}
-                final_text = f"Error: {e}"
+                message = surfaced.display_message(prefix=f"Endpoint #{attempt} failed")
+                yield surfaced.to_event(prefix=f"Endpoint #{attempt} failed")
+                final_text = f"Error: {message}"
             except Exception as e:
                 primary_failed = True
-                self.log.error(
-                    "FALLBACK_FAILED agent=%s attempt=%d error=%s",
+                surfaced = surface_exception(e)
+                self.log.warning(
+                    "AGENT_TYPED_ERROR phase=fallback agent=%s attempt=%d error_class=%s error_message=%s actionable_hint=%s",
                     self.agent_name,
                     attempt,
-                    str(e),
+                    surfaced.error_class,
+                    surfaced.error_message,
+                    surfaced.actionable_hint,
                 )
-                yield {"type": "error", "data": f"Endpoint #{attempt} failed: {e}"}
-                final_text = f"Error: {e}"
+                message = surfaced.display_message(prefix=f"Endpoint #{attempt} failed")
+                yield surfaced.to_event(prefix=f"Endpoint #{attempt} failed")
+                final_text = f"Error: {message}"
 
         if self._last_auto_pause_reason is not None:
             return

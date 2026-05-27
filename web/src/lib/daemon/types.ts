@@ -266,6 +266,10 @@ export type ErrorEnvelope = {
   type: "error";
   code: string;
   message: string;
+  error_class?: string | null;
+  error_message?: string | null;
+  underlying_traceback?: string | null;
+  actionable_hint?: string | null;
 };
 
 export type ToolStartEnvelope = {
@@ -339,7 +343,11 @@ export type NatsEventEnvelope = {
 export type ScheduledJobEnvelope =
   | { type: "scheduled_job_created"; job: Record<string, unknown> }
   | { type: "scheduled_job_triggered"; job_id: string; fired_at: string }
-  | { type: "scheduled_job_completed"; job_id: string; result_preview?: string | null }
+  | {
+      type: "scheduled_job_completed";
+      job_id: string;
+      result_preview?: string | null;
+    }
   | { type: "scheduled_job_failed"; job_id: string; error: string }
   | { type: "scheduled_job_cancelled"; job_id: string }
   | { type: "scheduled_job_paused"; job_id: string }

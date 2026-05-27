@@ -215,6 +215,10 @@ class ErrorEnvelope(ProtocolModel):
     type: Literal["error"]
     code: NonEmptyString
     message: str
+    error_class: str | None = None
+    error_message: str | None = None
+    underlying_traceback: str | None = None
+    actionable_hint: str | None = None
 
 
 class SessionIdleTimeoutEnvelope(ProtocolModel):

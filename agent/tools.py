@@ -15,6 +15,7 @@ from langchain_core.tools import StructuredTool
 
 LOGGER = logging.getLogger("agent.tools")
 
+from agent.error_surface import surface_exception
 from config import (
     DOCKER_SANDBOX_ALLOWED_NETWORKS,
     DOCKER_SANDBOX_CPUS,
@@ -634,6 +635,7 @@ def create_nats_request_tool(bus):
             result = future.result(timeout=timeout + 5)
             return result.get("response", str(result))
         except Exception as e:
+            surfaced = surface_exception(e, include_traceback=False)
             # Log the raw exception class+message so we can root-cause from
             # the daemon log instead of relying on the LLM's paraphrase.
             # Common case: NoRespondersError == sub-agent never spawned /
@@ -644,7 +646,19 @@ def create_nats_request_tool(bus):
                 type(e).__name__,
                 e,
             )
-            return f"Error requesting from agent '{agent_name}': {type(e).__name__}: {e}"
+            LOGGER.warning(
+                "NATS_TYPED_ERROR agent=%s target_agent=%s error_class=%s error_message=%s actionable_hint=%s",
+                getattr(bus, "agent_name", "?"),
+                agent_name,
+                surfaced.error_class,
+                surfaced.error_message,
+                surfaced.actionable_hint,
+            )
+            return (
+                f"Error requesting from agent '{agent_name}' "
+                f"[{surfaced.error_class}]: {surfaced.error_message}. "
+                f"Hint: {surfaced.actionable_hint}"
+            )
 
     async def _nats_request_async(
         agent_name: str,
@@ -660,13 +674,26 @@ def create_nats_request_tool(bus):
             )
             return result.get("response", str(result))
         except Exception as e:
+            surfaced = surface_exception(e, include_traceback=False)
             LOGGER.warning(
                 "nats_request to agent=%s failed: %s: %s",
                 agent_name,
                 type(e).__name__,
                 e,
             )
-            return f"Error requesting from agent '{agent_name}': {type(e).__name__}: {e}"
+            LOGGER.warning(
+                "NATS_TYPED_ERROR agent=%s target_agent=%s error_class=%s error_message=%s actionable_hint=%s",
+                getattr(bus, "agent_name", "?"),
+                agent_name,
+                surfaced.error_class,
+                surfaced.error_message,
+                surfaced.actionable_hint,
+            )
+            return (
+                f"Error requesting from agent '{agent_name}' "
+                f"[{surfaced.error_class}]: {surfaced.error_message}. "
+                f"Hint: {surfaced.actionable_hint}"
+            )
 
     return StructuredTool.from_function(
         func=_nats_request_sync,

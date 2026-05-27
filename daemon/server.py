@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agent_logger import get_logger, log_slash_command
 from agent.core import AgentRunner
+from agent.error_surface import surface_exception, surface_message
 from agent.agent_runs_client import AgentRunsClient
 from agent.runtime_config_resolver import RuntimeConfigResolver
 from agent.auto_loop_brain import (
@@ -201,6 +202,7 @@ SNAPSHOT_CHAT_HISTORY_MAX_MESSAGES = 200
 SNAPSHOT_CHAT_HISTORY_MAX_CHARS = 180_000
 TOKEN_FLUSH_INTERVAL_SECONDS = 0.04
 TOKEN_FLUSH_CHARS = 48
+AUTO_LOOP_BRAIN_STARTUP_PROBE_TIMEOUT_SECONDS = 60.0
 SCHEDULED_JOB_SESSION_PREFIX = "agent:kai:cron-wake:"
 SESSION_DISK_GC_INTERVAL_SECONDS = 3600.0
 DAEMON_SHUTDOWN_STEP_TIMEOUT_SECONDS = DEFAULT_TASK_SHUTDOWN_TIMEOUT_SECONDS
@@ -1017,7 +1019,10 @@ class DaemonServer:
             model=config.model_id,
             system="ping",
             user="reply 'pong'",
-            timeout=min(float(config.timeout_seconds), 10.0),
+            timeout=max(
+                float(config.timeout_seconds),
+                AUTO_LOOP_BRAIN_STARTUP_PROBE_TIMEOUT_SECONDS,
+            ),
             temperature=0.0,
             max_output_tokens=4,
         )
@@ -2021,8 +2026,22 @@ class DaemonServer:
                     managed.session.stop_auto_mode("stopped by user")
                 raise
             except Exception as exc:  # noqa: BLE001
-                result.error = str(exc)
-                managed.session.publish_event("agent.error", {"value": str(exc)})
+                surfaced = surface_exception(exc)
+                result.error = surfaced.display_message(prefix="Agent runtime failed")
+                self.log.warning(
+                    "DAEMON_TYPED_ERROR phase=run_input session=%s error_class=%s error_message=%s actionable_hint=%s",
+                    managed.session.name,
+                    surfaced.error_class,
+                    surfaced.error_message,
+                    surfaced.actionable_hint,
+                )
+                managed.session.publish_event(
+                    "agent.error",
+                    {
+                        "value": result.error,
+                        **surfaced.to_envelope_fields(),
+                    },
+                )
             finally:
                 if override_runner is not None:
                     managed.session.agent_runner = original_runner
@@ -3037,10 +3056,36 @@ class DaemonServer:
             )
 
         if topic == "agent.error":
+            message = str(payload.get("value") or "agent stream failed")
+            surfaced = (
+                None
+                if payload.get("error_class") or payload.get("error_message")
+                else surface_message(message)
+            )
             return ErrorEnvelope(
                 type="error",
-                code="agent_error",
-                message=payload.get("value") or "agent stream failed",
+                code=str(payload.get("code") or "agent_error"),
+                message=message,
+                error_class=(
+                    str(payload.get("error_class"))
+                    if payload.get("error_class")
+                    else (surfaced.error_class if surfaced else None)
+                ),
+                error_message=(
+                    str(payload.get("error_message"))
+                    if payload.get("error_message")
+                    else (surfaced.error_message if surfaced else message)
+                ),
+                underlying_traceback=(
+                    str(payload.get("underlying_traceback"))
+                    if payload.get("underlying_traceback")
+                    else None
+                ),
+                actionable_hint=(
+                    str(payload.get("actionable_hint"))
+                    if payload.get("actionable_hint")
+                    else (surfaced.actionable_hint if surfaced else None)
+                ),
             )
 
         if topic == "status.updated":
@@ -3294,15 +3339,39 @@ def _extract_command_remainder(command_text: str, root: str, subcommand: str) ->
     return remainder
 
 
-async def _send_error(websocket: WebSocket, code: str, message: str) -> None:
+async def _send_error(
+    websocket: WebSocket,
+    code: str,
+    message: str,
+    *,
+    error_class: str | None = None,
+    error_message: str | None = None,
+    underlying_traceback: str | None = None,
+    actionable_hint: str | None = None,
+) -> None:
+    if error_class is None and (
+        code.endswith("_failed") or code in {"agent_error", "interrupt_failed"}
+    ):
+        surfaced = surface_message(message)
+        error_class = surfaced.error_class
+        error_message = surfaced.error_message
+        actionable_hint = surfaced.actionable_hint
     await _send_server_envelope(
         websocket,
         ErrorEnvelope(
             type="error",
             code=code,
             message=message,
+            error_class=error_class,
+            error_message=error_message,
+            underlying_traceback=underlying_traceback,
+            actionable_hint=actionable_hint,
         ),
     )
+
+
+def _is_websocket_closed_runtime_error(exc: RuntimeError) -> bool:
+    return 'WebSocket is not connected. Need to call "accept" first.' in str(exc)
 
 
 def _handle_taskboard_webhook(
@@ -4188,6 +4257,22 @@ def create_app(
             await _send_error(websocket, "bad_request", str(exc))
             await websocket.close(code=1003)
             return
+        except WebSocketDisconnect:
+            daemon_server.log.warning(
+                "DAEMON_TYPED_ERROR phase=websocket_attach error_class=websocket_dropped error_message=client disconnected before attach actionable_hint=reconnect browser session"
+            )
+            return
+        except RuntimeError as exc:
+            if not _is_websocket_closed_runtime_error(exc):
+                raise
+            surfaced = surface_exception(exc, include_traceback=False)
+            daemon_server.log.warning(
+                "DAEMON_TYPED_ERROR phase=websocket_attach error_class=%s error_message=%s actionable_hint=%s",
+                surfaced.error_class,
+                surfaced.error_message,
+                surfaced.actionable_hint,
+            )
+            return
 
         if not isinstance(first_message, AttachEnvelope):
             await _send_error(
@@ -4221,22 +4306,51 @@ def create_app(
             )
         )
 
-        await _send_server_envelope(
-            websocket,
-            SessionAttachedEnvelope(
-                type="session_attached",
-                session=session.name,
-                state=daemon_server.session_snapshot(session),
-            ),
-        )
-        await _send_server_envelope(
-            websocket,
-            StatusEnvelope(
-                type="status",
-                activity=session.activity_status,
-                queue=len(session.input_queue),
-            ),
-        )
+        try:
+            await _send_server_envelope(
+                websocket,
+                SessionAttachedEnvelope(
+                    type="session_attached",
+                    session=session.name,
+                    state=daemon_server.session_snapshot(session),
+                ),
+            )
+            await _send_server_envelope(
+                websocket,
+                StatusEnvelope(
+                    type="status",
+                    activity=session.activity_status,
+                    queue=len(session.input_queue),
+                ),
+            )
+        except (WebSocketDisconnect, RuntimeError) as exc:
+            if isinstance(exc, RuntimeError) and not _is_websocket_closed_runtime_error(exc):
+                raise
+            surfaced = surface_exception(exc, include_traceback=False)
+            daemon_server.log.warning(
+                "DAEMON_TYPED_ERROR phase=websocket_attach_send session=%s error_class=%s error_message=%s actionable_hint=%s",
+                session.name,
+                surfaced.error_class,
+                surfaced.error_message,
+                surfaced.actionable_hint,
+            )
+            daemon_server._unregister_websocket_client(session.name)
+            session.event_bus.unsubscribe(event_queue)
+            forward_task.cancel()
+            try:
+                await forward_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as forward_exc:  # noqa: BLE001
+                forward_surfaced = surface_exception(forward_exc, include_traceback=False)
+                daemon_server.log.warning(
+                    "DAEMON_TYPED_ERROR phase=websocket_forward session=%s error_class=%s error_message=%s actionable_hint=%s",
+                    session.name,
+                    forward_surfaced.error_class,
+                    forward_surfaced.error_message,
+                    forward_surfaced.actionable_hint,
+                )
+            return
 
         try:
             while True:
@@ -4245,6 +4359,20 @@ def create_app(
                 except ValueError as exc:
                     await _send_error(websocket, "bad_request", str(exc))
                     continue
+                except WebSocketDisconnect:
+                    break
+                except RuntimeError as exc:
+                    if not _is_websocket_closed_runtime_error(exc):
+                        raise
+                    surfaced = surface_exception(exc, include_traceback=False)
+                    daemon_server.log.warning(
+                        "DAEMON_TYPED_ERROR phase=websocket_receive session=%s error_class=%s error_message=%s actionable_hint=%s",
+                        session.name,
+                        surfaced.error_class,
+                        surfaced.error_message,
+                        surfaced.actionable_hint,
+                    )
+                    break
 
                 if isinstance(payload, InputEnvelope):
                     if payload.text.strip().startswith("/auto"):
@@ -4519,8 +4647,19 @@ def create_app(
             daemon_server._unregister_websocket_client(session.name)
             session.event_bus.unsubscribe(event_queue)
             forward_task.cancel()
-            with suppress(asyncio.CancelledError):
+            try:
                 await forward_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                surfaced = surface_exception(exc, include_traceback=False)
+                daemon_server.log.warning(
+                    "DAEMON_TYPED_ERROR phase=websocket_forward session=%s error_class=%s error_message=%s actionable_hint=%s",
+                    session.name,
+                    surfaced.error_class,
+                    surfaced.error_message,
+                    surfaced.actionable_hint,
+                )
 
     @app.get("/", include_in_schema=False)
     async def web_index():

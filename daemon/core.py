@@ -1199,7 +1199,16 @@ class Session:
                                                 self._tool_input_key(data.get("input")),
                                             )
                                         )
-                                    payload = data if isinstance(data, dict) else {"value": data}
+                                    payload = dict(data) if isinstance(data, dict) else {"value": data}
+                                    if etype == "error":
+                                        for field_name in (
+                                            "error_class",
+                                            "error_message",
+                                            "underlying_traceback",
+                                            "actionable_hint",
+                                        ):
+                                            if event.get(field_name) is not None:
+                                                payload[field_name] = event[field_name]
                                     self.publish_event(f"agent.{etype}", payload)
                                     yield event
                     finally:

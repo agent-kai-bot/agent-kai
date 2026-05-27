@@ -18,6 +18,7 @@ import type {
   StatusEnvelope,
   WatchlistQuote,
 } from "$lib/daemon/types";
+import { formatDaemonError } from "$lib/daemon/error";
 
 export const DEFAULT_HTTP_BASE_URL = "http://127.0.0.1:8765";
 export const DEFAULT_SESSION_NAME = "terminal";
@@ -27,9 +28,15 @@ type WebSocketFactory = (url: string) => WebSocketLike;
 
 interface WebSocketLike {
   addEventListener(type: "open", listener: () => void): void;
-  addEventListener(type: "message", listener: (event: { data: string }) => void): void;
+  addEventListener(
+    type: "message",
+    listener: (event: { data: string }) => void,
+  ): void;
   addEventListener(type: "error", listener: () => void): void;
-  addEventListener(type: "close", listener: (event: { code?: number }) => void): void;
+  addEventListener(
+    type: "close",
+    listener: (event: { code?: number }) => void,
+  ): void;
   send(data: string): void;
   close(code?: number, reason?: string): void;
 }
@@ -76,7 +83,11 @@ function normalizeSessionName(session: string): string {
 
 function parseEnvelope(raw: string): ServerEnvelope {
   const parsed = JSON.parse(raw) as unknown;
-  if (!parsed || typeof parsed !== "object" || typeof (parsed as { type?: unknown }).type !== "string") {
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    typeof (parsed as { type?: unknown }).type !== "string"
+  ) {
     throw new Error("daemon sent an invalid envelope");
   }
   return parsed as ServerEnvelope;
@@ -108,22 +119,27 @@ function asNumber(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
-function normalizeAutoLoopBrainHealth(payload: Partial<AutoLoopBrainHealth>): AutoLoopBrainHealth {
+function normalizeAutoLoopBrainHealth(
+  payload: Partial<AutoLoopBrainHealth>,
+): AutoLoopBrainHealth {
   return {
     enabled: asBoolean(payload.enabled),
     effective_client: asString(payload.effective_client, "unknown"),
     effective_model: asString(payload.effective_model, "unknown"),
     kill_switch_active: asBoolean(payload.kill_switch_active),
     boot_probe_last_at: payload.boot_probe_last_at ?? null,
-    boot_probe_last_ok: typeof payload.boot_probe_last_ok === "boolean"
-      ? payload.boot_probe_last_ok
-      : null,
+    boot_probe_last_ok:
+      typeof payload.boot_probe_last_ok === "boolean"
+        ? payload.boot_probe_last_ok
+        : null,
     calls_total: asNumber(payload.calls_total),
     escalations_total: asNumber(payload.escalations_total),
   };
 }
 
-function normalizeAutoLoopBrainConfig(payload: Partial<AutoLoopBrainConfig>): AutoLoopBrainConfig {
+function normalizeAutoLoopBrainConfig(
+  payload: Partial<AutoLoopBrainConfig>,
+): AutoLoopBrainConfig {
   return {
     enabled: asBoolean(payload.enabled),
     client: asString(payload.client, "unknown"),
@@ -135,19 +151,27 @@ function normalizeAutoLoopBrainConfig(payload: Partial<AutoLoopBrainConfig>): Au
     min_continue_confidence: asNumber(payload.min_continue_confidence),
     timeout_seconds: asNumber(payload.timeout_seconds),
     max_output_tokens: asNumber(payload.max_output_tokens),
-    max_llm_critic_calls_per_session: asNumber(payload.max_llm_critic_calls_per_session),
-    max_consecutive_llm_critic_calls: asNumber(payload.max_consecutive_llm_critic_calls),
+    max_llm_critic_calls_per_session: asNumber(
+      payload.max_llm_critic_calls_per_session,
+    ),
+    max_consecutive_llm_critic_calls: asNumber(
+      payload.max_consecutive_llm_critic_calls,
+    ),
     kill_switch_active: asBoolean(payload.kill_switch_active),
   };
 }
 
-function normalizeSignalRouterConfig(payload: Partial<SignalRouterConfig>): SignalRouterConfig {
+function normalizeSignalRouterConfig(
+  payload: Partial<SignalRouterConfig>,
+): SignalRouterConfig {
   return {
     mode: payload.mode ?? "legacy",
     live_trades_enabled: asBoolean(payload.live_trades_enabled),
     kill_switch_active: asBoolean(payload.kill_switch_active),
     routes: Array.isArray(payload.routes) ? payload.routes : [],
-    last_decisions: Array.isArray(payload.last_decisions) ? payload.last_decisions : [],
+    last_decisions: Array.isArray(payload.last_decisions)
+      ? payload.last_decisions
+      : [],
     dedup_stats: payload.dedup_stats ?? {
       keys_count: 0,
       cooldown_hits_24h: 0,
@@ -156,7 +180,9 @@ function normalizeSignalRouterConfig(payload: Partial<SignalRouterConfig>): Sign
   };
 }
 
-function normalizeSignalRouterHealth(payload: Partial<SignalRouterHealth>): SignalRouterHealth {
+function normalizeSignalRouterHealth(
+  payload: Partial<SignalRouterHealth>,
+): SignalRouterHealth {
   return {
     mode: payload.mode ?? "legacy",
     routes_loaded: asNumber(payload.routes_loaded),
@@ -215,7 +241,11 @@ export class DaemonConnection {
     this.socket.send(JSON.stringify({ type: "interrupt" }));
   }
 
-  subscribe(channel: "chart" | "signals" | "nats", symbol?: string, tf?: string): void {
+  subscribe(
+    channel: "chart" | "signals" | "nats",
+    symbol?: string,
+    tf?: string,
+  ): void {
     this.socket.send(
       JSON.stringify({
         type: "subscribe",
@@ -226,7 +256,11 @@ export class DaemonConnection {
     );
   }
 
-  unsubscribe(channel: "chart" | "signals" | "nats", symbol?: string, tf?: string): void {
+  unsubscribe(
+    channel: "chart" | "signals" | "nats",
+    symbol?: string,
+    tf?: string,
+  ): void {
     this.socket.send(
       JSON.stringify({
         type: "unsubscribe",
@@ -292,7 +326,9 @@ export class DaemonClient {
       throw new Error(`${path} failed (${response.status})`);
     }
     const payload = (await response.json()) as unknown;
-    return payload && typeof payload === "object" ? (payload as JsonRecord) : {};
+    return payload && typeof payload === "object"
+      ? (payload as JsonRecord)
+      : {};
   }
 
   private async postJson(
@@ -316,7 +352,9 @@ export class DaemonClient {
       throw new Error(`${path} failed (${response.status})`);
     }
     const payload = (await response.json()) as unknown;
-    return payload && typeof payload === "object" ? (payload as JsonRecord) : {};
+    return payload && typeof payload === "object"
+      ? (payload as JsonRecord)
+      : {};
   }
 
   private async patchJson(
@@ -339,7 +377,10 @@ export class DaemonClient {
   }
 
   async fetchModelRegistry(token = ""): Promise<ModelRegistryResponse> {
-    const payload = (await this.requestJson("/api/models", token)) as Partial<ModelRegistryResponse>;
+    const payload = (await this.requestJson(
+      "/api/models",
+      token,
+    )) as Partial<ModelRegistryResponse>;
     return {
       agents: Array.isArray(payload.agents) ? payload.agents : [],
       endpoints: Array.isArray(payload.endpoints) ? payload.endpoints : [],
@@ -553,7 +594,10 @@ export class DaemonClient {
   }
 
   async fetchPortfolio(token = ""): Promise<PortfolioSnapshot> {
-    const payload = (await this.requestJson("/api/portfolio", token)) as Partial<PortfolioSnapshot>;
+    const payload = (await this.requestJson(
+      "/api/portfolio",
+      token,
+    )) as Partial<PortfolioSnapshot>;
     return {
       positions: Array.isArray(payload.positions) ? payload.positions : [],
       pnl: payload.pnl && typeof payload.pnl === "object" ? payload.pnl : {},
@@ -613,7 +657,7 @@ export class DaemonClient {
         try {
           const envelope = parseEnvelope(event.data);
           if (envelope.type === "error" && !resolved) {
-            rejectOnce(envelope.message);
+            rejectOnce(formatDaemonError(envelope));
             return;
           }
 
@@ -640,7 +684,7 @@ export class DaemonClient {
               }
               const laterEnvelope = parseEnvelope(laterEvent.data);
               if (laterEnvelope.type === "error" && !resolved) {
-                rejectOnce(laterEnvelope.message);
+                rejectOnce(formatDaemonError(laterEnvelope));
                 return;
               }
               connection.handleEnvelope(laterEnvelope);

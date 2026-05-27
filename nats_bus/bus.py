@@ -6,8 +6,12 @@ from datetime import datetime, timezone
 import nats
 from nats.aio.client import Client as NatsClient
 
-from agent_logger import log_nats
+from agent.error_surface import surface_exception
+from agent_logger import get_logger, log_nats
 from config import DEFAULT_AGENT, NATS_URL
+
+
+LOGGER = get_logger("nats")
 
 
 class NatsBus:
@@ -26,10 +30,33 @@ class NatsBus:
 
     async def connect(self):
         """Connect to the NATS server."""
+        async def _error_cb(exc):
+            surfaced = surface_exception(exc, include_traceback=False)
+            LOGGER.warning(
+                "NATS_TYPED_ERROR agent=%s error_class=%s error_message=%s actionable_hint=%s",
+                self.agent_name,
+                surfaced.error_class,
+                surfaced.error_message,
+                surfaced.actionable_hint,
+            )
+
+        async def _disconnected_cb():
+            LOGGER.warning("NATS_DISCONNECTED agent=%s url=%s", self.agent_name, self.url)
+
+        async def _reconnected_cb():
+            LOGGER.warning("NATS_RECONNECTED agent=%s url=%s", self.agent_name, self.url)
+
+        async def _closed_cb():
+            LOGGER.warning("NATS_CLOSED agent=%s url=%s", self.agent_name, self.url)
+
         self._nc = await nats.connect(
             self.url,
             reconnect_time_wait=2,
-            max_reconnect_attempts=10,
+            max_reconnect_attempts=-1,
+            error_cb=_error_cb,
+            disconnected_cb=_disconnected_cb,
+            reconnected_cb=_reconnected_cb,
+            closed_cb=_closed_cb,
         )
         # Announce presence
         await self.publish("system.registry", {
@@ -98,7 +125,19 @@ class NatsBus:
     async def request(self, subject: str, payload: dict, timeout=30.0):
         """Send a request and wait for a reply (NATS request/reply pattern)."""
         if not self.is_connected:
-            return {"error": "not connected"}
+            try:
+                await self.connect()
+            except Exception as exc:
+                surfaced = surface_exception(exc, include_traceback=False)
+                LOGGER.warning(
+                    "NATS_TYPED_ERROR agent=%s subject=%s error_class=%s error_message=%s actionable_hint=%s",
+                    self.agent_name,
+                    subject,
+                    surfaced.error_class,
+                    surfaced.error_message,
+                    surfaced.actionable_hint,
+                )
+                raise RuntimeError(f"NATS bus is not connected: {self.url}") from exc
         payload.setdefault("from", self.agent_name)
         data = json.dumps(payload).encode()
         self._notify("req", subject, payload)

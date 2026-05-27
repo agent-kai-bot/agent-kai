@@ -32,6 +32,7 @@
     DaemonClient,
     DEFAULT_SESSION_NAME,
   } from "$lib/daemon/client";
+  import { formatDaemonError } from "$lib/daemon/error";
   import { readStoredToken, writeStoredToken } from "$lib/daemon/storage";
   import {
     fullscreenChatMode,
@@ -922,7 +923,7 @@
     }
 
     if (envelope.type === "error") {
-      attachError = envelope.message;
+      attachError = formatDaemonError(envelope);
       return;
     }
   }
