@@ -15,6 +15,7 @@ REPO=${KAI_DAEMON_REPO:-/home/atc/git/claude-local-ai-agent}
 LOG=${KAI_DAEMON_LOG:-/tmp/kai-daemon.log}
 PIDFILE=${KAI_DAEMON_PIDFILE:-/tmp/kai-daemon.pid}
 PORT=${KAI_DAEMON_PORT:-18789}
+TOKEN_FILE=${KAI_DAEMON_TOKEN_FILE:-workspaces/daemon-token.txt}
 
 cd "$REPO"
 
@@ -73,11 +74,24 @@ disown
 echo "$new_pid" > "$PIDFILE"
 echo "Started pid $new_pid (log: $LOG, pidfile: $PIDFILE)"
 
-# Probe /health once it's up.
+# Probe /api/health once it's up.
+health_url="http://127.0.0.1:$PORT/api/health"
+probe_body=$(mktemp)
+trap 'rm -f "$probe_body"' EXIT
+
 for i in $(seq 1 30); do
-  if curl -sS -m 1 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+  auth_header=()
+  if [[ -r "$TOKEN_FILE" ]]; then
+    daemon_token=$(tr -d '\n\r' < "$TOKEN_FILE")
+    if [[ -n "$daemon_token" ]]; then
+      auth_header=(-H "Authorization: Bearer $daemon_token")
+    fi
+  fi
+
+  http_code=$(curl -sS -m 1 -o "$probe_body" -w "%{http_code}" "${auth_header[@]}" "$health_url" 2>/dev/null || true)
+  if [[ "$http_code" == "200" ]]; then
     echo "Daemon healthy on :$PORT after ${i}s"
-    curl -sS "http://127.0.0.1:$PORT/health" | head -c 800; echo
+    head -c 800 "$probe_body"; echo
     exit 0
   fi
   sleep 1
