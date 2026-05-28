@@ -1207,20 +1207,28 @@ class DaemonServer:
 
     def _track_background_task(
         self,
-        awaitable: Any,
+        awaitable_or_task: Any,
         *,
         name: str,
     ) -> asyncio.Task[Any] | None:
         """Create and track a daemon-owned background task."""
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return None
-        task = loop.create_task(awaitable, name=name)
-        self.background_tasks.add(task)
-        task.add_done_callback(self.background_tasks.discard)
-        task.add_done_callback(self._consume_background_task_exception)
+        if isinstance(awaitable_or_task, asyncio.Task):
+            task = awaitable_or_task
+            task.set_name(name)
+        else:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                close = getattr(awaitable_or_task, "close", None)
+                if callable(close):
+                    close()
+                return None
+            task = loop.create_task(awaitable_or_task, name=name)
+        if task not in self.background_tasks:
+            self.background_tasks.add(task)
+            task.add_done_callback(self.background_tasks.discard)
+            task.add_done_callback(self._consume_background_task_exception)
         return task
 
     async def _stop_background_tasks(self) -> None:
@@ -1257,20 +1265,14 @@ class DaemonServer:
             self.session_lifecycle_sweep_task is None
             or self.session_lifecycle_sweep_task.done()
         ):
-            self.session_lifecycle_sweep_task = asyncio.create_task(
+            self.session_lifecycle_sweep_task = self._track_background_task(
                 self._run_idle_session_sweeper(),
                 name="daemon-session-idle-sweeper",
             )
-            self.session_lifecycle_sweep_task.add_done_callback(
-                self._consume_background_task_exception
-            )
         if self.session_disk_gc_task is None or self.session_disk_gc_task.done():
-            self.session_disk_gc_task = asyncio.create_task(
+            self.session_disk_gc_task = self._track_background_task(
                 self._run_session_disk_gc(),
                 name="daemon-session-disk-gc",
-            )
-            self.session_disk_gc_task.add_done_callback(
-                self._consume_background_task_exception
             )
 
     async def _stop_session_lifecycle_tasks(self) -> None:
@@ -1625,7 +1627,7 @@ class DaemonServer:
             nats_bus=self.bus,
             runtime_config_resolver=self.runtime_config_resolver,
         )
-        self.taskboard_dispatcher_task = asyncio.create_task(
+        self.taskboard_dispatcher_task = self._track_background_task(
             self.taskboard_dispatcher.run(),
             name="daemon-taskboard-dispatcher",
         )
@@ -3006,6 +3008,42 @@ class DaemonServer:
             await flush_tokens()
             await _send_server_envelope(websocket, message)
 
+    async def _stop_websocket_forward_task(
+        self,
+        session_name: str,
+        task: asyncio.Task[Any] | None,
+    ) -> None:
+        """Cancel one websocket event-forwarder without letting cleanup hang."""
+
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await asyncio.wait_for(
+                task,
+                timeout=DAEMON_SHUTDOWN_STEP_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            if task.done() or task.cancelled():
+                return
+            raise
+        except TimeoutError:
+            self.log.warning(
+                "shutdown step timed out after %.1fs: websocket forward:%s",
+                DAEMON_SHUTDOWN_STEP_TIMEOUT_SECONDS,
+                session_name,
+            )
+            task.add_done_callback(self._consume_background_task_exception)
+        except Exception as exc:  # noqa: BLE001
+            surfaced = surface_exception(exc, include_traceback=False)
+            self.log.warning(
+                "DAEMON_TYPED_ERROR phase=websocket_forward session=%s error_class=%s error_message=%s actionable_hint=%s",
+                session_name,
+                surfaced.error_class,
+                surfaced.error_message,
+                surfaced.actionable_hint,
+            )
+
     def _event_to_message(
         self,
         *,
@@ -4297,14 +4335,21 @@ def create_app(
         daemon_server._register_websocket_client(session.name)
         subscriptions: dict[str, Any] = {"signals": False, "chart": set(), "nats": False}
         event_queue = session.subscribe_events()
-        forward_task = asyncio.create_task(
+        forward_task = daemon_server._track_background_task(
             daemon_server.forward_session_events(
                 websocket,
                 session,
                 event_queue,
                 subscriptions,
-            )
+            ),
+            name=f"daemon-ws-forward:{session.name}",
         )
+        if forward_task is None:
+            daemon_server._unregister_websocket_client(session.name)
+            session.event_bus.unsubscribe(event_queue)
+            await _send_error(websocket, "internal_error", "websocket forwarder failed")
+            await websocket.close(code=1011)
+            return
 
         try:
             await _send_server_envelope(
@@ -4336,20 +4381,7 @@ def create_app(
             )
             daemon_server._unregister_websocket_client(session.name)
             session.event_bus.unsubscribe(event_queue)
-            forward_task.cancel()
-            try:
-                await forward_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as forward_exc:  # noqa: BLE001
-                forward_surfaced = surface_exception(forward_exc, include_traceback=False)
-                daemon_server.log.warning(
-                    "DAEMON_TYPED_ERROR phase=websocket_forward session=%s error_class=%s error_message=%s actionable_hint=%s",
-                    session.name,
-                    forward_surfaced.error_class,
-                    forward_surfaced.error_message,
-                    forward_surfaced.actionable_hint,
-                )
+            await daemon_server._stop_websocket_forward_task(session.name, forward_task)
             return
 
         try:
@@ -4646,20 +4678,7 @@ def create_app(
                 session.stop_auto_mode("client disconnected")
             daemon_server._unregister_websocket_client(session.name)
             session.event_bus.unsubscribe(event_queue)
-            forward_task.cancel()
-            try:
-                await forward_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:  # noqa: BLE001
-                surfaced = surface_exception(exc, include_traceback=False)
-                daemon_server.log.warning(
-                    "DAEMON_TYPED_ERROR phase=websocket_forward session=%s error_class=%s error_message=%s actionable_hint=%s",
-                    session.name,
-                    surfaced.error_class,
-                    surfaced.error_message,
-                    surfaced.actionable_hint,
-                )
+            await daemon_server._stop_websocket_forward_task(session.name, forward_task)
 
     @app.get("/", include_in_schema=False)
     async def web_index():

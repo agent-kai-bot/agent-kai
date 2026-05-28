@@ -102,6 +102,38 @@ class DaemonServerShutdownTests(unittest.IsolatedAsyncioTestCase):
             with suppress(asyncio.CancelledError):
                 await task
 
+    async def test_shutdown_cancels_tracked_background_task(self):
+        server = DaemonServer(
+            agent_name="kai",
+            nats_url="nats://unit-test",
+            bus_factory=None,
+            taskboard_dispatcher_enabled=False,
+        )
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def tracked_task() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        task = server._track_background_task(
+            tracked_task(),
+            name="tracked-shutdown-test",
+        )
+        self.assertIsNotNone(task)
+        self.assertIn(task, server.background_tasks)
+        await started.wait()
+
+        with mock.patch("daemon.server.DAEMON_SHUTDOWN_STEP_TIMEOUT_SECONDS", 0.1):
+            await asyncio.wait_for(server._stop_background_tasks(), timeout=0.5)
+
+        self.assertTrue(cancelled.is_set())
+        self.assertTrue(task.done())
+        self.assertNotIn(task, server.background_tasks)
+
 
 def _fake_attach_runtime(
     session,
