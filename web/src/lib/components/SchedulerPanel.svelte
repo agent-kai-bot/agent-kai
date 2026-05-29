@@ -26,6 +26,10 @@
   function runCount(job: ScheduledJobRow): string {
     return String(job.run_count ?? 0);
   }
+
+  function failureCount(job: ScheduledJobRow): string {
+    return String(job.consecutive_failures ?? 0);
+  }
 </script>
 
 <Panel
@@ -47,7 +51,9 @@
             <th>Next Run</th>
             <th>Last Run</th>
             <th>Runs</th>
+            <th>Failures</th>
             <th>Max</th>
+            <th>Error</th>
             <th>Prompt</th>
           </tr>
         </thead>
@@ -61,7 +67,9 @@
               <td class="mono" title={valueOrDash(job.next_run)}>{valueOrDash(job.next_run)}</td>
               <td class="mono" title={valueOrDash(job.last_run)}>{valueOrDash(job.last_run)}</td>
               <td>{runCount(job)}</td>
+              <td>{failureCount(job)}</td>
               <td>{valueOrDash(job.max_runs)}</td>
+              <td class="error" title={valueOrDash(job.last_error)}>{valueOrDash(job.last_error)}</td>
               <td class="prompt" title={job.prompt_preview}>{job.prompt_preview}</td>
             </tr>
           {/each}
@@ -81,7 +89,7 @@
 
   .scheduler-table {
     width: 100%;
-    min-width: 58rem;
+    min-width: 68rem;
     border-collapse: collapse;
     font-size: 0.78rem;
   }
@@ -118,6 +126,14 @@
     min-width: 16rem;
     max-width: 22rem;
     color: var(--muted);
+  }
+
+  .error {
+    max-width: 14rem;
+    color: #ffb1b1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .status {

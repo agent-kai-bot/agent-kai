@@ -1779,6 +1779,8 @@ class DaemonServer:
             "created_at": job.created_at,
             "created_by": job.created_by,
             "last_result_preview": job.last_result_preview,
+            "last_error": job.last_error,
+            "consecutive_failures": job.consecutive_failures,
         }
 
     def scheduler_jobs_snapshot(self) -> list[dict[str, Any]]:
@@ -2465,7 +2467,12 @@ class DaemonServer:
                 "result_preview": payload.get("result_preview"),
             }
         elif event_type == "failed":
-            event_payload = {"job_id": job.id, "error": payload.get("error") or "job failed"}
+            event_payload = {
+                "job_id": job.id,
+                "error": payload.get("error") or "job failed",
+                "consecutive_failures": payload.get("consecutive_failures")
+                or job.consecutive_failures,
+            }
         else:
             event_payload = {"job_id": job.id}
 
@@ -2771,8 +2778,12 @@ class DaemonServer:
             f"{job.id} [{job.status}] session={job.owner_session} "
             f"type={job.type} next={next_run}{route}"
         )
+        if job.consecutive_failures:
+            text = f"{text} consecutive_failures={job.consecutive_failures}"
         if include_prompt:
             text = f"{text} prompt={job.prompt}"
+        if include_prompt and job.last_error:
+            text = f"{text} last_error={job.last_error}"
         return text
 
     def _handle_signal(self, signal: Signal) -> None:

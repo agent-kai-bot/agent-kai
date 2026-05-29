@@ -227,6 +227,8 @@ export type ScheduledJobRow = {
   created_at?: string;
   created_by?: string;
   last_result_preview?: string | null;
+  last_error?: string | null;
+  consecutive_failures?: number;
 };
 
 export type WatchlistPatch = {

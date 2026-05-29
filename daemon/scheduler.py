@@ -227,6 +227,8 @@ class ScheduledJob(BaseModel):
     max_runs: int | None = None
     status: JobStatus = "active"
     last_result_preview: str | None = None
+    last_error: str | None = None
+    consecutive_failures: int = 0
     concurrency: JobConcurrency = "queue"
     tool_budget: int | None = Field(default=None)
     target_agent_role: NonEmptyString | None = None
@@ -265,6 +267,8 @@ class ScheduledJob(BaseModel):
     def validate_job(self) -> "ScheduledJob":
         if self.run_count < 0:
             raise ValueError("run_count must be >= 0")
+        if self.consecutive_failures < 0:
+            raise ValueError("consecutive_failures must be >= 0")
         if self.max_runs is not None and self.max_runs < 1:
             raise ValueError("max_runs must be >= 1")
         if self.tool_budget is not None and self.tool_budget < 1:
@@ -761,6 +765,8 @@ class Scheduler:
             job_id,
             last_run=fired_at.isoformat(),
             last_result_preview=_truncate_preview(result_preview),
+            last_error=None,
+            consecutive_failures=0,
             next_run=next_run_iso,
             run_count=run_count,
             status=status,
@@ -777,18 +783,43 @@ class Scheduler:
     ) -> ScheduledJob:
         job = self._jobs[job_id]
         run_count = job.run_count + 1
+        last_error = _truncate_preview(error, limit=1000)
+        consecutive_failures = job.consecutive_failures + 1
+        next_run_iso: str | None = None
+        status: JobStatus = "failed"
         if job.type == "absolute":
             with suppress(Exception):
                 self._scheduler.remove_job(job_id)
+        elif job.type == "cron":
+            status = "active"
+            reference = fired_at
+            if reference.tzinfo is None:
+                reference = reference.replace(tzinfo=timezone.utc)
+            reference = max(reference.astimezone(timezone.utc), _utc_now())
+            next_run = self.next_run(job_id)
+            if next_run is None or next_run.astimezone(timezone.utc) <= reference:
+                next_run = self._next_cron_fire_after(job, reference)
+            next_run_iso = next_run.isoformat()
+            if self._scheduler.get_job(job_id) is None:
+                self._schedule_cron(job.model_copy(update={"status": "active"}))
+            self.log.warning(
+                "recurring scheduler job failed job_id=%s consecutive_failures=%s next_run=%s error=%s",
+                job.id,
+                consecutive_failures,
+                next_run_iso,
+                last_error or "job failed",
+            )
         updated = self.update_job(
             job_id,
             last_run=fired_at.isoformat(),
             last_result_preview=_truncate_preview(error),
-            next_run=None if job.type in {"absolute", "event"} else job.next_run,
+            last_error=last_error,
+            consecutive_failures=consecutive_failures,
+            next_run=next_run_iso,
             run_count=run_count,
-            status="failed",
+            status=status,
         )
-        self._emit_event("failed", updated, error=error)
+        self._emit_event("failed", updated, error=error, consecutive_failures=consecutive_failures)
         return updated
 
     def notify_triggered(self, job_id: str, *, fired_at: datetime) -> None:
@@ -821,10 +852,7 @@ class Scheduler:
         return when
 
     def _schedule_cron(self, job: ScheduledJob) -> datetime:
-        cron = job.spec.get("cron")
-        tz_name = job.spec.get("tz")
-        timezone_info = _coerce_timezone(tz_name if isinstance(tz_name, str) else None)
-        trigger = CronTrigger.from_crontab(str(cron), timezone=timezone_info)
+        trigger = self._cron_trigger(job)
         self._jobs[job.id] = job.model_copy(update={"status": "active"})
         self._scheduler.add_job(
             self._fire_scheduled_job,
@@ -839,6 +867,23 @@ class Scheduler:
         if next_run is None:
             raise RuntimeError(f"cron job '{job.id}' did not produce a next run")
         self._jobs[job.id] = self._jobs[job.id].model_copy(update={"next_run": next_run.isoformat()})
+        return next_run
+
+    def _cron_trigger(self, job: ScheduledJob) -> CronTrigger:
+        cron = job.spec.get("cron")
+        tz_name = job.spec.get("tz")
+        timezone_info = _coerce_timezone(tz_name if isinstance(tz_name, str) else None)
+        return CronTrigger.from_crontab(str(cron), timezone=timezone_info)
+
+    def _next_cron_fire_after(self, job: ScheduledJob, after: datetime) -> datetime:
+        trigger = self._cron_trigger(job)
+        reference = after
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=timezone.utc)
+        reference = reference.astimezone(trigger.timezone)
+        next_run = trigger.get_next_fire_time(reference, reference)
+        if next_run is None:
+            raise RuntimeError(f"cron job '{job.id}' did not produce a next run")
         return next_run
 
     def _persist_jobs(self) -> None:
@@ -897,7 +942,7 @@ class Scheduler:
         now = _utc_now()
         should_persist = False
         for job in list(self._jobs.values()):
-            if job.status != "active":
+            if job.status != "active" and not (job.type == "cron" and job.status == "failed"):
                 continue
             if job.type == "event":
                 continue
@@ -921,6 +966,12 @@ class Scheduler:
 
             self.schedule_job(job, persist=False)
             should_persist = True
+            if job.status == "failed":
+                self.log.warning(
+                    "re-armed failed recurring scheduler job on startup job_id=%s consecutive_failures=%s",
+                    job.id,
+                    job.consecutive_failures,
+                )
             if persisted_next_run is None or persisted_next_run > now:
                 continue
             age = (now - persisted_next_run).total_seconds()

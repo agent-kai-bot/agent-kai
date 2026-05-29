@@ -259,6 +259,7 @@ class ScheduledJobFailedEnvelope(ProtocolModel):
     type: Literal["scheduled_job_failed"]
     job_id: NonEmptyString
     error: str
+    consecutive_failures: int | None = None
     target_agent_role: str | None = None
     reasoning_effort: str | None = None
     thinking_level: str | None = None

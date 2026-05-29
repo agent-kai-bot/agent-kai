@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
-from datetime import timezone, timedelta
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from daemon.scheduler import (
@@ -488,6 +489,146 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(updated.run_count, 1)
                 self.assertIsNotNone(updated.last_run)
                 self.assertEqual(updated.last_result_preview, "session missing")
+                self.assertEqual(updated.last_error, "session missing")
+                self.assertEqual(updated.consecutive_failures, 1)
+            finally:
+                await scheduler.shutdown()
+
+    async def test_failed_cron_job_stays_active_advances_and_logs_failure_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scheduler = Scheduler(
+                dispatch_callback=lambda *_args: None,
+                jobs_path=Path(tmpdir) / "scheduler" / "jobs.json",
+                apscheduler_factory=_FakeAsyncIOScheduler,
+            )
+            await scheduler.start()
+            try:
+                job = scheduler.create_recurring_job(
+                    cron="0 * * * *",
+                    prompt="Wallet snapshot",
+                    owner_session="alpha",
+                    created_by="agent",
+                    timezone_name="UTC",
+                )
+                scheduler._scheduler.jobs[job.id]["next_run_time"] = None
+                fired_at = _utc_now().astimezone(timezone.utc).replace(
+                    minute=0,
+                    second=0,
+                    microsecond=0,
+                )
+                expected_next_run = (fired_at + timedelta(hours=1)).isoformat()
+
+                with self.assertLogs("daemon.scheduler", level="WARNING") as captured:
+                    updated = scheduler.record_failure(
+                        job.id,
+                        fired_at=fired_at,
+                        error="wallet snapshot failed",
+                    )
+
+                self.assertEqual(updated.status, "active")
+                self.assertEqual(updated.run_count, 1)
+                self.assertEqual(updated.consecutive_failures, 1)
+                self.assertEqual(updated.last_error, "wallet snapshot failed")
+                self.assertEqual(updated.last_result_preview, "wallet snapshot failed")
+                self.assertEqual(updated.next_run, expected_next_run)
+                messages = "\n".join(captured.output)
+                self.assertIn(f"job_id={job.id}", messages)
+                self.assertIn("consecutive_failures=1", messages)
+            finally:
+                await scheduler.shutdown()
+
+    async def test_failed_overdue_cron_job_is_rearmed_on_reload(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jobs_path = Path(tmpdir) / "scheduler" / "jobs.json"
+            jobs_path.parent.mkdir(parents=True, exist_ok=True)
+            now = _utc_now().replace(microsecond=0)
+            overdue = now - timedelta(days=2)
+            jobs_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "jobs": {
+                            "job-overdue-cron": {
+                                "id": "job-overdue-cron",
+                                "type": "cron",
+                                "spec": {"cron": "*/5 * * * *", "tz": "UTC"},
+                                "prompt": "Gameday retro",
+                                "owner_session": "alpha",
+                                "created_at": (now - timedelta(days=3)).isoformat(),
+                                "created_by": "agent",
+                                "last_run": overdue.isoformat(),
+                                "next_run": overdue.isoformat(),
+                                "run_count": 7,
+                                "status": "failed",
+                                "last_error": "previous failure",
+                                "consecutive_failures": 3,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            scheduler = Scheduler(
+                dispatch_callback=lambda *_args: None,
+                jobs_path=jobs_path,
+                apscheduler_factory=_FakeAsyncIOScheduler,
+            )
+            await scheduler.start()
+            try:
+                updated = scheduler.get_job("job-overdue-cron")
+                self.assertIsNotNone(updated)
+                self.assertEqual(updated.status, "active")
+                self.assertEqual(updated.consecutive_failures, 3)
+                self.assertEqual(updated.last_error, "previous failure")
+                self.assertIn("job-overdue-cron", scheduler._scheduler.jobs)
+                self.assertIsNotNone(updated.next_run)
+                next_run = datetime.fromisoformat(updated.next_run)
+                self.assertGreater(next_run, now)
+            finally:
+                await scheduler.shutdown()
+
+    async def test_failed_one_shot_job_stays_terminal_on_reload(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jobs_path = Path(tmpdir) / "scheduler" / "jobs.json"
+            jobs_path.parent.mkdir(parents=True, exist_ok=True)
+            now = _utc_now().replace(microsecond=0)
+            run_at = now - timedelta(minutes=10)
+            jobs_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "jobs": {
+                            "job-failed-once": {
+                                "id": "job-failed-once",
+                                "type": "absolute",
+                                "spec": {"at": run_at.isoformat()},
+                                "prompt": "One shot",
+                                "owner_session": "alpha",
+                                "created_at": (now - timedelta(hours=1)).isoformat(),
+                                "created_by": "agent",
+                                "last_run": run_at.isoformat(),
+                                "run_count": 1,
+                                "status": "failed",
+                                "last_error": "one-shot failure",
+                                "consecutive_failures": 1,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            scheduler = Scheduler(
+                dispatch_callback=lambda *_args: None,
+                jobs_path=jobs_path,
+                apscheduler_factory=_FakeAsyncIOScheduler,
+            )
+            await scheduler.start()
+            try:
+                updated = scheduler.get_job("job-failed-once")
+                self.assertIsNotNone(updated)
+                self.assertEqual(updated.status, "failed")
+                self.assertIsNone(updated.next_run)
+                self.assertNotIn("job-failed-once", scheduler._scheduler.jobs)
             finally:
                 await scheduler.shutdown()
 
