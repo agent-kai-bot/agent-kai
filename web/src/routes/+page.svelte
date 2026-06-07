@@ -1147,7 +1147,17 @@
 
   onMount(() => {
     tokenRequired = !localhostHosts.has(window.location.hostname);
-    token = tokenRequired ? readStoredToken() : "";
+    const urlToken =
+      new URLSearchParams(window.location.search).get("token")?.trim() ?? "";
+    if (urlToken) {
+      writeStoredToken(urlToken);
+      window.history.replaceState(
+        {},
+        document.title,
+        window.location.pathname + window.location.hash,
+      );
+    }
+    token = urlToken || (tokenRequired ? readStoredToken() : "");
     void refreshSessions();
     void refreshModelInfo();
     const onKeydown = (event: KeyboardEvent) => {
